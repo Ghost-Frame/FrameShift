@@ -4,4 +4,4 @@ CTX_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export CTX_DIR
 CONTEXT_PHRASES=("embedding" "vector" "recall" "knowledge graph")
 export CONTEXT_PHRASES
-source "${AGENT_CONFIG_DIR:-$HOME/.agent-config}/claude/bin/sync-context.sh"
+source "$CTX_DIR/../bin/sync-context.sh"

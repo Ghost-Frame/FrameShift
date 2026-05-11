@@ -90,7 +90,7 @@ Research output must be grounded in verifiable sources, not training-data recall
 - Codebase: `file/path.rs:42` or `file/path.rs:42-58` for ranges
 - Commits: `abc1234 ("commit message", YYYY-MM-DD)`
 - Specs: `RFC 1234 Section 5.2` or `NIST SP 800-63B Section 4.1`
-- External: `[title](URL), accessed YYYY-MM-DD`
+- External: `[title](https://example.com), accessed YYYY-MM-DD`
 
 ### Research tools
 - `kleos-cli search` for prior findings and decisions

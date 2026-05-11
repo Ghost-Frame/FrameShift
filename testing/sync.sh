@@ -9,4 +9,4 @@ export CTX_DIR
 CONTEXT_PHRASES=("coverage" "flaky" "test vector" "assertion")
 export CONTEXT_PHRASES
 
-source "${AGENT_CONFIG_DIR:-$HOME/.agent-config}/claude/bin/sync-context.sh"
+source "$CTX_DIR/../bin/sync-context.sh"

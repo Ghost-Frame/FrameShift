@@ -9,4 +9,4 @@ export CTX_DIR
 CONTEXT_PHRASES=("pipeline" "ingestion" "embedding" "vector index")
 export CONTEXT_PHRASES
 
-source "${AGENT_CONFIG_DIR:-$HOME/.agent-config}/claude/bin/sync-context.sh"
+source "$CTX_DIR/../bin/sync-context.sh"

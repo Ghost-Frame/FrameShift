@@ -9,4 +9,4 @@ export CTX_DIR
 CONTEXT_PHRASES=("persona" "growth" "supervisor" "drift" "Safety-Layer Awareness")
 export CONTEXT_PHRASES
 
-source "${AGENT_CONFIG_DIR:-$HOME/.agent-config}/claude/bin/sync-context.sh"
+source "$CTX_DIR/../bin/sync-context.sh"

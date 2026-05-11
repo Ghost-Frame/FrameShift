@@ -16,7 +16,7 @@ Each context follows the same three-file template:
 <context>/
   AGENTS.md   # The persona. Loaded on session start.
   GROWTH.md   # Running observations log. Appended during sessions.
-  sync.sh     # Validation wrapper (expects an external helper).
+  sync.sh     # Validation wrapper. Delegates to bin/sync-context.sh.
 ```
 
 `GROWTH.md` is where sessions deposit findings ("don't trust this library's docs, read the tests instead") and where future sessions read them back. The persona file is the soul. The growth log is the memory.
@@ -71,7 +71,7 @@ Six patterns repeat across every persona:
 
 Pick the contexts that match your work. Drop them into your repo. Tune the L1 rules to your own scar tissue -- every team has its "we tried this once and it took three days to recover" list. The framework is the structure. The content is yours.
 
-The `sync.sh` wrappers source an external validation helper not bundled here. If you have your own validator, point `AGENT_CONFIG_DIR` at it. Otherwise ignore them; the persona files are the substantive content.
+Each context's `sync.sh` runs the bundled validator at `bin/sync-context.sh`. Edit the persona, run `./sync.sh` from inside the context directory, and it checks the cascade anchors, the L1 rule block, the required vocabulary for that context, the minimum line count, and broken relative links. No setup, no env vars, no external dependencies beyond `bash` and `python3`.
 
 ## References
 

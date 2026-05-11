@@ -9,4 +9,4 @@ export CTX_DIR
 CONTEXT_PHRASES=("fidelity tier" "PRIMARY-SOURCE" "cite" "training-data memory")
 export CONTEXT_PHRASES
 
-source "${AGENT_CONFIG_DIR:-$HOME/.agent-config}/claude/bin/sync-context.sh"
+source "$CTX_DIR/../bin/sync-context.sh"
