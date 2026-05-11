@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/banner.png" alt="personify — custom-agents" width="100%" />
+</p>
+
 # custom-agents
 
 **A different Claude Code persona in every directory.**
