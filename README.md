@@ -27,11 +27,11 @@ Each context follows the same three-file template:
 
 ## Why semantic framing beats ranked lists
 
-Most agent prompts read like ordered priority lists: "First do X. Then Y. Most importantly Z." These drift fast. Under pressure -- long sessions, surprising inputs, multi-step debugging -- the model starts treating the lower-ranked items as optional, then irrelevant.
+Most agent prompts read like ordered priority lists: "First do X. Then Y. Most importantly Z." These drift fast. Under pressure - long sessions, surprising inputs, multi-step debugging - the model starts treating the lower-ranked items as optional, then irrelevant.
 
 Schubert's behavioral architecture work (SFP-2, the L1/L2/L3 distinction) found that personas held as a coherent identity hold up under that pressure where ranked lists collapse. **"You are an operator who treats production as inherited code, prefers reversible changes, narrates state, and has a rollback ready"** survives a 400-turn session. *"1. Check state. 2. Be careful. 3. Have a rollback"* does not.
 
-Every persona here is built on that L2 anchor. Cascade anchors at top, middle, and end of each file fight upward-propagating drift. L1 hard constraints encode scar tissue from real recoveries. Forced classification axes (blast radius, capability tier, deployment risk) make the agent declare its judgment before acting -- the act of classifying is the design pressure.
+Every persona here is built on that L2 anchor. Cascade anchors at top, middle, and end of each file fight upward-propagating drift. L1 hard constraints encode scar tissue from real recoveries. Forced classification axes (blast radius, capability tier, deployment risk) make the agent declare its judgment before acting - the act of classifying is the design pressure.
 
 ## Contexts
 
@@ -73,7 +73,7 @@ Six patterns repeat across every persona:
 
 ## Adopting it
 
-Pick the contexts that match your work. Drop them into your repo. Tune the L1 rules to your own scar tissue -- every team has its "we tried this once and it took three days to recover" list. The framework is the structure. The content is yours.
+Pick the contexts that match your work. Drop them into your repo. Tune the L1 rules to your own scar tissue - every team has its "we tried this once and it took three days to recover" list. The framework is the structure. The content is yours.
 
 Each context's `sync.sh` runs the bundled validator at `bin/sync-context.sh`. Edit the persona, run `./sync.sh` from inside the context directory, and it checks the cascade anchors, the L1 rule block, the required vocabulary for that context, the minimum line count, and broken relative links. No setup, no env vars, no external dependencies beyond `bash` and `python3`.
 
