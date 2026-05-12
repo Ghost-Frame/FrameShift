@@ -1,43 +1,43 @@
 <p align="center">
-  <img src="assets/banner.png" alt="personify — custom-agents" width="100%" />
+  <img src="assets/banner.png" alt="personify — archetypes" width="100%" />
 </p>
 
-# custom-agents
+# archetypes
 
-**A different Claude Code persona in every directory.**
+**A different archetype in every directory.**
 
-`cd cryptographic/` and you get a spec-anchored cryptographer who refuses to invent primitives. `cd systems/` and you get a paranoid operator who state-checks before touching anything and has a rollback ready. `cd writer/` and you get a technical editor who deletes a sentence before adding one. Same model. Different operator.
+`cd cryptographic/` and you get a spec-anchored cryptographer who refuses to invent primitives. `cd systems/` and you get a paranoid operator who state-checks before touching anything and has a rollback ready. `cd writer/` and you get a technical editor who deletes a sentence before adding one. Same model. Different archetype.
 
-Each subdirectory is a self-contained behavioral identity that Claude Code loads on session start. The point is not to give the model more rules. It is to anchor it in a coherent identity that survives long sessions, surprising inputs, and the slow drift that turns careful operators into sloppy ones around turn 200.
+Each subdirectory is a self-contained archetype loaded on session start. The point is not to give the model more rules. It is to anchor it in a coherent stance that survives long sessions, surprising inputs, and the slow drift that turns careful operators into sloppy ones around turn 200.
 
 ## How it works
 
-Claude Code auto-loads `AGENTS.md` from the working directory. Launch from `systems/` and the systems engineer wakes up. Launch from `cryptographic/` and the cryptographer wakes up. The directory is the trigger.
+Any coding agent that honors the `AGENTS.md` convention auto-loads it from the working directory. Launch from `systems/` and the systems engineer wakes up. Launch from `cryptographic/` and the cryptographer wakes up. The directory is the trigger.
 
 Each context follows the same three-file template:
 
 ```
 <context>/
-  AGENTS.md   # The persona. Loaded on session start.
+  AGENTS.md   # The archetype. Loaded on session start.
   GROWTH.md   # Running observations log. Appended during sessions.
   sync.sh     # Validation wrapper. Delegates to bin/sync-context.sh.
 ```
 
-`GROWTH.md` is where sessions deposit findings ("don't trust this library's docs, read the tests instead") and where future sessions read them back. The persona file is the soul. The growth log is the memory.
+`GROWTH.md` is where sessions deposit findings ("don't trust this library's docs, read the tests instead") and where future sessions read them back. The archetype file is the soul. The growth log is the memory.
 
 ## Why semantic framing beats ranked lists
 
 Most agent prompts read like ordered priority lists: "First do X. Then Y. Most importantly Z." These drift fast. Under pressure - long sessions, surprising inputs, multi-step debugging - the model starts treating the lower-ranked items as optional, then irrelevant.
 
-Schubert's behavioral architecture work (SFP-2, the L1/L2/L3 distinction) found that personas held as a coherent identity hold up under that pressure where ranked lists collapse. **"You are an operator who treats production as inherited code, prefers reversible changes, narrates state, and has a rollback ready"** survives a 400-turn session. *"1. Check state. 2. Be careful. 3. Have a rollback"* does not.
+Schubert's behavioral architecture work (SFP-2, the L1/L2/L3 distinction) found that archetypes held as a coherent stance hold up under that pressure where ranked lists collapse. **"You are an operator who treats production as inherited code, prefers reversible changes, narrates state, and has a rollback ready"** survives a 400-turn session. *"1. Check state. 2. Be careful. 3. Have a rollback"* does not.
 
-Every persona here is built on that L2 anchor. Cascade anchors at top, middle, and end of each file fight upward-propagating drift. L1 hard constraints encode scar tissue from real recoveries. Forced classification axes (blast radius, capability tier, deployment risk) make the agent declare its judgment before acting - the act of classifying is the design pressure.
+Every archetype here is built on that L2 anchor. Cascade anchors at top, middle, and end of each file fight upward-propagating drift. L1 hard constraints encode scar tissue from real recoveries. Forced classification axes (blast radius, capability tier, deployment risk) make the operator declare its judgment before acting - the act of classifying is the design pressure.
 
 ## Contexts
 
 | Directory | The operator you wake up |
 |---|---|
-| `agents/` | Agent designer. Personas, growth, supervision, multi-agent loops |
+| `agents/` | Agent designer. Archetypes, growth, supervision, multi-agent loops |
 | `architecture/` | Skeptical architect. Stress-tests proposals before they cost anything to fix |
 | `bots/` | Discord bot personality engineer. Character fidelity across thousands of turns |
 | `creative/` | Creative coder. Aesthetic judgment over convention |
@@ -62,20 +62,20 @@ Every persona here is built on that L2 anchor. Cascade anchors at top, middle, a
 
 ## The toolkit
 
-Six patterns repeat across every persona:
+Six patterns repeat across every archetype:
 
-- **L2 semantic framing.** Identity as coherent stance, not ranked priorities. The first sentence of every persona names who the agent is, not what it does.
+- **L2 semantic framing.** Identity as coherent stance, not ranked priorities. The first sentence of every archetype names who the operator is, not what they do.
 - **Cascade anchors.** Re-anchor at top, middle, and end. Drift propagates upward through context, so redundancy at the start, middle, and end of the file matters more than thoroughness.
 - **L1 hard constraints.** Never-do rules with the reasoning attached. Scar tissue from real incidents. These survive context erosion better than soft guidance.
-- **Forced classification.** Each context declares an axis (LOCAL/SERVICE/HOST/FLEET/GLOBAL for systems, AUTONOMOUS/ASSISTED/CONSTRAINED/TOY for agents, ON-CHARACTER/DRIFTING/OFF-CHARACTER/BROKEN for bots). The agent must classify before acting. The classification is the design pressure.
-- **Self-evaluation hooks.** Each persona ends with a short checklist run before non-trivial actions.
-- **Growth integration.** The persona is read-only at session start. The growth log is append-only during the session. Next session reads both.
+- **Forced classification.** Each context declares an axis (LOCAL/SERVICE/HOST/FLEET/GLOBAL for systems, AUTONOMOUS/ASSISTED/CONSTRAINED/TOY for agents, ON-CHARACTER/DRIFTING/OFF-CHARACTER/BROKEN for bots). The operator must classify before acting. The classification is the design pressure.
+- **Self-evaluation hooks.** Each archetype ends with a short checklist run before non-trivial actions.
+- **Growth integration.** The archetype is read-only at session start. The growth log is append-only during the session. Next session reads both.
 
 ## Adopting it
 
 Pick the contexts that match your work. Drop them into your repo. Tune the L1 rules to your own scar tissue - every team has its "we tried this once and it took three days to recover" list. The framework is the structure. The content is yours.
 
-Each context's `sync.sh` runs the bundled validator at `bin/sync-context.sh`. Edit the persona, run `./sync.sh` from inside the context directory, and it checks the cascade anchors, the L1 rule block, the required vocabulary for that context, the minimum line count, and broken relative links. No setup, no env vars, no external dependencies beyond `bash` and `python3`.
+Each context's `sync.sh` runs the bundled validator at `bin/sync-context.sh`. Edit the archetype, run `./sync.sh` from inside the context directory, and it checks the cascade anchors, the L1 rule block, the required vocabulary for that context, the minimum line count, and broken relative links. No setup, no env vars, no external dependencies beyond `bash` and `python3`.
 
 ## References
 
