@@ -8,6 +8,7 @@ members = [
     "crates/personify-memory",
     "crates/personify-memory-http",
     "crates/personify-memory-sqlite-fts",
+    "crates/personify-runtime",
 ]
 
 [workspace.package]

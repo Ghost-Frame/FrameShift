@@ -1453,6 +1453,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "personify-runtime"
+version = "0.1.0"
+dependencies = [
+ "personify-memory",
+ "personify-template",
+ "personify-vault",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "personify-template"
 version = "0.1.0"
 dependencies = [
