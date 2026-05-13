@@ -53,7 +53,7 @@ Invoke these before relevant work. Skills produce structured output that the per
 | `rust-hygiene` | Rust-based tools |
 | `verification-before-completion` | Before declaring any task done |
 
-The structured dev workflow is mandatory for all non-trivial work. See L1 Rules.
+The structured dev workflow ($DEV_WORKFLOW) is mandatory for all non-trivial work. See L1 Rules.
 
 ---
 
@@ -64,7 +64,7 @@ The structured dev workflow is mandatory for all non-trivial work. See L1 Rules.
 - Never require configuration that can be inferred from the environment.
 - Never break backward compatibility without a deprecation period and a warning on old invocations.
 - Always test the error path as thoroughly as the happy path.
-- Always run the structured dev workflow's workflow: `spec_task` before new tools, `consider_approaches` for design decisions, `challenge_code` before declaring done, `session_diff` before merge.
+- Always run the structured dev workflow: `spec_task` before new tools, `consider_approaches` for design decisions, `challenge_code` before declaring done, `session_diff` before merge.
 - Never edit a file you did not write without a `dep_risk(file)` check first.
 - Call `check_breakage(symbol)` before changing any public CLI interface or library API.
 
@@ -75,7 +75,7 @@ The structured dev workflow is mandatory for all non-trivial work. See L1 Rules.
 Devtools work in the user's environment uses these specific tools and patterns.
 
 ### AST and parsing
-- tree-sitter 0.24 for AST parsing (the code analysis tool)
+- tree-sitter 0.24 for AST parsing (the code analyzer)
 - Language bindings: Rust, TypeScript, Python, Go, C, JSON
 - JSON stdin/stdout for agent-compatible tool I/O
 
@@ -88,7 +88,7 @@ Devtools work in the user's environment uses these specific tools and patterns.
 ### Skill authoring
 - skill-forge (Astro 6.x) for skill marketplace UI
 - Markdown with YAML frontmatter for skill definitions
-- the structured dev workflow as exemplar: `--input`/`--output` JSON files, rusqlite for state persistence
+- Structured dev workflow as exemplar: `--input`/`--output` JSON files, rusqlite for state persistence
 
 ### Hook systems
 - Bash + Python3 for pre/post-tool enforcement gates
@@ -161,7 +161,7 @@ For larger tools, restate the target DX, the maturity classification, and the co
 - **Session start:** Read `./GROWTH.md` before the first prompt.
 - **During session:** When a toolchain behavior, AST quirk, parser edge case, or DX insight took effort to discover, append a dated note to `GROWTH.md` immediately. Do not wait for session end.
 - **Session end:** Reflect on what shifted in your understanding of the user's toolchain, error patterns, or DX priorities. Append a final summary observation.
-- **the memory server dual-write:** Send significant findings to the memory server via `the-memory-cli store` -- searchable across all contexts. Every `the-memory-cli store` call from this context must include `--tags "context:devtools"` and `--source "claude-code:devtools"`.
+- **Memory dual-write:** Send significant findings to the memory server via `$MEMORY_CLI store` -- searchable across all contexts. Every `$MEMORY_CLI store` call from this context must include `--tags "context:devtools"` and `--source "claude-code:devtools"`.
 
 This file (`AGENTS.md`) is the canonical persona for every agent that runs in this directory. `GROWTH.md` is the running log. Edit `AGENTS.md` when the persona itself needs to change, then run `./sync.sh` to validate.
 

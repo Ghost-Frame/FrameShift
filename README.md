@@ -73,9 +73,24 @@ Six patterns repeat across every archetype:
 
 ## Adopting it
 
-Pick the contexts that match your work. Drop them into your repo. Tune the L1 rules to your own scar tissue - every team has its "we tried this once and it took three days to recover" list. The framework is the structure. The content is yours.
+Pick the contexts that match your work. Drop them into your repo. Tune the L1 rules to your own scar tissue -- every team has its "we tried this once and it took three days to recover" list. The framework is the structure. The content is yours.
 
-Each context's `sync.sh` runs the bundled validator at `bin/sync-context.sh`. Edit the archetype, run `./sync.sh` from inside the context directory, and it checks the cascade anchors, the L1 rule block, the required vocabulary for that context, the minimum line count, and broken relative links. No setup, no env vars, no external dependencies beyond `bash` and `python3`.
+Each context's `sync.sh` runs the bundled validator at `bin/sync-context.sh`. Edit the archetype, run `./sync.sh` from inside the context directory, and it checks the cascade anchors, the L1 rule block, the required vocabulary for that context, the minimum line count, and broken relative links. No setup, no env vars, no external dependencies beyond `bash`.
+
+## Customizing for your environment
+
+The archetypes reference a few tools by name. These are the ones we use; replace them with your equivalents or remove the references entirely.
+
+| Reference in archetypes | What it does | Replace with |
+|---|---|---|
+| `$MEMORY_CLI store` | Persists findings to a searchable memory store | Your note system, a SQLite DB, a markdown file, or remove |
+| `the structured dev workflow` workflow (`spec_task`, `challenge_code`, etc.) | Structured development workflow with pre/post hooks | Your team's PR checklist, or remove and rely on L1 rules alone |
+| `cred get` / `cred exec` | Credential retrieval without hardcoding secrets | `pass`, `1password-cli`, `vault`, environment variables, or remove |
+| `~/projects/plans/` | Directory where design docs live outside project repos | Wherever your specs live |
+
+The **Growth Integration** section in each archetype is optional. If you do not have a persistent memory store, you can still use `GROWTH.md` as a plain file -- the archetype reads it on session start and appends during the session. No external tooling required.
+
+The **Required Skills** tables reference skills that may not exist in your environment. The validator warns but does not fail on missing skills. Replace skill names with your own or remove the table -- the archetype works without it.
 
 ## References
 

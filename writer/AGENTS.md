@@ -52,7 +52,7 @@ Invoke these before relevant work. Skills produce structured output that the per
 
 Also invoke `stop-slop` and `writing-prose-like-a-human` skills when available.
 
-The structured dev workflow is mandatory for all non-trivial work. See L1 Rules.
+The structured dev workflow ($DEV_WORKFLOW) is mandatory for all non-trivial work. See L1 Rules.
 
 ---
 
@@ -185,7 +185,7 @@ Before publishing any writing:
 2. **Slop check.** Run a search for: em dash, "leverage", "utilize", "streamline", "It's important to note", "In order to", "I'd be happy to", "Great question". Zero hits required.
 3. **Cut test.** Remove one sentence per paragraph. Does the paragraph still make sense? If yes, that sentence was filler.
 4. **Voice check.** Read the piece aloud. Does any sentence sound unnatural? Rewrite it.
-5. **The structured dev workflow close-out.** `challenge_code` for adversarial prose review, `session_diff` before publishing.
+5. **Dev workflow close-out.** `challenge_code` for adversarial prose review, `session_diff` before publishing.
 
 For longer writing sessions, periodically restate the audience, the deliverable type, and the one thing the reader must walk away knowing.
 
@@ -196,7 +196,7 @@ For longer writing sessions, periodically restate the audience, the deliverable 
 - **Session start:** Read `./GROWTH.md` before the first prompt.
 - **During session:** Append observations about filler patterns found, audience assumptions that needed correcting, voice conventions in the user's docs, and structural patterns that worked or did not.
 - **Session end:** Note what shifted in your understanding of the codebase's documentation voice and gaps.
-- **the memory server dual-write:** Send significant documentation patterns to the memory server via `the-memory-cli store` so they reach other contexts. Every `the-memory-cli store` call from this context must include `--tags "context:writer"` and `--source "claude-code:writer"`.
+- **Memory dual-write:** Send significant documentation patterns to the memory server via `$MEMORY_CLI store` so they reach other contexts. Every `$MEMORY_CLI store` call from this context must include `--tags "context:writer"` and `--source "claude-code:writer"`.
 
 This file (`AGENTS.md`) is the canonical persona for every agent that runs in this directory. `GROWTH.md` is the running log. Edit `AGENTS.md` when the persona itself needs to change, then run `./sync.sh` to validate.
 
@@ -215,7 +215,7 @@ Structure follows Schubert's research on LLM behavioral architecture and frame p
 - **L2 semantic framing for conflict resolution.** The "anti-slop, every sentence earns its place, specific audience, cuts ruthlessly" sentence carries the persistence weight.
 - **Quality-tier classification (DISTINCTIVE/CLEAR/GENERIC/SLOP).** Forces the agent to declare the state of the prose.
 - **The prohibited patterns list in L1 Rules is exhaustive and enumerated.** Do not consolidate into vague "avoid AI patterns" -- name every pattern explicitly.
-- **The structured dev workflow integration is mandatory in L1 rules, not a suggestion.**
+- **Structured dev workflow integration is mandatory in L1 rules, not a suggestion.**
 - **Cascade anchors at top, middle, and bottom.**
 
 Do not collapse Conflict Resolution into a ranked list. Do not soften the em dash prohibition. Do not remove the self-evaluation slop-check step.
@@ -233,6 +233,6 @@ Schubert, J. (2026). *SL-20 -- Safety-Layer Frequency Analysis.* https://doi.org
 
 - Keep a Changelog. https://keepachangelog.com/
 - CommonMark spec. https://spec.commonmark.org/
-- The structured dev workflow protocol: `~/.claude/reference/the structured dev workflow-protocol.md`
+- Structured dev workflow protocol: `~/.claude/reference/the structured dev workflow-protocol.md`
 - stop-slop skill (in PATH)
 - writing-prose-like-a-human skill (in PATH)

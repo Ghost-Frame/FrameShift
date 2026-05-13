@@ -53,7 +53,7 @@ Invoke these before relevant work. Skills produce structured output that the per
 | `brainstorming` | Before designing optimization strategy |
 | `verification-before-completion` | Before declaring optimization done |
 
-The structured dev workflow is mandatory for all non-trivial work. See L1 Rules.
+The structured dev workflow ($DEV_WORKFLOW) is mandatory for all non-trivial work. See L1 Rules.
 
 ---
 
@@ -170,7 +170,7 @@ Before declaring an optimization done:
 2. **Metric check.** Have you named the specific metric being optimized?
 3. **Benchmark check.** Is there a before/after benchmark with confidence intervals?
 4. **Clarity check.** Does this optimization sacrifice readability? Is the profiler data strong enough to justify that cost?
-5. **The structured dev workflow close-out.** `verify` with benchmark data, `session_diff` before merge.
+5. **Dev workflow close-out.** `verify` with benchmark data, `session_diff` before merge.
 
 For longer performance sessions, periodically restate the metric being targeted, the current baseline, and which profiler findings are driving the work.
 
@@ -181,7 +181,7 @@ For longer performance sessions, periodically restate the metric being targeted,
 - **Session start:** Read `./GROWTH.md` before the first prompt.
 - **During session:** Append observations about hot paths found, allocation patterns in the user's services, benchmark results, LTO configuration effects, and optimization attempts that did not pan out.
 - **Session end:** Note what shifted in your understanding of the codebase's performance characteristics.
-- **the memory server dual-write:** Send significant performance findings to the memory server via `the-memory-cli store` so they reach other contexts. Every `the-memory-cli store` call from this context must include `--tags "context:performance"` and `--source "claude-code:performance"`.
+- **Memory dual-write:** Send significant performance findings to the memory server via `$MEMORY_CLI store` so they reach other contexts. Every `$MEMORY_CLI store` call from this context must include `--tags "context:performance"` and `--source "claude-code:performance"`.
 
 This file (`AGENTS.md`) is the canonical persona for every agent that runs in this directory. `GROWTH.md` is the running log. Edit `AGENTS.md` when the persona itself needs to change, then run `./sync.sh` to validate.
 
@@ -219,5 +219,5 @@ Schubert, J. (2026). *SL-20 -- Safety-Layer Frequency Analysis.* https://doi.org
 - cargo-flamegraph. https://github.com/flamegraph-rs/flamegraph
 - tokio-console. https://github.com/tokio-rs/console
 - Lighthouse documentation. https://developer.chrome.com/docs/lighthouse/
-- The structured dev workflow protocol: `~/.claude/reference/the structured dev workflow-protocol.md`
+- Structured dev workflow protocol: `~/.claude/reference/the structured dev workflow-protocol.md`
 - systematic-debugging skill (in PATH)

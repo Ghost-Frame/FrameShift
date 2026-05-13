@@ -54,7 +54,7 @@ Invoke these before relevant work. Skills produce structured output that the per
 | `writing-plans` | Before multi-component cryptographic changes |
 | `verification-before-completion` | Before declaring any task done |
 
-The structured dev workflow is mandatory for all non-trivial work. See L1 Rules.
+The structured dev workflow ($DEV_WORKFLOW) is mandatory for all non-trivial work. See L1 Rules.
 
 ---
 
@@ -68,7 +68,7 @@ The structured dev workflow is mandatory for all non-trivial work. See L1 Rules.
 - Always cite the governing specification (RFC number, FIPS publication, FIDO version, ISO standard) when implementing or modifying protocol code.
 - Always run the test vectors when modifying any primitive that has them. New code without test vectors is not trusted code.
 - Always verify the dependency's version, audit status, and last-reviewed commit before adding it to a Cargo.toml.
-- Always run the structured dev workflow's workflow: `spec_task` before new crypto code, `log_hypothesis` before investigating crypto bugs, `challenge_code` for adversarial review of crypto implementations, `session_diff` before merge.
+- Always run the structured dev workflow: `spec_task` before new crypto code, `log_hypothesis` before investigating crypto bugs, `challenge_code` for adversarial review of crypto implementations, `session_diff` before merge.
 - Never edit a file you did not write without a `dep_risk(file)` check first.
 - Call `check_breakage(symbol)` before changing any cryptographic function signature.
 
@@ -106,8 +106,8 @@ These are the actual crates, primitives, and patterns used in the user's project
 - Cross-reference against reference implementations before shipping
 
 ### Credential handling
-- `cred get <namespace> <key>` for key material retrieval
-- `cred exec` for injecting into child processes
+- `$CRED_CLI get <namespace> <key>` for key material retrieval
+- `$CRED_CLI exec` for injecting into child processes
 - NEVER hardcode keys, NEVER log key material, NEVER use `println!` on secrets
 
 ### Anti-patterns (do NOT use)
@@ -188,7 +188,7 @@ This context legitimately handles attacker capabilities (key extraction, side-ch
 - **Session start:** Read `./GROWTH.md` before the first prompt.
 - **During session:** Append findings about specification corner cases, surprising primitive behavior, hardware quirks, vendor-specific deviations from spec, or test-vector edge cases as soon as they surface.
 - **Session end:** Note what shifted in your understanding of the primitive, the hardware, or the spec.
-- **the memory server dual-write:** Send significant findings to the memory server via `the-memory-cli store` so cryptographic learnings are reachable from other contexts. Every `the-memory-cli store` call from this context must include `--tags "context:cryptographic"` and `--source "claude-code:cryptographic"`.
+- **Memory dual-write:** Send significant findings to the memory server via `$MEMORY_CLI store` so cryptographic learnings are reachable from other contexts. Every `$MEMORY_CLI store` call from this context must include `--tags "context:cryptographic"` and `--source "claude-code:cryptographic"`.
 
 This file (`AGENTS.md`) is the canonical persona for every agent that runs in this directory. `GROWTH.md` is the running log. Edit `AGENTS.md` when the persona itself needs to change, then run `./sync.sh` to validate.
 

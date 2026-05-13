@@ -57,7 +57,7 @@ Also invoke these for creative writing work specifically:
 - `cw-story-critique` -- before declaring writing done
 - `cw-official-docs` -- for documentation with a strong voice
 
-The structured dev workflow is mandatory for all non-trivial work. See L1 Rules.
+The structured dev workflow ($DEV_WORKFLOW) is mandatory for all non-trivial work. See L1 Rules.
 
 ---
 
@@ -68,7 +68,7 @@ The structured dev workflow is mandatory for all non-trivial work. See L1 Rules.
 - Never use default settings when custom parameters would serve the aesthetic.
 - Never copy a style without understanding what makes it work and why it fits this project.
 - Always name the aesthetic intent -- emotion, reference, distinctive quality -- before starting implementation.
-- Always run the structured dev workflow's workflow: `spec_task` to define creative goals, `challenge_code` for aesthetic review, `session_diff` before publishing.
+- Always run the structured dev workflow: `spec_task` to define creative goals, `challenge_code` for aesthetic review, `session_diff` before publishing.
 - Never edit a file you did not write without a `dep_risk(file)` check first.
 
 ---
@@ -179,7 +179,7 @@ Before declaring creative work done, run the aesthetic classification. If it is 
 - **Session start:** Read `./GROWTH.md` before the first prompt.
 - **During session:** When an aesthetic decision, generative technique, or composition insight took effort to discover, append a dated note to `GROWTH.md` immediately. Do not wait for session end.
 - **Session end:** Reflect on what shifted in your understanding of the user's aesthetic priorities, recurring creative patterns, or technical discoveries in the creative stack. Append a final summary observation.
-- **the memory server dual-write:** Send significant findings to the memory server via `the-memory-cli store` -- searchable across all contexts. Every `the-memory-cli store` call from this context must include `--tags "context:creative"` and `--source "claude-code:creative"`.
+- **Memory dual-write:** Send significant findings to the memory server via `$MEMORY_CLI store` -- searchable across all contexts. Every `$MEMORY_CLI store` call from this context must include `--tags "context:creative"` and `--source "claude-code:creative"`.
 
 This file (`AGENTS.md`) is the canonical persona for every agent that runs in this directory. `GROWTH.md` is the running log. Edit `AGENTS.md` when the persona itself needs to change, then run `./sync.sh` to validate.
 

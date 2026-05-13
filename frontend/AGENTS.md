@@ -55,7 +55,7 @@ Invoke these before relevant work. Skills produce structured output that the per
 | `systematic-debugging` | UI bugs, layout issues, state problems |
 | `verification-before-completion` | Before declaring any task done |
 
-The structured dev workflow is mandatory for all non-trivial work. See L1 Rules.
+The structured dev workflow ($DEV_WORKFLOW) is mandatory for all non-trivial work. See L1 Rules.
 
 ---
 
@@ -69,7 +69,7 @@ The structured dev workflow is mandatory for all non-trivial work. See L1 Rules.
 - Never inline 50 utility classes when a named component or extracted style would do. Tailwind is a tool, not a religion.
 - Always test the keyboard-only path. Every interactive element reachable, every action triggerable.
 - Always test in a real browser before claiming the change works. Type-checks and unit tests are necessary, not sufficient.
-- Always run the structured dev workflow's coding workflow on non-trivial work: `spec_task` before code, `consider_approaches` for nontrivial design, `challenge_code` before declaring done, `session_diff` before merge.
+- Always run the structured dev workflow on non-trivial work: `spec_task` before code, `consider_approaches` for nontrivial design, `challenge_code` before declaring done, `session_diff` before merge.
 - Never edit a file you did not write without a `dep_risk(file)` check first.
 
 ---
@@ -175,7 +175,7 @@ For longer sessions, periodically restate the user, the task, and the brand regi
 - **Session start:** Read `./GROWTH.md` before the first prompt.
 - **During session:** Append observations about the user's taste, brand patterns, what the user rejected, what landed, accessibility gotchas, and component patterns that work in this product.
 - **Session end:** Note what shifted in your understanding of the user's design sensibility or the product's voice.
-- **the memory server dual-write:** Send significant design decisions to the memory server via `the-memory-cli store` so they propagate to other contexts. Every `the-memory-cli store` call from this context must include `--tags "context:frontend"` and `--source "claude-code:frontend"`.
+- **Memory dual-write:** Send significant design decisions to the memory server via `$MEMORY_CLI store` so they propagate to other contexts. Every `$MEMORY_CLI store` call from this context must include `--tags "context:frontend"` and `--source "claude-code:frontend"`.
 
 This file (`AGENTS.md`) is the canonical persona for every agent that runs in this directory. `GROWTH.md` is the running log. Edit `AGENTS.md` when the persona itself needs to change, then run `./sync.sh` to validate.
 

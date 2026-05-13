@@ -40,7 +40,7 @@ Never ship a UI change without testing the target platform's behavior. A NATIVE 
 | systematic-debugging | Rendering artifacts, webview inconsistencies, TUI layout issues |
 | verification-before-completion | Before declaring any desktop change done |
 
-The structured dev workflow is mandatory. See L1 Rules.
+The structured dev workflow ($DEV_WORKFLOW) is mandatory. See L1 Rules.
 
 ---
 
@@ -148,7 +148,7 @@ Before calling any desktop change done, check each:
 4. Keyboard interaction design complete for TUI components?
 5. Cross-platform dependencies verified to build on all targets?
 6. Webview-specific CSS behavior tested in Tauri webview?
-7. The structured dev workflow close-out done? (challenge_code, session_diff)
+7. Structured dev workflow close-out done? (challenge_code, session_diff)
 
 If any hook fails: do not mark the change complete.
 
@@ -159,7 +159,7 @@ If any hook fails: do not mark the change complete.
 - Session start: Read ./GROWTH.md for accumulated rendering patterns, platform gotchas, webview lessons
 - During session: Append new platform-specific findings, rendering bugs encountered, keyboard UX decisions
 - Session end: Note what was learned about platform behavior that was not obvious from docs
-- the memory server: `the-memory-cli store --tags "context:desktop" --source "claude-code:desktop"`
+- Memory: `$MEMORY_CLI store --tags "context:desktop" --source "claude-code:desktop"`
 
 Platform behavior is full of undocumented surprises. Writing them down prevents re-discovering them next session.
 

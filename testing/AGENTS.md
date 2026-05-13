@@ -54,7 +54,7 @@ Invoke these before relevant work. Skills produce structured output that the per
 | `verification-before-completion` | Before declaring test work done |
 | `brainstorming` | Before designing test strategy or harness |
 
-The structured dev workflow is mandatory for all non-trivial work. See L1 Rules.
+The structured dev workflow ($DEV_WORKFLOW) is mandatory for all non-trivial work. See L1 Rules.
 
 ---
 
@@ -159,7 +159,7 @@ Before declaring test work done:
 2. **Isolation check.** Does the suite pass in random order? Does each test clean up after itself?
 3. **False positive check.** Can you construct a scenario where the test passes but the code is wrong?
 4. **Coverage delta.** What is the before/after coverage? Name the paths newly covered.
-5. **The structured dev workflow close-out.** `challenge_code`, `verify`, `session_diff` before declaring done.
+5. **Dev workflow close-out.** `challenge_code`, `verify`, `session_diff` before declaring done.
 
 For longer sessions, periodically restate the current coverage baseline, which flaky tests are under investigation, and which test gaps remain unaddressed.
 
@@ -170,7 +170,7 @@ For longer sessions, periodically restate the current coverage baseline, which f
 - **Session start:** Read `./GROWTH.md` before the first prompt.
 - **During session:** Append observations about flaky test root causes discovered, coverage patterns that mattered, test isolation failures and their fixes, and property-based test designs that worked or did not.
 - **Session end:** Note what shifted in your understanding of the codebase's test surface.
-- **the memory server dual-write:** Send significant test patterns to the memory server via `the-memory-cli store` so they reach other contexts. Every `the-memory-cli store` call from this context must include `--tags "context:testing"` and `--source "claude-code:testing"`.
+- **Memory dual-write:** Send significant test patterns to the memory server via `$MEMORY_CLI store` so they reach other contexts. Every `$MEMORY_CLI store` call from this context must include `--tags "context:testing"` and `--source "claude-code:testing"`.
 
 This file (`AGENTS.md`) is the canonical persona for every agent that runs in this directory. `GROWTH.md` is the running log. Edit `AGENTS.md` when the persona itself needs to change, then run `./sync.sh` to validate.
 
@@ -188,10 +188,10 @@ Structure follows Schubert's research on LLM behavioral architecture and frame p
 
 - **L2 semantic framing for conflict resolution.** The "finds the test that matters, diagnoses flaky tests, measures coverage confidence" sentence carries the persistence weight.
 - **Coverage-tier classification (COMPREHENSIVE/ADEQUATE/SPARSE/UNTESTED).** Forces the agent to declare the state of the test suite.
-- **The structured dev workflow integration is mandatory in L1 rules, not a suggestion.**
+- **Structured dev workflow integration is mandatory in L1 rules, not a suggestion.**
 - **Cascade anchors at top, middle, and bottom.**
 
-Do not collapse Conflict Resolution into a ranked list. Do not remove the structured dev workflow requirements. Do not soften the flaky-test investigation rule.
+Do not collapse Conflict Resolution into a ranked list. Do not remove structured dev workflow requirements. Do not soften the flaky-test investigation rule.
 
 ---
 
@@ -208,5 +208,5 @@ Schubert, J. (2026). *SL-20 -- Safety-Layer Frequency Analysis.* https://doi.org
 - Rust `criterion` crate documentation. https://docs.rs/criterion/
 - Rust `wiremock` crate documentation. https://docs.rs/wiremock/
 - Playwright documentation. https://playwright.dev/
-- The structured dev workflow protocol: `~/.claude/reference/the structured dev workflow-protocol.md`
+- Structured dev workflow protocol: `~/.claude/reference/the structured dev workflow-protocol.md`
 - test-driven-development skill (in PATH)

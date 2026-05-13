@@ -55,7 +55,7 @@ Invoke these before relevant work. Skills produce structured output that the per
 | `systematic-debugging` | When an experiment produces unexpected results |
 | `verification-before-completion` | Before declaring an experiment's findings |
 
-The structured dev workflow is lighter here but still applies. See L1 Rules.
+The structured dev workflow ($DEV_WORKFLOW) is lighter here but still applies. See L1 Rules.
 
 ---
 
@@ -91,7 +91,7 @@ The lab is low-ceremony but not zero-awareness.
 4. Decide: GRADUATED (move to production context) or disposable (delete)
 
 ### Capture pattern
-- `the-memory-cli store` the finding immediately -- experiments are worthless if the answer is lost
+- `$MEMORY_CLI store` the finding immediately -- experiments are worthless if the answer is lost
 - Tag with `--tags "context:lab,experiment"` and `--source "claude-code:lab"`
 - If GRADUATED: write a brief summary of what was learned and which production context receives it
 
@@ -145,7 +145,7 @@ Before declaring a lab experiment done:
 
 1. **State the question.** Was it answered? With what confidence?
 2. **State the finding.** In one paragraph, what did we learn?
-3. **Capture.** Append to `GROWTH.md`; if the finding crosses contexts, also `the-memory-cli store`.
+3. **Capture.** Append to `GROWTH.md`; if the finding crosses contexts, also `$MEMORY_CLI store`.
 4. **Decide status.** LIVE, PARKED, GRADUATED, DEAD.
 5. **Act on the status.** Graduate by moving the work; kill by deleting; park by leaving a resume note.
 
@@ -158,7 +158,7 @@ For longer sessions, periodically restate the question of the current experiment
 - **Session start:** Read `./GROWTH.md` before the first prompt.
 - **During session:** Append findings as soon as they emerge -- even small ones. The lab's value is the accumulated GROWTH.md, not the surviving code.
 - **Session end:** State the status of every experiment touched. Capture findings for any that completed.
-- **the memory server dual-write:** Send cross-context findings to the memory server via `the-memory-cli store` so they reach other workspaces -- especially `~/rust` and `~/agents`, where lab experiments tend to graduate. Every `the-memory-cli store` call from this context must include `--tags "context:lab"` and `--source "claude-code:lab"`.
+- **Memory dual-write:** Send cross-context findings to the memory server via `$MEMORY_CLI store` so they reach other workspaces -- especially `~/rust` and `~/agents`, where lab experiments tend to graduate. Every `$MEMORY_CLI store` call from this context must include `--tags "context:lab"` and `--source "claude-code:lab"`.
 
 This file (`AGENTS.md`) is the canonical persona for every agent that runs in this directory. `GROWTH.md` is the running log -- in this context, GROWTH.md is the primary artifact, more valuable than any individual experiment.
 
@@ -194,4 +194,4 @@ Schubert, J. (2026). *Structural Transformations in Multi-Stage Dialogues -- Run
 ### Lab references
 
 - The other context directories (`~/rust`, `~/agents`, `~/security`, `~/cryptographic`, `~/systems`, `~/frontend`, `~/architecture`) -- these are the graduation targets when an experiment proves out.
-- `~/projects/plans/` -- when an experiment becomes interesting enough to need a real spec, the spec lives there, not here.
+- `$PLANS_DIR/` -- when an experiment becomes interesting enough to need a real spec, the spec lives there, not here.

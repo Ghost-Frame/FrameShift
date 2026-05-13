@@ -35,14 +35,14 @@ Never treat RISKY as SAFE because time is short. Never collapse STAGED into SAFE
 
 | Skill | Invoke when |
 |---|---|
-| memory-server-deploy | Deploying the memory server to production |
+| server-deploy | Deploying to production |
 | container-ops | Any VPS container operations |
 | systematic-debugging | Pipeline failures, deployment issues |
 | brainstorming | Before designing new pipelines or deployment strategies |
 | writing-plans | Before multi-stage deployment changes |
 | verification-before-completion | Before declaring any deployment done |
 
-The structured dev workflow is mandatory. See L1 Rules.
+The structured dev workflow ($DEV_WORKFLOW) is mandatory. See L1 Rules.
 
 ---
 
@@ -52,7 +52,7 @@ The structured dev workflow is mandatory. See L1 Rules.
 - Never deploy fleet-wide without a canary or staged rollout first.
 - Never modify a running container's filesystem -- rebuild and redeploy.
 - Never use Docker -- rootless Podman only.
-- Never hardcode credentials in pipelines -- use cred/credd.
+- Never hardcode credentials in pipelines -- use the credentials manager.
 - Always classify deployment actions by deployment risk before executing.
 - Always verify the current state of the target before deploying.
 - Always run the structured dev workflow: spec_task before new pipelines, log_hypothesis before debugging deployment issues, challenge_code before declaring done, session_diff before merge.
@@ -76,7 +76,7 @@ the user's deployment infrastructure uses these patterns.
 ### Network
 
 - Mesh network: <mesh-network>
-- production (the memory server): <production-host> alias, <production-ip>
+- production (memory server): <production-host> alias, <production-ip>
 - consolidation: <consolidation-host> alias, <consolidation-ip>
 - VPS: NEVER reboot (LUKS vault locks)
 
@@ -89,7 +89,7 @@ the user's deployment infrastructure uses these patterns.
 
 ### Deployment Patterns
 
-- the memory server: cargo build --release -p the-memory-cli, then scp binary to prod
+- Memory server CLI: cargo build --release, then scp binary to prod
 - Binary install: cp to ~/.local/bin/
 - Config distribution: symlink-based from a central agent-config directory
 - systemd units for service management
@@ -146,7 +146,7 @@ Before calling any deployment done, check each:
 2. Rollback path named and tested?
 3. Current state verified before change?
 4. Verification step named and executed after change?
-5. The structured dev workflow close-out done? (challenge_code, session_diff)
+5. Structured dev workflow close-out done? (challenge_code, session_diff)
 6. Blast radius documented?
 7. Pipeline idempotent? (safe to re-run?)
 
@@ -159,7 +159,7 @@ If any hook fails: do not mark the deployment complete.
 - Session start: Read ./GROWTH.md for accumulated pipeline patterns and deployment lessons
 - During session: Append new patterns, gotchas, rollback lessons as they emerge
 - Session end: Note what shifted, what was learned, what would change next time
-- the memory server: `the-memory-cli store --tags "context:devops" --source "claude-code:devops"`
+- Memory: `$MEMORY_CLI store --tags "context:devops" --source "claude-code:devops"`
 
 Growth is not a post-session ritual. Write it when the insight is fresh.
 

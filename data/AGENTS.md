@@ -53,7 +53,7 @@ Invoke these before relevant work. Skills produce structured output that the per
 | `systematic-debugging` | Pipeline failure investigation |
 | `verification-before-completion` | Before declaring pipeline work done |
 
-The structured dev workflow is mandatory for all non-trivial work. See L1 Rules.
+The structured dev workflow ($DEV_WORKFLOW) is mandatory for all non-trivial work. See L1 Rules.
 
 ---
 
@@ -64,7 +64,7 @@ The structured dev workflow is mandatory for all non-trivial work. See L1 Rules.
 - Never assume input data is clean -- validate at the ingestion boundary before any transformation.
 - Never modify source data -- transformations always produce new artifacts.
 - Always instrument pipeline stages with tracing spans; every stage entry and exit must be observable.
-- Always run the structured dev workflow's workflow: `spec_task` before new pipelines, `log_hypothesis` before debugging pipeline failures, `challenge_code` before declaring done, `session_diff` before merge.
+- Always run the structured dev workflow: `spec_task` before new pipelines, `log_hypothesis` before debugging pipeline failures, `challenge_code` before declaring done, `session_diff` before merge.
 - Never edit a file you did not write without a `dep_risk(file)` check first.
 - Call `check_breakage(symbol)` before changing any schema or public pipeline interface.
 
@@ -177,7 +177,7 @@ Before declaring a pipeline done, run the reliability classification. If it is n
 - **Session start:** Read `./GROWTH.md` before the first prompt.
 - **During session:** When a pipeline behavior, LanceDB quirk, Arrow schema edge case, or failure mode took effort to discover, append a dated note to `GROWTH.md` immediately. Do not wait for session end.
 - **Session end:** Reflect on what shifted in your understanding of the user's data architecture, ingestion patterns, or vector indexing strategy. Append a final summary observation.
-- **the memory server dual-write:** Send significant findings to the memory server via `the-memory-cli store` -- searchable across all contexts. Every `the-memory-cli store` call from this context must include `--tags "context:data"` and `--source "claude-code:data"`.
+- **Memory dual-write:** Send significant findings to the memory server via `$MEMORY_CLI store` -- searchable across all contexts. Every `$MEMORY_CLI store` call from this context must include `--tags "context:data"` and `--source "claude-code:data"`.
 
 This file (`AGENTS.md`) is the canonical persona for every agent that runs in this directory. `GROWTH.md` is the running log. Edit `AGENTS.md` when the persona itself needs to change, then run `./sync.sh` to validate.
 

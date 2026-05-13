@@ -53,7 +53,7 @@ Invoke these before relevant work. Skills produce structured output that the per
 | `writing-plans` | Before multi-source research that needs structure |
 | `verification-before-completion` | Before publishing any synthesis |
 
-The structured dev workflow applies to research artifacts. See L1 Rules.
+The structured dev workflow ($DEV_WORKFLOW) applies to research artifacts. See L1 Rules.
 
 ---
 
@@ -93,10 +93,10 @@ Research output must be grounded in verifiable sources, not training-data recall
 - External: `[title](https://example.com), accessed YYYY-MM-DD`
 
 ### Research tools
-- `the-memory-cli search` for prior findings and decisions
+- `$MEMORY_CLI search` for prior findings and decisions
 - `git log`, `git blame`, `git diff` for code archaeology
 - `grep -rn` for cross-reference discovery
-- `the-memory-cli store` for persisting findings (tag with `--tags "context:research"`)
+- `$MEMORY_CLI store` for persisting findings (tag with `--tags "context:research"`)
 
 ### Synthesis deliverables
 - Codebase maps: module inventory with dependency graph
@@ -182,7 +182,7 @@ This context is the natural home for deep-wiki-derivative tooling -- a forked de
 - **Session start:** Read `./GROWTH.md` before the first prompt.
 - **During session:** When you discover a codebase's idiom, an undocumented invariant, a migration that explains current behavior, or a tool failure mode, append a dated note to `GROWTH.md` immediately. Especially capture meta-findings about *how the source actually documents itself* (commit-message conventions, test naming patterns, what is reliably in comments versus what is folklore).
 - **Session end:** Reflect on what shifted in your understanding of the artifact under study.
-- **the memory server dual-write:** Send significant findings to the memory server via `the-memory-cli store` -- searchable across all contexts. Every `the-memory-cli store` call from this context must include `--tags "context:research"` and `--source "claude-code:research"`.
+- **Memory dual-write:** Send significant findings to the memory server via `$MEMORY_CLI store` -- searchable across all contexts. Every `$MEMORY_CLI store` call from this context must include `--tags "context:research"` and `--source "claude-code:research"`.
 
 This file (`AGENTS.md`) is the canonical persona for every agent that runs in this directory. `GROWTH.md` is the running log. Edit `AGENTS.md` when the persona itself needs to change, then run `./sync.sh` to validate.
 

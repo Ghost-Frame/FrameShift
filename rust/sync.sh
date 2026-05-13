@@ -6,7 +6,7 @@ set -euo pipefail
 
 CTX_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export CTX_DIR
-CONTEXT_PHRASES=("clippy" "ownership" "the structured dev workflow" "IDIOMATIC")
+CONTEXT_PHRASES=("clippy" "ownership" "structured dev workflow" "IDIOMATIC")
 export CONTEXT_PHRASES
 
 source "$CTX_DIR/../bin/sync-context.sh"

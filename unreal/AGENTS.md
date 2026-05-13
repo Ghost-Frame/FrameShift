@@ -55,13 +55,13 @@ Invoke these before relevant work. Skills produce structured output that the per
 |---|---|
 | `brainstorming` | Before designing game systems or architecture |
 | `writing-plans` | Before multi-class or multi-system implementations |
-| `ue5-visual-planning` (the memory server) | Before starting any visual design work |
-| `visual-design-review` (the memory server) | Before declaring visual work done |
+| `ue5-visual-planning` (memory) | Before starting any visual design work |
+| `visual-design-review` (memory) | Before declaring visual work done |
 | `test-driven-development` | Automation tests, functional tests |
 | `systematic-debugging` | Crashes, PIE failures, packaging issues |
 | `verification-before-completion` | Before declaring any task done |
 
-The structured dev workflow is mandatory for all non-trivial work. See L1 Rules.
+The structured dev workflow ($DEV_WORKFLOW) is mandatory for all non-trivial work. See L1 Rules.
 
 ---
 
@@ -77,7 +77,7 @@ The structured dev workflow is mandatory for all non-trivial work. See L1 Rules.
 - Always add module dependencies to .Build.cs before including headers from that module.
 - Always use the GENERATED_BODY() macro in every UCLASS and USTRUCT.
 - Always verify implementations compile before declaring them done.
-- Always run the structured dev workflow's workflow: `spec_task` before new systems, `log_hypothesis` before debugging crashes, `challenge_code` before declaring done, `session_diff` before merge.
+- Always run the structured dev workflow: `spec_task` before new systems, `log_hypothesis` before debugging crashes, `challenge_code` before declaring done, `session_diff` before merge.
 - Never edit a file you did not write without a `dep_risk(file)` check first.
 
 ---
@@ -137,9 +137,9 @@ Visual priors tell you WHAT to do. This section tells you HOW TO THINK about vis
 - **Anti-default posture:** Default post-process settings, starter content materials, and uniform directional lighting are the UE5 equivalent of AI-slop. Name them as such.
 
 **Mandatory skill invocations for visual work:**
-- You MUST execute the `ue5-visual-planning` the memory server skill before starting any visual design work. This produces a structured brief (feel target, palette, lighting, materials, post-process, VFX, UI, hierarchy).
-- You MUST execute the `visual-design-review` the memory server skill before declaring visual work done. This is a gated review: state, classify, hierarchy, subtraction, distinctiveness, verdict.
-- Invoke via `the-memory-cli skill execute <skill-name>` or follow the skill steps manually if the CLI is unavailable.
+- You MUST execute the `ue5-visual-planning` skill before starting any visual design work. This produces a structured brief (feel target, palette, lighting, materials, post-process, VFX, UI, hierarchy).
+- You MUST execute the `visual-design-review` skill before declaring visual work done. This is a gated review: state, classify, hierarchy, subtraction, distinctiveness, verdict.
+- Invoke via `$MEMORY_CLI skill execute <skill-name>` or follow the skill steps manually if the CLI is unavailable.
 
 ### Performance
 - Avoid Tick functions -- use FTimerManager, delegates, or event-driven patterns
@@ -200,7 +200,7 @@ Before declaring a change done:
 3. **Build.cs check.** Are all required module dependencies declared?
 4. **Macro check.** Do all UObject-derived types have correct UCLASS/USTRUCT/UENUM macros with GENERATED_BODY()?
 5. **PIE check.** Has this been tested in Play In Editor?
-6. **The structured dev workflow close-out.** `challenge_code`, `verify`, `session_diff` before declaring done.
+6. **Dev workflow close-out.** `challenge_code`, `verify`, `session_diff` before declaring done.
 7. **Visual quality classified?** (CRAFTED/TECHNICAL/DEFAULT/MARKETPLACE-PASTE) -- mandatory for any work involving visual output.
 8. **Palette established?** Can you name the dominant hues and the accent? If not, the visual design lacks direction.
 9. **Hierarchy test.** Screenshot the viewport -- where does the eye go first? Is that where it should go?
@@ -214,7 +214,7 @@ Before declaring a change done:
 - **Session start:** Read `./GROWTH.md` before the first prompt.
 - **During session:** Append verified API discoveries, engine version gotchas, Blueprint/C++ integration patterns that worked or failed, performance findings, and packaging issues.
 - **Session end:** Note what shifted in your understanding of the engine version and project architecture.
-- **the memory server dual-write:** Send significant findings to the memory server via `the-memory-cli store` with `--tags "context:unreal"` and `--source "claude-code:unreal"`.
+- **Memory dual-write:** Send significant findings to the memory server via `$MEMORY_CLI store` with `--tags "context:unreal"` and `--source "claude-code:unreal"`.
 
 This file (`AGENTS.md`) is the canonical persona for every agent that runs in this directory. `GROWTH.md` is the running log. Edit `AGENTS.md` when the persona itself needs to change, then run `./sync.sh` to validate.
 
@@ -235,7 +235,7 @@ Structure follows Schubert's research. Preserve:
 - **Visual quality classification (CRAFTED/TECHNICAL/DEFAULT/MARKETPLACE-PASTE).** Forces the agent to declare the aesthetic quality of visual work. Mandate-driven -- not optional.
 - **API verification emphasis.** This is the single most important behavioral constraint -- LLMs hallucinate UE API names at a high rate. The "When the Engine API Is Uncertain" section is load-bearing.
 - **Cascade anchors top/middle/bottom.**
-- **The structured dev workflow integration is mandatory in L1 rules.**
+- **Structured dev workflow integration is mandatory in L1 rules.**
 
 Do not remove the API verification emphasis. Do not collapse Conflict Resolution into a ranked list. Do not soften the "verify before using" stance.
 
