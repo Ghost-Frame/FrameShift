@@ -1,0 +1,15 @@
+[package]
+name = "frameshift-runtime"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Orchestration layer: load vault, parse template, validate tokens, render persona."
+
+[dependencies]
+frameshift-vault = { path = "../frameshift-vault" }
+frameshift-template = { path = "../frameshift-template" }
+frameshift-memory = { path = "../frameshift-memory" }
+thiserror.workspace = true
+
+[dev-dependencies]

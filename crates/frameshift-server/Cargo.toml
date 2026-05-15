@@ -1,0 +1,40 @@
+[package]
+name = "frameshift-server"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "HTTP server for the frameshift persona marketplace (Layer 6 skeleton)"
+
+[[bin]]
+name = "frameshift-server"
+path = "src/main.rs"
+
+[dependencies]
+frameshift-catalog = { path = "../frameshift-catalog" }
+frameshift-objects = { path = "../frameshift-objects" }
+frameshift-runtime = { path = "../frameshift-runtime" }
+frameshift-memory = { path = "../frameshift-memory" }
+frameshift-pack = { path = "../frameshift-pack" }
+axum = { workspace = true }
+tokio = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+secrecy = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+mimalloc = { workspace = true }
+figment = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tower = { workspace = true }
+http-body-util = { workspace = true }

@@ -1,19 +1,19 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/personify-pack",
-    "crates/personify-vault",
-    "crates/personify-vault-local",
-    "crates/personify-template",
-    "crates/personify-memory",
-    "crates/personify-memory-http",
-    "crates/personify-memory-sqlite-fts",
-    "crates/personify-runtime",
-    "crates/personify-catalog",
-    "crates/personify-catalog-postgres",
-    "crates/personify-objects",
-    "crates/personify-objects-fs",
-    "crates/personify-server",
+    "crates/frameshift-pack",
+    "crates/frameshift-vault",
+    "crates/frameshift-vault-local",
+    "crates/frameshift-template",
+    "crates/frameshift-memory",
+    "crates/frameshift-memory-http",
+    "crates/frameshift-memory-sqlite-fts",
+    "crates/frameshift-runtime",
+    "crates/frameshift-catalog",
+    "crates/frameshift-catalog-postgres",
+    "crates/frameshift-objects",
+    "crates/frameshift-objects-fs",
+    "crates/frameshift-server",
 ]
 
 [workspace.package]

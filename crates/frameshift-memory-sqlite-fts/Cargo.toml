@@ -1,0 +1,23 @@
+[package]
+name = "frameshift-memory-sqlite-fts"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "SQLite FTS5-backed MemoryAdapter implementation for frameshift"
+
+[dependencies]
+frameshift-memory = { path = "../frameshift-memory" }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+rusqlite = { workspace = true }
+deadpool-sqlite = { workspace = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

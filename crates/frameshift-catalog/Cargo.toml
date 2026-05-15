@@ -1,0 +1,16 @@
+[package]
+name = "frameshift-catalog"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Catalog backend trait + canonical types for the frameshift marketplace"
+
+[dependencies]
+frameshift-pack = { path = "../frameshift-pack" }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+base64 = { workspace = true }

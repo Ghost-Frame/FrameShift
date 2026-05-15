@@ -1,0 +1,88 @@
+//! Router composition for the frameshift HTTP server.
+//!
+//! [`app`] assembles the full [`axum::Router`] by nesting sub-routers and
+//! applying global middleware layers. The returned router has no bound state;
+//! call `.with_state(state)` on the result to produce a `Router<()>` ready
+//! for `axum::serve`.
+//!
+//! # Middleware stack
+//!
+//! `axum::Router::layer` wraps each new layer AROUND the existing stack, so
+//! the LAST `.layer(...)` call below becomes the OUTERMOST layer at request
+//! handling time. Reading the actual call order in [`app`]:
+//!
+//! 1. `PropagateRequestId` -- innermost; copies the generated `x-request-id`
+//!    from the request extensions onto the outgoing response.
+//! 2. `SetRequestId` -- generates a UUID v4 id (via [`RequestIdGenerator`])
+//!    when the incoming request has no `x-request-id` header, and stamps it
+//!    onto the request extensions for `PropagateRequestId` to read.
+//! 3. `TraceLayer` -- opens a span per request with method, path, status,
+//!    request_id; logs on response.
+//! 4. `CompressionLayer` -- gzip response compression.
+//! 5. `RequestBodyLimitLayer` -- outermost; caps request body size BEFORE
+//!    the rest of the stack sees any bytes.
+
+use axum::Router;
+use tower_http::compression::CompressionLayer;
+use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::request_id::{PropagateRequestIdLayer, SetRequestIdLayer};
+
+use crate::mcp::mcp_router;
+use crate::middleware::request_id::RequestIdGenerator;
+use crate::middleware::tracing::make_trace_layer;
+use crate::routes::authors::authors_router;
+use crate::routes::handles::handles_router;
+use crate::routes::ops::ops_router;
+use crate::routes::packs::packs_router;
+use crate::state::AppState;
+
+/// Build the complete Axum router for the frameshift HTTP server.
+///
+/// The router is structured as follows:
+///
+/// ```text
+/// /
+///   /healthz    -- ops
+///   /metrics    -- ops
+///   /v1
+///     /packs    -- pack read endpoints
+///     /authors  -- author lookup
+///     /handles  -- handle lookup
+///   /mcp        -- MCP placeholder (501 for all methods)
+/// ```
+///
+/// Global middleware (applied to all routes):
+/// - Request-ID propagation and generation (UUID v4).
+/// - Tracing layer with one span per HTTP request.
+/// - Gzip compression.
+/// - Request body size limit from `state.config.max_request_bytes`.
+///
+/// # Parameters
+///
+/// - `state` -- the fully constructed [`AppState`] to wire into the router.
+///
+/// # Returns
+///
+/// An `axum::Router` with `AppState` already wired in via `.with_state(state)`.
+/// The caller passes this directly to `axum::serve`.
+pub fn app(state: AppState) -> Router {
+    let max_body = state.config.max_request_bytes;
+
+    let v1 = Router::new()
+        .nest("/packs", packs_router())
+        .nest("/authors", authors_router())
+        .nest("/handles", handles_router());
+
+    let x_request_id = axum::http::HeaderName::from_static("x-request-id");
+
+    Router::new()
+        .merge(ops_router())
+        .nest("/v1", v1)
+        .nest("/mcp", mcp_router())
+        .layer(PropagateRequestIdLayer::new(x_request_id.clone()))
+        .layer(SetRequestIdLayer::new(x_request_id, RequestIdGenerator))
+        .layer(make_trace_layer())
+        .layer(CompressionLayer::new())
+        .layer(RequestBodyLimitLayer::new(max_body))
+        .with_state(state)
+}

@@ -1,0 +1,13 @@
+//! Route modules for the frameshift HTTP server.
+//!
+//! Each sub-module corresponds to a logical grouping of endpoints:
+//!
+//! - [`packs`] -- `GET /v1/packs*` read endpoints.
+//! - [`authors`] -- `GET /v1/authors/{pubkey}` lookup.
+//! - [`handles`] -- `GET /v1/handles/{handle}` lookup.
+//! - [`ops`] -- `GET /healthz` and `GET /metrics` operational endpoints.
+
+pub mod authors;
+pub mod handles;
+pub mod ops;
+pub mod packs;

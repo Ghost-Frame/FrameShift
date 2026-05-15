@@ -1,0 +1,12 @@
+[package]
+name = "frameshift-objects"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Content-addressed pack object store trait + types"
+
+[dependencies]
+frameshift-pack = { path = "../frameshift-pack" }
+async-trait = { workspace = true }
+thiserror = { workspace = true }

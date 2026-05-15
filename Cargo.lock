@@ -1069,6 +1069,203 @@ dependencies = [
 ]
 
 [[package]]
+name = "frameshift-catalog"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "chrono",
+ "frameshift-pack",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "frameshift-catalog-postgres"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bb8",
+ "chrono",
+ "diesel",
+ "diesel-async",
+ "diesel_migrations",
+ "frameshift-catalog",
+ "frameshift-pack",
+ "futures-util",
+ "hex",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "testcontainers",
+ "testcontainers-modules",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "frameshift-memory"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "frameshift-memory-http"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "frameshift-memory",
+ "reqwest",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "url",
+ "uuid",
+ "wiremock",
+]
+
+[[package]]
+name = "frameshift-memory-sqlite-fts"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "deadpool-sqlite",
+ "frameshift-memory",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "frameshift-objects"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "frameshift-pack",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "frameshift-objects-fs"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "frameshift-objects",
+ "frameshift-pack",
+ "hex",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "frameshift-pack"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "rand 0.8.6",
+ "serde",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml 0.8.23",
+ "unicode-normalization",
+]
+
+[[package]]
+name = "frameshift-runtime"
+version = "0.1.0"
+dependencies = [
+ "frameshift-memory",
+ "frameshift-template",
+ "frameshift-vault",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "frameshift-server"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "figment",
+ "frameshift-catalog",
+ "frameshift-memory",
+ "frameshift-objects",
+ "frameshift-pack",
+ "frameshift-runtime",
+ "hex",
+ "http-body-util",
+ "mimalloc",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "frameshift-template"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml 0.8.23",
+]
+
+[[package]]
+name = "frameshift-vault"
+version = "0.1.0"
+dependencies = [
+ "secrecy",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml 0.8.23",
+ "url",
+]
+
+[[package]]
+name = "frameshift-vault-local"
+version = "0.1.0"
+dependencies = [
+ "age",
+ "frameshift-vault",
+ "secrecy",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml 0.8.23",
+ "zeroize",
+]
+
+[[package]]
 name = "futures"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2099,203 +2296,6 @@ name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
-
-[[package]]
-name = "personify-catalog"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "base64 0.22.1",
- "chrono",
- "personify-pack",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "personify-catalog-postgres"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bb8",
- "chrono",
- "diesel",
- "diesel-async",
- "diesel_migrations",
- "futures-util",
- "hex",
- "personify-catalog",
- "personify-pack",
- "secrecy",
- "serde",
- "serde_json",
- "testcontainers",
- "testcontainers-modules",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "personify-memory"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "chrono",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "personify-memory-http"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "chrono",
- "personify-memory",
- "reqwest",
- "secrecy",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "url",
- "uuid",
- "wiremock",
-]
-
-[[package]]
-name = "personify-memory-sqlite-fts"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "chrono",
- "deadpool-sqlite",
- "personify-memory",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "personify-objects"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "personify-pack",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "personify-objects-fs"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "hex",
- "personify-objects",
- "personify-pack",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "personify-pack"
-version = "0.1.0"
-dependencies = [
- "ed25519-dalek",
- "rand 0.8.6",
- "serde",
- "sha2 0.10.9",
- "tempfile",
- "thiserror 2.0.18",
- "toml 0.8.23",
- "unicode-normalization",
-]
-
-[[package]]
-name = "personify-runtime"
-version = "0.1.0"
-dependencies = [
- "personify-memory",
- "personify-template",
- "personify-vault",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "personify-server"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "base64 0.22.1",
- "chrono",
- "figment",
- "hex",
- "http-body-util",
- "mimalloc",
- "personify-catalog",
- "personify-memory",
- "personify-objects",
- "personify-pack",
- "personify-runtime",
- "secrecy",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tower",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "personify-template"
-version = "0.1.0"
-dependencies = [
- "serde",
- "tempfile",
- "thiserror 2.0.18",
- "toml 0.8.23",
-]
-
-[[package]]
-name = "personify-vault"
-version = "0.1.0"
-dependencies = [
- "secrecy",
- "serde",
- "tempfile",
- "thiserror 2.0.18",
- "toml 0.8.23",
- "url",
-]
-
-[[package]]
-name = "personify-vault-local"
-version = "0.1.0"
-dependencies = [
- "age",
- "personify-vault",
- "secrecy",
- "tempfile",
- "thiserror 2.0.18",
- "toml 0.8.23",
- "zeroize",
-]
 
 [[package]]
 name = "phf"
