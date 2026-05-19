@@ -10,8 +10,8 @@ Personas are not instruction lists. They are complete behavioral identities -- t
 
 ## What this repo contains
 
-- `crates/` -- Rust workspace: CLI, client engine, pack tooling, composition, conformance, HTTP server
-- `personas/` -- pack manifests for the open-source persona library (see the [deep product writeup](personas/README.md))
+- `crates/` -- Rust workspace (20 crates): CLI, client engine, pack tooling, composition, conformance, catalog, memory, vault, object storage, HTTP server
+- `personas/` -- pack manifests for the persona library (see the [deep product writeup](personas/README.md))
 
 ## How it works
 
@@ -70,7 +70,7 @@ id = "test-driven-development"
 invoke_when = "All cryptographic implementations -- tests BEFORE code"
 ```
 
-Patch operations (`frameshift rule add`, `frameshift skill remove`) replace hand-editing. Semantic diffs show typed changes between versions, not text diffs.
+Patch operations replace hand-editing. Semantic diffs show typed changes between versions, not text diffs.
 
 ## Growth
 
@@ -87,12 +87,6 @@ frameshift activate <name>                   # Set active persona for this proje
 frameshift sync                              # Reconcile central store with lockfile
 frameshift gc                                # Remove unreferenced cache entries
 frameshift project-id                        # Print hashed project ID
-frameshift rule add|remove                   # Patch rules in persona source
-frameshift skill add|remove                  # Patch skills in persona source
-frameshift diff <name> <v1> <v2>             # Semantic diff between versions
-frameshift render                            # Re-render persona source to markdown
-frameshift migrate                           # Legacy markdown to structured TOML
-frameshift grow append                       # Append an entry to the active persona's growth log
 ```
 
 ## Building
