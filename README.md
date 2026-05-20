@@ -126,6 +126,12 @@ cargo run -p frameshift-cli -- install cryptographic@0.1.0 --from-path personas/
 
 Elastic License 2.0. See [LICENSE](LICENSE) for details.
 
+### Commercial licensing
+
+The Elastic License 2.0 prohibits offering FrameShift to third parties as a
+hosted or managed service. To sell, host, or distribute FrameShift on your own
+platform, contact us for a commercial license: support@syntheos.dev.
+
 ## Further reading
 
 - [Persona deep dive and product writeup](personas/README.md)
