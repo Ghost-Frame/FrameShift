@@ -80,34 +80,75 @@ pub fn rank(
     weights: &PolicyWeights,
     prefs: &Preferences,
 ) -> Vec<Scored> {
+    // Precompute IDF for each task token: tokens that appear in fewer persona
+    // keyword sets are weighted higher (rare tokens are more discriminating).
+    // idf[tok] = log2(n_personas / (df + 1) + 1), clamped to [0, ∞).
+    let n_personas = index.profiles.len().max(1) as f32;
+    let idf_weights: std::collections::HashMap<&str, f32> = if ctx.task_tokens.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        ctx.task_tokens
+            .iter()
+            .map(|tok| {
+                let df = index
+                    .profiles
+                    .iter()
+                    .filter(|p| p.keywords.contains(tok))
+                    .count() as f32;
+                let idf = (n_personas / (df + 1.0) + 1.0).log2();
+                (tok.as_str(), idf)
+            })
+            .collect()
+    };
+    // Maximum possible IDF sum (all tokens have df=0, i.e., unique per persona).
+    let max_idf_sum: f32 = idf_weights.values().sum::<f32>().max(f32::EPSILON);
+
     let mut scored: Vec<Scored> = index
         .profiles
         .iter()
         .map(|profile| {
-            // Language score: sum weights of context languages present in persona languages.
-            let lang_sum: f32 = ctx
+            // Language score: IDF-style precision -- reward personas whose language
+            // set PRECISELY covers the context languages rather than broadly.
+            // matching_langs / persona_lang_count gives higher scores to specialist
+            // personas (fewer languages, tighter match) than generalist ones.
+            // Blended 50/50 with the recall-side (lang_sum / ctx.lang_count) to
+            // balance precision and recall.
+            let matching_lang_sum: f32 = ctx
                 .languages
                 .iter()
                 .filter(|(lang, _)| profile.languages.contains(*lang))
                 .map(|(_, weight)| weight)
                 .sum();
-            // Normalize by context language count (at least 1).
+            let persona_lang_count = profile.languages.len().max(1) as f32;
             let lang_score = if ctx.languages.is_empty() {
                 0.0
             } else {
-                (lang_sum / ctx.languages.len() as f32).min(1.0)
+                // Recall: fraction of context languages covered by this persona.
+                let recall = (matching_lang_sum / ctx.languages.len() as f32).min(1.0);
+                // Precision: fraction of persona's languages that are in the context.
+                let precision = (matching_lang_sum / persona_lang_count).min(1.0);
+                // F1-style blend: harmonic mean of precision and recall.
+                let f1 = if precision + recall > 0.0 {
+                    2.0 * precision * recall / (precision + recall)
+                } else {
+                    0.0
+                };
+                f1
             };
 
-            // Lexical score: fraction of task tokens that hit persona keywords.
+            // Lexical score: IDF-weighted sum of task token hits normalized to [0.0, 1.0].
+            // Rare task tokens (appearing in fewer personas) contribute more weight than
+            // common tokens, rewarding specialist personas over generalist ones.
             let lex_score = if ctx.task_tokens.is_empty() {
                 0.0
             } else {
-                let hits = ctx
+                let hit_idf_sum: f32 = ctx
                     .task_tokens
                     .iter()
-                    .filter(|tok| profile.keywords.contains(tok))
-                    .count();
-                hits as f32 / ctx.task_tokens.len() as f32
+                    .filter(|tok| profile.keywords.contains(*tok))
+                    .map(|tok| idf_weights.get(tok.as_str()).copied().unwrap_or(0.0))
+                    .sum();
+                (hit_idf_sum / max_idf_sum).min(1.0)
             };
 
             // Capability score: prefer personas with no required tools and no network egress.

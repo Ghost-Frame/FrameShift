@@ -63,7 +63,16 @@ pub fn sense(project_root: &Path, task_hint: Option<&str>) -> ContextSignal {
         .map(|(lang, count)| (lang, (count as f32 / max_count).min(1.0)))
         .collect();
 
-    let task_tokens = tokenize(task_hint.unwrap_or(""));
+    let mut task_tokens = tokenize(task_hint.unwrap_or(""));
+
+    // Expand task tokens with domain synonyms so that natural-language phrasing
+    // maps to canonical terminology used in persona keyword sets.
+    expand_task_tokens(&mut task_tokens);
+
+    // Augment language signals from task hint: if the task itself uses
+    // writing-domain terms, inject a "prose" language signal so writer-type
+    // personas can compete with code-language personas on equal footing.
+    let languages = augment_languages_from_task(languages, &task_tokens);
 
     ContextSignal {
         project_name,
@@ -149,6 +158,80 @@ fn detect_markers(
             *raw_counts.entry(lang.to_string()).or_insert(0) += 1;
         }
     }
+}
+
+/// Synonym expansion rules: (trigger_token, tokens_to_inject[]).
+///
+/// When a trigger token appears in the task hint, the corresponding synonyms
+/// are added to the task token list (if not already present). This maps
+/// natural-language phrasing to canonical terminology used in persona keywords.
+const TASK_SYNONYMS: &[(&str, &[&str])] = &[
+    // "release notes" -> changelog (writer-domain canonical term)
+    ("release", &["changelog"]),
+    // "docs" / "documentation" -> documentation (normalized form)
+    ("docs", &["documentation"]),
+    // "refactor" -> refactoring
+    ("refactor", &["refactoring"]),
+    // "lint" -> linting
+    ("lint", &["linting"]),
+    // "bench" / "benchmark" -> benchmarking
+    ("bench", &["benchmark", "benchmarking"]),
+    // "perf" -> performance
+    ("perf", &["performance"]),
+    // "sec" / "security" -> security
+    ("sec", &["security"]),
+];
+
+/// Expand task tokens with domain synonyms defined in `TASK_SYNONYMS`.
+///
+/// For each trigger token found in `tokens`, the mapped synonyms are appended
+/// to `tokens` if not already present. Preserves existing order and deduplicates
+/// new additions.
+fn expand_task_tokens(tokens: &mut Vec<String>) {
+    let mut additions: Vec<String> = Vec::new();
+
+    for (trigger, synonyms) in TASK_SYNONYMS {
+        if tokens.iter().any(|t| t == *trigger) {
+            for syn in *synonyms {
+                let s = syn.to_string();
+                if !tokens.contains(&s) && !additions.contains(&s) {
+                    additions.push(s);
+                }
+            }
+        }
+    }
+
+    tokens.extend(additions);
+}
+
+/// Writing-domain task tokens that imply a `prose` language signal.
+///
+/// When any of these appear in the task hint, the context gets a `prose`
+/// language entry so that writer-type personas can rank on language overlap.
+/// These terms must be specific enough to identify a writing task without
+/// triggering for incidental mentions in code-focused personas.
+const PROSE_TASK_TRIGGERS: &[&str] = &[
+    "docs", "doc", "documentation", "changelog", "changelogs",
+    "readme", "tutorial", "tutorials", "release", "notes",
+    "prose", "writing", "copywriting", "blog", "post",
+    "draft", "publish", "article", "essay",
+];
+
+/// Augment `languages` with a `prose` entry if the task tokens mention writing
+/// domain terms. The injected weight is 2.0 -- higher than the max file-based
+/// language weight (1.0) -- to ensure prose-specialist personas rank above
+/// generalist personas that happen to also have prose in their language set.
+fn augment_languages_from_task(
+    mut languages: BTreeMap<String, f32>,
+    task_tokens: &[String],
+) -> BTreeMap<String, f32> {
+    let has_prose_signal = task_tokens
+        .iter()
+        .any(|t| PROSE_TASK_TRIGGERS.contains(&t.as_str()));
+    if has_prose_signal {
+        languages.entry("prose".to_string()).or_insert(2.0);
+    }
+    languages
 }
 
 /// Push `value` into `vec` only if not already present (cheap dedup during walk).

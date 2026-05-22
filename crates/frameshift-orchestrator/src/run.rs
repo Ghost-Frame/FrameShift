@@ -20,8 +20,15 @@ pub struct SelectionInputs<'a> {
     pub task_hint: Option<&'a str>,
 
     /// List of persona source directories to index.
-    /// Each must contain a valid `persona.toml` (loaded by `PersonaIndex::from_dirs`).
+    /// Each must contain a valid `persona.toml` or `AGENTS.md` (loaded by
+    /// `PersonaIndex::from_dirs`). Ignored when `catalog_root` is set.
     pub source_dirs: Vec<PathBuf>,
+
+    /// Optional catalog root to index instead of `source_dirs`.
+    ///
+    /// When set, the index is built via `PersonaIndex::from_catalog`, which
+    /// enumerates immediate subdirs of the given path. `source_dirs` is ignored.
+    pub catalog_root: Option<PathBuf>,
 
     /// Per-persona scoring bias preferences.
     pub prefs: Preferences,
@@ -33,17 +40,27 @@ pub struct SelectionInputs<'a> {
 /// Run a full persona selection pass and return ranked results.
 ///
 /// Senses the project context from `inputs.project_root`, builds a
-/// `PersonaIndex` from `inputs.source_dirs`, applies scoring weights and
-/// preferences, and returns the sorted result from `policy::rank`.
+/// `PersonaIndex` from `inputs.catalog_root` (when set) or `inputs.source_dirs`,
+/// applies scoring weights and preferences, and returns the sorted result from
+/// `policy::rank`.
 ///
-/// Returns an empty `Vec` (not an error) when `source_dirs` is empty.
+/// Returns an empty `Vec` (not an error) when both `catalog_root` is absent
+/// and `source_dirs` is empty.
 pub fn select(inputs: &SelectionInputs<'_>) -> Result<Vec<Scored>, OrchestratorError> {
-    if inputs.source_dirs.is_empty() {
+    let index = if let Some(catalog_root) = &inputs.catalog_root {
+        PersonaIndex::from_catalog(catalog_root)?
+    } else {
+        if inputs.source_dirs.is_empty() {
+            return Ok(Vec::new());
+        }
+        PersonaIndex::from_dirs(&inputs.source_dirs)?
+    };
+
+    if index.profiles.is_empty() {
         return Ok(Vec::new());
     }
 
     let ctx = sense(inputs.project_root, inputs.task_hint);
-    let index = PersonaIndex::from_dirs(&inputs.source_dirs)?;
     let ranked = rank(&ctx, &index, &inputs.weights, &inputs.prefs);
     Ok(ranked)
 }
@@ -54,7 +71,7 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    /// Build a minimal persona source directory suitable for indexing.
+    /// Build a minimal persona source directory suitable for indexing (persona.toml).
     fn make_persona_source(dir: &Path, name: &str) {
         fs::create_dir_all(dir).unwrap();
         let toml = format!(
@@ -72,6 +89,18 @@ tone = "precise"
         fs::write(dir.join("persona.toml"), toml).unwrap();
     }
 
+    /// Build a freeform persona dir with only AGENTS.md + pack.toml.
+    fn make_freeform_persona(dir: &Path, name: &str, body: &str) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(
+            dir.join("pack.toml"),
+            format!(
+                "schema_version = 1\nname = \"{name}\"\nauthor_handle = \"test\"\nauthor_pubkey = \"local-unsigned\"\nversion = \"0.1.0\"\n"
+            ),
+        ).unwrap();
+        fs::write(dir.join("AGENTS.md"), body).unwrap();
+    }
+
     /// select() returns one entry per installed persona source.
     #[test]
     fn select_returns_all_personas() {
@@ -86,6 +115,7 @@ tone = "precise"
             project_root: project.path(),
             task_hint: None,
             source_dirs: vec![dir_a, dir_b],
+            catalog_root: None,
             prefs: Preferences::new(),
             weights: PolicyWeights::default(),
         };
@@ -102,6 +132,7 @@ tone = "precise"
             project_root: project.path(),
             task_hint: None,
             source_dirs: vec![],
+            catalog_root: None,
             prefs: Preferences::new(),
             weights: PolicyWeights::default(),
         };
@@ -122,11 +153,44 @@ tone = "precise"
             project_root: project.path(),
             task_hint: Some("refactor rust module"),
             source_dirs: vec![dir_a],
+            catalog_root: None,
             prefs: Preferences::new(),
             weights: PolicyWeights::default(),
         };
 
         let ranked = select(&inputs).unwrap();
         assert_eq!(ranked.len(), 1);
+    }
+
+    /// select() with catalog_root indexes the catalog instead of source_dirs.
+    #[test]
+    fn select_with_catalog_root_indexes_catalog() {
+        let tmp = TempDir::new().unwrap();
+        let catalog = tmp.path().join("catalog");
+
+        make_freeform_persona(
+            &catalog.join("rust"),
+            "rust",
+            "# Rust\n\n## L2 Anchor\n\ncargo clippy rustc ownership lifetimes\n",
+        );
+        make_freeform_persona(
+            &catalog.join("writer"),
+            "writer",
+            "# Writer\n\nDocumentation, READMEs, changelogs, prose, tutorials.\n",
+        );
+
+        let project = TempDir::new().unwrap();
+        let inputs = SelectionInputs {
+            project_root: project.path(),
+            task_hint: Some("refactor a rust clippy lint"),
+            source_dirs: vec![],
+            catalog_root: Some(catalog),
+            prefs: Preferences::new(),
+            weights: PolicyWeights::default(),
+        };
+
+        let ranked = select(&inputs).unwrap();
+        assert_eq!(ranked.len(), 2, "catalog should index both personas");
+        assert_eq!(ranked[0].persona, "rust", "rust should rank first for rust task");
     }
 }

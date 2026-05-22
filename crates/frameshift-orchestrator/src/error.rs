@@ -16,4 +16,8 @@ pub enum OrchestratorError {
     /// Loading a persona source directory failed.
     #[error("persona source load failed: {0}")]
     SourceLoad(#[from] frameshift_source::SourceError),
+
+    /// TOML deserialization failed (pack.toml parsing).
+    #[error("TOML parse error: {0}")]
+    TomlDeserialize(#[from] toml::de::Error),
 }

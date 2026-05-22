@@ -81,6 +81,7 @@ pub fn evaluate_and_apply(
         project_root,
         task_hint: None,
         source_dirs,
+        catalog_root: None,
         prefs,
         weights: PolicyWeights::default(),
     };

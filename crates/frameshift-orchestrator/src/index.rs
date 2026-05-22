@@ -1,9 +1,10 @@
 //! Persona index: matchable representations of installed personas.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use frameshift_source::PersonaSource;
+use serde::Deserialize;
 
 use crate::error::OrchestratorError;
 
@@ -41,6 +42,36 @@ pub struct PersonaProfile {
 
     /// Whether the capability manifest declares network egress required.
     pub network_egress: bool,
+}
+
+/// Minimal pack.toml structure for freeform personas that lack `persona.toml`.
+///
+/// Only the fields we care about for profile extraction are deserialized.
+#[derive(Debug, Deserialize, Default)]
+struct PackManifest {
+    /// Canonical name of the persona pack.
+    #[serde(default)]
+    name: Option<String>,
+
+    /// Optional human-readable description.
+    #[serde(default)]
+    description: Option<String>,
+
+    /// Optional capability manifest section.
+    #[serde(default)]
+    capability_manifest: Option<PackCapabilityManifest>,
+}
+
+/// Capability manifest section inside pack.toml.
+#[derive(Debug, Deserialize, Default)]
+struct PackCapabilityManifest {
+    /// Tools this persona requires to be available.
+    #[serde(default)]
+    required_tools: Vec<String>,
+
+    /// Whether network egress is required.
+    #[serde(default)]
+    network_egress: bool,
 }
 
 impl PersonaProfile {
@@ -125,14 +156,233 @@ impl PersonaProfile {
             network_egress,
         }
     }
+
+    /// Build a `PersonaProfile` from a freeform AGENTS.md persona directory.
+    ///
+    /// `dir` must contain `AGENTS.md`. `pack.toml` is optional but used for
+    /// name, description, and capability_manifest when present. The markdown
+    /// body is tokenized for keywords; high-signal sections (L2 anchor, Tech
+    /// Stack, Concrete Patterns, Operating Frame) are weighted by including
+    /// their tokens twice. Language detection runs the language lexicon over
+    /// the resulting keyword set.
+    pub fn from_agents_md(dir: &Path) -> Result<Self, OrchestratorError> {
+        let agents_md_path = dir.join("AGENTS.md");
+        let body = std::fs::read_to_string(&agents_md_path)?;
+
+        // Read pack.toml if present; silently default on absence or parse failure.
+        let pack: PackManifest = {
+            let pack_path = dir.join("pack.toml");
+            if pack_path.exists() {
+                let raw = std::fs::read_to_string(&pack_path)?;
+                toml::from_str(&raw).unwrap_or_default()
+            } else {
+                PackManifest::default()
+            }
+        };
+
+        // Name: pack.toml `name` > directory file_name.
+        let name = pack
+            .name
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| {
+                dir.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "unknown".to_string())
+            });
+
+        // Build keyword corpus: always include the full body.
+        // High-signal sections are included twice for weighting.
+        let mut corpus = body.clone();
+        for section in extract_high_signal_sections(&body) {
+            corpus.push(' ');
+            corpus.push_str(&section);
+        }
+        // Include the persona name itself for self-match.
+        corpus.push(' ');
+        corpus.push_str(&name);
+
+        let mut keywords = extract_keywords(&corpus);
+        // Ensure the persona name (as a keyword token) is always present.
+        let name_tok = name.to_lowercase();
+        if name_tok.len() >= 3 && !keywords.iter().any(|k| k == &name_tok) {
+            keywords.push(name_tok.clone());
+        }
+
+        // Language detection via lexicon.
+        let mut languages: BTreeSet<String> = BTreeSet::new();
+        for (trigger, canonical) in LANGUAGE_LEXICON {
+            if keywords.iter().any(|k| k == *trigger) {
+                languages.insert(canonical.to_string());
+            }
+        }
+        // Also check for language names in the KNOWN_LANGUAGES list.
+        for lang in KNOWN_LANGUAGES {
+            if keywords.iter().any(|k| k == *lang) {
+                languages.insert(lang.to_string());
+            }
+        }
+        // If the persona name IS a known language, add it.
+        let name_lower = name.to_lowercase();
+        for lang in KNOWN_LANGUAGES {
+            if name_lower == *lang {
+                languages.insert(lang.to_string());
+            }
+        }
+
+        // Capability manifest from pack.toml.
+        let (required_tools, network_egress) = pack
+            .capability_manifest
+            .map(|cm| (cm.required_tools, cm.network_egress))
+            .unwrap_or_else(|| (Vec::new(), false));
+
+        Ok(PersonaProfile {
+            name,
+            description: pack.description,
+            languages,
+            keywords,
+            required_tools,
+            network_egress,
+        })
+    }
+
+    /// Build a `PersonaProfile` from a persona directory using dual-source logic.
+    ///
+    /// Prefers `persona.toml` when present (typed source path). Falls back to
+    /// `AGENTS.md` for freeform personas. Returns an error if neither file exists.
+    pub fn from_persona_dir(dir: &Path) -> Result<Self, OrchestratorError> {
+        let persona_toml = dir.join("persona.toml");
+        let agents_md = dir.join("AGENTS.md");
+
+        if persona_toml.exists() {
+            let src = PersonaSource::load_from_dir(dir)?;
+            Ok(Self::from_source(&src))
+        } else if agents_md.exists() {
+            Self::from_agents_md(dir)
+        } else {
+            Err(OrchestratorError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "persona dir {} has neither persona.toml nor AGENTS.md",
+                    dir.display()
+                ),
+            )))
+        }
+    }
 }
+
+/// Language lexicon: maps trigger tokens to canonical language names.
+///
+/// Each entry is (trigger_keyword, canonical_language). Multiple triggers can
+/// map to the same canonical language (e.g., "cargo" -> "rust"). The pseudo-
+/// language "prose" captures writing/documentation domain personas so they
+/// compete on equal footing with code-language personas.
+const LANGUAGE_LEXICON: &[(&str, &str)] = &[
+    ("rust", "rust"),
+    ("cargo", "rust"),
+    ("clippy", "rust"),
+    ("rustc", "rust"),
+    ("tauri", "rust"),
+    ("typescript", "typescript"),
+    ("tsx", "typescript"),
+    ("react", "typescript"),
+    ("svelte", "typescript"),
+    ("vue", "typescript"),
+    ("javascript", "javascript"),
+    ("node", "javascript"),
+    ("npm", "javascript"),
+    ("discord", "javascript"),
+    ("python", "python"),
+    ("pip", "python"),
+    ("pytest", "python"),
+    ("django", "python"),
+    ("go", "go"),
+    ("golang", "go"),
+    ("bash", "shell"),
+    ("shell", "shell"),
+    ("zsh", "shell"),
+    ("cpp", "cpp"),
+    ("c++", "cpp"),
+    ("java", "java"),
+    ("kotlin", "kotlin"),
+    ("swift", "swift"),
+    ("ruby", "ruby"),
+    ("scala", "scala"),
+    ("haskell", "haskell"),
+    ("elixir", "elixir"),
+    ("erlang", "erlang"),
+    ("clojure", "clojure"),
+    ("sql", "sql"),
+    ("yaml", "yaml"),
+    ("toml", "toml"),
+    ("markdown", "markdown"),
+    // Writing/documentation domain: maps to pseudo-language "prose" so that
+    // writer-specialist personas accumulate a language signal. Only distinctive
+    // writing-domain terms are included here (not generic "documentation" which
+    // appears in all AGENTS.md files), so only genuine writing personas get the
+    // prose language tag.
+    ("prose", "prose"),
+    ("changelog", "prose"),
+    ("changelogs", "prose"),
+    ("tutorial", "prose"),
+    ("tutorials", "prose"),
+    ("copywriting", "prose"),
+    ("slop", "prose"),
+    ("antiSlop", "prose"),
+];
 
 /// Known language identifiers used for keyword-based language detection.
 const KNOWN_LANGUAGES: &[&str] = &[
     "rust", "typescript", "javascript", "python", "go", "java", "ruby",
     "c", "cpp", "markdown", "toml", "shell", "bash", "sql", "yaml",
     "haskell", "kotlin", "swift", "scala", "elixir", "erlang", "clojure",
+    "prose",
 ];
+
+/// Extract section bodies from high-signal headings for double-weighting.
+///
+/// Scans `body` for headings containing any of the high-signal keywords
+/// (case-insensitive). Returns the text under each matching heading until the
+/// next heading of the same or higher level.
+fn extract_high_signal_sections(body: &str) -> Vec<String> {
+    const HIGH_SIGNAL: &[&str] = &[
+        "l2 anchor", "tech stack", "concrete patterns", "operating frame",
+        "who you are", "language", "stack", "tools",
+    ];
+
+    let mut sections: Vec<String> = Vec::new();
+    let mut current_heading_level: usize = 0;
+    let mut current_is_signal = false;
+    let mut current_section = String::new();
+
+    for line in body.lines() {
+        if line.starts_with('#') {
+            // Save the previous section if it was a signal section.
+            if current_is_signal && !current_section.is_empty() {
+                sections.push(current_section.clone());
+            }
+            current_section.clear();
+
+            // Compute heading level (number of leading '#' chars).
+            let level = line.chars().take_while(|c| *c == '#').count();
+            let heading_text = line.trim_start_matches('#').trim().to_lowercase();
+
+            current_heading_level = level;
+            current_is_signal = HIGH_SIGNAL.iter().any(|s| heading_text.contains(s));
+        } else if current_is_signal {
+            current_section.push_str(line);
+            current_section.push('\n');
+        }
+        // Suppress unused warning on level variable (used for context only).
+        let _ = current_heading_level;
+    }
+
+    // Capture trailing section.
+    if current_is_signal && !current_section.is_empty() {
+        sections.push(current_section);
+    }
+
+    sections
+}
 
 /// Extract deduplicated, lowercase, stopword-filtered keyword tokens from `text`.
 ///
@@ -164,21 +414,89 @@ impl PersonaIndex {
 
     /// Load persona sources from a list of directories and build an index.
     ///
-    /// Each directory must contain a valid `persona.toml`. Returns an error if
-    /// any directory fails to load.
+    /// Each directory is processed via `PersonaProfile::from_persona_dir`, which
+    /// accepts both `persona.toml` (typed) and `AGENTS.md` (freeform) personas.
+    /// Directories that have neither file are skipped with a warning instead of
+    /// failing the whole batch.
     pub fn from_dirs(dirs: &[PathBuf]) -> Result<Self, OrchestratorError> {
-        let mut sources = Vec::with_capacity(dirs.len());
+        let mut profiles = Vec::with_capacity(dirs.len());
         for dir in dirs {
-            let src = PersonaSource::load_from_dir(dir)?;
-            sources.push(src);
+            match PersonaProfile::from_persona_dir(dir) {
+                Ok(profile) => profiles.push(profile),
+                Err(OrchestratorError::Io(e))
+                    if e.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    tracing::warn!(
+                        dir = %dir.display(),
+                        "skipping persona dir: no persona.toml or AGENTS.md found"
+                    );
+                }
+                Err(e) => return Err(e),
+            }
         }
-        Ok(Self::build(&sources))
+        Ok(PersonaIndex { profiles })
+    }
+
+    /// Build a `PersonaIndex` from all immediate subdirectories of `catalog_root`.
+    ///
+    /// Enumerates subdirs of `catalog_root`, skipping `bin`, `.git`, and any
+    /// entry whose name starts with `.`. Each subdir is indexed via
+    /// `PersonaProfile::from_persona_dir`; dirs with neither persona.toml nor
+    /// AGENTS.md are skipped with a warning.
+    pub fn from_catalog(catalog_root: &Path) -> Result<Self, OrchestratorError> {
+        let mut profiles = Vec::new();
+
+        // Directories to skip at the catalog root level.
+        const SKIP_DIRS: &[&str] = &["bin", ".git"];
+
+        let mut entries: Vec<_> = std::fs::read_dir(catalog_root)?
+            .filter_map(|e| e.ok())
+            .collect();
+        entries.sort_by_key(|e| e.file_name());
+
+        for entry in entries {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+
+            // Skip dotfiles, bin, .git.
+            if name_str.starts_with('.') || SKIP_DIRS.contains(&name_str.as_ref()) {
+                continue;
+            }
+
+            match PersonaProfile::from_persona_dir(&path) {
+                Ok(profile) => profiles.push(profile),
+                Err(OrchestratorError::Io(e))
+                    if e.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    tracing::warn!(
+                        dir = %path.display(),
+                        "skipping catalog dir: no persona.toml or AGENTS.md found"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        dir = %path.display(),
+                        error = %e,
+                        "skipping catalog dir: failed to load persona"
+                    );
+                }
+            }
+        }
+
+        Ok(PersonaIndex { profiles })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::TempDir;
 
     /// Build a minimal PersonaSource for testing.
     fn minimal_source(name: &str, tone: &str) -> PersonaSource {
@@ -242,5 +560,125 @@ mod tests {
         ];
         let index = PersonaIndex::build(&sources);
         assert_eq!(index.profiles.len(), 2);
+    }
+
+    /// from_agents_md extracts name from pack.toml and rust from a rust-flavored body.
+    #[test]
+    fn from_agents_md_extracts_rust() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("rust");
+        fs::create_dir_all(&dir).unwrap();
+
+        fs::write(
+            dir.join("pack.toml"),
+            "schema_version = 1\nname = \"rust\"\nauthor_handle = \"test\"\nauthor_pubkey = \"local-unsigned\"\nversion = \"0.1.0\"\n",
+        ).unwrap();
+
+        fs::write(
+            dir.join("AGENTS.md"),
+            "# AGENTS.md -- Rust Context\n\n## L2 Anchor -- Who You Are Here\n\nYou work on Rust code. cargo clippy rustc are your tools.\nOwnership, lifetimes, memory safety. No unwraps in library code.\n",
+        ).unwrap();
+
+        let profile = PersonaProfile::from_agents_md(&dir).unwrap();
+        assert_eq!(profile.name, "rust");
+        assert!(
+            profile.languages.contains("rust"),
+            "rust must be in languages; got: {:?}",
+            profile.languages
+        );
+        assert!(
+            profile.keywords.iter().any(|k| k == "rust" || k == "cargo" || k == "clippy"),
+            "expected rust/cargo/clippy in keywords; got: {:?}",
+            profile.keywords
+        );
+    }
+
+    /// from_persona_dir prefers persona.toml when both exist.
+    #[test]
+    fn from_persona_dir_prefers_persona_toml() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("mypersona");
+        fs::create_dir_all(&dir).unwrap();
+
+        // Write persona.toml (typed source).
+        fs::write(
+            dir.join("persona.toml"),
+            "schema_version = 1\nname = \"from-persona-toml\"\nauthor_handle = \"test\"\nauthor_pubkey = \"local-unsigned\"\nversion = \"0.1.0\"\n[voice]\ntone = \"precise\"\n",
+        ).unwrap();
+
+        // Also write AGENTS.md with a different name -- should be ignored.
+        fs::write(dir.join("AGENTS.md"), "# from-agents-md\n\nSome content.\n").unwrap();
+
+        let profile = PersonaProfile::from_persona_dir(&dir).unwrap();
+        assert_eq!(profile.name, "from-persona-toml");
+    }
+
+    /// from_persona_dir uses AGENTS.md when no persona.toml.
+    #[test]
+    fn from_persona_dir_uses_agents_md_fallback() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("writer");
+        fs::create_dir_all(&dir).unwrap();
+
+        fs::write(
+            dir.join("pack.toml"),
+            "schema_version = 1\nname = \"writer\"\nauthor_handle = \"test\"\nauthor_pubkey = \"local-unsigned\"\nversion = \"0.1.0\"\n",
+        ).unwrap();
+        fs::write(
+            dir.join("AGENTS.md"),
+            "# AGENTS.md -- Writer Context\n\nDocumentation, changelogs, READMEs, prose, tutorials.\n",
+        ).unwrap();
+
+        let profile = PersonaProfile::from_persona_dir(&dir).unwrap();
+        assert_eq!(profile.name, "writer");
+        assert!(
+            profile.keywords.iter().any(|k| k == "documentation" || k == "docs" || k == "writer" || k == "prose"),
+            "expected writing-related keywords; got: {:?}",
+            profile.keywords
+        );
+    }
+
+    /// from_catalog indexes multiple dirs and skips one with neither file.
+    #[test]
+    fn from_catalog_indexes_dirs_and_skips_invalid() {
+        let tmp = TempDir::new().unwrap();
+        let catalog = tmp.path();
+
+        // Valid freeform persona.
+        let rust_dir = catalog.join("rust");
+        fs::create_dir_all(&rust_dir).unwrap();
+        fs::write(rust_dir.join("AGENTS.md"), "# Rust\n\ncargo clippy rustc ownership\n").unwrap();
+
+        // Valid typed persona.
+        let typed_dir = catalog.join("typed");
+        fs::create_dir_all(&typed_dir).unwrap();
+        fs::write(
+            typed_dir.join("persona.toml"),
+            "schema_version = 1\nname = \"typed\"\nauthor_handle = \"test\"\nauthor_pubkey = \"local-unsigned\"\nversion = \"0.1.0\"\n[voice]\ntone = \"direct\"\n",
+        ).unwrap();
+
+        // Dir with neither file -- should be skipped.
+        let empty_dir = catalog.join("empty");
+        fs::create_dir_all(&empty_dir).unwrap();
+
+        // Dotfile dir -- should be skipped by name.
+        let dot_dir = catalog.join(".hidden");
+        fs::create_dir_all(&dot_dir).unwrap();
+        fs::write(dot_dir.join("AGENTS.md"), "# hidden\n").unwrap();
+
+        // bin dir -- should be skipped by name.
+        let bin_dir = catalog.join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+
+        let index = PersonaIndex::from_catalog(catalog).unwrap();
+        assert_eq!(
+            index.profiles.len(),
+            2,
+            "expected rust + typed, got: {:?}",
+            index.profiles.iter().map(|p| &p.name).collect::<Vec<_>>()
+        );
+        let names: Vec<&str> = index.profiles.iter().map(|p| p.name.as_str()).collect();
+        assert!(names.contains(&"rust"), "rust persona must be indexed");
+        assert!(names.contains(&"typed"), "typed persona must be indexed");
     }
 }

@@ -298,6 +298,7 @@ fn call_select(arguments: &serde_json::Value, client: &Client) -> ToolResult {
         project_root: &project_root,
         task_hint: task_hint.as_deref(),
         source_dirs,
+        catalog_root: None,
         prefs,
         weights: PolicyWeights::default(),
     };
