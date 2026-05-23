@@ -8,6 +8,7 @@
 //! - [`ops`] -- `GET /healthz` and `GET /metrics` operational endpoints.
 
 pub mod authors;
+pub mod downloads;
 pub mod handles;
 pub mod ops;
 pub mod packs;

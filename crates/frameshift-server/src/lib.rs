@@ -31,6 +31,7 @@
 //! transparency log, full MCP surface.
 
 pub mod config;
+pub mod download;
 pub mod error;
 pub mod mcp;
 pub mod middleware;

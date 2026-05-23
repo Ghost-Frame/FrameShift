@@ -17,6 +17,14 @@
 //! | `MAX_REQUEST_BYTES` | `1048576` (1 MiB) | Maximum allowed request body size |
 //! | `MAX_SEARCH_LIMIT` | `200` | Maximum value for `?limit=` on search endpoints |
 //! | `SHUTDOWN_GRACE` | `30` | Seconds to wait for in-flight requests during shutdown |
+//! | `CORS_ALLOWED_ORIGINS` | `""` | Comma-separated list of allowed CORS origins; empty disables CORS |
+//! | `DOWNLOAD_SECRET` | `""` | 64-char hex (32 bytes) HMAC key for signed download URLs; empty disables the download endpoints |
+//! | `DOWNLOAD_TOKEN_TTL` | `300` | Default TTL in seconds for newly minted download tokens (5 minutes) |
+//! | `DOWNLOAD_MAX_TOKEN_TTL` | `1800` | Hard cap on token TTL accepted by the verifier (30 minutes) |
+//!
+//! Env var names match the struct field names verbatim (figment maps
+//! `download_secret` <-> `DOWNLOAD_SECRET`); shorter aliases would require an
+//! explicit remap step which we don't have yet.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -99,6 +107,77 @@ pub struct ServerConfig {
     ///
     /// Default: 30 seconds.
     pub shutdown_grace: Duration,
+
+    /// Comma-separated list of origins allowed by the CORS preflight layer.
+    ///
+    /// Empty (the default) disables the CORS layer entirely. Production
+    /// deployments set this to the marketplace web origin. Whitespace
+    /// around commas is trimmed at parse time by
+    /// [`ServerConfig::cors_origins`].
+    pub cors_allowed_origins: String,
+
+    /// HMAC key (32 bytes, hex-encoded) for signed download URLs.
+    ///
+    /// Empty disables the `/dl/...` and `POST /download-url` endpoints
+    /// entirely. Production deployments MUST set the `DOWNLOAD_SECRET` env
+    /// to a 64-char hex value generated with `openssl rand -hex 32` and
+    /// supplied via a secrets manager (never committed to disk in plaintext).
+    /// Stored as [`SecretString`] so the bytes never appear in `Debug`.
+    pub download_secret: SecretString,
+
+    /// Default TTL for newly minted download tokens.
+    ///
+    /// Short enough to limit replay if a URL leaks, long enough for slow
+    /// clients to start the download. Default: 5 minutes.
+    pub download_token_ttl: Duration,
+
+    /// Hard upper bound on token TTL accepted by the verifier.
+    ///
+    /// Tokens whose `expires` claim is more than this far in the future are
+    /// rejected even if the HMAC validates -- this protects against a future
+    /// signer bug from issuing arbitrarily long-lived tokens. Default:
+    /// 30 minutes.
+    pub download_max_token_ttl: Duration,
+}
+
+impl ServerConfig {
+    /// Iterator over CORS origins parsed from [`Self::cors_allowed_origins`].
+    ///
+    /// Splits on `,`, trims each entry, and skips empty segments. Yields
+    /// borrowed `&str` slices into the underlying field so the caller can
+    /// decide whether to validate as a `HeaderValue` or treat as a sentinel.
+    pub fn cors_origins(&self) -> impl Iterator<Item = &str> {
+        self.cors_allowed_origins
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Decode [`Self::download_secret`] from hex into the 32-byte HMAC key.
+    ///
+    /// Returns `Ok(None)` when the secret is empty (download endpoints are
+    /// administratively disabled). Returns `Err` when the secret is present
+    /// but malformed (not 64 hex chars). The decoded key is wrapped in
+    /// [`SecretString`] so it never appears in `Debug` output -- callers
+    /// should `expose_secret()` on the result only at the HMAC call site.
+    pub fn download_key(&self) -> Result<Option<[u8; 32]>, String> {
+        use secrecy::ExposeSecret;
+        let raw = self.download_secret.expose_secret().trim();
+        if raw.is_empty() {
+            return Ok(None);
+        }
+        let bytes =
+            hex::decode(raw).map_err(|e| format!("DOWNLOAD_SECRET hex decode failed: {e}"))?;
+        if bytes.len() != 32 {
+            return Err(format!(
+                "DOWNLOAD_SECRET must decode to 32 bytes, got {}",
+                bytes.len()
+            ));
+        }
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&bytes);
+        Ok(Some(out))
+    }
 }
 
 /// Manual `Debug` implementation that redacts `postgres_url`.
@@ -117,6 +196,10 @@ impl std::fmt::Debug for ServerConfig {
             .field("max_request_bytes", &self.max_request_bytes)
             .field("max_search_limit", &self.max_search_limit)
             .field("shutdown_grace", &self.shutdown_grace)
+            .field("cors_allowed_origins", &self.cors_allowed_origins)
+            .field("download_secret", &"[REDACTED]")
+            .field("download_token_ttl", &self.download_token_ttl)
+            .field("download_max_token_ttl", &self.download_max_token_ttl)
             .finish()
     }
 }
@@ -155,6 +238,18 @@ struct RawConfig {
 
     /// Graceful shutdown duration in seconds.
     shutdown_grace: u64,
+
+    /// Comma-separated CORS allowed origins (raw string).
+    cors_allowed_origins: String,
+
+    /// HMAC key for download URLs (hex, 64 chars, optional).
+    download_secret: String,
+
+    /// Download token TTL in seconds.
+    download_token_ttl: u64,
+
+    /// Max accepted download token TTL in seconds.
+    download_max_token_ttl: u64,
 }
 
 impl RawConfig {
@@ -172,6 +267,10 @@ impl RawConfig {
             max_request_bytes: self.max_request_bytes,
             max_search_limit: self.max_search_limit,
             shutdown_grace: Duration::from_secs(self.shutdown_grace),
+            cors_allowed_origins: self.cors_allowed_origins,
+            download_secret: SecretString::new(self.download_secret),
+            download_token_ttl: Duration::from_secs(self.download_token_ttl),
+            download_max_token_ttl: Duration::from_secs(self.download_max_token_ttl),
         }
     }
 }
@@ -190,6 +289,10 @@ fn default_raw_config() -> RawConfig {
         max_request_bytes: 1_048_576,
         max_search_limit: 200,
         shutdown_grace: 30,
+        cors_allowed_origins: String::new(),
+        download_secret: String::new(),
+        download_token_ttl: 300,
+        download_max_token_ttl: 1800,
     }
 }
 
@@ -223,22 +326,116 @@ mod tests {
 
     #[test]
     fn debug_redacts_postgres_url() {
+        // Use a unique token in the URL so the assertion below cannot be
+        // satisfied by the literal field NAME "download_secret" -- the test
+        // is checking that the URL credential value is hidden, not that the
+        // word "secret" appears nowhere in the struct's Debug output.
+        let pg = "postgres://user:RAW_PG_CREDENTIAL@host/db";
         let cfg = ServerConfig {
             bind_addr: "127.0.0.1:3000".parse().unwrap(),
-            postgres_url: SecretString::new("postgres://user:secret@host/db".into()),
+            postgres_url: SecretString::new(pg.into()),
             object_store_root: PathBuf::from("/tmp"),
             log_level: "info".into(),
             log_format: LogFormat::Text,
             max_request_bytes: 1_048_576,
             max_search_limit: 200,
             shutdown_grace: Duration::from_secs(30),
+            cors_allowed_origins: String::new(),
+            download_secret: SecretString::new(String::new()),
+            download_token_ttl: Duration::from_secs(300),
+            download_max_token_ttl: Duration::from_secs(1800),
         };
         let debug = format!("{cfg:?}");
         assert!(
-            !debug.contains("secret"),
-            "Debug must not expose postgres_url"
+            !debug.contains("RAW_PG_CREDENTIAL"),
+            "Debug must not expose postgres_url credential: {debug}"
         );
         assert!(debug.contains("[REDACTED]"), "Debug must show [REDACTED]");
+    }
+
+    #[test]
+    fn cors_origins_splits_and_trims_comma_separated() {
+        let cfg = ServerConfig {
+            bind_addr: "127.0.0.1:3000".parse().unwrap(),
+            postgres_url: SecretString::new("x".into()),
+            object_store_root: PathBuf::from("/tmp"),
+            log_level: "info".into(),
+            log_format: LogFormat::Text,
+            max_request_bytes: 1,
+            max_search_limit: 1,
+            shutdown_grace: Duration::from_secs(1),
+            cors_allowed_origins: " https://a.example , ,https://b.example ".into(),
+            download_secret: SecretString::new(String::new()),
+            download_token_ttl: Duration::from_secs(300),
+            download_max_token_ttl: Duration::from_secs(1800),
+        };
+        let got: Vec<&str> = cfg.cors_origins().collect();
+        assert_eq!(got, vec!["https://a.example", "https://b.example"]);
+    }
+
+    #[test]
+    fn cors_origins_empty_yields_no_entries() {
+        let cfg = ServerConfig {
+            bind_addr: "127.0.0.1:3000".parse().unwrap(),
+            postgres_url: SecretString::new("x".into()),
+            object_store_root: PathBuf::from("/tmp"),
+            log_level: "info".into(),
+            log_format: LogFormat::Text,
+            max_request_bytes: 1,
+            max_search_limit: 1,
+            shutdown_grace: Duration::from_secs(1),
+            cors_allowed_origins: String::new(),
+            download_secret: SecretString::new(String::new()),
+            download_token_ttl: Duration::from_secs(300),
+            download_max_token_ttl: Duration::from_secs(1800),
+        };
+        assert_eq!(cfg.cors_origins().count(), 0);
+    }
+
+    #[test]
+    fn download_key_empty_returns_none() {
+        let cfg = make_test_cfg("");
+        assert!(matches!(cfg.download_key(), Ok(None)));
+    }
+
+    #[test]
+    fn download_key_valid_hex_returns_bytes() {
+        let hex32 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let cfg = make_test_cfg(hex32);
+        let key = cfg.download_key().expect("hex valid").expect("not None");
+        assert_eq!(key[0], 0x01);
+        assert_eq!(key[31], 0xef);
+    }
+
+    #[test]
+    fn download_key_wrong_length_errors() {
+        let cfg = make_test_cfg("deadbeef"); // 4 bytes, not 32
+        assert!(cfg.download_key().is_err());
+    }
+
+    #[test]
+    fn download_key_invalid_hex_errors() {
+        let cfg = make_test_cfg("zz".repeat(32).as_str());
+        assert!(cfg.download_key().is_err());
+    }
+
+    /// Build a [`ServerConfig`] populated with test-friendly defaults and the
+    /// given `download_secret`.
+    fn make_test_cfg(secret: &str) -> ServerConfig {
+        ServerConfig {
+            bind_addr: "127.0.0.1:3000".parse().unwrap(),
+            postgres_url: SecretString::new("x".into()),
+            object_store_root: PathBuf::from("/tmp"),
+            log_level: "info".into(),
+            log_format: LogFormat::Text,
+            max_request_bytes: 1,
+            max_search_limit: 1,
+            shutdown_grace: Duration::from_secs(1),
+            cors_allowed_origins: String::new(),
+            download_secret: SecretString::new(secret.into()),
+            download_token_ttl: Duration::from_secs(300),
+            download_max_token_ttl: Duration::from_secs(1800),
+        }
     }
 
     #[test]

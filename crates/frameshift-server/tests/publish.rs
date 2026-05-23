@@ -51,6 +51,10 @@ fn test_config() -> Arc<ServerConfig> {
         max_request_bytes: 4 * 1024 * 1024,
         max_search_limit: 100,
         shutdown_grace: Duration::from_secs(1),
+        cors_allowed_origins: String::new(),
+        download_secret: SecretString::new(String::new()),
+        download_token_ttl: Duration::from_secs(300),
+        download_max_token_ttl: Duration::from_secs(1800),
     })
 }
 
@@ -195,6 +199,7 @@ fn catalog_with_author(signing: &SigningKey, handle: &str) -> (MockCatalog, Ed25
                 created_at: Utc::now(),
                 latest_version: Some("0.1.0".to_string()),
                 total_downloads: 0,
+                extends: None,
             },
         );
     }

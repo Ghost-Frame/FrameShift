@@ -279,12 +279,37 @@ impl CatalogBackend for MockCatalog {
             detail: "mock catalog is always healthy".to_string(),
         })
     }
+
+    /// Set the `extends` field on the pack head record.
+    ///
+    /// Errors with `NotFound` if the pack is absent; otherwise mutates the
+    /// in-memory record in place.
+    async fn set_pack_extends(
+        &self,
+        pack_name: &str,
+        extends: Option<&str>,
+    ) -> Result<(), CatalogError> {
+        let mut state = self.state.write().unwrap();
+        match state.packs.get_mut(pack_name) {
+            Some(rec) => {
+                rec.extends = extends.map(str::to_string);
+                Ok(())
+            }
+            None => Err(CatalogError::NotFound {
+                kind: "pack",
+                key: pack_name.to_string(),
+            }),
+        }
+    }
 }
 
 /// Helper: build a minimal [`AuthorRecord`] for test setup.
 ///
 /// `pubkey_bytes` is the raw 32-byte Ed25519 public key. `handle` is the
-/// unique author handle.
+/// unique author handle. Marked `#[allow(dead_code)]` because each
+/// `tests/*.rs` file is a separate test binary and this helper is only
+/// referenced by integration.rs.
+#[allow(dead_code)]
 pub fn make_author(pubkey_bytes: [u8; 32], handle: &str) -> AuthorRecord {
     AuthorRecord {
         pubkey: Ed25519PublicKey(pubkey_bytes),

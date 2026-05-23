@@ -58,6 +58,10 @@ fn test_config() -> Arc<ServerConfig> {
         max_request_bytes: 1_048_576,
         max_search_limit: 100,
         shutdown_grace: Duration::from_secs(1),
+        cors_allowed_origins: String::new(),
+        download_secret: SecretString::new(String::new()),
+        download_token_ttl: Duration::from_secs(300),
+        download_max_token_ttl: Duration::from_secs(1800),
     })
 }
 
@@ -185,6 +189,7 @@ fn make_pack(name: &str, author: Ed25519PublicKey) -> PackRecord {
         created_at: Utc::now(),
         latest_version: Some("1.0.0".to_string()),
         total_downloads: 0,
+        extends: None,
     }
 }
 
@@ -521,4 +526,155 @@ async fn packs_valid_sort_trending_returns_200() {
     let state = make_state(MockCatalog::new(), MockPackStore::new());
     let resp = oneshot_get(state, "/v1/packs?sort=trending").await;
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+// ---------------------------------------------------------------------------
+// Signed download URL (POST .../download-url + GET /dl/{hash})
+// ---------------------------------------------------------------------------
+
+/// Build an [`AppState`] with a 32-byte test HMAC key wired into config so the
+/// download endpoints are operational.
+fn dl_state(catalog: MockCatalog, objects: MockPackStore) -> AppState {
+    let hex32 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1:0".parse().unwrap(),
+        postgres_url: SecretString::new("postgres://test".into()),
+        object_store_root: PathBuf::from("/tmp"),
+        log_level: "off".into(),
+        log_format: LogFormat::Text,
+        max_request_bytes: 1_048_576,
+        max_search_limit: 100,
+        shutdown_grace: Duration::from_secs(1),
+        cors_allowed_origins: String::new(),
+        download_secret: SecretString::new(hex32.into()),
+        download_token_ttl: Duration::from_secs(60),
+        download_max_token_ttl: Duration::from_secs(300),
+    };
+    AppState {
+        catalog: Arc::new(catalog),
+        objects: Arc::new(objects),
+        runtime: None,
+        config: Arc::new(cfg),
+    }
+}
+
+/// Issue a one-shot POST request with empty body.
+async fn oneshot_post_empty(
+    state: AppState,
+    path: &str,
+) -> axum::http::Response<axum::body::Body> {
+    let router = app(state);
+    let request = Request::builder()
+        .method("POST")
+        .uri(path)
+        .body(axum::body::Body::empty())
+        .unwrap();
+    router.oneshot(request).await.unwrap()
+}
+
+/// Happy path: POST mints a token, GET /dl/{hash} validates it and streams the blob.
+#[tokio::test]
+async fn download_url_mint_then_stream_succeeds() {
+    let blob = b"signed-download-content".to_vec();
+    let hash = ObjectHash::of(&blob);
+    let author_key = Ed25519PublicKey([4u8; 32]);
+
+    let catalog = MockCatalog::new();
+    {
+        let mut s = catalog.state.write().unwrap();
+        s.packs
+            .insert("dl-pack".to_string(), make_pack("dl-pack", author_key));
+        s.versions.insert(
+            ("dl-pack".to_string(), "1.0.0".to_string()),
+            make_version("dl-pack", "1.0.0", hash, author_key),
+        );
+    }
+    let objects = MockPackStore::new();
+    objects.insert(hash, blob.clone());
+
+    let state = dl_state(catalog, objects);
+
+    // Step 1: mint the URL.
+    let resp = oneshot_post_empty(state.clone(), "/v1/packs/dl-pack/versions/1.0.0/download-url")
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let url = body["url"].as_str().expect("url field present").to_string();
+    let expires_at = body["expires_at"].as_i64().expect("expires_at integer");
+    assert!(url.starts_with("/dl/"));
+    assert!(url.contains("token="));
+    assert!(url.contains("expires="));
+    assert!(expires_at > 0);
+
+    // Step 2: GET that URL and confirm the blob streams.
+    let resp = oneshot_get(state, &url).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "application/octet-stream"
+    );
+    let bytes = body_bytes(resp).await;
+    assert_eq!(bytes, blob);
+}
+
+/// Tampering with the token in the URL produces 403 Forbidden.
+#[tokio::test]
+async fn download_url_with_tampered_token_returns_403() {
+    let blob = b"tamper-target".to_vec();
+    let hash = ObjectHash::of(&blob);
+    let author_key = Ed25519PublicKey([5u8; 32]);
+
+    let catalog = MockCatalog::new();
+    {
+        let mut s = catalog.state.write().unwrap();
+        s.packs.insert(
+            "tamper-pack".to_string(),
+            make_pack("tamper-pack", author_key),
+        );
+        s.versions.insert(
+            ("tamper-pack".to_string(), "1.0.0".to_string()),
+            make_version("tamper-pack", "1.0.0", hash, author_key),
+        );
+    }
+    let objects = MockPackStore::new();
+    objects.insert(hash, blob);
+    let state = dl_state(catalog, objects);
+
+    let resp = oneshot_post_empty(
+        state.clone(),
+        "/v1/packs/tamper-pack/versions/1.0.0/download-url",
+    )
+    .await;
+    let body = body_json(resp).await;
+    let mut url = body["url"].as_str().unwrap().to_string();
+    // Flip the last hex character of the token.
+    let token_pos = url.find("token=").unwrap() + 6;
+    let mut chars: Vec<char> = url.chars().collect();
+    let last_hex_idx = token_pos + 63;
+    chars[last_hex_idx] = if chars[last_hex_idx] == '0' { '1' } else { '0' };
+    url = chars.into_iter().collect();
+
+    let resp = oneshot_get(state, &url).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+/// When DOWNLOAD_SECRET is empty (the default), the mint endpoint refuses with
+/// 400 and the verifier refuses with 403.
+#[tokio::test]
+async fn download_endpoints_disabled_when_secret_unset() {
+    // Use default test_config which has DOWNLOAD_SECRET empty.
+    let state = make_state(MockCatalog::new(), MockPackStore::new());
+
+    let resp = oneshot_post_empty(
+        state.clone(),
+        "/v1/packs/anything/versions/1.0.0/download-url",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // GET /dl/{hash}?token=&expires= with the disabled secret -> 403.
+    let zeros = "0".repeat(64);
+    let url = format!("/dl/{zeros}?token={}&expires=9999999999", "a".repeat(64));
+    let resp = oneshot_get(state, &url).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }

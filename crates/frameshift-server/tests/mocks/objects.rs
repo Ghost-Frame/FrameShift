@@ -39,7 +39,10 @@ impl MockPackStore {
     /// Insert a blob into the store under `hash`.
     ///
     /// No hash verification is performed here; test code is trusted to supply
-    /// consistent (hash, bytes) pairs.
+    /// consistent (hash, bytes) pairs. Each tests/*.rs file builds an
+    /// independent test binary, so this method may appear dead in binaries
+    /// that exercise only the publish path while integration.rs calls it.
+    #[allow(dead_code)]
     pub fn insert(&self, hash: ObjectHash, bytes: Vec<u8>) {
         self.blobs
             .write()

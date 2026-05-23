@@ -19,11 +19,16 @@
 //! 3. `TraceLayer` -- opens a span per request with method, path, status,
 //!    request_id; logs on response.
 //! 4. `CompressionLayer` -- gzip response compression.
-//! 5. `RequestBodyLimitLayer` -- outermost; caps request body size BEFORE
-//!    the rest of the stack sees any bytes.
+//! 5. `RequestBodyLimitLayer` -- caps request body size BEFORE the rest of
+//!    the stack sees any bytes.
+//! 6. `CorsLayer` -- outermost; handles preflight `OPTIONS` requests and
+//!    stamps `Access-Control-Allow-*` headers on responses. Only applied
+//!    when `state.config.cors_allowed_origins` is non-empty.
 
+use axum::http::{header, HeaderName, HeaderValue, Method};
 use axum::Router;
 use tower_http::compression::CompressionLayer;
+use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::request_id::{PropagateRequestIdLayer, SetRequestIdLayer};
 
@@ -31,6 +36,7 @@ use crate::mcp::mcp_router;
 use crate::middleware::request_id::RequestIdGenerator;
 use crate::middleware::tracing::make_trace_layer;
 use crate::routes::authors::authors_router;
+use crate::routes::downloads::{dl_router, pack_download_url_router};
 use crate::routes::handles::handles_router;
 use crate::routes::ops::ops_router;
 use crate::routes::packs::packs_router;
@@ -67,22 +73,85 @@ use crate::state::AppState;
 /// The caller passes this directly to `axum::serve`.
 pub fn app(state: AppState) -> Router {
     let max_body = state.config.max_request_bytes;
+    let cors = build_cors_layer(&state);
+
+    let packs = packs_router().nest(
+        "/{name}/versions/{version}/download-url",
+        pack_download_url_router(),
+    );
 
     let v1 = Router::new()
-        .nest("/packs", packs_router())
+        .nest("/packs", packs)
         .nest("/authors", authors_router())
         .nest("/handles", handles_router());
 
     let x_request_id = axum::http::HeaderName::from_static("x-request-id");
 
-    Router::new()
+    let mut router = Router::new()
         .merge(ops_router())
         .nest("/v1", v1)
+        .nest("/dl", dl_router())
         .nest("/mcp", mcp_router())
         .layer(PropagateRequestIdLayer::new(x_request_id.clone()))
         .layer(SetRequestIdLayer::new(x_request_id, RequestIdGenerator))
         .layer(make_trace_layer())
         .layer(CompressionLayer::new())
-        .layer(RequestBodyLimitLayer::new(max_body))
-        .with_state(state)
+        .layer(RequestBodyLimitLayer::new(max_body));
+
+    if let Some(cors) = cors {
+        router = router.layer(cors);
+    }
+
+    router.with_state(state)
+}
+
+/// Build the `CorsLayer` from `state.config.cors_allowed_origins`.
+///
+/// Returns `None` when the configured origin list is empty, so the router
+/// does not apply any CORS layer at all (preserves prior behavior). When at
+/// least one origin parses to a valid `HeaderValue`, returns a `CorsLayer`
+/// configured with:
+///
+/// - methods: `GET`, `POST`, `PUT`, `DELETE`, `OPTIONS`, `HEAD`
+/// - allowed headers: `Authorization`, `Content-Type`
+/// - exposed headers: `X-Request-Id` (lets browsers correlate logs)
+/// - max age: 600 seconds (10 minute preflight cache)
+///
+/// Origins that fail `HeaderValue::from_str` are skipped with a `tracing::warn`,
+/// but startup is not aborted -- a single typo in `CORS_ALLOWED_ORIGINS` must
+/// not knock the server over.
+fn build_cors_layer(state: &AppState) -> Option<CorsLayer> {
+    let origins: Vec<HeaderValue> = state
+        .config
+        .cors_origins()
+        .filter_map(|raw| match HeaderValue::from_str(raw) {
+            Ok(v) => Some(v),
+            Err(err) => {
+                tracing::warn!(origin = raw, %err, "ignoring invalid CORS origin");
+                None
+            }
+        })
+        .collect();
+
+    if origins.is_empty() {
+        return None;
+    }
+
+    let expose: HeaderName = HeaderName::from_static("x-request-id");
+
+    Some(
+        CorsLayer::new()
+            .allow_origin(origins)
+            .allow_methods([
+                Method::GET,
+                Method::POST,
+                Method::PUT,
+                Method::DELETE,
+                Method::OPTIONS,
+                Method::HEAD,
+            ])
+            .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+            .expose_headers([expose])
+            .max_age(std::time::Duration::from_secs(600)),
+    )
 }

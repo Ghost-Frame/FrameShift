@@ -55,6 +55,17 @@ pub enum AppError {
     #[error("unauthorized: {0}")]
     Unauthorized(String),
 
+    /// The request is well-formed and authenticated but the credentials do
+    /// not authorise the action. Specifically used by the signed-download
+    /// verifier when the HMAC token is malformed, expired, or signature
+    /// mismatches.
+    ///
+    /// Maps to `403 Forbidden`. The message in the variant is logged but
+    /// NEVER sent in the response body -- only the fixed string
+    /// `"forbidden"` is returned to avoid leaking which check failed.
+    #[error("forbidden: {0}")]
+    Forbidden(String),
+
     /// An unexpected backend failure occurred.
     ///
     /// Maps to `500 Internal Server Error`. The message is NOT included in
@@ -144,6 +155,7 @@ impl IntoResponse for AppError {
             AppError::NotFound(m) => (StatusCode::NOT_FOUND, m),
             AppError::Conflict(m) => (StatusCode::CONFLICT, m),
             AppError::Unauthorized(m) => (StatusCode::UNAUTHORIZED, m),
+            AppError::Forbidden(_) => (StatusCode::FORBIDDEN, "forbidden".to_string()),
             AppError::Internal(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal server error".to_string(),
