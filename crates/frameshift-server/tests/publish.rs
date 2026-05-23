@@ -55,6 +55,14 @@ fn test_config() -> Arc<ServerConfig> {
         download_secret: SecretString::new(String::new()),
         download_token_ttl: Duration::from_secs(300),
         download_max_token_ttl: Duration::from_secs(1800),
+        download_rate_per_min: 0,
+        object_store_backend: "fs".to_string(),
+        r2_endpoint: String::new(),
+        r2_bucket: String::new(),
+        r2_prefix: "objects".to_string(),
+        r2_region: "auto".to_string(),
+        r2_access_key_id: String::new(),
+        r2_secret_access_key: SecretString::new(String::new()),
     })
 }
 

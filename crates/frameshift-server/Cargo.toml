@@ -15,6 +15,7 @@ frameshift-catalog = { path = "../frameshift-catalog" }
 frameshift-catalog-postgres = { path = "../frameshift-catalog-postgres" }
 frameshift-objects = { path = "../frameshift-objects" }
 frameshift-objects-fs = { path = "../frameshift-objects-fs" }
+frameshift-objects-r2 = { path = "../frameshift-objects-r2" }
 frameshift-runtime = { path = "../frameshift-runtime" }
 frameshift-memory = { path = "../frameshift-memory" }
 frameshift-pack = { path = "../frameshift-pack" }
@@ -41,6 +42,7 @@ tar = "0.4"
 flate2 = "1"
 hmac = { workspace = true }
 sha2 = { workspace = true }
+tower_governor = "0.8"
 
 [dev-dependencies]
 tokio = { workspace = true }

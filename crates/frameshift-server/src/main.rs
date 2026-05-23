@@ -12,7 +12,9 @@ use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
 use frameshift_catalog_postgres::{PostgresCatalog, PostgresCatalogConfig};
+use frameshift_objects::PackStore;
 use frameshift_objects_fs::{FsPackStore, FsPackStoreConfig};
+use frameshift_objects_r2::{R2PackStore, R2PackStoreConfig};
 use frameshift_server::{AppState, LogFormat, ServerConfig, ServerError};
 
 /// Use mimalloc as the global allocator for improved throughput on
@@ -60,23 +62,67 @@ async fn build_state(config: Arc<ServerConfig>) -> Result<AppState, ServerError>
         .await
         .map_err(|e| ServerError::Startup(e.to_string()))?;
 
-    let objects_config = FsPackStoreConfig {
-        root: config.object_store_root.clone(),
-        verify_on_read: true,
-        max_bytes: None,
-        fsync_on_put: true,
-    };
-
-    let objects = FsPackStore::new(objects_config)
-        .await
-        .map_err(|e| ServerError::Startup(e.to_string()))?;
+    let objects = build_object_store(&config).await?;
 
     Ok(AppState {
         catalog: Arc::new(catalog),
-        objects: Arc::new(objects),
+        objects,
         runtime: None,
         config,
     })
+}
+
+/// Construct the configured [`PackStore`] backend and return it as
+/// `Arc<dyn PackStore>` so handlers see a single trait object regardless
+/// of which adapter was chosen.
+///
+/// Selected via `config.object_store_backend`:
+///
+/// - `"fs"` (default) -> [`FsPackStore`] rooted at `OBJECT_STORE_ROOT`.
+/// - `"r2"` -> [`R2PackStore`] talking to the configured S3-compatible
+///   endpoint with `R2_*` credentials.
+///
+/// Unknown values produce a [`ServerError::Startup`] so a typo in the env
+/// fails fast rather than silently defaulting.
+async fn build_object_store(
+    config: &ServerConfig,
+) -> Result<Arc<dyn PackStore>, ServerError> {
+    match config.object_store_backend.as_str() {
+        "fs" => {
+            let fs_cfg = FsPackStoreConfig {
+                root: config.object_store_root.clone(),
+                verify_on_read: true,
+                max_bytes: None,
+                fsync_on_put: true,
+            };
+            let fs = FsPackStore::new(fs_cfg)
+                .await
+                .map_err(|e| ServerError::Startup(format!("FsPackStore: {e}")))?;
+            Ok(Arc::new(fs))
+        }
+        "r2" => {
+            let r2_cfg = R2PackStoreConfig {
+                endpoint: config.r2_endpoint.clone(),
+                bucket: config.r2_bucket.clone(),
+                prefix: config.r2_prefix.clone(),
+                region: config.r2_region.clone(),
+                access_key_id: config.r2_access_key_id.clone(),
+                secret_access_key: config.r2_secret_access_key.clone(),
+            };
+            let r2 =
+                R2PackStore::new(r2_cfg).map_err(|e| ServerError::Startup(format!("R2: {e}")))?;
+            tracing::info!(
+                bucket = %config.r2_bucket,
+                prefix = %config.r2_prefix,
+                endpoint = %config.r2_endpoint,
+                "R2 object store configured"
+            );
+            Ok(Arc::new(r2))
+        }
+        other => Err(ServerError::Startup(format!(
+            "unknown OBJECT_STORE_BACKEND={other:?}; expected \"fs\" or \"r2\""
+        ))),
+    }
 }
 
 #[tokio::main]

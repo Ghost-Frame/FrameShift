@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/frameshift-objects-r2",
     "crates/frameshift-capabilities",
     "crates/frameshift-catalog",
     "crates/frameshift-catalog-postgres",

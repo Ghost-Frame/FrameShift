@@ -62,6 +62,14 @@ fn test_config() -> Arc<ServerConfig> {
         download_secret: SecretString::new(String::new()),
         download_token_ttl: Duration::from_secs(300),
         download_max_token_ttl: Duration::from_secs(1800),
+        download_rate_per_min: 0,
+        object_store_backend: "fs".to_string(),
+        r2_endpoint: String::new(),
+        r2_bucket: String::new(),
+        r2_prefix: "objects".to_string(),
+        r2_region: "auto".to_string(),
+        r2_access_key_id: String::new(),
+        r2_secret_access_key: SecretString::new(String::new()),
     })
 }
 
@@ -535,6 +543,11 @@ async fn packs_valid_sort_trending_returns_200() {
 /// Build an [`AppState`] with a 32-byte test HMAC key wired into config so the
 /// download endpoints are operational.
 fn dl_state(catalog: MockCatalog, objects: MockPackStore) -> AppState {
+    dl_state_with_rate(catalog, objects, 0)
+}
+
+/// Variant of [`dl_state`] that lets a test pin the per-IP mint rate limit.
+fn dl_state_with_rate(catalog: MockCatalog, objects: MockPackStore, rate: u32) -> AppState {
     let hex32 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     let cfg = ServerConfig {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -549,6 +562,14 @@ fn dl_state(catalog: MockCatalog, objects: MockPackStore) -> AppState {
         download_secret: SecretString::new(hex32.into()),
         download_token_ttl: Duration::from_secs(60),
         download_max_token_ttl: Duration::from_secs(300),
+        download_rate_per_min: rate,
+        object_store_backend: "fs".to_string(),
+        r2_endpoint: String::new(),
+        r2_bucket: String::new(),
+        r2_prefix: "objects".to_string(),
+        r2_region: "auto".to_string(),
+        r2_access_key_id: String::new(),
+        r2_secret_access_key: SecretString::new(String::new()),
     };
     AppState {
         catalog: Arc::new(catalog),
@@ -677,4 +698,64 @@ async fn download_endpoints_disabled_when_secret_unset() {
     let url = format!("/dl/{zeros}?token={}&expires=9999999999", "a".repeat(64));
     let resp = oneshot_get(state, &url).await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+/// With `download_rate_per_min = 2`, firing 5 mint requests from the same
+/// peer yields at most 2 successful 200s before the governor returns 429.
+///
+/// We don't pin exact counts because governor replenishes mid-test; we just
+/// assert that AT LEAST ONE 429 appears (the limit kicked in) AND AT LEAST
+/// ONE 200 appears (the limit isn't blanket-rejecting).
+#[tokio::test]
+async fn download_url_rate_limited_returns_429() {
+    use frameshift_pack::ObjectHash;
+
+    let blob = b"rate-limited".to_vec();
+    let hash = ObjectHash::of(&blob);
+    let author_key = Ed25519PublicKey([6u8; 32]);
+
+    let catalog = MockCatalog::new();
+    {
+        let mut s = catalog.state.write().unwrap();
+        s.packs
+            .insert("rl-pack".to_string(), make_pack("rl-pack", author_key));
+        s.versions.insert(
+            ("rl-pack".to_string(), "1.0.0".to_string()),
+            make_version("rl-pack", "1.0.0", hash, author_key),
+        );
+    }
+    let objects = MockPackStore::new();
+    objects.insert(hash, blob);
+    let state = dl_state_with_rate(catalog, objects, 2);
+
+    // Build the app ONCE so the governor's internal token bucket is shared
+    // across requests (re-building the app per request would yield a fresh
+    // bucket every time and the limit would never trigger). SmartIpKeyExtractor
+    // reads X-Forwarded-For first, so we stamp a stable IP on each request --
+    // oneshot requests have no real peer address.
+    let router = app(state);
+    let mut statuses = Vec::new();
+    for _ in 0..5 {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/packs/rl-pack/versions/1.0.0/download-url")
+            .header("x-forwarded-for", "10.0.0.1")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        statuses.push(resp.status());
+    }
+
+    let ok = statuses
+        .iter()
+        .filter(|s| **s == StatusCode::OK)
+        .count();
+    let limited = statuses
+        .iter()
+        .filter(|s| **s == StatusCode::TOO_MANY_REQUESTS)
+        .count();
+    assert!(
+        ok >= 1 && limited >= 1,
+        "expected mix of 200 and 429, got {statuses:?}"
+    );
 }

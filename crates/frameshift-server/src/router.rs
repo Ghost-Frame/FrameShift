@@ -24,9 +24,21 @@
 //! 6. `CorsLayer` -- outermost; handles preflight `OPTIONS` requests and
 //!    stamps `Access-Control-Allow-*` headers on responses. Only applied
 //!    when `state.config.cors_allowed_origins` is non-empty.
+//!
+//! # Per-route layers
+//!
+//! The `download-url` mint endpoint additionally has a per-IP rate-limit
+//! layer (governor) applied only to its sub-router, so the rest of the
+//! API (including the verifier `/dl/{hash}`) is not impacted.
+
+use std::num::NonZeroU32;
+use std::sync::Arc;
 
 use axum::http::{header, HeaderName, HeaderValue, Method};
 use axum::Router;
+use tower_governor::governor::GovernorConfigBuilder;
+use tower_governor::key_extractor::SmartIpKeyExtractor;
+use tower_governor::GovernorLayer;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
@@ -75,10 +87,8 @@ pub fn app(state: AppState) -> Router {
     let max_body = state.config.max_request_bytes;
     let cors = build_cors_layer(&state);
 
-    let packs = packs_router().nest(
-        "/{name}/versions/{version}/download-url",
-        pack_download_url_router(),
-    );
+    let mint_router = build_mint_router(&state);
+    let packs = packs_router().nest("/{name}/versions/{version}/download-url", mint_router);
 
     let v1 = Router::new()
         .nest("/packs", packs)
@@ -103,6 +113,39 @@ pub fn app(state: AppState) -> Router {
     }
 
     router.with_state(state)
+}
+
+/// Build the download-URL mint sub-router with the per-IP rate-limit layer
+/// applied when `state.config.download_rate_per_min` is positive.
+///
+/// `0` disables rate limiting (escape hatch for local dev / load tests).
+/// When positive, the [`GovernorLayer`] is configured with:
+///
+/// - period = `60 / rate_per_min` seconds (interval between token
+///   replenishments)
+/// - burst = `rate_per_min` (maximum tokens that can accumulate)
+/// - key extractor = [`SmartIpKeyExtractor`], which reads the leftmost
+///   `X-Forwarded-For` entry (set by Pangolin Traefik) and falls back to
+///   the connection peer when the header is absent
+///
+/// The layer is applied only at the mint sub-router; it does NOT apply to
+/// the verifier `/dl/{hash}` (HMAC is the gate there) or to any other
+/// endpoint.
+fn build_mint_router(state: &AppState) -> Router<AppState> {
+    let router = pack_download_url_router();
+    let rate = state.config.download_rate_per_min;
+    if rate == 0 {
+        return router;
+    }
+    let burst = NonZeroU32::new(rate).expect("rate > 0 verified above");
+    let period_secs = (60u64 / u64::from(rate)).max(1);
+    let conf = GovernorConfigBuilder::default()
+        .period(std::time::Duration::from_secs(period_secs))
+        .burst_size(burst.into())
+        .key_extractor(SmartIpKeyExtractor)
+        .finish()
+        .expect("governor config valid (period > 0, burst > 0)");
+    router.layer(GovernorLayer::new(Arc::new(conf)))
 }
 
 /// Build the `CorsLayer` from `state.config.cors_allowed_origins`.

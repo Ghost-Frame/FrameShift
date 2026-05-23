@@ -21,6 +21,14 @@
 //! | `DOWNLOAD_SECRET` | `""` | 64-char hex (32 bytes) HMAC key for signed download URLs; empty disables the download endpoints |
 //! | `DOWNLOAD_TOKEN_TTL` | `300` | Default TTL in seconds for newly minted download tokens (5 minutes) |
 //! | `DOWNLOAD_MAX_TOKEN_TTL` | `1800` | Hard cap on token TTL accepted by the verifier (30 minutes) |
+//! | `DOWNLOAD_RATE_PER_MIN` | `10` | Per-IP rate limit on the mint endpoint (requests/minute); 0 disables |
+//! | `OBJECT_STORE_BACKEND` | `fs` | `fs` (filesystem) or `r2` (S3-compatible / Cloudflare R2) |
+//! | `R2_ENDPOINT` | `""` | S3 endpoint URL for R2 (required when backend is `r2`) |
+//! | `R2_BUCKET` | `""` | Bucket name (required when backend is `r2`) |
+//! | `R2_PREFIX` | `objects` | Key prefix for pack blobs inside the bucket |
+//! | `R2_REGION` | `auto` | S3 region (R2 always uses `auto`) |
+//! | `R2_ACCESS_KEY_ID` | `""` | Access key ID for the bucket |
+//! | `R2_SECRET_ACCESS_KEY` | `""` | Secret access key (supplied via a secrets manager in production) |
 //!
 //! Env var names match the struct field names verbatim (figment maps
 //! `download_secret` <-> `DOWNLOAD_SECRET`); shorter aliases would require an
@@ -138,6 +146,43 @@ pub struct ServerConfig {
     /// signer bug from issuing arbitrarily long-lived tokens. Default:
     /// 30 minutes.
     pub download_max_token_ttl: Duration,
+
+    /// Per-IP rate limit (requests / minute) on the download-URL mint
+    /// endpoint.
+    ///
+    /// `0` disables rate limiting (escape hatch for local dev or load
+    /// tests). The verifier endpoint `/dl/{hash}` is NOT rate-limited --
+    /// HMAC validation is the gate there. Default: 10.
+    pub download_rate_per_min: u32,
+
+    /// Selected object store backend: `"fs"` (default) or `"r2"`.
+    ///
+    /// `main.rs` reads this to choose between [`frameshift_objects_fs`] and
+    /// [`frameshift_objects_r2`]. Both implementations satisfy the
+    /// [`frameshift_objects::PackStore`] trait, so handlers don't care
+    /// which is wired in.
+    pub object_store_backend: String,
+
+    /// R2 endpoint URL (e.g. `https://<acct>.r2.cloudflarestorage.com`).
+    ///
+    /// Used only when `object_store_backend == "r2"`. Empty otherwise.
+    pub r2_endpoint: String,
+
+    /// R2 bucket name. Used only when backend is `r2`.
+    pub r2_bucket: String,
+
+    /// Key prefix for pack blobs inside the R2 bucket. Default: `objects`.
+    pub r2_prefix: String,
+
+    /// R2 region. Always `"auto"` for Cloudflare R2.
+    pub r2_region: String,
+
+    /// R2 access key ID. Used only when backend is `r2`.
+    pub r2_access_key_id: String,
+
+    /// R2 secret access key. Stored as [`SecretString`] so the bytes never
+    /// appear in `Debug` output. Supplied via a secrets manager in production.
+    pub r2_secret_access_key: SecretString,
 }
 
 impl ServerConfig {
@@ -200,6 +245,14 @@ impl std::fmt::Debug for ServerConfig {
             .field("download_secret", &"[REDACTED]")
             .field("download_token_ttl", &self.download_token_ttl)
             .field("download_max_token_ttl", &self.download_max_token_ttl)
+            .field("download_rate_per_min", &self.download_rate_per_min)
+            .field("object_store_backend", &self.object_store_backend)
+            .field("r2_endpoint", &self.r2_endpoint)
+            .field("r2_bucket", &self.r2_bucket)
+            .field("r2_prefix", &self.r2_prefix)
+            .field("r2_region", &self.r2_region)
+            .field("r2_access_key_id", &self.r2_access_key_id)
+            .field("r2_secret_access_key", &"[REDACTED]")
             .finish()
     }
 }
@@ -250,6 +303,24 @@ struct RawConfig {
 
     /// Max accepted download token TTL in seconds.
     download_max_token_ttl: u64,
+
+    /// Per-IP mint-endpoint rate limit (requests / minute).
+    download_rate_per_min: u32,
+
+    /// Object store backend selector (`fs` | `r2`).
+    object_store_backend: String,
+    /// R2 endpoint URL.
+    r2_endpoint: String,
+    /// R2 bucket name.
+    r2_bucket: String,
+    /// R2 key prefix.
+    r2_prefix: String,
+    /// R2 region (`auto`).
+    r2_region: String,
+    /// R2 access key ID.
+    r2_access_key_id: String,
+    /// R2 secret access key (raw string, wrapped in `SecretString` on convert).
+    r2_secret_access_key: String,
 }
 
 impl RawConfig {
@@ -271,6 +342,14 @@ impl RawConfig {
             download_secret: SecretString::new(self.download_secret),
             download_token_ttl: Duration::from_secs(self.download_token_ttl),
             download_max_token_ttl: Duration::from_secs(self.download_max_token_ttl),
+            download_rate_per_min: self.download_rate_per_min,
+            object_store_backend: self.object_store_backend,
+            r2_endpoint: self.r2_endpoint,
+            r2_bucket: self.r2_bucket,
+            r2_prefix: self.r2_prefix,
+            r2_region: self.r2_region,
+            r2_access_key_id: self.r2_access_key_id,
+            r2_secret_access_key: SecretString::new(self.r2_secret_access_key),
         }
     }
 }
@@ -293,6 +372,14 @@ fn default_raw_config() -> RawConfig {
         download_secret: String::new(),
         download_token_ttl: 300,
         download_max_token_ttl: 1800,
+        download_rate_per_min: 10,
+        object_store_backend: "fs".to_string(),
+        r2_endpoint: String::new(),
+        r2_bucket: String::new(),
+        r2_prefix: "objects".to_string(),
+        r2_region: "auto".to_string(),
+        r2_access_key_id: String::new(),
+        r2_secret_access_key: String::new(),
     }
 }
 
@@ -344,6 +431,14 @@ mod tests {
             download_secret: SecretString::new(String::new()),
             download_token_ttl: Duration::from_secs(300),
             download_max_token_ttl: Duration::from_secs(1800),
+            download_rate_per_min: 0,
+            object_store_backend: "fs".to_string(),
+            r2_endpoint: String::new(),
+            r2_bucket: String::new(),
+            r2_prefix: "objects".to_string(),
+            r2_region: "auto".to_string(),
+            r2_access_key_id: String::new(),
+            r2_secret_access_key: SecretString::new(String::new()),
         };
         let debug = format!("{cfg:?}");
         assert!(
@@ -368,6 +463,14 @@ mod tests {
             download_secret: SecretString::new(String::new()),
             download_token_ttl: Duration::from_secs(300),
             download_max_token_ttl: Duration::from_secs(1800),
+            download_rate_per_min: 0,
+            object_store_backend: "fs".to_string(),
+            r2_endpoint: String::new(),
+            r2_bucket: String::new(),
+            r2_prefix: "objects".to_string(),
+            r2_region: "auto".to_string(),
+            r2_access_key_id: String::new(),
+            r2_secret_access_key: SecretString::new(String::new()),
         };
         let got: Vec<&str> = cfg.cors_origins().collect();
         assert_eq!(got, vec!["https://a.example", "https://b.example"]);
@@ -388,6 +491,14 @@ mod tests {
             download_secret: SecretString::new(String::new()),
             download_token_ttl: Duration::from_secs(300),
             download_max_token_ttl: Duration::from_secs(1800),
+            download_rate_per_min: 0,
+            object_store_backend: "fs".to_string(),
+            r2_endpoint: String::new(),
+            r2_bucket: String::new(),
+            r2_prefix: "objects".to_string(),
+            r2_region: "auto".to_string(),
+            r2_access_key_id: String::new(),
+            r2_secret_access_key: SecretString::new(String::new()),
         };
         assert_eq!(cfg.cors_origins().count(), 0);
     }
@@ -435,6 +546,14 @@ mod tests {
             download_secret: SecretString::new(secret.into()),
             download_token_ttl: Duration::from_secs(300),
             download_max_token_ttl: Duration::from_secs(1800),
+            download_rate_per_min: 0,
+            object_store_backend: "fs".to_string(),
+            r2_endpoint: String::new(),
+            r2_bucket: String::new(),
+            r2_prefix: "objects".to_string(),
+            r2_region: "auto".to_string(),
+            r2_access_key_id: String::new(),
+            r2_secret_access_key: SecretString::new(String::new()),
         }
     }
 
