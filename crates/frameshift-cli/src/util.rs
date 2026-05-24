@@ -72,6 +72,7 @@ pub enum CliError {
     /// Used by M2+ stubs so they can return through the normal `Result`
     /// pathway rather than calling `std::process::exit` directly, which
     /// would break test isolation.
+    #[expect(dead_code)]
     #[error("{0}: not implemented until M2")]
     NotImplemented(&'static str),
 

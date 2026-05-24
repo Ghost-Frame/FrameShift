@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use clap::Args;
 use frameshift_client::Client;
-use frameshift_orchestrator::{Preferences, PolicyWeights, SelectionInputs};
+use frameshift_orchestrator::{PolicyWeights, Preferences, SelectionInputs};
 
 use crate::util::CliError;
 
@@ -70,7 +70,10 @@ pub fn run_select(client: &Client, args: SelectArgs) -> Result<(), CliError> {
     }
 
     // Print header.
-    println!("{:<30} {:>7} {:>10}  {}", "persona", "score", "confidence", "rationale");
+    println!(
+        "{:<30} {:>7} {:>10}  rationale",
+        "persona", "score", "confidence"
+    );
     println!("{}", "-".repeat(80));
 
     // Print top 5.

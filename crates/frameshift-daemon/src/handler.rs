@@ -1,9 +1,9 @@
-/// Method dispatch for the JSON-RPC daemon.
-///
-/// Each handler receives the optional params object and a reference to the
-/// shared `Client`, performs the requested operation, and returns either a
-/// JSON result value or a `(code, message)` error tuple that maps directly
-/// to a JSON-RPC error response.
+//! Method dispatch for the JSON-RPC daemon.
+//!
+//! Each handler receives the optional params object and a reference to the
+//! shared `Client`, performs the requested operation, and returns either a
+//! JSON result value or a `(code, message)` error tuple that maps directly
+//! to a JSON-RPC error response.
 
 use frameshift_client::{Client, InstallRequest, InstallSource, PersonaSpec};
 use serde_json::Value;
@@ -38,10 +38,7 @@ pub fn dispatch(
 ///
 /// Params: `{ "project_root": "<path>" }`
 /// Returns: `{ "project_id": "<hex-id>" }`
-fn handle_project_id(
-    params: Option<Value>,
-    client: &Client,
-) -> Result<Value, (i32, String)> {
+fn handle_project_id(params: Option<Value>, client: &Client) -> Result<Value, (i32, String)> {
     let root = get_str(&params, "project_root")?;
     let project_id = client
         .project_id(&PathBuf::from(&root))
@@ -53,10 +50,7 @@ fn handle_project_id(
 ///
 /// Params: `{ "spec": "<name>@<version>", "project_root": "<path>", "from_path": "<optional-pack-dir>" }`
 /// Returns: `{ "persona": "<name>", "version": "<ver>", "hash": "<hex>" }`
-fn handle_install(
-    params: Option<Value>,
-    client: &Client,
-) -> Result<Value, (i32, String)> {
+fn handle_install(params: Option<Value>, client: &Client) -> Result<Value, (i32, String)> {
     let spec_str = get_str(&params, "spec")?;
     let root = get_str(&params, "project_root")?;
 
@@ -95,10 +89,7 @@ fn handle_install(
 ///
 /// Params: `{ "persona": "<name>", "project_root": "<path>" }`
 /// Returns: `{ "activated": "<name>" }`
-fn handle_activate(
-    params: Option<Value>,
-    client: &Client,
-) -> Result<Value, (i32, String)> {
+fn handle_activate(params: Option<Value>, client: &Client) -> Result<Value, (i32, String)> {
     let persona = get_str(&params, "persona")?;
     let root = get_str(&params, "project_root")?;
 
@@ -113,10 +104,7 @@ fn handle_activate(
 ///
 /// Params: `{ "project_root": "<path>" }`
 /// Returns: `{ "personas": ["<name>", ...] }`
-fn handle_sync(
-    params: Option<Value>,
-    client: &Client,
-) -> Result<Value, (i32, String)> {
+fn handle_sync(params: Option<Value>, client: &Client) -> Result<Value, (i32, String)> {
     let root = get_str(&params, "project_root")?;
 
     let report = client
@@ -130,10 +118,7 @@ fn handle_sync(
 ///
 /// Params: none required.
 /// Returns: `{ "removed": <count> }`
-fn handle_gc(
-    _params: Option<Value>,
-    client: &Client,
-) -> Result<Value, (i32, String)> {
+fn handle_gc(_params: Option<Value>, client: &Client) -> Result<Value, (i32, String)> {
     let report = client
         .gc()
         .map_err(|e| (crate::protocol::INTERNAL_ERROR, e.to_string()))?;
@@ -145,10 +130,7 @@ fn handle_gc(
 ///
 /// Params: `{ "project_root": "<path>", "persona": "<name>", "text": "<growth-entry>" }`
 /// Returns: `{ "appended": true }`
-fn handle_grow_append(
-    params: Option<Value>,
-    client: &Client,
-) -> Result<Value, (i32, String)> {
+fn handle_grow_append(params: Option<Value>, client: &Client) -> Result<Value, (i32, String)> {
     let root = get_str(&params, "project_root")?;
     let persona = get_str(&params, "persona")?;
     let text = get_str(&params, "text")?;
@@ -212,9 +194,15 @@ mod tests {
         // Use the tempdir itself as the project root -- it exists on disk.
         let params = serde_json::json!({ "project_root": tmp.path().to_str().unwrap() });
         let result = dispatch("project_id", Some(params), &client);
-        assert!(result.is_ok(), "unexpected error: {:?}", result.unwrap_err());
+        assert!(
+            result.is_ok(),
+            "unexpected error: {:?}",
+            result.unwrap_err()
+        );
         let val = result.unwrap();
-        let id = val["project_id"].as_str().expect("project_id should be a string");
+        let id = val["project_id"]
+            .as_str()
+            .expect("project_id should be a string");
         assert!(!id.is_empty());
     }
 
@@ -224,8 +212,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let client = test_client(&tmp);
         let result = dispatch("gc", None, &client);
-        assert!(result.is_ok(), "unexpected error: {:?}", result.unwrap_err());
+        assert!(
+            result.is_ok(),
+            "unexpected error: {:?}",
+            result.unwrap_err()
+        );
         let val = result.unwrap();
-        assert!(val.get("removed").is_some(), "result must have 'removed' key");
+        assert!(
+            val.get("removed").is_some(),
+            "result must have 'removed' key"
+        );
     }
 }

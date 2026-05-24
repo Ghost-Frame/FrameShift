@@ -3,7 +3,7 @@
 /// Each tool maps directly to a frameshift-client or frameshift-growth operation.
 use frameshift_client::{Client, InstallRequest, InstallSource, PersonaSpec};
 use frameshift_orchestrator::{
-    AuditLog, Mode, ModeState, Preferences, PolicyWeights, SelectionInputs,
+    AuditLog, Mode, ModeState, PolicyWeights, Preferences, SelectionInputs,
 };
 
 use crate::protocol::{ToolContent, ToolDef, ToolResult};
@@ -62,12 +62,13 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "frameshift_select".to_string(),
-            description: "Rank installed personas for the given project context. Returns a ranked list with score, confidence, and rationale. Read-only; does not change active state.".to_string(),
+            description: "Rank installed personas for the given project context. Returns a ranked list with score, confidence, and rationale. Read-only; does not change active state. Pass 'library' to rank from a catalog directory instead of installed personas.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "project_root": {"type": "string"},
-                    "task": {"type": "string"}
+                    "task": {"type": "string"},
+                    "library": {"type": "string"}
                 },
                 "required": ["project_root"]
             }),
@@ -95,6 +96,22 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                         "type": "string",
                         "enum": ["on", "off", "status", "lock", "unlock"]
                     }
+                },
+                "required": ["project_root", "action"]
+            }),
+        },
+        ToolDef {
+            name: "frameshift_prefs".to_string(),
+            description: "View and adjust per-persona preference biases. Actions: show, bump, decay, reset.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "project_root": {"type": "string"},
+                    "action": {
+                        "type": "string",
+                        "enum": ["show", "bump", "decay", "reset"]
+                    },
+                    "persona": {"type": "string"}
                 },
                 "required": ["project_root", "action"]
             }),
@@ -138,6 +155,7 @@ pub fn call_tool(name: &str, arguments: &serde_json::Value, client: &Client) -> 
         "frameshift_select" => call_select(arguments, client),
         "frameshift_use" => call_use(arguments, client),
         "frameshift_automate" => call_automate(arguments, client),
+        "frameshift_prefs" => call_prefs(arguments, client),
         _ => err_result(format!("unknown tool: {}", name)),
     }
 }
@@ -269,6 +287,8 @@ fn call_grow_append(arguments: &serde_json::Value, client: &Client) -> ToolResul
 ///
 /// Senses context from `project_root`, indexes installed personas, ranks them,
 /// and returns `{ "ranked": [{persona, score, confidence, rationale}] }`.
+/// When `library` is provided, ranks from that catalog directory instead of
+/// the project-installed personas.
 fn call_select(arguments: &serde_json::Value, client: &Client) -> ToolResult {
     let project_root_str = match arguments.get("project_root").and_then(|v| v.as_str()) {
         Some(s) => s,
@@ -280,6 +300,10 @@ fn call_select(arguments: &serde_json::Value, client: &Client) -> ToolResult {
         .get("task")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    let library = arguments
+        .get("library")
+        .and_then(|v| v.as_str())
+        .map(std::path::PathBuf::from);
 
     // Resolve orchestrator state dir and load preferences.
     let state_dir = match client.orchestrator_state_dir(&project_root) {
@@ -288,17 +312,21 @@ fn call_select(arguments: &serde_json::Value, client: &Client) -> ToolResult {
     };
     let prefs = Preferences::load(&state_dir.join("automate-prefs.json")).unwrap_or_default();
 
-    // Collect installed source dirs.
-    let source_dirs = match client.installed_persona_source_dirs(&project_root) {
-        Ok(dirs) => dirs,
-        Err(e) => return err_result(format!("could not list personas: {}", e)),
+    // When library is given, use catalog_root mode; otherwise installed source dirs.
+    let (source_dirs, catalog_root) = if let Some(lib) = library {
+        (vec![], Some(lib))
+    } else {
+        match client.installed_persona_source_dirs(&project_root) {
+            Ok(dirs) => (dirs, None),
+            Err(e) => return err_result(format!("could not list personas: {}", e)),
+        }
     };
 
     let inputs = SelectionInputs {
         project_root: &project_root,
         task_hint: task_hint.as_deref(),
         source_dirs,
-        catalog_root: None,
+        catalog_root,
         prefs,
         weights: PolicyWeights::default(),
     };
@@ -467,7 +495,94 @@ fn call_automate(arguments: &serde_json::Value, client: &Client) -> ToolResult {
             ok_result(serde_json::json!({ "locked": false }).to_string())
         }
 
-        other => err_result(format!("unknown action '{}'; expected: on, off, status, lock, unlock", other)),
+        other => err_result(format!(
+            "unknown action '{}'; expected: on, off, status, lock, unlock",
+            other
+        )),
+    }
+}
+
+/// Handle the frameshift_prefs tool call.
+///
+/// Views or adjusts per-persona preference biases stored in `automate-prefs.json`.
+/// Actions: show (list all biases), bump (increase persona bias), decay (decrease
+/// persona bias), reset (clear all biases).
+fn call_prefs(arguments: &serde_json::Value, client: &Client) -> ToolResult {
+    let project_root_str = match arguments.get("project_root").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => return err_result("missing required argument: project_root".to_string()),
+    };
+
+    let action = match arguments.get("action").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => return err_result("missing required argument: action".to_string()),
+    };
+
+    let project_root = std::path::PathBuf::from(project_root_str);
+
+    let state_dir = match client.orchestrator_state_dir(&project_root) {
+        Ok(d) => d,
+        Err(e) => return err_result(format!("could not determine state dir: {}", e)),
+    };
+
+    let prefs_path = state_dir.join("automate-prefs.json");
+
+    match action {
+        "show" => {
+            let prefs = Preferences::load(&prefs_path).unwrap_or_default();
+            let text = serde_json::json!({ "bias": prefs.bias }).to_string();
+            ok_result(text)
+        }
+
+        "bump" => {
+            let persona = match arguments.get("persona").and_then(|v| v.as_str()) {
+                Some(s) => s,
+                None => return err_result("bump requires 'persona' argument".to_string()),
+            };
+            let mut prefs = Preferences::load(&prefs_path).unwrap_or_default();
+            prefs.record_override(None, persona);
+            if let Err(e) = prefs.save(&prefs_path) {
+                return err_result(format!("failed to save preferences: {}", e));
+            }
+            let text = serde_json::json!({
+                "persona": persona,
+                "bias": prefs.bias_for(persona),
+            })
+            .to_string();
+            ok_result(text)
+        }
+
+        "decay" => {
+            let persona = match arguments.get("persona").and_then(|v| v.as_str()) {
+                Some(s) => s,
+                None => return err_result("decay requires 'persona' argument".to_string()),
+            };
+            let mut prefs = Preferences::load(&prefs_path).unwrap_or_default();
+            prefs.record_override(Some(persona), "__manual_decay__");
+            prefs.bias.remove("__manual_decay__");
+            if let Err(e) = prefs.save(&prefs_path) {
+                return err_result(format!("failed to save preferences: {}", e));
+            }
+            let text = serde_json::json!({
+                "persona": persona,
+                "bias": prefs.bias_for(persona),
+            })
+            .to_string();
+            ok_result(text)
+        }
+
+        "reset" => {
+            let prefs = Preferences::new();
+            if let Err(e) = prefs.save(&prefs_path) {
+                return err_result(format!("failed to save preferences: {}", e));
+            }
+            ok_result(serde_json::json!({ "reset": true }).to_string())
+        }
+
+        other => err_result(format!(
+            "unknown action '{}'; expected: show, bump, decay, reset",
+            other
+        )),
     }
 }
 
@@ -485,7 +600,11 @@ mod tests {
             name, version
         );
         fs::write(dir.join("pack.toml"), manifest).unwrap();
-        fs::write(dir.join("AGENTS.md"), format!("# {}\n\nTest content.\n", name)).unwrap();
+        fs::write(
+            dir.join("AGENTS.md"),
+            format!("# {}\n\nTest content.\n", name),
+        )
+        .unwrap();
     }
 
     /// Create a Client pointed at a temporary data root with no config overlay.
@@ -496,11 +615,11 @@ mod tests {
         })
     }
 
-    /// Verify that tool_definitions returns the expected number of tools (4 original + 3 new).
+    /// Verify that tool_definitions returns the expected number of tools (4 original + 4 new).
     #[test]
-    fn tool_definitions_returns_seven() {
+    fn tool_definitions_returns_eight() {
         let defs = tool_definitions();
-        assert_eq!(defs.len(), 7);
+        assert_eq!(defs.len(), 8);
     }
 
     /// Verify that calling an unknown tool name returns an is_error result.
@@ -533,7 +652,11 @@ mod tests {
         });
 
         let result = call_tool("frameshift_install", &args, &client);
-        assert!(result.is_error.is_none(), "unexpected error: {:?}", result.content[0].text);
+        assert!(
+            result.is_error.is_none(),
+            "unexpected error: {:?}",
+            result.content[0].text
+        );
         assert!(result.content[0].text.contains("test@0.1.0"));
     }
 
@@ -551,7 +674,11 @@ mod tests {
         });
 
         let result = call_tool("frameshift_list", &args, &client);
-        assert!(result.is_error.is_none(), "unexpected error: {:?}", result.content[0].text);
+        assert!(
+            result.is_error.is_none(),
+            "unexpected error: {:?}",
+            result.content[0].text
+        );
         let parsed: serde_json::Value = serde_json::from_str(&result.content[0].text).unwrap();
         assert!(parsed["personas"].is_array());
     }
@@ -589,7 +716,11 @@ mod tests {
         });
 
         let result = call_tool("frameshift_grow_append", &args, &client);
-        assert!(result.is_error.is_none(), "unexpected error: {:?}", result.content[0].text);
+        assert!(
+            result.is_error.is_none(),
+            "unexpected error: {:?}",
+            result.content[0].text
+        );
         let parsed: serde_json::Value = serde_json::from_str(&result.content[0].text).unwrap();
         assert_eq!(parsed["appended"], true);
     }
@@ -608,9 +739,16 @@ mod tests {
         });
 
         let result = call_tool("frameshift_select", &args, &client);
-        assert!(result.is_error.is_none(), "unexpected error: {:?}", result.content[0].text);
+        assert!(
+            result.is_error.is_none(),
+            "unexpected error: {:?}",
+            result.content[0].text
+        );
         let parsed: serde_json::Value = serde_json::from_str(&result.content[0].text).unwrap();
-        assert!(parsed["ranked"].is_array(), "result must have a 'ranked' array");
+        assert!(
+            parsed["ranked"].is_array(),
+            "result must have a 'ranked' array"
+        );
     }
 
     /// Verify that frameshift_automate status returns mode and active fields.
@@ -628,9 +766,196 @@ mod tests {
         });
 
         let result = call_tool("frameshift_automate", &args, &client);
-        assert!(result.is_error.is_none(), "unexpected error: {:?}", result.content[0].text);
+        assert!(
+            result.is_error.is_none(),
+            "unexpected error: {:?}",
+            result.content[0].text
+        );
         let parsed: serde_json::Value = serde_json::from_str(&result.content[0].text).unwrap();
         assert!(parsed["mode"].is_string(), "result must have 'mode' string");
+    }
+
+    /// frameshift_prefs show on a fresh project returns an empty bias map.
+    #[test]
+    fn tool_call_prefs_show_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+
+        let client = make_client(&tmp.path().join("data"));
+
+        let result = call_tool(
+            "frameshift_prefs",
+            &serde_json::json!({
+                "project_root": project_root.to_str().unwrap(),
+                "action": "show"
+            }),
+            &client,
+        );
+        assert!(
+            result.is_error.is_none(),
+            "unexpected error: {:?}",
+            result.content[0].text
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&result.content[0].text).unwrap();
+        assert!(parsed["bias"].is_object(), "result must have a 'bias' object");
+        assert_eq!(
+            parsed["bias"].as_object().unwrap().len(),
+            0,
+            "fresh project must have no recorded biases"
+        );
+    }
+
+    /// frameshift_prefs bump increases a persona's bias and persists across calls.
+    #[test]
+    fn tool_call_prefs_bump_persists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+
+        let client = make_client(&tmp.path().join("data"));
+        let root_str = project_root.to_str().unwrap();
+
+        // Bump a persona.
+        let bump = call_tool(
+            "frameshift_prefs",
+            &serde_json::json!({
+                "project_root": root_str,
+                "action": "bump",
+                "persona": "rust"
+            }),
+            &client,
+        );
+        assert!(bump.is_error.is_none(), "bump failed: {:?}", bump.content[0].text);
+        let bump_parsed: serde_json::Value =
+            serde_json::from_str(&bump.content[0].text).unwrap();
+        let bumped_bias = bump_parsed["bias"].as_f64().unwrap();
+        assert!(bumped_bias > 0.0, "bump must produce a positive bias");
+
+        // Show should now reflect the bump.
+        let show = call_tool(
+            "frameshift_prefs",
+            &serde_json::json!({"project_root": root_str, "action": "show"}),
+            &client,
+        );
+        let show_parsed: serde_json::Value =
+            serde_json::from_str(&show.content[0].text).unwrap();
+        assert_eq!(
+            show_parsed["bias"]["rust"].as_f64().unwrap(),
+            bumped_bias,
+            "show must report the bumped bias"
+        );
+    }
+
+    /// frameshift_prefs reset clears every recorded bias.
+    #[test]
+    fn tool_call_prefs_reset_clears_biases() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+
+        let client = make_client(&tmp.path().join("data"));
+        let root_str = project_root.to_str().unwrap();
+
+        // Seed a bias.
+        call_tool(
+            "frameshift_prefs",
+            &serde_json::json!({
+                "project_root": root_str,
+                "action": "bump",
+                "persona": "rust"
+            }),
+            &client,
+        );
+
+        // Reset.
+        let reset = call_tool(
+            "frameshift_prefs",
+            &serde_json::json!({"project_root": root_str, "action": "reset"}),
+            &client,
+        );
+        assert!(reset.is_error.is_none());
+        let reset_parsed: serde_json::Value =
+            serde_json::from_str(&reset.content[0].text).unwrap();
+        assert_eq!(reset_parsed["reset"], true);
+
+        // Show must now be empty.
+        let show = call_tool(
+            "frameshift_prefs",
+            &serde_json::json!({"project_root": root_str, "action": "show"}),
+            &client,
+        );
+        let show_parsed: serde_json::Value =
+            serde_json::from_str(&show.content[0].text).unwrap();
+        assert_eq!(
+            show_parsed["bias"].as_object().unwrap().len(),
+            0,
+            "reset must leave an empty bias map"
+        );
+    }
+
+    /// frameshift_prefs bump without 'persona' argument is an error.
+    #[test]
+    fn tool_call_prefs_bump_requires_persona() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+
+        let client = make_client(&tmp.path().join("data"));
+
+        let result = call_tool(
+            "frameshift_prefs",
+            &serde_json::json!({
+                "project_root": project_root.to_str().unwrap(),
+                "action": "bump"
+            }),
+            &client,
+        );
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content[0].text.contains("persona"));
+    }
+
+    /// frameshift_select with a `library` argument indexes that catalog
+    /// directory instead of the project's installed personas. With a single
+    /// pack present the ranked array must be non-empty.
+    #[test]
+    fn tool_call_select_with_library_indexes_catalog() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+
+        // A "catalog" directory containing one pack.
+        let catalog_root = tmp.path().join("catalog");
+        let pack_dir = catalog_root.join("cat-persona");
+        make_pack_dir(&pack_dir, "cat-persona", "0.1.0");
+
+        let client = make_client(&tmp.path().join("data"));
+
+        let result = call_tool(
+            "frameshift_select",
+            &serde_json::json!({
+                "project_root": project_root.to_str().unwrap(),
+                "library": catalog_root.to_str().unwrap()
+            }),
+            &client,
+        );
+        assert!(
+            result.is_error.is_none(),
+            "unexpected error: {:?}",
+            result.content[0].text
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&result.content[0].text).unwrap();
+        let ranked = parsed["ranked"]
+            .as_array()
+            .expect("result must have a 'ranked' array");
+        assert!(
+            !ranked.is_empty(),
+            "library mode must rank at least the one pack present"
+        );
+        assert!(
+            ranked.iter().any(|entry| entry["persona"] == "cat-persona"),
+            "ranked list must include the catalog pack"
+        );
     }
 
     /// Verify that frameshift_automate on/off round-trip persists mode.

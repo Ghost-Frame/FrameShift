@@ -1,8 +1,8 @@
-/// Binary entry point for the Frameshift daemon.
-///
-/// Initializes tracing, builds the `Client`, binds the Unix socket, optionally
-/// starts the file watcher on the data root, and then drives the JSON-RPC
-/// serve loop until a `shutdown` RPC is received or the process is killed.
+//! Binary entry point for the Frameshift daemon.
+//!
+//! Initializes tracing, builds the `Client`, binds the Unix socket, optionally
+//! starts the file watcher on the data root, and then drives the JSON-RPC
+//! serve loop until a `shutdown` RPC is received or the process is killed.
 
 use frameshift_daemon::{orchestrator, watcher};
 use frameshift_orchestrator::controller::{SwitchController, SwitchPolicy};

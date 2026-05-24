@@ -65,12 +65,12 @@ pub fn run_use(client: &Client, args: UseArgs) -> Result<(), CliError> {
     }
 
     // Activate the persona (syncs the lock first, then writes the active marker).
-    client.activate(&project_root, &args.name).map_err(|e| {
-        match e {
+    client
+        .activate(&project_root, &args.name)
+        .map_err(|e| match e {
             ClientError::PersonaNotInstalled(name) => CliError::PersonaNotFound { name },
             other => CliError::Orchestrator(other.to_string()),
-        }
-    })?;
+        })?;
 
     // Read and print the rendered persona for the claude target.
     let rendered = client.rendered_persona(&project_root, &args.name, "claude")?;
@@ -89,7 +89,7 @@ fn read_pack_version(persona_dir: &Path) -> Option<String> {
     for line in raw.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with("version") {
-            if let Some(val) = trimmed.splitn(2, '=').nth(1) {
+            if let Some(val) = trimmed.split_once('=').map(|x| x.1) {
                 let version = val.trim().trim_matches('"').trim_matches('\'').to_string();
                 if !version.is_empty() {
                     return Some(version);

@@ -18,13 +18,14 @@ use cmd::automate::AutomateArgs;
 use cmd::diff::DiffArgs;
 use cmd::grow::GrowArgs;
 use cmd::migrate::MigrateArgs;
+use cmd::prefs::PrefsArgs;
+use cmd::publish::PublishArgs;
 use cmd::render::RenderArgs;
 use cmd::rule::{RuleArgs, RuleCommand};
 use cmd::select::SelectArgs;
 use cmd::skill::{SkillArgs, SkillCommand};
 use cmd::use_persona::UseArgs;
 use cmd::verify::VerifyArgs;
-use cmd::publish::PublishArgs;
 use util::CliError;
 
 /// Frameshift persona engine CLI.
@@ -108,6 +109,9 @@ enum Command {
 
     /// Manage automate-mode state (on/off/status/lock/unlock).
     Automate(AutomateArgs),
+
+    /// View and adjust per-persona preference biases.
+    Prefs(PrefsArgs),
 }
 
 /// Typed run-level error that carries an exit code alongside a message.
@@ -334,6 +338,11 @@ fn run() -> Result<(), RunError> {
         Command::Automate(args) => {
             let client = make_client()?;
             cmd::automate::run_automate(&client, args).map_err(RunError::from)
+        }
+
+        Command::Prefs(args) => {
+            let client = make_client()?;
+            cmd::prefs::run_prefs(&client, args).map_err(RunError::from)
         }
     }
 }

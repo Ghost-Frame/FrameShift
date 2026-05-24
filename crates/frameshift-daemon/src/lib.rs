@@ -1,8 +1,8 @@
-/// Library surface for `frameshift-daemon`.
-///
-/// Re-exports all internal modules so that integration tests and other crates
-/// can reach the protocol, handler, socket, and watcher logic without
-/// depending on the binary entry point.
+//! Library surface for `frameshift-daemon`.
+//!
+//! Re-exports all internal modules so that integration tests and other crates
+//! can reach the protocol, handler, socket, and watcher logic without
+//! depending on the binary entry point.
 
 /// Error types used throughout the daemon.
 pub mod error;

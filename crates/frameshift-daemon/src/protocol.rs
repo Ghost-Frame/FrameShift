@@ -1,5 +1,5 @@
-/// JSON-RPC 2.0 wire types and helper functions for serializing
-/// responses and parsing incoming requests over the Unix socket.
+//! JSON-RPC 2.0 wire types and helper functions for serializing
+//! responses and parsing incoming requests over the Unix socket.
 
 use serde::{Deserialize, Serialize};
 
@@ -94,11 +94,7 @@ pub fn parse_request(line: &str) -> Result<RpcRequest, String> {
     let value: serde_json::Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(_) => {
-            return Err(error(
-                serde_json::Value::Null,
-                PARSE_ERROR,
-                "parse error",
-            ));
+            return Err(error(serde_json::Value::Null, PARSE_ERROR, "parse error"));
         }
     };
 
@@ -132,7 +128,7 @@ mod tests {
         let result = parse_request("not json at all {{{");
         assert!(result.is_err());
         let err_str = result.unwrap_err();
-        let parsed: serde_json::Value = serde_json::from_str(&err_str.trim()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(err_str.trim()).unwrap();
         assert_eq!(parsed["error"]["code"], PARSE_ERROR);
     }
 
@@ -143,7 +139,7 @@ mod tests {
         let result = parse_request(line);
         assert!(result.is_err());
         let err_str = result.unwrap_err();
-        let parsed: serde_json::Value = serde_json::from_str(&err_str.trim()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(err_str.trim()).unwrap();
         assert_eq!(parsed["error"]["code"], INVALID_REQUEST);
     }
 }

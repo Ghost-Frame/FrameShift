@@ -2,6 +2,23 @@
 //!
 //! All three surfaces call `select` with a `SelectionInputs` struct so that
 //! parity is structural rather than duplicated across callers.
+//!
+//! # SwitchController is intentionally NOT used here
+//!
+//! `select()` returns raw ranked results without applying the
+//! `SwitchController` hysteresis policy (debounce, switch margin, minimum
+//! confidence). This is by design:
+//!
+//! - **CLI `select` / MCP `frameshift_select`**: read-only ranking for user
+//!   inspection. The user decides what to do with the results -- no side effects.
+//! - **CLI `use` / MCP `frameshift_use`**: explicit user override that bypasses
+//!   automation policy. These actions feed into `Preferences` as learned bias.
+//! - **Daemon `evaluate_and_apply`**: the only caller that applies
+//!   `SwitchController` on top of `select()` results, because it acts
+//!   autonomously without a human in the loop.
+//!
+//! If you need policy-gated selection outside the daemon, construct a
+//! `SwitchController` and call `controller.decide(&ranked)` on the results.
 
 use std::path::{Path, PathBuf};
 
@@ -138,7 +155,10 @@ tone = "precise"
         };
 
         let ranked = select(&inputs).unwrap();
-        assert!(ranked.is_empty(), "expected empty result for no source dirs");
+        assert!(
+            ranked.is_empty(),
+            "expected empty result for no source dirs"
+        );
     }
 
     /// select() with a task hint passes tokens through to the lexical scorer.
@@ -191,6 +211,9 @@ tone = "precise"
 
         let ranked = select(&inputs).unwrap();
         assert_eq!(ranked.len(), 2, "catalog should index both personas");
-        assert_eq!(ranked[0].persona, "rust", "rust should rank first for rust task");
+        assert_eq!(
+            ranked[0].persona, "rust",
+            "rust should rank first for rust task"
+        );
     }
 }

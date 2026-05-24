@@ -9,10 +9,10 @@ use std::path::Path;
 
 use frameshift_client::Client;
 use frameshift_orchestrator::{
-    audit::{AuditLog, Transition, now_timestamp},
-    mode::{Mode, ModeState},
+    audit::{now_timestamp, AuditLog, Transition},
     controller::{Decision, SwitchController},
     feedback::Preferences,
+    mode::{Mode, ModeState},
     policy::PolicyWeights,
     run::{select, SelectionInputs},
 };
@@ -28,11 +28,7 @@ use frameshift_orchestrator::{
 ///
 /// The `controller` parameter must be mutable and is shared across calls within
 /// a project's watch loop so that debounce state persists across events.
-pub fn evaluate_and_apply(
-    client: &Client,
-    controller: &mut SwitchController,
-    project_root: &Path,
-) {
+pub fn evaluate_and_apply(client: &Client, controller: &mut SwitchController, project_root: &Path) {
     let state_dir = match client.orchestrator_state_dir(project_root) {
         Ok(d) => d,
         Err(e) => {
@@ -98,9 +94,24 @@ pub fn evaluate_and_apply(
     let decision = controller.decide(&ranked);
 
     // Step 5: act on Switch decisions.
-    if let Decision::Switch { to, rationale, confidence } = decision {
+    if let Decision::Switch {
+        to,
+        rationale,
+        confidence,
+    } = decision
+    {
+        // Read the currently active persona before overwriting the marker.
+        let from = match client.project_paths(project_root) {
+            Ok(paths) if paths.active_path.exists() => std::fs::read_to_string(&paths.active_path)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+            _ => None,
+        };
+
         tracing::info!(
             persona = %to,
+            from = from.as_deref().unwrap_or("(none)"),
             confidence = %confidence,
             "orchestrator: switching persona"
         );
@@ -110,11 +121,11 @@ pub fn evaluate_and_apply(
             return;
         }
 
-        // Append an audit transition.
+        // Append an audit transition with the previous persona recorded.
         let mut audit = AuditLog::load(&audit_path).unwrap_or_default();
         let transition = Transition {
             timestamp: now_timestamp(),
-            from: None, // daemon does not track previous name here
+            from,
             to: to.clone(),
             confidence,
             rationale,
@@ -157,7 +168,10 @@ mod tests {
         // If we got here without panicking, the no-op path works.
         // The active marker must not have been written.
         let paths = client.project_paths(&project_root).unwrap();
-        assert!(!paths.active_path.exists(), "active marker must not exist after no-op");
+        assert!(
+            !paths.active_path.exists(),
+            "active marker must not exist after no-op"
+        );
     }
 
     /// evaluate_and_apply does not switch when locked.
@@ -187,7 +201,10 @@ mod tests {
 
         // Active marker still absent since lock prevented switching.
         let paths = client.project_paths(&project_root).unwrap();
-        assert!(!paths.active_path.exists(), "active marker must not be written while locked");
+        assert!(
+            !paths.active_path.exists(),
+            "active marker must not be written while locked"
+        );
     }
 
     /// evaluate_and_apply with mode on but no personas returns without error.
@@ -269,5 +286,81 @@ mod tests {
         }
         // If not activated (NoCandidates or Hold), that is also acceptable for
         // this fixture since confidence depends on context sensing.
+    }
+
+    /// When a persona is already active and `evaluate_and_apply` performs a
+    /// switch, the audit log entry must record the previous persona name in
+    /// `Transition.from`. Prior to the from-tracking fix the daemon always
+    /// wrote `None`, which broke audit-trail continuity.
+    #[test]
+    fn evaluate_records_from_persona_in_audit_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+
+        let pack_dir = tmp.path().join("pack");
+        fs::create_dir_all(&pack_dir).unwrap();
+        fs::write(
+            pack_dir.join("pack.toml"),
+            "schema_version = 1\nname = \"new-persona\"\nauthor_handle = \"test\"\nauthor_pubkey = \"local-unsigned\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(pack_dir.join("AGENTS.md"), "# New Persona\n\nTest.\n").unwrap();
+
+        let data_root = tmp.path().join("data");
+        let client = test_client(&data_root);
+
+        // Install the new persona.
+        client
+            .install(InstallRequest {
+                project_root: project_root.clone(),
+                spec: PersonaSpec {
+                    name: "new-persona".to_string(),
+                    version: "0.1.0".to_string(),
+                },
+                source: InstallSource::LocalPath(pack_dir),
+            })
+            .unwrap();
+
+        // Pre-seed the active marker with a different persona name. This
+        // simulates a prior session where "old-persona" was active.
+        let paths = client.project_paths(&project_root).unwrap();
+        if let Some(parent) = paths.active_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&paths.active_path, "old-persona\n").unwrap();
+
+        // Enable mode.
+        let state_dir = client.orchestrator_state_dir(&project_root).unwrap();
+        let mode = ModeState { mode: Mode::On };
+        mode.save(&state_dir.join("automate.json")).unwrap();
+
+        // Lenient policy so the single installed persona crosses the
+        // confidence threshold and a Switch decision is produced.
+        let policy = SwitchPolicy {
+            min_confidence: 0.0,
+            switch_margin: 0.0,
+            debounce_ticks: 1,
+        };
+        let mut controller = SwitchController::new(policy);
+        controller.arm();
+
+        evaluate_and_apply(&client, &mut controller, &project_root);
+
+        // If the orchestrator decided to switch, the audit log must contain
+        // an entry whose `from` is the pre-seeded persona name.
+        let audit_path = state_dir.join("automate-audit.jsonl");
+        if audit_path.exists() {
+            let log =
+                AuditLog::load(&audit_path).expect("audit log should load if it exists");
+            let recent = log.recent(1);
+            if !recent.is_empty() {
+                assert_eq!(
+                    recent[0].from.as_deref(),
+                    Some("old-persona"),
+                    "Transition.from must record the persona that was active before the switch"
+                );
+            }
+        }
     }
 }

@@ -1,8 +1,8 @@
-/// File system watcher for the Frameshift daemon.
-///
-/// Wraps `notify::RecommendedWatcher` and bridges its synchronous callback
-/// API to a tokio `mpsc` channel so that the async main loop can react to
-/// file-change events without blocking.
+//! File system watcher for the Frameshift daemon.
+//!
+//! Wraps `notify::RecommendedWatcher` and bridges its synchronous callback
+//! API to a tokio `mpsc` channel so that the async main loop can react to
+//! file-change events without blocking.
 
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::Path;

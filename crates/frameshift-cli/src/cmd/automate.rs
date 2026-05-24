@@ -46,13 +46,17 @@ pub fn run_automate(client: &Client, args: AutomateArgs) -> Result<(), CliError>
     match args.action {
         AutomateAction::On => {
             let state = ModeState { mode: Mode::On };
-            state.save(&mode_path).map_err(|e| CliError::Orchestrator(e.to_string()))?;
+            state
+                .save(&mode_path)
+                .map_err(|e| CliError::Orchestrator(e.to_string()))?;
             println!("automate mode: on");
         }
 
         AutomateAction::Off => {
             let state = ModeState { mode: Mode::Off };
-            state.save(&mode_path).map_err(|e| CliError::Orchestrator(e.to_string()))?;
+            state
+                .save(&mode_path)
+                .map_err(|e| CliError::Orchestrator(e.to_string()))?;
             println!("automate mode: off");
         }
 
@@ -108,17 +112,17 @@ pub fn run_automate(client: &Client, args: AutomateArgs) -> Result<(), CliError>
             // Persist a lock marker file alongside the mode state.
             let lock_path = state_dir.join("automate-lock.json");
             if let Some(parent) = lock_path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| CliError::Io(e))?;
+                std::fs::create_dir_all(parent).map_err(CliError::Io)?;
             }
             let lock_content = serde_json::json!({"locked": true}).to_string();
-            std::fs::write(&lock_path, lock_content).map_err(|e| CliError::Io(e))?;
+            std::fs::write(&lock_path, lock_content).map_err(CliError::Io)?;
             println!("persona locked; daemon will not auto-switch");
         }
 
         AutomateAction::Unlock => {
             let lock_path = state_dir.join("automate-lock.json");
             if lock_path.exists() {
-                std::fs::remove_file(&lock_path).map_err(|e| CliError::Io(e))?;
+                std::fs::remove_file(&lock_path).map_err(CliError::Io)?;
             }
             println!("persona unlocked; daemon may auto-switch");
         }

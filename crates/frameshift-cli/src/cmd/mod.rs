@@ -7,6 +7,7 @@ pub mod automate;
 pub mod diff;
 pub mod grow;
 pub mod migrate;
+pub mod prefs;
 pub mod publish;
 pub mod render;
 pub mod rule;

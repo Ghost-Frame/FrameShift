@@ -45,10 +45,7 @@ fn handle_message(line: &str, client: &Client) -> Option<JsonRpcResponse> {
     };
 
     // Notifications have no id -- do not respond to them.
-    if msg.id.is_none() {
-        return None;
-    }
-
+    msg.id.as_ref()?;
     let id = msg.id.clone();
 
     match msg.method.as_str() {
@@ -136,7 +133,10 @@ mod tests {
         // A notification has no "id" field.
         let line = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
         let result = handle_message(line, &client);
-        assert!(result.is_none(), "notifications must not produce a response");
+        assert!(
+            result.is_none(),
+            "notifications must not produce a response"
+        );
     }
 
     /// Verify that an initialize request returns serverInfo.name.
@@ -161,16 +161,16 @@ mod tests {
         assert_eq!(serialized["error"]["code"], -32601);
     }
 
-    /// Verify that tools/list returns the expected seven tool names.
+    /// Verify that tools/list returns the expected eight tool names.
     #[test]
-    fn tools_list_returns_four_tools() {
+    fn tools_list_returns_eight_tools() {
         let tmp = tempfile::tempdir().unwrap();
         let client = make_client(tmp.path());
         let line = r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#;
         let response = handle_message(line, &client).expect("should produce a response");
         let serialized = serde_json::to_value(&response).unwrap();
         let tools = serialized["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 8);
     }
 
     /// Verify tools/call with frameshift_install succeeds end-to-end.
@@ -206,7 +206,8 @@ mod tests {
             "method": "tools/call",
             "params": args
         });
-        let response = handle_message(&msg.to_string(), &client).expect("should produce a response");
+        let response =
+            handle_message(&msg.to_string(), &client).expect("should produce a response");
         let serialized = serde_json::to_value(&response).unwrap();
         // Should be a success result (no error field).
         assert!(serialized.get("error").is_none() || serialized["error"].is_null());
@@ -219,7 +220,8 @@ mod tests {
     fn malformed_json_returns_parse_error() {
         let tmp = tempfile::tempdir().unwrap();
         let client = make_client(tmp.path());
-        let response = handle_message("not json {{{{", &client).expect("should produce error response");
+        let response =
+            handle_message("not json {{{{", &client).expect("should produce error response");
         let serialized = serde_json::to_value(&response).unwrap();
         assert_eq!(serialized["error"]["code"], -32700);
     }
@@ -280,7 +282,8 @@ mod tests {
                 "arguments": { "project_root": project_root.to_str().unwrap() }
             }
         });
-        let response = handle_message(&msg.to_string(), &client).expect("should produce a response");
+        let response =
+            handle_message(&msg.to_string(), &client).expect("should produce a response");
         let serialized = serde_json::to_value(&response).unwrap();
         assert!(
             serialized.get("error").is_none() || serialized["error"].is_null(),
@@ -304,15 +307,14 @@ mod tests {
             "method": "prompts/get",
             "params": { "name": "no-such-prompt", "arguments": {} }
         });
-        let response = handle_message(&msg.to_string(), &client).expect("should produce a response");
+        let response =
+            handle_message(&msg.to_string(), &client).expect("should produce a response");
         let serialized = serde_json::to_value(&response).unwrap();
         assert_eq!(serialized["error"]["code"], -32602);
-        assert!(
-            serialized["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("unknown prompt")
-        );
+        assert!(serialized["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unknown prompt"));
     }
 
     /// Verify grow_append integration through the full message handler.
@@ -360,7 +362,8 @@ mod tests {
             }
         });
 
-        let response = handle_message(&msg.to_string(), &client).expect("should produce a response");
+        let response =
+            handle_message(&msg.to_string(), &client).expect("should produce a response");
         let serialized = serde_json::to_value(&response).unwrap();
         assert!(serialized.get("error").is_none() || serialized["error"].is_null());
         let content_text = serialized["result"]["content"][0]["text"].as_str().unwrap();

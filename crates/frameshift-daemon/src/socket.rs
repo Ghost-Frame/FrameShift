@@ -1,8 +1,8 @@
-/// Unix socket server for the JSON-RPC daemon.
-///
-/// Accepts connections on the provided `UnixListener`, spawns a tokio task
-/// for each connection, and drives the request/response loop until the
-/// connection closes or a `shutdown` RPC is received.
+//! Unix socket server for the JSON-RPC daemon.
+//!
+//! Accepts connections on the provided `UnixListener`, spawns a tokio task
+//! for each connection, and drives the request/response loop until the
+//! connection closes or a `shutdown` RPC is received.
 
 use crate::handler::dispatch;
 use crate::protocol;
@@ -81,20 +81,15 @@ async fn handle_connection(
             }
         };
 
-        let id = request
-            .id
-            .clone()
-            .unwrap_or(serde_json::Value::Null);
+        let id = request.id.clone().unwrap_or(serde_json::Value::Null);
         let method = request.method.clone();
         let params = request.params.clone();
         let is_shutdown = method == "shutdown";
 
         // Run the synchronous client operation on a blocking thread.
         let client_ref = Arc::clone(&client);
-        let response = tokio::task::spawn_blocking(move || {
-            dispatch(&method, params, &client_ref)
-        })
-        .await;
+        let response =
+            tokio::task::spawn_blocking(move || dispatch(&method, params, &client_ref)).await;
 
         let response_str = match response {
             Ok(Ok(result)) => protocol::success(id, result),

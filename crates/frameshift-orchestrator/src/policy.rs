@@ -128,12 +128,11 @@ pub fn rank(
                 // Precision: fraction of persona's languages that are in the context.
                 let precision = (matching_lang_sum / persona_lang_count).min(1.0);
                 // F1-style blend: harmonic mean of precision and recall.
-                let f1 = if precision + recall > 0.0 {
+                if precision + recall > 0.0 {
                     2.0 * precision * recall / (precision + recall)
                 } else {
                     0.0
-                };
-                f1
+                }
             };
 
             // Lexical score: IDF-weighted sum of task token hits normalized to [0.0, 1.0].
@@ -206,7 +205,12 @@ pub fn rank(
             let rationale = if rationale_parts.is_empty() {
                 format!("{}: no signal matched", profile.name)
             } else {
-                format!("{} {:.2}: {}", profile.name, final_score, rationale_parts.join("; "))
+                format!(
+                    "{} {:.2}: {}",
+                    profile.name,
+                    final_score,
+                    rationale_parts.join("; ")
+                )
             };
 
             let components = ScoreComponents {
@@ -226,7 +230,11 @@ pub fn rank(
         .collect();
 
     // Sort descending by score.
-    scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     // Compute confidence for the top entry based on absolute score and margin.
     if let Some(top) = scored.first_mut() {
@@ -254,7 +262,10 @@ mod tests {
         PersonaProfile {
             name: name.to_string(),
             description: None,
-            languages: languages.iter().map(|l| l.to_string()).collect::<BTreeSet<_>>(),
+            languages: languages
+                .iter()
+                .map(|l| l.to_string())
+                .collect::<BTreeSet<_>>(),
             keywords: keywords.iter().map(|k| k.to_string()).collect(),
             required_tools: vec![],
             network_egress: false,
@@ -278,9 +289,19 @@ mod tests {
     /// A rust-heavy context ranks a rust persona above an unrelated one.
     #[test]
     fn rust_context_ranks_rust_persona_first() {
-        let rust_profile = make_profile("rust-expert", &["rust"], &["rust", "cargo", "clippy", "memory"]);
-        let web_profile = make_profile("web-designer", &["javascript", "typescript"], &["react", "css", "html", "frontend"]);
-        let index = PersonaIndex { profiles: vec![rust_profile, web_profile] };
+        let rust_profile = make_profile(
+            "rust-expert",
+            &["rust"],
+            &["rust", "cargo", "clippy", "memory"],
+        );
+        let web_profile = make_profile(
+            "web-designer",
+            &["javascript", "typescript"],
+            &["react", "css", "html", "frontend"],
+        );
+        let index = PersonaIndex {
+            profiles: vec![rust_profile, web_profile],
+        };
 
         let ctx = make_ctx(&[("rust", 1.0), ("toml", 0.2)], &["clippy", "lint"]);
         let weights = PolicyWeights::default();
@@ -298,7 +319,9 @@ mod tests {
     fn no_task_tokens_uses_language_score() {
         let rust_profile = make_profile("rust-expert", &["rust"], &["rust", "cargo"]);
         let py_profile = make_profile("python-dev", &["python"], &["python", "django"]);
-        let index = PersonaIndex { profiles: vec![rust_profile, py_profile] };
+        let index = PersonaIndex {
+            profiles: vec![rust_profile, py_profile],
+        };
 
         let ctx = make_ctx(&[("rust", 1.0)], &[]);
         let weights = PolicyWeights::default();
@@ -313,7 +336,9 @@ mod tests {
     fn preference_bias_nudges_score() {
         let a = make_profile("alpha", &["rust"], &["rust"]);
         let b = make_profile("beta", &["rust"], &["rust"]);
-        let index = PersonaIndex { profiles: vec![a, b] };
+        let index = PersonaIndex {
+            profiles: vec![a, b],
+        };
 
         let ctx = make_ctx(&[("rust", 1.0)], &[]);
         let weights = PolicyWeights::default();

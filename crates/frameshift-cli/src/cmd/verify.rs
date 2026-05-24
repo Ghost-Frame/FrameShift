@@ -10,9 +10,11 @@ use std::path::PathBuf;
 
 use clap::Args;
 use frameshift_client::Client;
-use frameshift_conformance::{bundle_score, load_from_dir, score_test, MockRunner, Runner, TestCase};
+use frameshift_conformance::{
+    bundle_score, load_from_dir, score_test, MockRunner, Runner, TestCase,
+};
 
-use crate::util::{CliError, persona_source_dir};
+use crate::util::{persona_source_dir, CliError};
 
 /// Arguments for the `verify` subcommand.
 ///
@@ -64,8 +66,7 @@ pub fn run_verify(args: VerifyArgs) -> Result<(), CliError> {
     };
 
     // Load the bundle from the directory.
-    let bundle = load_from_dir(&bundle_dir)
-        .map_err(|e| CliError::Conformance(e.to_string()))?;
+    let bundle = load_from_dir(&bundle_dir).map_err(|e| CliError::Conformance(e.to_string()))?;
 
     // Build the mock runner once and reuse it for every test case.
     let runner = MockRunner::new(args.canned_response.clone());
@@ -86,11 +87,15 @@ pub fn run_verify(args: VerifyArgs) -> Result<(), CliError> {
         .collect::<Result<_, CliError>>()?;
 
     // Print the results table.
-    println!("{:<20} {:<12} {:<8} {}", "id", "scorer", "score", "result");
+    println!("{:<20} {:<12} {:<8} result", "id", "scorer", "score");
     println!("{}", "-".repeat(55));
     for (test, response) in &results {
         let score = score_test(test, response);
-        let pass = if score.0 >= args.threshold { "pass" } else { "FAIL" };
+        let pass = if score.0 >= args.threshold {
+            "pass"
+        } else {
+            "FAIL"
+        };
         println!(
             "{:<20} {:<12} {:<8.3} {}",
             test.id,
@@ -103,7 +108,10 @@ pub fn run_verify(args: VerifyArgs) -> Result<(), CliError> {
 
     // Compute and print the overall score.
     let overall = bundle_score(&bundle, &results);
-    println!("overall score: {:.3} (threshold: {:.3})", overall.0, args.threshold);
+    println!(
+        "overall score: {:.3} (threshold: {:.3})",
+        overall.0, args.threshold
+    );
 
     if overall.0 < args.threshold {
         return Err(CliError::Growth(format!(
@@ -183,7 +191,10 @@ value = "{expected_value}"
             threshold: 0.5,
         };
         let result = run_verify(args);
-        assert!(result.is_ok(), "expected Ok for matching response: {result:?}");
+        assert!(
+            result.is_ok(),
+            "expected Ok for matching response: {result:?}"
+        );
     }
 
     /// Canned response "goodbye" does not contain "hello" -- score should be 0.0.
@@ -215,7 +226,10 @@ value = "{expected_value}"
             canned_response: "hello world".to_string(),
             threshold: 0.5,
         };
-        assert!(run_verify(args).is_ok(), "score 1.0 should pass threshold 0.5");
+        assert!(
+            run_verify(args).is_ok(),
+            "score 1.0 should pass threshold 0.5"
+        );
     }
 
     /// Score 0.0 < threshold 0.5 -- should return Err.
@@ -230,6 +244,9 @@ value = "{expected_value}"
             canned_response: "goodbye".to_string(),
             threshold: 0.5,
         };
-        assert!(run_verify(args).is_err(), "score 0.0 should fail threshold 0.5");
+        assert!(
+            run_verify(args).is_err(),
+            "score 0.0 should fail threshold 0.5"
+        );
     }
 }
