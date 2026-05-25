@@ -187,7 +187,7 @@ mod tests {
         // Enable mode.
         let state_dir = client.orchestrator_state_dir(&project_root).unwrap();
         fs::create_dir_all(&state_dir).unwrap();
-        let mode = ModeState { mode: Mode::On };
+        let mode = ModeState { mode: Mode::On, sensitivity: 0.5 };
         mode.save(&state_dir.join("automate.json")).unwrap();
 
         // Write lock marker.
@@ -220,7 +220,7 @@ mod tests {
         // Enable mode, no lock.
         let state_dir = client.orchestrator_state_dir(&project_root).unwrap();
         fs::create_dir_all(&state_dir).unwrap();
-        let mode = ModeState { mode: Mode::On };
+        let mode = ModeState { mode: Mode::On, sensitivity: 0.5 };
         mode.save(&state_dir.join("automate.json")).unwrap();
 
         let policy = SwitchPolicy::default();
@@ -264,7 +264,7 @@ mod tests {
 
         // Enable mode.
         let state_dir = client.orchestrator_state_dir(&project_root).unwrap();
-        let mode = ModeState { mode: Mode::On };
+        let mode = ModeState { mode: Mode::On, sensitivity: 0.5 };
         mode.save(&state_dir.join("automate.json")).unwrap();
 
         // Use a lenient policy so the single persona will pass the confidence threshold.
@@ -272,6 +272,8 @@ mod tests {
             min_confidence: 0.0,
             switch_margin: 0.0,
             debounce_ticks: 1,
+            z_threshold: 0.0,
+            min_gap_fraction: 0.0,
         };
         let mut controller = SwitchController::new(policy);
         controller.arm();
@@ -332,7 +334,7 @@ mod tests {
 
         // Enable mode.
         let state_dir = client.orchestrator_state_dir(&project_root).unwrap();
-        let mode = ModeState { mode: Mode::On };
+        let mode = ModeState { mode: Mode::On, sensitivity: 0.5 };
         mode.save(&state_dir.join("automate.json")).unwrap();
 
         // Lenient policy so the single installed persona crosses the
@@ -341,6 +343,8 @@ mod tests {
             min_confidence: 0.0,
             switch_margin: 0.0,
             debounce_ticks: 1,
+            z_threshold: 0.0,
+            min_gap_fraction: 0.0,
         };
         let mut controller = SwitchController::new(policy);
         controller.arm();

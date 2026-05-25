@@ -73,6 +73,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let state = ModeState::load(&tmp.path().join("mode.json")).unwrap();
         assert_eq!(state.mode, Mode::Off);
+        assert!((state.sensitivity - 0.5).abs() < f32::EPSILON);
     }
 
     /// Save then load round-trips Mode::On with default sensitivity.

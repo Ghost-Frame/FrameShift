@@ -409,15 +409,15 @@ fn call_automate(arguments: &serde_json::Value, client: &Client) -> ToolResult {
 
     match action {
         "on" => {
-            let state = ModeState { mode: Mode::On };
+            let state = ModeState { mode: Mode::On, sensitivity: 0.5 };
             if let Err(e) = state.save(&mode_path) {
                 return err_result(format!("failed to save mode: {}", e));
             }
-            ok_result(serde_json::json!({ "mode": "on" }).to_string())
+            ok_result(serde_json::json!({ "mode": "on", "sensitivity": state.sensitivity }).to_string())
         }
 
         "off" => {
-            let state = ModeState { mode: Mode::Off };
+            let state = ModeState { mode: Mode::Off, sensitivity: 0.5 };
             if let Err(e) = state.save(&mode_path) {
                 return err_result(format!("failed to save mode: {}", e));
             }
