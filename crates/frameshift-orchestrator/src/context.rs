@@ -160,40 +160,45 @@ fn detect_markers(
     }
 }
 
-/// Synonym expansion rules: (trigger_token, tokens_to_inject[]).
+/// Domain clusters for bidirectional synonym expansion.
 ///
-/// When a trigger token appears in the task hint, the corresponding synonyms
-/// are added to the task token list (if not already present). This maps
-/// natural-language phrasing to canonical terminology used in persona keywords.
-const TASK_SYNONYMS: &[(&str, &[&str])] = &[
-    // "release notes" -> changelog (writer-domain canonical term)
-    ("release", &["changelog"]),
-    // "docs" / "documentation" -> documentation (normalized form)
-    ("docs", &["documentation"]),
-    // "refactor" -> refactoring
-    ("refactor", &["refactoring"]),
-    // "lint" -> linting
-    ("lint", &["linting"]),
-    // "bench" / "benchmark" -> benchmarking
-    ("bench", &["benchmark", "benchmarking"]),
-    // "perf" -> performance
-    ("perf", &["performance"]),
-    // "sec" / "security" -> security
-    ("sec", &["security"]),
+/// When any token in a cluster appears in the task, ALL tokens in that
+/// cluster become available for matching. This closes vocabulary gaps
+/// between task descriptions and persona keyword sets.
+const DOMAIN_CLUSTERS: &[&[&str]] = &[
+    &["debug", "debugging", "error", "crash", "panic", "backtrace",
+      "stacktrace", "fix", "trace", "segfault", "coredump"],
+    &["security", "vulnerability", "cve", "audit", "pentest", "exploit",
+      "hardening", "threat", "compliance", "owasp"],
+    &["test", "testing", "unittest", "integration", "coverage", "assertion",
+      "mock", "fixture", "snapshot", "e2e"],
+    &["docs", "documentation", "readme", "tutorial", "changelog", "prose",
+      "copywriting", "draft", "publish", "article"],
+    &["perf", "performance", "benchmark", "profiling", "flamegraph",
+      "latency", "throughput", "optimization", "hotpath"],
+    &["deploy", "deployment", "infrastructure", "ci", "cd", "pipeline",
+      "container", "docker", "kubernetes", "systemd", "nginx"],
+    &["refactor", "refactoring", "cleanup", "restructure", "extract",
+      "inline", "rename", "decompose"],
+    &["review", "reviewing", "pullrequest", "approve", "critique"],
+    &["implement", "implementing", "build", "create", "feature",
+      "scaffold", "wire", "integrate"],
+    &["design", "architect", "architecture", "plan", "planning",
+      "spec", "specification", "rfc", "proposal"],
 ];
 
-/// Expand task tokens with domain synonyms defined in `TASK_SYNONYMS`.
+/// Expand task tokens with domain cluster members.
 ///
-/// For each trigger token found in `tokens`, the mapped synonyms are appended
-/// to `tokens` if not already present. Preserves existing order and deduplicates
-/// new additions.
+/// For each token in `tokens`, if it belongs to any domain cluster, all
+/// other members of that cluster are added (if not already present).
 fn expand_task_tokens(tokens: &mut Vec<String>) {
     let mut additions: Vec<String> = Vec::new();
 
-    for (trigger, synonyms) in TASK_SYNONYMS {
-        if tokens.iter().any(|t| t == *trigger) {
-            for syn in *synonyms {
-                let s = syn.to_string();
+    for cluster in DOMAIN_CLUSTERS {
+        let has_member = tokens.iter().any(|t| cluster.contains(&t.as_str()));
+        if has_member {
+            for member in *cluster {
+                let s = member.to_string();
                 if !tokens.contains(&s) && !additions.contains(&s) {
                     additions.push(s);
                 }
@@ -329,5 +334,33 @@ mod tests {
         // Walking .git would produce "shell" or nothing useful; we just verify no panic
         // and that we get a valid signal back.
         let _ = sig;
+    }
+
+    /// Debug cluster: matching "debug" injects all other cluster members.
+    #[test]
+    fn cluster_expansion_adds_all_members() {
+        let mut tokens = vec!["debug".to_string(), "rust".to_string()];
+        expand_task_tokens(&mut tokens);
+        assert!(tokens.contains(&"debugging".to_string()));
+        assert!(tokens.contains(&"error".to_string()));
+        assert!(tokens.contains(&"crash".to_string()));
+    }
+
+    /// Debug cluster expansion is bidirectional: a non-primary member triggers the full cluster.
+    #[test]
+    fn cluster_expansion_is_bidirectional() {
+        let mut tokens = vec!["backtrace".to_string()];
+        expand_task_tokens(&mut tokens);
+        assert!(tokens.contains(&"debug".to_string()));
+        assert!(tokens.contains(&"debugging".to_string()));
+    }
+
+    /// Security cluster: matching "vulnerability" injects all other cluster members.
+    #[test]
+    fn security_cluster_expands() {
+        let mut tokens = vec!["vulnerability".to_string()];
+        expand_task_tokens(&mut tokens);
+        assert!(tokens.contains(&"security".to_string()));
+        assert!(tokens.contains(&"cve".to_string()));
     }
 }
