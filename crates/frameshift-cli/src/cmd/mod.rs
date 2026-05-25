@@ -5,6 +5,7 @@
 
 pub mod automate;
 pub mod diff;
+pub mod feedback;
 pub mod grow;
 pub mod migrate;
 pub mod prefs;

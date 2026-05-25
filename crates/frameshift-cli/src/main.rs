@@ -16,6 +16,7 @@ use frameshift_client::{Client, InstallRequest, InstallSource, PersonaSpec};
 
 use cmd::automate::AutomateArgs;
 use cmd::diff::DiffArgs;
+use cmd::feedback::FeedbackArgs;
 use cmd::grow::GrowArgs;
 use cmd::migrate::MigrateArgs;
 use cmd::prefs::PrefsArgs;
@@ -112,6 +113,9 @@ enum Command {
 
     /// View and adjust per-persona preference biases.
     Prefs(PrefsArgs),
+
+    /// Record a persona selection override for preference learning.
+    Feedback(FeedbackArgs),
 }
 
 /// Typed run-level error that carries an exit code alongside a message.
@@ -343,6 +347,11 @@ fn run() -> Result<(), RunError> {
         Command::Prefs(args) => {
             let client = make_client()?;
             cmd::prefs::run_prefs(&client, args).map_err(RunError::from)
+        }
+
+        Command::Feedback(args) => {
+            let client = make_client()?;
+            cmd::feedback::run_feedback(&client, args).map_err(RunError::from)
         }
     }
 }
