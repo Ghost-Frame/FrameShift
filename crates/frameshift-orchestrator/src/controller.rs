@@ -272,6 +272,7 @@ mod tests {
             components: ScoreComponents {
                 language: score,
                 lexical: 0.0,
+                intent: 0.0,
                 capability: 0.0,
             },
         }

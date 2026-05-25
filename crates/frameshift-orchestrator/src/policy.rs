@@ -14,17 +14,20 @@ pub struct PolicyWeights {
     pub language: f32,
     /// Weight for lexical (task-token vs. keyword) overlap scoring.
     pub lexical: f32,
+    /// Weight for intent alignment scoring.
+    pub intent: f32,
     /// Weight for capability heuristic scoring.
     pub capability: f32,
 }
 
 impl Default for PolicyWeights {
-    /// Returns the default weights: language 0.5, lexical 0.4, capability 0.1.
+    /// Returns the default weights: language 0.3, lexical 0.25, intent 0.3, capability 0.15.
     fn default() -> Self {
         PolicyWeights {
-            language: 0.5,
-            lexical: 0.4,
-            capability: 0.1,
+            language: 0.3,
+            lexical: 0.25,
+            intent: 0.3,
+            capability: 0.15,
         }
     }
 }
@@ -34,8 +37,10 @@ impl Default for PolicyWeights {
 pub struct ScoreComponents {
     /// Language overlap component (0..1).
     pub language: f32,
-    /// Lexical overlap component (0..1).
+    /// Lexical overlap component (0..1), after any anti-keyword penalty.
     pub lexical: f32,
+    /// Intent alignment component (0..1).
+    pub intent: f32,
     /// Capability heuristic component (0..1).
     pub capability: f32,
 }
@@ -150,6 +155,36 @@ pub fn rank(
                 (hit_idf_sum / max_idf_sum).min(1.0)
             };
 
+            // Intent score: how well the persona's declared intents match the task intent.
+            let intent_score = if let Some(task_intent) = ctx.inferred_intent {
+                if profile.primary_intents.is_empty() {
+                    0.0
+                } else {
+                    profile.primary_intents
+                        .iter()
+                        .map(|pi| crate::intent::relatedness(*pi, task_intent))
+                        .fold(0.0_f32, f32::max)
+                }
+            } else {
+                0.0
+            };
+
+            // Anti-keyword penalty: penalize lexical score if task tokens match anti-keywords.
+            let anti_hit_count = if profile.anti_keywords.is_empty() {
+                0
+            } else {
+                ctx.task_tokens
+                    .iter()
+                    .filter(|t| profile.anti_keywords.contains(t))
+                    .count()
+            };
+            let lex_score = if anti_hit_count > 0 && !ctx.task_tokens.is_empty() {
+                let penalty = (anti_hit_count as f32 / ctx.task_tokens.len() as f32) * 0.5;
+                (lex_score - penalty).max(0.0)
+            } else {
+                lex_score
+            };
+
             // Capability score: prefer personas with no required tools and no network egress.
             let cap_score = if profile.required_tools.is_empty() && !profile.network_egress {
                 1.0
@@ -162,6 +197,7 @@ pub fn rank(
             // Blended score.
             let blended = weights.language * lang_score
                 + weights.lexical * lex_score
+                + weights.intent * intent_score
                 + weights.capability * cap_score;
 
             // Apply preference bias and clamp.
@@ -196,6 +232,9 @@ pub fn rank(
                     lex_score
                 ));
             }
+            if intent_score > 0.0 {
+                rationale_parts.push(format!("intent_score={:.2}", intent_score));
+            }
             if cap_score > 0.0 {
                 rationale_parts.push(format!("cap_score={:.2}", cap_score));
             }
@@ -216,6 +255,7 @@ pub fn rank(
             let components = ScoreComponents {
                 language: lang_score,
                 lexical: lex_score,
+                intent: intent_score,
                 capability: cap_score,
             };
 
@@ -285,6 +325,7 @@ mod tests {
                 .collect::<BTreeMap<_, _>>(),
             frameworks: vec![],
             task_tokens: task_tokens.iter().map(|t| t.to_string()).collect(),
+            inferred_intent: None,
         }
     }
 
@@ -361,5 +402,49 @@ mod tests {
         let ctx = make_ctx(&[("rust", 1.0)], &["foo"]);
         let ranked = rank(&ctx, &index, &PolicyWeights::default(), &Preferences::new());
         assert!(ranked.is_empty());
+    }
+
+    /// A persona whose primary_intents match the inferred task intent scores higher.
+    #[test]
+    fn intent_match_boosts_score() {
+        use crate::intent::Intent;
+
+        let mut rust = make_profile("rust-expert", &["rust"], &["rust", "cargo"]);
+        rust.primary_intents = vec![Intent::Implementation, Intent::Debugging];
+
+        let mut perf = make_profile("perf-expert", &["rust"], &["rust", "profiling"]);
+        perf.primary_intents = vec![Intent::Performance];
+
+        let index = PersonaIndex { profiles: vec![rust, perf] };
+        let ctx = ContextSignal {
+            project_name: "test".to_string(),
+            languages: {
+                let mut m = std::collections::BTreeMap::new();
+                m.insert("rust".to_string(), 1.0);
+                m
+            },
+            frameworks: vec![],
+            task_tokens: vec!["debugging".to_string(), "error".to_string()],
+            inferred_intent: Some(Intent::Debugging),
+        };
+
+        let ranked = rank(&ctx, &index, &PolicyWeights::default(), &Preferences::new());
+        assert_eq!(ranked[0].persona, "rust-expert", "debugging intent should boost rust-expert");
+    }
+
+    /// Anti-keywords penalize the lexical score when task tokens match the blacklist.
+    #[test]
+    fn anti_keywords_penalize_score() {
+        let mut persona_a = make_profile("backend", &["rust"], &["rust", "api"]);
+        persona_a.anti_keywords = vec!["css".to_string(), "frontend".to_string()];
+
+        let persona_b = make_profile("frontend", &["typescript"], &["react", "css"]);
+
+        let index = PersonaIndex { profiles: vec![persona_a, persona_b] };
+        let ctx = make_ctx(&[("rust", 1.0)], &["css", "styling", "frontend"]);
+
+        let ranked = rank(&ctx, &index, &PolicyWeights::default(), &Preferences::new());
+        let backend_entry = ranked.iter().find(|s| s.persona == "backend").unwrap();
+        assert!(backend_entry.components.lexical < 0.3, "anti-keywords should penalize lexical score");
     }
 }

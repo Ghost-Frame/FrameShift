@@ -30,6 +30,9 @@ pub struct ContextSignal {
     /// Normalized, lowercase tokens extracted from `task_hint`.
     /// Used by the policy scorer for lexical matching against persona keywords.
     pub task_tokens: Vec<String>,
+
+    /// The inferred task intent from task token analysis, if any.
+    pub inferred_intent: Option<crate::intent::Intent>,
 }
 
 /// Walk `project_root` (bounded by depth and file count), scan extensions for
@@ -74,11 +77,15 @@ pub fn sense(project_root: &Path, task_hint: Option<&str>) -> ContextSignal {
     // personas can compete with code-language personas on equal footing.
     let languages = augment_languages_from_task(languages, &task_tokens);
 
+    // Classify the inferred task intent from task token analysis.
+    let inferred_intent = crate::intent::classify(&task_tokens);
+
     ContextSignal {
         project_name,
         languages,
         frameworks,
         task_tokens,
+        inferred_intent,
     }
 }
 
