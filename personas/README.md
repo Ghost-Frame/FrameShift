@@ -117,25 +117,40 @@ Resolution order: base -> mixins (in order) -> root persona. Conflicting rule ID
 | Frame | What wakes up |
 |---|---|
 | `agents/` | Agent designer. Personas, growth, supervision, multi-agent loops |
+| `api-integrator/` | API glue engineer. REST, GraphQL, webhooks, OAuth, rate limits, idempotency keys |
 | `architecture/` | Skeptical architect. Stress-tests proposals before they cost anything to fix |
 | `bots/` | Discord bot personality engineer. Character fidelity across thousands of turns |
+| `commit-curator/` | Git commit hygienist. Splits diffs into logical commits, writes clear messages |
 | `creative/` | Creative coder. Aesthetic judgment over convention |
 | `cryptographic/` | Cryptographer. Spec-anchored, constant-time aware, never invents primitives |
+| `daily-planner/` | Morning ritual. Synthesizes loose ends into a focused plan for today |
 | `data/` | Data engineer. Idempotent, observable, recoverable pipelines |
+| `database/` | Database engineer. Schema design, query optimization, migrations, indexing strategy |
+| `dep-updater/` | Dependency updater. Reads changelogs, runs tests, evaluates breakage risk |
 | `desktop/` | Desktop and TUI engineer. Tauri, ratatui, wgpu, native feel over web-wrapper convenience |
 | `devops/` | Deployment engineer. Staged rollouts, named rollback paths, fleet-wide awareness |
 | `devtools/` | Tooling builder. Developer experience as the product |
+| `embedded/` | Embedded engineer. ESP32, RP2040, STM32, no_std Rust, resource-constrained and real-time |
 | `frontend/` | Frontend engineer. SvelteKit, Astro, Tailwind, no component library sludge |
 | `gatekeeper/` | Paranoid gatekeeper. Classifies before it lets anything cross the public boundary |
+| `go-engineer/` | Go engineer. Stdlib-first, table tests, context propagation, errors-as-values |
+| `issue-triager/` | Issue triage. Labels, priorities, dedup, needs-info detection |
+| `journal-keeper/` | Daily and weekly logger. Captures what was learned, done, pending, stuck |
+| `kleos-archaeologist/` | Memory archaeologist. Mines accumulated memory for patterns and forgotten decisions |
 | `lab/` | Experimenter. Speed over polish, findings over artifacts |
 | `memory/` | Memory architect. Vector search, embedding pipelines, recall fidelity over latency |
+| `mobile-dev/` | Mobile developer. iOS, Android, React Native, Flutter, native feel where it matters |
+| `orchestrator/` | Task decomposer. Dispatches subagents in parallel, supervises, integrates results |
 | `performance/` | Performance analyst. Profiles before optimizing, benchmarks before claiming |
+| `pr-author/` | PR author. Descriptions, reviewer selection, draft management, follow-up tracking |
+| `python-engineer/` | Python engineer. uv, ruff, pyright, async where it earns its keep |
 | `research/` | Source-grounded researcher. Refuses to paraphrase from training-data memory |
 | `reviewer/` | Code reviewer. Five lenses: correctness, security, performance, style, documentation |
 | `rust/` | Rust engineer. Idiomatic, clippy-strict, no unwraps in library code |
 | `security/` | Security analyst. Opsec-first, classifies by noise level |
 | `systems/` | Operator with steady hands. State-check first, change second, verify third |
 | `testing/` | QA engineer. Finds the test that matters |
+| `typescript-engineer/` | TypeScript engineer. Strict tsconfig, zod at the boundary, ESM modules |
 | `unreal/` | Unreal developer. Blueprint plus C++ hybrid. Verifies API names before using them |
 | `writer/` | Technical editor. Every sentence earns its place |
 

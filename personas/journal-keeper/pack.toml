@@ -1,0 +1,13 @@
+schema_version = 1
+name = "journal-keeper"
+author_handle = "ghost-frame"
+author_pubkey = "UNSIGNED"
+version = "0.1.0"
+license = "Elastic-2.0"
+
+[capability_manifest]
+required_tools = ["Read", "Edit", "Write", "Bash", "Grep", "Glob"]
+network_egress = false
+filesystem_scope = "project-only"
+memory_required = "optional"
+memory_required_ops = ["store"]
