@@ -85,6 +85,10 @@ diesel::table! {
         capability_manifest_json -> Jsonb,
         /// Integer identifying the pack schema format used at publication time.
         schema_version -> Integer,
+        /// Author-declared conformance score (0.0..=1.0); NULL if the pack ships no baseline.
+        conformance_score -> Nullable<Float>,
+        /// Bundle hash the score was computed against; NULL if no baseline.
+        conformance_bundle_hash -> Nullable<Text>,
         /// SPDX license identifier.
         license -> Text,
         /// UTC timestamp when this version was published.
@@ -93,6 +97,29 @@ diesel::table! {
         status -> Jsonb,
         /// Size of the pack artifact in bytes.
         size_bytes -> BigInt,
+    }
+}
+
+diesel::table! {
+    /// The `pack_telemetry` table stores accumulated telemetry per pack/version.
+    ///
+    /// Primary key: `(pack_name, version, signal_kind, signal_key)`.
+    /// `pack_name` references `packs(name)`.
+    pack_telemetry (pack_name, version, signal_kind, signal_key) {
+        /// Parent pack name.
+        pack_name -> Text,
+        /// Pack version string, or the empty string for whole-pack counters.
+        version -> Text,
+        /// Telemetry kind string (e.g. selection_count).
+        signal_kind -> Text,
+        /// Optional signal-specific key (e.g. rule id, skill name, bundle hash).
+        signal_key -> Text,
+        /// Accumulated counter for this signal.
+        count -> BigInt,
+        /// Optional scalar value associated with the signal.
+        value -> Nullable<Double>,
+        /// UTC timestamp when this row was last updated.
+        updated_at -> Timestamptz,
     }
 }
 
@@ -120,4 +147,10 @@ diesel::joinable!(pack_versions -> authors (author_pubkey));
 // Allow Diesel join inference between handles and authors.
 diesel::joinable!(handles -> authors (pubkey));
 
-diesel::allow_tables_to_appear_in_same_query!(authors, packs, pack_versions, handles,);
+diesel::allow_tables_to_appear_in_same_query!(
+    authors,
+    packs,
+    pack_versions,
+    pack_telemetry,
+    handles,
+);

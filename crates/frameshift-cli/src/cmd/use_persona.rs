@@ -72,6 +72,19 @@ pub fn run_use(client: &Client, args: UseArgs) -> Result<(), CliError> {
             other => CliError::Orchestrator(other.to_string()),
         })?;
 
+    let session = format!("cli:{}", std::process::id());
+    client
+        .record_selection_event(&project_root, &args.name, &session, false, None)
+        .map_err(|e| CliError::Growth(e.to_string()))?;
+
+    if let Ok(registry_session) = std::env::var("FRAMESHIFT_SESSION") {
+        if !registry_session.trim().is_empty() {
+            client
+                .send_telemetry_for_persona(&project_root, &args.name, &registry_session)
+                .map_err(CliError::Client)?;
+        }
+    }
+
     // Read and print the rendered persona for the claude target.
     let rendered = client.rendered_persona(&project_root, &args.name, "claude")?;
     println!("{}", rendered);

@@ -99,6 +99,8 @@ fn make_version(
         parent_hash: None,
         capability_manifest_json: r#"{"permissions":[]}"#.to_string(),
         schema_version: 1,
+        conformance_score: None,
+        conformance_bundle_hash: None,
         license: "Apache-2.0".to_string(),
         published_at: chrono::Utc::now(),
         status: PackStatus::Active,

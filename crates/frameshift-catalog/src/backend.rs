@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use crate::error::{CatalogError, HealthStatus};
 use crate::filters::{PackSearchFilters, PackSearchResult};
 use crate::identity::Ed25519PublicKey;
-use crate::records::{AuthorRecord, PackRecord, PackVersionRecord};
+use crate::records::{AuthorRecord, PackRecord, PackVersionRecord, TelemetrySignal};
 use crate::status::TombstoneRecord;
 
 /// Catalog backend for the persona marketplace.
@@ -313,4 +313,44 @@ pub trait CatalogBackend: Send + Sync {
         pack_name: &str,
         extends: Option<&str>,
     ) -> Result<(), CatalogError>;
+
+    /// Accumulate telemetry signals for a backend that supports M5 telemetry.
+    ///
+    /// Backends that do not implement telemetry may keep the default behavior,
+    /// which returns `CatalogError::BackendError`.
+    async fn ingest_telemetry(&self, _signals: Vec<TelemetrySignal>) -> Result<(), CatalogError> {
+        Err(CatalogError::BackendError(Box::new(std::io::Error::other(
+            "telemetry ingest is not implemented by this catalog backend",
+        ))))
+    }
+
+    /// Read accumulated telemetry for a pack, optionally filtered to one version.
+    ///
+    /// Backends that do not implement telemetry may keep the default behavior,
+    /// which returns `CatalogError::BackendError`.
+    async fn get_telemetry(
+        &self,
+        _name: &str,
+        _version: Option<&str>,
+    ) -> Result<Vec<TelemetrySignal>, CatalogError> {
+        Err(CatalogError::BackendError(Box::new(std::io::Error::other(
+            "telemetry read is not implemented by this catalog backend",
+        ))))
+    }
+
+    /// Store the conformance score and bundle hash for a published version.
+    ///
+    /// Backends that do not implement this write may keep the default behavior,
+    /// which returns `CatalogError::BackendError`.
+    async fn set_conformance_score(
+        &self,
+        _name: &str,
+        _version: &str,
+        _score: f32,
+        _bundle_hash: &str,
+    ) -> Result<(), CatalogError> {
+        Err(CatalogError::BackendError(Box::new(std::io::Error::other(
+            "conformance score writes are not implemented by this catalog backend",
+        ))))
+    }
 }

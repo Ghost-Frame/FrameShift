@@ -39,8 +39,11 @@ pub enum ClientError {
         actual_version: String,
     },
 
-    #[error("registry installs are not yet implemented; use --from-path for M0")]
-    RegistryInstallNotImplemented,
+    #[error("registry fetch failed: {0}")]
+    RegistryFetch(String),
+
+    #[error("telemetry error: {0}")]
+    Telemetry(String),
 
     #[error("cache entry {hash} is missing at {path}")]
     MissingCacheEntry { hash: String, path: PathBuf },

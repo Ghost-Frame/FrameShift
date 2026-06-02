@@ -52,6 +52,7 @@ use crate::routes::downloads::{dl_router, pack_download_url_router};
 use crate::routes::handles::handles_router;
 use crate::routes::ops::ops_router;
 use crate::routes::packs::packs_router;
+use crate::routes::telemetry::telemetry_router;
 use crate::state::AppState;
 
 /// Build the complete Axum router for the frameshift HTTP server.
@@ -92,6 +93,7 @@ pub fn app(state: AppState) -> Router {
 
     let v1 = Router::new()
         .nest("/packs", packs)
+        .nest("/telemetry", telemetry_router())
         .nest("/authors", authors_router())
         .nest("/handles", handles_router());
 

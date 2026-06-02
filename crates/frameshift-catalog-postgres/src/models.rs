@@ -18,10 +18,10 @@ use serde_json::Value as JsonValue;
 
 use frameshift_catalog::{
     AuthorRecord, CatalogError, Ed25519PublicKey, OauthLink, ObjectHash, PackRecord, PackStatus,
-    PackVersionRecord,
+    PackVersionRecord, TelemetryKind, TelemetrySignal,
 };
 
-use crate::schema::{authors, handles, pack_versions, packs};
+use crate::schema::{authors, handles, pack_telemetry, pack_versions, packs};
 
 /// Row struct for the `authors` table.
 ///
@@ -133,6 +133,10 @@ pub(crate) struct PackVersionRow {
     pub capability_manifest_json: JsonValue,
     /// Pack schema version integer; stored as i32, converted to u32 on read.
     pub schema_version: i32,
+    /// Author-side conformance score; NULL when the pack ships no baseline.
+    pub conformance_score: Option<f32>,
+    /// Bundle hash the score was computed against; NULL when unset.
+    pub conformance_bundle_hash: Option<String>,
     /// SPDX license string.
     pub license: String,
     /// UTC publication timestamp.
@@ -165,6 +169,10 @@ pub(crate) struct NewPackVersionRow {
     pub capability_manifest_json: JsonValue,
     /// Pack schema version integer; passed as i32 (u32 converted before insert).
     pub schema_version: i32,
+    /// Author-side conformance score; NULL when the pack ships no baseline.
+    pub conformance_score: Option<f32>,
+    /// Bundle hash the score was computed against; NULL when unset.
+    pub conformance_bundle_hash: Option<String>,
     /// SPDX license string.
     pub license: String,
     /// JSON status object.
@@ -200,6 +208,30 @@ pub(crate) struct NewHandleRow {
     pub handle: String,
     /// Raw 32-byte Ed25519 pubkey.
     pub pubkey: Vec<u8>,
+}
+
+/// Row struct for the `pack_telemetry` table.
+///
+/// Used by the Postgres telemetry read/write methods to store and retrieve
+/// accumulated telemetry signals.
+#[derive(Debug, Clone, Queryable, Selectable, Insertable, AsChangeset)]
+#[diesel(table_name = pack_telemetry)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub(crate) struct TelemetryRow {
+    /// Parent pack name.
+    pub pack_name: String,
+    /// Pack version string, or the empty string for whole-pack counters.
+    pub version: String,
+    /// Telemetry kind string.
+    pub signal_kind: String,
+    /// Optional signal-specific key.
+    pub signal_key: String,
+    /// Accumulated counter for the signal row.
+    pub count: i64,
+    /// Optional scalar payload for the signal row.
+    pub value: Option<f64>,
+    /// UTC timestamp when the row was last updated.
+    pub updated_at: DateTime<Utc>,
 }
 
 // ── Conversion helpers ──────────────────────────────────────────────────────
@@ -308,10 +340,37 @@ impl PackVersionRow {
             parent_hash,
             capability_manifest_json,
             schema_version,
+            conformance_score: self.conformance_score,
+            conformance_bundle_hash: self.conformance_bundle_hash,
             license: self.license,
             published_at: self.published_at,
             status,
             size_bytes,
         })
     }
+}
+
+/// Convert a telemetry row into a typed signal, validating the stored kind.
+pub(crate) fn telemetry_row_to_signal(row: TelemetryRow) -> Result<TelemetrySignal, CatalogError> {
+    let kind = match row.signal_kind.as_str() {
+        "selection_count" => TelemetryKind::SelectionCount,
+        "auto_select_count" => TelemetryKind::AutoSelectCount,
+        "conformance_score" => TelemetryKind::ConformanceScore,
+        "rule_cited" => TelemetryKind::RuleCited,
+        "skill_friction" => TelemetryKind::SkillFriction,
+        other => {
+            return Err(CatalogError::BackendError(Box::new(std::io::Error::other(
+                format!("telemetry row has unknown kind: {other}"),
+            ))));
+        }
+    };
+
+    Ok(TelemetrySignal {
+        pack_name: row.pack_name,
+        version: row.version,
+        kind,
+        key: row.signal_key,
+        count: row.count.max(0) as u64,
+        value: row.value,
+    })
 }

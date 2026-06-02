@@ -1,11 +1,13 @@
 mod error;
 mod model;
+mod telemetry;
 
 pub use error::ClientError;
 pub use model::{
     ClientOptions, GcReport, InstallReport, InstallRequest, InstallSource, LockedPersona, Lockfile,
     PersonaSpec, ProjectConfig, ProjectPaths, SyncReport, SCHEMA_VERSION,
 };
+pub use telemetry::flush_for_persona;
 
 use base64::{engine::general_purpose, Engine as _};
 use ed25519_dalek::VerifyingKey;
@@ -28,6 +30,8 @@ const CENTRAL_LOCK_FILENAME: &str = "lock.toml";
 const ACTIVE_FILENAME: &str = "active";
 /// Env var to override the auto-derived path-hash project_id.
 const PROJECT_ID_ENV: &str = "FRAMESHIFT_PROJECT_ID";
+const REGISTRY_API_ENV: &str = "FRAMESHIFT_API_URL";
+const DEFAULT_REGISTRY_API_BASE: &str = "https://frameshift-api.syntheos.dev/v1";
 
 const RENDER_TARGETS: [(&str, &str); 4] = [
     ("claude", "CLAUDE.md"),
@@ -105,15 +109,12 @@ impl Client {
         let paths = self.project_paths(&request.project_root)?;
         let locked = match &request.source {
             InstallSource::LocalPath(pack_dir) => {
-                let pack = Pack::from_dir(pack_dir)?;
-                validate_pack_request(&pack, &request.spec)?;
-                verify_pack_signature_if_present(&pack)?;
-                let hash = pack.canonical_hash_hex();
-                let cache_path = paths.cache_dir.join(&hash);
-                ensure_cached_pack(pack_dir, &cache_path)?;
-                locked_persona_from_pack(&pack)
+                self.install_from_dir(&paths, pack_dir, &request.spec)?
             }
-            InstallSource::Registry => return Err(ClientError::RegistryInstallNotImplemented),
+            InstallSource::Registry => {
+                let downloaded = download_registry_pack(&request.spec)?;
+                self.install_from_dir(&paths, &downloaded.pack_root, &request.spec)?
+            }
         };
 
         let mut lockfile = load_lockfile(&paths.lock_path)?.unwrap_or_default();
@@ -139,6 +140,36 @@ impl Client {
         write_file(&paths.active_path, persona.as_bytes())
     }
 
+    /// Append a structured project-scope selection event for telemetry and local learning.
+    pub fn record_selection_event(
+        &self,
+        project_root: &Path,
+        persona: &str,
+        session: &str,
+        auto_selected: bool,
+        task: Option<&str>,
+    ) -> Result<(), ClientError> {
+        let project_id = self.project_id(project_root)?;
+        let entry = frameshift_growth::GrowthEntry {
+            ts: frameshift_growth::current_timestamp(),
+            session: session.to_string(),
+            project_id: project_id.clone(),
+            persona: persona.to_string(),
+            auto_selected,
+            task: task.map(str::to_string),
+            intent: Some("selection".to_string()),
+            text: if auto_selected {
+                format!("Auto-selected persona '{persona}'")
+            } else {
+                format!("Selected persona '{persona}'")
+            },
+            scope: frameshift_growth::Scope::Project,
+        };
+
+        frameshift_growth::append_jsonl(self.data_root(), &project_id, persona, &entry)
+            .map_err(|error| ClientError::Telemetry(error.to_string()))
+    }
+
     pub fn sync(&self, project_root: &Path) -> Result<SyncReport, ClientError> {
         let paths = self.project_paths(project_root)?;
         let Some((raw_lock, lockfile)) = load_lockfile_with_raw(&paths.lock_path)? else {
@@ -157,6 +188,34 @@ impl Client {
                 .map(|persona| persona.name.clone())
                 .collect(),
         })
+    }
+
+    /// Load the project configuration from the central store, or defaults when absent.
+    pub fn project_config(&self, project_root: &Path) -> Result<ProjectConfig, ClientError> {
+        let paths = self.project_paths(project_root)?;
+        load_project_config(&paths.config_path)
+    }
+
+    /// Flush opt-in telemetry for one persona using the project's config gate.
+    pub fn send_telemetry_for_persona(
+        &self,
+        project_root: &Path,
+        persona: &str,
+        session_token: &str,
+    ) -> Result<usize, ClientError> {
+        let paths = self.project_paths(project_root)?;
+        let config = load_project_config(&paths.config_path)?;
+        if !config.telemetry_opt_in {
+            return Ok(0);
+        }
+
+        telemetry::flush_for_persona(
+            self.data_root(),
+            &paths.project_id,
+            persona,
+            &registry_api_base(),
+            session_token,
+        )
     }
 
     pub fn gc(&self) -> Result<GcReport, ClientError> {
@@ -385,6 +444,108 @@ impl Client {
 
         Ok(())
     }
+
+    /// Install a pack from an extracted local directory.
+    fn install_from_dir(
+        &self,
+        paths: &ProjectPaths,
+        pack_dir: &Path,
+        spec: &PersonaSpec,
+    ) -> Result<LockedPersona, ClientError> {
+        let pack = Pack::from_dir(pack_dir)?;
+        validate_pack_request(&pack, spec)?;
+        verify_pack_signature_if_present(&pack)?;
+        let hash = pack.canonical_hash_hex();
+        let cache_path = paths.cache_dir.join(&hash);
+        ensure_cached_pack(pack_dir, &cache_path)?;
+        Ok(locked_persona_from_pack(&pack))
+    }
+}
+
+/// Extracted registry pack rooted at the directory that contains `pack.toml`.
+struct DownloadedRegistryPack {
+    /// The tempdir backing the extracted payload.
+    _temp_dir: tempfile::TempDir,
+    /// The extracted pack root directory.
+    pack_root: PathBuf,
+}
+
+/// Download and extract a registry pack for the requested spec.
+fn download_registry_pack(spec: &PersonaSpec) -> Result<DownloadedRegistryPack, ClientError> {
+    let url = format!(
+        "{}/packs/{}/versions/{}/pack",
+        registry_api_base(),
+        spec.name,
+        spec.version
+    );
+    let response = reqwest::blocking::get(&url)
+        .map_err(|error| ClientError::RegistryFetch(format!("download {url}: {error}")))?;
+    if !response.status().is_success() {
+        return Err(ClientError::RegistryFetch(format!(
+            "download failed for {}@{}: HTTP {}",
+            spec.name,
+            spec.version,
+            response.status()
+        )));
+    }
+
+    let bytes = response
+        .bytes()
+        .map_err(|error| ClientError::RegistryFetch(format!("read response body: {error}")))?;
+    let temp_dir =
+        tempfile::tempdir().map_err(|error| ClientError::RegistryFetch(error.to_string()))?;
+    let archive_path = temp_dir.path().join("pack.tar.gz");
+    let extract_dir = temp_dir.path().join("extract");
+
+    fs::write(&archive_path, &bytes).map_err(|source| ClientError::Io {
+        path: archive_path.clone(),
+        source,
+    })?;
+    ensure_dir(&extract_dir)?;
+
+    let archive_file = fs::File::open(&archive_path).map_err(|source| ClientError::Io {
+        path: archive_path.clone(),
+        source,
+    })?;
+    let decoder = flate2::read::GzDecoder::new(archive_file);
+    let mut archive = tar::Archive::new(decoder);
+    archive
+        .unpack(&extract_dir)
+        .map_err(|error| ClientError::RegistryFetch(format!("extract archive: {error}")))?;
+
+    let pack_root = find_pack_root(&extract_dir)?;
+    Ok(DownloadedRegistryPack {
+        _temp_dir: temp_dir,
+        pack_root,
+    })
+}
+
+/// Return the registry base URL used for pack downloads.
+fn registry_api_base() -> String {
+    std::env::var(REGISTRY_API_ENV)
+        .unwrap_or_else(|_| DEFAULT_REGISTRY_API_BASE.to_string())
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// Find the extracted directory that contains `pack.toml`.
+fn find_pack_root(extract_dir: &Path) -> Result<PathBuf, ClientError> {
+    let root_manifest = extract_dir.join("pack.toml");
+    if root_manifest.is_file() {
+        return Ok(extract_dir.to_path_buf());
+    }
+
+    for entry in read_dir_sorted(extract_dir)? {
+        let path = entry.path();
+        if path.is_dir() && path.join("pack.toml").is_file() {
+            return Ok(path);
+        }
+    }
+
+    Err(ClientError::RegistryFetch(format!(
+        "pack.toml not found in extracted archive under {}",
+        extract_dir.display()
+    )))
 }
 
 fn default_data_root() -> Result<PathBuf, ClientError> {
@@ -590,6 +751,18 @@ fn upsert_locked_persona(lockfile: &mut Lockfile, persona: LockedPersona) {
 
 fn load_lockfile(path: &Path) -> Result<Option<Lockfile>, ClientError> {
     load_lockfile_with_raw(path).map(|maybe| maybe.map(|(_, lockfile)| lockfile))
+}
+
+fn load_project_config(path: &Path) -> Result<ProjectConfig, ClientError> {
+    if !path.exists() {
+        return Ok(ProjectConfig::default());
+    }
+
+    let raw = read_to_string(path)?;
+    toml::from_str(&raw).map_err(|source| ClientError::TomlDeserialize {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 fn load_lockfile_with_raw(path: &Path) -> Result<Option<(String, Lockfile)>, ClientError> {
@@ -805,10 +978,7 @@ mod tests {
     use super::*;
 
     /// Helper: set up a minimal pack and install it, returning the client and project root.
-    fn install_test_persona(
-        tmp: &tempfile::TempDir,
-        name: &str,
-    ) -> (Client, std::path::PathBuf) {
+    fn install_test_persona(tmp: &tempfile::TempDir, name: &str) -> (Client, std::path::PathBuf) {
         let pack_dir = tmp.path().join("pack");
         fs::create_dir_all(&pack_dir).unwrap();
         fs::write(
@@ -848,11 +1018,12 @@ mod tests {
     fn installed_persona_source_dirs_returns_entries() {
         let tmp = tempfile::tempdir().unwrap();
         let (client, project_root) = install_test_persona(&tmp, "mypersona");
-        let dirs = client
-            .installed_persona_source_dirs(&project_root)
-            .unwrap();
+        let dirs = client.installed_persona_source_dirs(&project_root).unwrap();
         assert_eq!(dirs.len(), 1, "expected exactly one source dir");
-        assert!(dirs[0].ends_with("source"), "source dir should end with 'source'");
+        assert!(
+            dirs[0].ends_with("source"),
+            "source dir should end with 'source'"
+        );
     }
 
     /// installed_persona_source_dirs returns empty vec when no personas installed.
@@ -865,9 +1036,7 @@ mod tests {
             data_root: tmp.path().join("data"),
             config_root: None,
         });
-        let dirs = client
-            .installed_persona_source_dirs(&project_root)
-            .unwrap();
+        let dirs = client.installed_persona_source_dirs(&project_root).unwrap();
         assert!(dirs.is_empty());
     }
 
@@ -925,7 +1094,10 @@ mod tests {
         assert!(state_dir.exists(), "state dir should exist after install");
         // The path should contain "projects" and the project id.
         let s = state_dir.to_string_lossy();
-        assert!(s.contains("projects"), "state dir path must contain 'projects'");
+        assert!(
+            s.contains("projects"),
+            "state dir path must contain 'projects'"
+        );
     }
 
     #[test]
@@ -965,7 +1137,11 @@ mod tests {
             "schema_version = 1\nname = \"testpersona\"\nauthor_handle = \"test\"\nauthor_pubkey = \"local-unsigned\"\nversion = \"0.1.0\"\n",
         )
         .unwrap();
-        fs::write(pack_dir.join("AGENTS.md"), "# Test Persona\n\nBehavior rules here.\n").unwrap();
+        fs::write(
+            pack_dir.join("AGENTS.md"),
+            "# Test Persona\n\nBehavior rules here.\n",
+        )
+        .unwrap();
 
         let project_root = tmp.path().join("project");
         fs::create_dir_all(&project_root).unwrap();
@@ -992,15 +1168,27 @@ mod tests {
             .join("personas/testpersona/rendered/claude/CLAUDE.md");
         let content = fs::read_to_string(&rendered).unwrap();
 
-        assert!(content.contains("# Infrastructure"), "missing infra overlay");
+        assert!(
+            content.contains("# Infrastructure"),
+            "missing infra overlay"
+        );
         assert!(content.contains("Test infra content"), "missing infra body");
-        assert!(content.contains("Active persona: testpersona"), "missing persona context header");
-        assert!(content.contains("# Test Persona"), "missing persona content");
+        assert!(
+            content.contains("Active persona: testpersona"),
+            "missing persona context header"
+        );
+        assert!(
+            content.contains("# Test Persona"),
+            "missing persona content"
+        );
 
         // Infra must come before persona content
         let infra_pos = content.find("# Infrastructure").unwrap();
         let persona_pos = content.find("# Test Persona").unwrap();
-        assert!(infra_pos < persona_pos, "infra overlay must precede persona content");
+        assert!(
+            infra_pos < persona_pos,
+            "infra overlay must precede persona content"
+        );
     }
 
     #[test]
@@ -1042,7 +1230,13 @@ mod tests {
             .join("personas/noinfratestp/rendered/claude/CLAUDE.md");
         let content = fs::read_to_string(&rendered).unwrap();
 
-        assert!(content.contains("# Bare Persona"), "persona content must be present");
-        assert!(!content.contains("Infrastructure"), "no infra overlay expected");
+        assert!(
+            content.contains("# Bare Persona"),
+            "persona content must be present"
+        );
+        assert!(
+            !content.contains("Infrastructure"),
+            "no infra overlay expected"
+        );
     }
 }

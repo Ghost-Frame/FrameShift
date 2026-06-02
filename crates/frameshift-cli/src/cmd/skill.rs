@@ -116,7 +116,10 @@ mod tests {
         let src = PersonaSource::new(Persona::new("sp1"));
         src.write_to_dir(&persona_dir).expect("write");
 
-        let client = Client::new(ClientOptions { data_root, config_root: None });
+        let client = Client::new(ClientOptions {
+            data_root,
+            config_root: None,
+        });
         let args = SkillAddArgs {
             persona: "sp1".to_string(),
             id: "brainstorming".to_string(),
@@ -160,7 +163,10 @@ mod tests {
         };
         src.write_to_dir(&persona_dir).expect("write");
 
-        let client = Client::new(ClientOptions { data_root, config_root: None });
+        let client = Client::new(ClientOptions {
+            data_root,
+            config_root: None,
+        });
         let args = SkillRemoveArgs {
             persona: "sp2".to_string(),
             id: "brainstorming".to_string(),
@@ -198,7 +204,10 @@ mod tests {
         };
         src.write_to_dir(&persona_dir).expect("write");
 
-        let client = Client::new(ClientOptions { data_root, config_root: None });
+        let client = Client::new(ClientOptions {
+            data_root,
+            config_root: None,
+        });
         let args = SkillAddArgs {
             persona: "dup-skill".to_string(),
             id: "brainstorming".to_string(),

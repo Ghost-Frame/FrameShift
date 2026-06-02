@@ -7,12 +7,17 @@ license.workspace = true
 description = "Client engine for installing and materializing frameshift packs"
 
 [dependencies]
+frameshift-growth = { path = "../frameshift-growth" }
 frameshift-pack = { path = "../frameshift-pack" }
 base64.workspace = true
 ed25519-dalek.workspace = true
+flate2 = "1"
 hex.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde.workspace = true
 sha2.workspace = true
+tar = "0.4"
+tempfile.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 tracing.workspace = true

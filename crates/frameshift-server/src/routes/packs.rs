@@ -56,6 +56,10 @@ pub fn packs_router() -> Router<AppState> {
     Router::new()
         .route("/", get(search_packs).post(publish_pack))
         .route("/{name}", get(get_pack))
+        .route(
+            "/{name}/telemetry",
+            get(crate::routes::telemetry::get_pack_telemetry),
+        )
         .route("/{name}/versions", get(list_pack_versions))
         .route("/{name}/versions/{version}", get(get_pack_version))
         .route("/{name}/versions/{version}/pack", get(download_pack_bytes))
@@ -105,7 +109,7 @@ struct PublishFields {
 ///
 /// TODO(M5): real session token verification (currently accepts any
 /// non-empty value).
-fn verify_session_header(headers: &HeaderMap) -> Result<(), AppError> {
+pub fn verify_session_header(headers: &HeaderMap) -> Result<(), AppError> {
     let token = headers
         .get(SESSION_HEADER)
         .and_then(|v| v.to_str().ok())
@@ -311,8 +315,7 @@ pub async fn publish_pack(
     // Extract tar.gz into a tempdir, then load the pack from the extracted
     // directory. The TempDir is dropped at the end of the function and the
     // bytes are moved into the object store before that point.
-    let tmp = tempfile::TempDir::new()
-        .map_err(|e| AppError::Internal(format!("tempdir: {e}")))?;
+    let tmp = tempfile::TempDir::new().map_err(|e| AppError::Internal(format!("tempdir: {e}")))?;
     extract_targz(pack_archive.clone(), tmp.path().to_path_buf()).await?;
 
     let pack_root = find_pack_root(tmp.path())?;
@@ -396,6 +399,14 @@ pub async fn publish_pack(
         parent_hash,
         capability_manifest_json,
         schema_version: manifest.schema_version,
+        conformance_score: manifest
+            .conformance_baseline
+            .as_ref()
+            .map(|baseline| baseline.score),
+        conformance_bundle_hash: manifest
+            .conformance_baseline
+            .as_ref()
+            .map(|baseline| baseline.bundle_hash.clone()),
         license: manifest.license.clone().unwrap_or_default(),
         published_at: Utc::now(),
         status: PackStatus::Active,

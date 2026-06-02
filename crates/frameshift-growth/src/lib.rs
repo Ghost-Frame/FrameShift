@@ -80,11 +80,15 @@ pub fn append_with_timestamp(
             source,
         })?;
 
-    writeln!(file, "---\n<!-- growth: {} -->\n\n{}\n", timestamp, entry_text)
-        .map_err(|source| GrowthError::Io {
-            path: growth_path,
-            source,
-        })?;
+    writeln!(
+        file,
+        "---\n<!-- growth: {} -->\n\n{}\n",
+        timestamp, entry_text
+    )
+    .map_err(|source| GrowthError::Io {
+        path: growth_path,
+        source,
+    })?;
 
     Ok(())
 }
@@ -114,6 +118,11 @@ fn format_utc_now() -> String {
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
         year, month, day, hours, minutes, seconds
     )
+}
+
+/// Format the current UTC time as an RFC3339 timestamp for cross-crate callers.
+pub fn current_timestamp() -> String {
+    format_utc_now()
 }
 
 /// Convert days since Unix epoch to (year, month, day).
@@ -213,7 +222,10 @@ pub fn append_jsonl(
         .create(true)
         .append(true)
         .open(&path)
-        .map_err(|source| GrowthError::Io { path: path.clone(), source })?;
+        .map_err(|source| GrowthError::Io {
+            path: path.clone(),
+            source,
+        })?;
     file.write_all(line.as_bytes())
         .map_err(|source| GrowthError::Io { path, source })?;
 
@@ -398,7 +410,8 @@ pub fn summarize(
     }
 
     // Most recent entry per intent category.
-    let mut by_intent: std::collections::BTreeMap<String, &GrowthEntry> = std::collections::BTreeMap::new();
+    let mut by_intent: std::collections::BTreeMap<String, &GrowthEntry> =
+        std::collections::BTreeMap::new();
     let mut no_intent: Vec<&GrowthEntry> = Vec::new();
 
     // Process entries in reverse chronological order.
@@ -415,10 +428,13 @@ pub fn summarize(
         // Simple Jaccard dedup: skip if > 50% token overlap with any selected entry.
         let tokens: std::collections::HashSet<&str> = entry.text.split_whitespace().collect();
         let is_dup = selected.iter().any(|existing| {
-            let existing_tokens: std::collections::HashSet<&str> = existing.split_whitespace().collect();
+            let existing_tokens: std::collections::HashSet<&str> =
+                existing.split_whitespace().collect();
             let intersection = tokens.intersection(&existing_tokens).count();
             let union = tokens.union(&existing_tokens).count();
-            if union == 0 { return true; }
+            if union == 0 {
+                return true;
+            }
             (intersection as f32 / union as f32) > 0.5
         });
         if !is_dup {
@@ -554,7 +570,9 @@ mod tests {
         };
         append_jsonl(tmp.path(), "abc123", "rust", &entry).unwrap();
 
-        let path = tmp.path().join("projects/abc123/personas/rust/growth.jsonl");
+        let path = tmp
+            .path()
+            .join("projects/abc123/personas/rust/growth.jsonl");
         assert!(path.exists());
         let content = fs::read_to_string(&path).unwrap();
         let parsed: GrowthEntry = serde_json::from_str(content.trim()).unwrap();
@@ -629,7 +647,11 @@ mod tests {
                 persona: "rust".to_string(),
                 auto_selected: false,
                 task: None,
-                intent: if i % 3 == 0 { Some("debugging".to_string()) } else { None },
+                intent: if i % 3 == 0 {
+                    Some("debugging".to_string())
+                } else {
+                    None
+                },
                 text: format!("learning number {i}"),
                 scope: Scope::Project,
             };
@@ -638,7 +660,10 @@ mod tests {
 
         let summary = summarize(tmp.path(), "p1", "rust", Scope::Project).unwrap();
         let line_count = summary.lines().filter(|l| !l.is_empty()).count();
-        assert!(line_count <= 10, "summary should cap at 10 entries, got {line_count}");
+        assert!(
+            line_count <= 10,
+            "summary should cap at 10 entries, got {line_count}"
+        );
         assert!(!summary.is_empty());
     }
 }

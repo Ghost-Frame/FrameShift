@@ -9,6 +9,8 @@ pub struct ProjectConfig {
     pub schema_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
+    #[serde(default)]
+    pub telemetry_opt_in: bool,
 }
 
 impl Default for ProjectConfig {
@@ -16,6 +18,7 @@ impl Default for ProjectConfig {
         Self {
             schema_version: SCHEMA_VERSION,
             project_id: None,
+            telemetry_opt_in: false,
         }
     }
 }
