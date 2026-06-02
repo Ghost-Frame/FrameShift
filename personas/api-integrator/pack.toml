@@ -3,6 +3,8 @@ name = "api-integrator"
 author_handle = "ghost-frame"
 author_pubkey = "UNSIGNED"
 version = "0.1.0"
+description = "API integration, contract design, and service-to-service debugging work."
+tags = ["api", "integration", "contracts", "backend"]
 license = "Elastic-2.0"
 
 [capability_manifest]
