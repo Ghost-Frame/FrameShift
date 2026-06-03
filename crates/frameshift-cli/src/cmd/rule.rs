@@ -174,7 +174,10 @@ mod tests {
         src.write_to_dir(&persona_dir)
             .expect("write initial source");
 
-        let client = Client::new(ClientOptions { data_root, config_root: None });
+        let client = Client::new(ClientOptions {
+            data_root,
+            config_root: None,
+        });
         let args = RuleAddArgs {
             persona: "test-persona".to_string(),
             id: "no-panic".to_string(),
@@ -220,7 +223,10 @@ mod tests {
         };
         src.write_to_dir(&persona_dir).expect("write");
 
-        let client = Client::new(ClientOptions { data_root, config_root: None });
+        let client = Client::new(ClientOptions {
+            data_root,
+            config_root: None,
+        });
         let args = RuleRemoveArgs {
             persona: "p2".to_string(),
             id: "r1".to_string(),
@@ -260,7 +266,10 @@ mod tests {
         };
         src.write_to_dir(&persona_dir).expect("write");
 
-        let client = Client::new(ClientOptions { data_root, config_root: None });
+        let client = Client::new(ClientOptions {
+            data_root,
+            config_root: None,
+        });
         let args = RuleAddArgs {
             persona: "dup".to_string(),
             id: "existing".to_string(),

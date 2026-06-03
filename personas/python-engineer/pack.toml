@@ -3,6 +3,8 @@ name = "python-engineer"
 author_handle = "ghost-frame"
 author_pubkey = "UNSIGNED"
 version = "0.1.0"
+description = "Python services, tooling, scripting, and data-heavy workflows."
+tags = ["python", "backend", "scripting", "tooling"]
 license = "Elastic-2.0"
 
 [capability_manifest]

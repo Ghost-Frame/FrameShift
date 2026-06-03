@@ -3,6 +3,8 @@ name = "cryptographic"
 author_handle = "ghost-frame"
 author_pubkey = "UNSIGNED"
 version = "0.1.0"
+description = "Applied cryptography, key handling, and protocol-level security work."
+tags = ["cryptography", "security", "keys", "protocols"]
 license = "Elastic-2.0"
 
 [capability_manifest]

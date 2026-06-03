@@ -3,6 +3,8 @@ name = "issue-triager"
 author_handle = "ghost-frame"
 author_pubkey = "UNSIGNED"
 version = "0.1.0"
+description = "Bug sorting, reproduction analysis, and issue prioritization."
+tags = ["triage", "bugs", "reproduction", "prioritization"]
 license = "Elastic-2.0"
 
 [capability_manifest]

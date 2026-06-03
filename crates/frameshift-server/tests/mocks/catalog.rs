@@ -20,7 +20,7 @@ use frameshift_catalog::backend::CatalogBackend;
 use frameshift_catalog::error::{CatalogError, HealthStatus};
 use frameshift_catalog::filters::{PackSearchFilters, PackSearchResult};
 use frameshift_catalog::identity::Ed25519PublicKey;
-use frameshift_catalog::records::{AuthorRecord, PackRecord, PackVersionRecord};
+use frameshift_catalog::records::{AuthorRecord, PackRecord, PackVersionRecord, TelemetrySignal};
 use frameshift_catalog::status::TombstoneRecord;
 
 /// Shared mutable state for [`MockCatalog`].
@@ -37,6 +37,12 @@ pub struct MockState {
 
     /// Pack version records, keyed by `(pack_name, version)`.
     pub versions: HashMap<(String, String), PackVersionRecord>,
+
+    /// In-memory telemetry signals accumulated by ingest calls.
+    pub telemetry: Vec<TelemetrySignal>,
+
+    /// Conformance scores recorded for pack versions.
+    pub scores: HashMap<(String, String), (f32, String)>,
 
     /// When `true`, the next mutating call returns `CatalogError::Conflict`.
     pub inject_conflict: bool,
@@ -234,6 +240,69 @@ impl CatalogBackend for MockCatalog {
         _version: &str,
     ) -> Result<u64, CatalogError> {
         Ok(0)
+    }
+
+    /// Accumulate telemetry signals in memory for integration tests.
+    async fn ingest_telemetry(&self, signals: Vec<TelemetrySignal>) -> Result<(), CatalogError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|e| CatalogError::BackendError(e.to_string().into()))?;
+
+        for signal in signals {
+            if let Some(existing) = state.telemetry.iter_mut().find(|entry| {
+                entry.pack_name == signal.pack_name
+                    && entry.version == signal.version
+                    && entry.kind == signal.kind
+                    && entry.key == signal.key
+            }) {
+                existing.count += signal.count;
+                existing.value = signal.value;
+            } else {
+                state.telemetry.push(signal);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Read telemetry signals for a pack, optionally filtered to one version.
+    async fn get_telemetry(
+        &self,
+        name: &str,
+        version: Option<&str>,
+    ) -> Result<Vec<TelemetrySignal>, CatalogError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|e| CatalogError::BackendError(e.to_string().into()))?;
+
+        Ok(state
+            .telemetry
+            .iter()
+            .filter(|entry| entry.pack_name == name)
+            .filter(|entry| version.is_none_or(|wanted| entry.version == wanted))
+            .cloned()
+            .collect())
+    }
+
+    /// Store a conformance score in the mock state for test assertions.
+    async fn set_conformance_score(
+        &self,
+        name: &str,
+        version: &str,
+        score: f32,
+        bundle_hash: &str,
+    ) -> Result<(), CatalogError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|e| CatalogError::BackendError(e.to_string().into()))?;
+        state.scores.insert(
+            (name.to_string(), version.to_string()),
+            (score, bundle_hash.to_string()),
+        );
+        Ok(())
     }
 
     /// Tombstone a pack version (no-op in mock).

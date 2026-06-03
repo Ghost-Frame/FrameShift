@@ -9,6 +9,10 @@ pub struct PackManifest {
     pub author_pubkey: String,
     pub version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub license: Option<String>,
@@ -107,6 +111,8 @@ name = "zenpilot"
 author_handle = "alice"
 author_pubkey = "age1test..."
 version = "1.2.0"
+description = "A thoughtful architectural review persona"
+tags = ["architecture", "review"]
 parent_hash = "sha256:abc123"
 license = "CC-BY-SA-4.0"
 
@@ -135,6 +141,14 @@ optional = true
         assert_eq!(manifest.name, "zenpilot");
         assert_eq!(manifest.schema_version, 1);
         assert_eq!(manifest.author_handle, "alice");
+        assert_eq!(
+            manifest.description,
+            Some("A thoughtful architectural review persona".to_string())
+        );
+        assert_eq!(
+            manifest.tags,
+            vec!["architecture".to_string(), "review".to_string()]
+        );
         assert_eq!(manifest.parent_hash, Some("sha256:abc123".to_string()));
 
         let cap = manifest.capability_manifest.unwrap();
@@ -167,6 +181,8 @@ version = "0.1.0"
         assert!(manifest.requires.is_none());
         assert!(manifest.tokens_required.is_none());
         assert!(manifest.parent_hash.is_none());
+        assert!(manifest.description.is_none());
+        assert!(manifest.tags.is_empty());
     }
 
     #[test]
@@ -177,6 +193,8 @@ version = "0.1.0"
             author_handle: "alice".to_string(),
             author_pubkey: "age1test...".to_string(),
             version: "1.0.0".to_string(),
+            description: Some("Child persona".to_string()),
+            tags: vec!["child".to_string(), "mixin".to_string()],
             parent_hash: None,
             license: None,
             capability_manifest: None,
@@ -203,6 +221,8 @@ version = "0.1.0"
             author_handle: "t".to_string(),
             author_pubkey: "k".to_string(),
             version: "0.1.0".to_string(),
+            description: None,
+            tags: Vec::new(),
             parent_hash: None,
             license: None,
             capability_manifest: None,
@@ -217,5 +237,7 @@ version = "0.1.0"
         assert!(!serialized.contains("extends"));
         assert!(!serialized.contains("mixin"));
         assert!(!serialized.contains("conformance_baseline"));
+        assert!(!serialized.contains("description"));
+        assert!(!serialized.contains("tags"));
     }
 }

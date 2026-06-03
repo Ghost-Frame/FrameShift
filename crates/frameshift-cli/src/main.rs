@@ -25,6 +25,7 @@ use cmd::render::RenderArgs;
 use cmd::rule::{RuleArgs, RuleCommand};
 use cmd::select::SelectArgs;
 use cmd::skill::{SkillArgs, SkillCommand};
+use cmd::telemetry::TelemetryArgs;
 use cmd::use_persona::UseArgs;
 use cmd::verify::VerifyArgs;
 use util::CliError;
@@ -89,6 +90,9 @@ enum Command {
 
     /// Append to a persona's local growth log.
     Grow(GrowArgs),
+
+    /// Flush opt-in telemetry signals to the registry.
+    Telemetry(TelemetryArgs),
 
     // ------------------------------------------------------------------
     // M2 -- verify and publish
@@ -319,6 +323,7 @@ fn run() -> Result<(), RunError> {
         // M2 -- grow
         // ------------------------------------------------------------------
         Command::Grow(args) => cmd::grow::run(args).map_err(RunError::from),
+        Command::Telemetry(args) => cmd::telemetry::run(args).map_err(RunError::from),
 
         // ------------------------------------------------------------------
         // M2 -- verify and publish

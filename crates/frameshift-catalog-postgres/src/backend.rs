@@ -25,17 +25,18 @@ use tracing::{debug, error, instrument};
 
 use frameshift_catalog::{
     AuthorRecord, CatalogBackend, CatalogError, Ed25519PublicKey, HealthStatus, PackRecord,
-    PackSearchFilters, PackSearchResult, PackVersionRecord, SortMode, TombstoneRecord,
+    PackSearchFilters, PackSearchResult, PackVersionRecord, SortMode, TelemetrySignal,
+    TombstoneRecord,
 };
 
 use crate::config::PostgresCatalogConfig;
 use crate::errors::{map_diesel_error, map_migration_error, map_pool_error};
 use crate::models::{
-    vec_to_pubkey, AuthorRow, HandleRow, NewAuthorRow, NewHandleRow, NewPackRow, NewPackVersionRow,
-    PackRow, PackVersionRow,
+    telemetry_row_to_signal, vec_to_pubkey, AuthorRow, HandleRow, NewAuthorRow, NewHandleRow,
+    NewPackRow, NewPackVersionRow, PackRow, PackVersionRow, TelemetryRow,
 };
 use crate::pool::{build_pool, PgPool};
-use crate::schema::{authors, handles, pack_versions, packs};
+use crate::schema::{authors, handles, pack_telemetry, pack_versions, packs};
 
 /// Embedded migration files compiled into the binary at build time.
 ///
@@ -338,6 +339,8 @@ impl CatalogBackend for PostgresCatalog {
             parent_hash: record.parent_hash.map(|h| h.as_bytes().to_vec()),
             capability_manifest_json: capability_json,
             schema_version: schema_version_i32,
+            conformance_score: record.conformance_score,
+            conformance_bundle_hash: record.conformance_bundle_hash.clone(),
             license: record.license.clone(),
             status: status_json,
             size_bytes: size_bytes_i64,
@@ -777,21 +780,204 @@ impl CatalogBackend for PostgresCatalog {
     ) -> Result<(), CatalogError> {
         let mut conn = self.pool.get().await.map_err(map_pool_error)?;
 
-        let rows_affected = diesel::sql_query(
-            "UPDATE packs SET extends = $1 WHERE name = $2",
-        )
-        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
-            extends.map(str::to_string),
-        )
-        .bind::<diesel::sql_types::Text, _>(pack_name.to_string())
-        .execute(&mut *conn)
-        .await
-        .map_err(|e| map_diesel_error(e, "pack", pack_name.to_string()))?;
+        let rows_affected = diesel::sql_query("UPDATE packs SET extends = $1 WHERE name = $2")
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+                extends.map(str::to_string),
+            )
+            .bind::<diesel::sql_types::Text, _>(pack_name.to_string())
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| map_diesel_error(e, "pack", pack_name.to_string()))?;
 
         if rows_affected == 0 {
             return Err(CatalogError::NotFound {
                 kind: "pack",
                 key: pack_name.to_string(),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Accumulate telemetry signals for the catalog's M5 telemetry table.
+    ///
+    /// Each incoming signal is validated against the `pack_versions` table
+    /// before being upserted into `pack_telemetry`. Counters are added to the
+    /// stored count, scalar values overwrite the previous value, and
+    /// `updated_at` is refreshed to the current UTC time.
+    #[instrument(skip(self, signals))]
+    async fn ingest_telemetry(&self, signals: Vec<TelemetrySignal>) -> Result<(), CatalogError> {
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+
+        for signal in signals {
+            let version_exists: bool = diesel::select(diesel::dsl::exists(
+                pack_versions::table.filter(
+                    pack_versions::pack_name
+                        .eq(&signal.pack_name)
+                        .and(pack_versions::version.eq(&signal.version)),
+                ),
+            ))
+            .get_result(&mut *conn)
+            .await
+            .map_err(|e| {
+                map_diesel_error(
+                    e,
+                    "pack_version",
+                    format!("{}@{}", signal.pack_name, signal.version),
+                )
+            })?;
+
+            if !version_exists {
+                return Err(CatalogError::NotFound {
+                    kind: "pack_version",
+                    key: format!("{}@{}", signal.pack_name, signal.version),
+                });
+            }
+
+            let count = i64::try_from(signal.count).map_err(|_| {
+                CatalogError::InvalidArgument(format!(
+                    "telemetry count {} exceeds i64::MAX",
+                    signal.count
+                ))
+            })?;
+            let updated_at = Utc::now();
+            let row = TelemetryRow {
+                pack_name: signal.pack_name.clone(),
+                version: signal.version.clone(),
+                signal_kind: signal.kind.as_str().to_string(),
+                signal_key: signal.key.clone(),
+                count,
+                value: signal.value,
+                updated_at: updated_at.clone(),
+            };
+
+            diesel::insert_into(pack_telemetry::table)
+                .values(&row)
+                .on_conflict((
+                    pack_telemetry::pack_name,
+                    pack_telemetry::version,
+                    pack_telemetry::signal_kind,
+                    pack_telemetry::signal_key,
+                ))
+                .do_update()
+                .set((
+                    pack_telemetry::count.eq(pack_telemetry::count + row.count),
+                    pack_telemetry::value.eq(row.value),
+                    pack_telemetry::updated_at.eq(updated_at),
+                ))
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| map_diesel_error(e, "pack_telemetry", signal.pack_name.clone()))?;
+        }
+
+        Ok(())
+    }
+
+    /// Read accumulated telemetry for a pack, optionally filtered to a version.
+    ///
+    /// When `version` is `Some`, the adapter first verifies that the specific
+    /// version exists and returns `NotFound` if it does not. When `version` is
+    /// `None`, the pack head record is verified instead. The returned signals
+    /// are ordered by version, kind, and key for deterministic iteration.
+    #[instrument(skip(self, name, version))]
+    async fn get_telemetry(
+        &self,
+        name: &str,
+        version: Option<&str>,
+    ) -> Result<Vec<TelemetrySignal>, CatalogError> {
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+
+        match version {
+            Some(version) => {
+                let version_exists: bool = diesel::select(diesel::dsl::exists(
+                    pack_versions::table.filter(
+                        pack_versions::pack_name
+                            .eq(name)
+                            .and(pack_versions::version.eq(version)),
+                    ),
+                ))
+                .get_result(&mut *conn)
+                .await
+                .map_err(|e| map_diesel_error(e, "pack_version", format!("{name}@{version}")))?;
+
+                if !version_exists {
+                    return Err(CatalogError::NotFound {
+                        kind: "pack_version",
+                        key: format!("{name}@{version}"),
+                    });
+                }
+            }
+            None => {
+                let pack_exists: bool = diesel::select(diesel::dsl::exists(
+                    packs::table.filter(packs::name.eq(name)),
+                ))
+                .get_result(&mut *conn)
+                .await
+                .map_err(|e| map_diesel_error(e, "pack", name.to_string()))?;
+
+                if !pack_exists {
+                    return Err(CatalogError::NotFound {
+                        kind: "pack",
+                        key: name.to_string(),
+                    });
+                }
+            }
+        }
+
+        let mut query = pack_telemetry::table
+            .filter(pack_telemetry::pack_name.eq(name))
+            .into_boxed();
+        if let Some(version) = version {
+            query = query.filter(pack_telemetry::version.eq(version));
+        }
+
+        let rows: Vec<TelemetryRow> = query
+            .select(TelemetryRow::as_select())
+            .order((
+                pack_telemetry::version.asc(),
+                pack_telemetry::signal_kind.asc(),
+                pack_telemetry::signal_key.asc(),
+            ))
+            .load(&mut *conn)
+            .await
+            .map_err(|e| map_diesel_error(e, "pack_telemetry", name.to_string()))?;
+
+        rows.into_iter().map(telemetry_row_to_signal).collect()
+    }
+
+    /// Store the conformance score and bundle hash for a specific version.
+    ///
+    /// The score and bundle hash are written back onto the `pack_versions`
+    /// row for the published version. Missing rows return `NotFound`.
+    #[instrument(skip(self, name, version, score, bundle_hash))]
+    async fn set_conformance_score(
+        &self,
+        name: &str,
+        version: &str,
+        score: f32,
+        bundle_hash: &str,
+    ) -> Result<(), CatalogError> {
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+
+        let rows_affected = diesel::update(
+            pack_versions::table.filter(
+                pack_versions::pack_name
+                    .eq(name)
+                    .and(pack_versions::version.eq(version)),
+            ),
+        )
+        .set((
+            pack_versions::conformance_score.eq(Some(score)),
+            pack_versions::conformance_bundle_hash.eq(Some(bundle_hash.to_string())),
+        ))
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| map_diesel_error(e, "pack_version", format!("{name}@{version}")))?;
+
+        if rows_affected == 0 {
+            return Err(CatalogError::NotFound {
+                kind: "pack_version",
+                key: format!("{name}@{version}"),
             });
         }
 

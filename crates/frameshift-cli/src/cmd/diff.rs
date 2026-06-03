@@ -171,7 +171,10 @@ mod tests {
         };
         src_b.write_to_dir(&dir_b).expect("write pb");
 
-        let client = Client::new(ClientOptions { data_root, config_root: None });
+        let client = Client::new(ClientOptions {
+            data_root,
+            config_root: None,
+        });
         let args = DiffArgs {
             persona_a: "pa".to_string(),
             persona_b: "pb".to_string(),

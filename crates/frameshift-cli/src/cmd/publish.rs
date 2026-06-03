@@ -10,7 +10,7 @@ use clap::Args;
 use frameshift_client::Client;
 use frameshift_source::render::{render_to_markdown, RenderTarget};
 
-use crate::util::{CliError, load_persona_by_name};
+use crate::util::{load_persona_by_name, CliError};
 
 /// Arguments for the `publish` subcommand.
 #[derive(Debug, Args)]
@@ -57,11 +57,7 @@ pub fn run_publish(args: PublishArgs) -> Result<(), CliError> {
     std::fs::write(&agents_md_path, markdown)?;
 
     // Print summary.
-    let version = src
-        .persona
-        .version
-        .as_deref()
-        .unwrap_or("(no version)");
+    let version = src.persona.version.as_deref().unwrap_or("(no version)");
     println!(
         "published {} v{} to {}",
         args.persona,

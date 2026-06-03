@@ -14,5 +14,6 @@ pub mod render;
 pub mod rule;
 pub mod select;
 pub mod skill;
+pub mod telemetry;
 pub mod use_persona;
 pub mod verify;
