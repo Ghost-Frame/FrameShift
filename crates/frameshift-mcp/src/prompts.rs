@@ -310,7 +310,19 @@ fn get_required_path(
         .get(key)
         .and_then(|v| v.as_str())
         .ok_or_else(|| format!("missing required argument: {key}"))?;
-    Ok(PathBuf::from(s))
+    // Same boundary guard as the tool surface: require an absolute path with no
+    // `..` component so a prompt-injected argument cannot traverse the filesystem.
+    let path = PathBuf::from(s);
+    if !path.is_absolute() {
+        return Err(format!("path must be absolute: {s:?}"));
+    }
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(format!("path must not contain '..': {s:?}"));
+    }
+    Ok(path)
 }
 
 /// Build a one-message PromptResult containing a user-role text block.

@@ -146,6 +146,24 @@ fn err_result(text: String) -> ToolResult {
 /// Returns a ToolResult -- errors are represented as is_error results rather than
 /// propagated as Rust errors, matching the MCP protocol's expectation that tools/call
 /// always returns a 200-level JSON-RPC response.
+/// Validate a caller-supplied filesystem path argument.
+///
+/// At the MCP boundary the caller is a local agent, but a prompt-injected tool
+/// call could pass a traversal path. Require the path to be absolute and to
+/// contain no `..` component: this blocks relative/`..` escapes while still
+/// letting the agent address any real project directory by absolute path.
+fn validate_path_arg(raw: &str) -> Result<std::path::PathBuf, String> {
+    use std::path::Component;
+    let path = std::path::PathBuf::from(raw);
+    if !path.is_absolute() {
+        return Err(format!("path must be absolute: {raw:?}"));
+    }
+    if path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(format!("path must not contain '..': {raw:?}"));
+    }
+    Ok(path)
+}
+
 pub fn call_tool(name: &str, arguments: &serde_json::Value, client: &Client) -> ToolResult {
     match name {
         "frameshift_install" => call_install(arguments, client),
@@ -180,10 +198,16 @@ fn call_install(arguments: &serde_json::Value, client: &Client) -> ToolResult {
         Err(e) => return err_result(format!("invalid spec \"{}\": {}", spec_str, e)),
     };
 
-    let project_root = std::path::PathBuf::from(project_root_str);
+    let project_root = match validate_path_arg(project_root_str) {
+        Ok(p) => p,
+        Err(e) => return err_result(e),
+    };
 
     let source = match arguments.get("from_path").and_then(|v| v.as_str()) {
-        Some(p) => InstallSource::LocalPath(std::path::PathBuf::from(p)),
+        Some(p) => match validate_path_arg(p) {
+            Ok(pb) => InstallSource::LocalPath(pb),
+            Err(e) => return err_result(e),
+        },
         None => InstallSource::Registry,
     };
 
@@ -217,7 +241,10 @@ fn call_activate(arguments: &serde_json::Value, client: &Client) -> ToolResult {
         None => return err_result("missing required argument: project_root".to_string()),
     };
 
-    let project_root = std::path::PathBuf::from(project_root_str);
+    let project_root = match validate_path_arg(project_root_str) {
+        Ok(p) => p,
+        Err(e) => return err_result(e),
+    };
 
     match client.activate(&project_root, persona) {
         Ok(()) => {
@@ -237,7 +264,10 @@ fn call_list(arguments: &serde_json::Value, client: &Client) -> ToolResult {
         None => return err_result("missing required argument: project_root".to_string()),
     };
 
-    let project_root = std::path::PathBuf::from(project_root_str);
+    let project_root = match validate_path_arg(project_root_str) {
+        Ok(p) => p,
+        Err(e) => return err_result(e),
+    };
 
     match client.sync(&project_root) {
         Ok(report) => {
@@ -272,7 +302,10 @@ fn call_grow_append(arguments: &serde_json::Value, client: &Client) -> ToolResul
         None => return err_result("missing required argument: text".to_string()),
     };
 
-    let project_root = std::path::PathBuf::from(project_root_str);
+    let project_root = match validate_path_arg(project_root_str) {
+        Ok(p) => p,
+        Err(e) => return err_result(e),
+    };
 
     let project_id = match client.project_id(&project_root) {
         Ok(id) => id,
@@ -300,15 +333,21 @@ fn call_select(arguments: &serde_json::Value, client: &Client) -> ToolResult {
         None => return err_result("missing required argument: project_root".to_string()),
     };
 
-    let project_root = std::path::PathBuf::from(project_root_str);
+    let project_root = match validate_path_arg(project_root_str) {
+        Ok(p) => p,
+        Err(e) => return err_result(e),
+    };
     let task_hint = arguments
         .get("task")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    let library = arguments
-        .get("library")
-        .and_then(|v| v.as_str())
-        .map(std::path::PathBuf::from);
+    let library = match arguments.get("library").and_then(|v| v.as_str()) {
+        Some(p) => match validate_path_arg(p) {
+            Ok(pb) => Some(pb),
+            Err(e) => return err_result(e),
+        },
+        None => None,
+    };
 
     // Resolve orchestrator state dir and load preferences.
     let state_dir = match client.orchestrator_state_dir(&project_root) {
@@ -372,7 +411,10 @@ fn call_use(arguments: &serde_json::Value, client: &Client) -> ToolResult {
         None => return err_result("missing required argument: persona".to_string()),
     };
 
-    let project_root = std::path::PathBuf::from(project_root_str);
+    let project_root = match validate_path_arg(project_root_str) {
+        Ok(p) => p,
+        Err(e) => return err_result(e),
+    };
 
     if let Err(e) = client.activate(&project_root, persona) {
         return err_result(format!("activate failed: {}", e));
@@ -401,7 +443,10 @@ fn call_automate(arguments: &serde_json::Value, client: &Client) -> ToolResult {
         None => return err_result("missing required argument: action".to_string()),
     };
 
-    let project_root = std::path::PathBuf::from(project_root_str);
+    let project_root = match validate_path_arg(project_root_str) {
+        Ok(p) => p,
+        Err(e) => return err_result(e),
+    };
 
     let state_dir = match client.orchestrator_state_dir(&project_root) {
         Ok(d) => d,
@@ -523,7 +568,10 @@ fn call_prefs(arguments: &serde_json::Value, client: &Client) -> ToolResult {
         None => return err_result("missing required argument: action".to_string()),
     };
 
-    let project_root = std::path::PathBuf::from(project_root_str);
+    let project_root = match validate_path_arg(project_root_str) {
+        Ok(p) => p,
+        Err(e) => return err_result(e),
+    };
 
     let state_dir = match client.orchestrator_state_dir(&project_root) {
         Ok(d) => d,
@@ -596,6 +644,15 @@ mod tests {
     use super::*;
     use frameshift_client::{ClientOptions, InstallRequest, InstallSource, PersonaSpec};
     use std::fs;
+
+    /// validate_path_arg accepts clean absolute paths and rejects relative/`..`.
+    #[test]
+    fn validate_path_arg_guards_traversal() {
+        assert!(validate_path_arg("/home/user/project").is_ok());
+        assert!(validate_path_arg("relative/path").is_err());
+        assert!(validate_path_arg("/home/user/../../etc").is_err());
+        assert!(validate_path_arg("..").is_err());
+    }
 
     /// Create a minimal pack directory suitable for install testing.
     fn make_pack_dir(dir: &std::path::Path, name: &str, version: &str) {
