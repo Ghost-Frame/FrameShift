@@ -5,6 +5,7 @@
 //! entry point for serialization and deserialization.
 
 use std::collections::BTreeMap;
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -28,7 +29,7 @@ pub const MAX_SUPPORTED_SCHEMA_VERSION: u32 = 1;
 /// Serializes to / deserializes from the canonical vault TOML format.
 /// Construct with [`Default`] for an empty vault at schema version 1, or
 /// deserialize from a TOML string produced by a vault backend.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct VaultData {
     /// Schema version of the vault file.  Must be `<= MAX_SUPPORTED_SCHEMA_VERSION`.
     pub schema_version: u32,
@@ -60,6 +61,36 @@ pub struct VaultData {
     /// Overlay values are prose strings injected into agent prompts.
     #[serde(default)]
     pub overlays: BTreeMap<String, String>,
+}
+
+/// Redacting `Debug`: the `variables` and `overlays` maps hold plaintext
+/// secrets (API keys, tokens) and prose injected into prompts. This impl prints
+/// their KEY names but never their values, so `{:?}` / `tracing::debug!(?vault)`
+/// / panic messages cannot leak vault secrets to logs or crash dumps. Every
+/// other field is non-secret and printed normally.
+impl fmt::Debug for VaultData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VaultData")
+            .field("schema_version", &self.schema_version)
+            .field("identity", &self.identity)
+            .field("auth", &self.auth)
+            .field("preferences", &self.preferences)
+            .field("memory", &self.memory)
+            .field("variables", &RedactedValues(&self.variables))
+            .field("overlays", &RedactedValues(&self.overlays))
+            .finish()
+    }
+}
+
+/// `Debug` helper that renders a map as its key set with every value redacted.
+struct RedactedValues<'a>(&'a BTreeMap<String, String>);
+
+impl fmt::Debug for RedactedValues<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_map()
+            .entries(self.0.keys().map(|k| (k, "<redacted>")))
+            .finish()
+    }
 }
 
 impl VaultData {

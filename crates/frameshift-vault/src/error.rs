@@ -32,6 +32,11 @@ pub enum VaultError {
     #[error("vault backend unavailable: {0}")]
     BackendUnavailable(String),
 
+    /// A vault field failed a semantic validation rule (e.g. a disallowed
+    /// endpoint scheme, an over-cap map, or a dangling vault reference).
+    #[error("invalid vault configuration: {0}")]
+    InvalidConfig(String),
+
     /// The vault file declares a `schema_version` higher than this library supports.
     #[error(
         "unsupported vault schema version {found}; this library supports up to {max_supported}"
