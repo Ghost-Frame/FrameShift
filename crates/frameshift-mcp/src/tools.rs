@@ -261,6 +261,11 @@ fn call_grow_append(arguments: &serde_json::Value, client: &Client) -> ToolResul
         Some(s) => s,
         None => return err_result("missing required argument: persona".to_string()),
     };
+    // Validate at the MCP boundary: grow append joins the name into a growth.md
+    // path in the client layer, which does not itself guard this path.
+    if let Err(e) = frameshift_client::validate_persona_name(persona) {
+        return err_result(format!("invalid persona name: {e}"));
+    }
 
     let text = match arguments.get("text").and_then(|v| v.as_str()) {
         Some(s) => s,

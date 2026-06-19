@@ -33,6 +33,10 @@ pub struct UseArgs {
 /// first, then writes the active marker) and reads and prints the rendered
 /// output for the `claude` target.
 pub fn run_use(client: &Client, args: UseArgs) -> Result<(), CliError> {
+    // Reject unsafe names before `args.name` is joined to `--from` (or any
+    // central-store path); consistent with every other subcommand.
+    crate::util::validate_persona_name(&args.name)?;
+
     let project_root = std::env::current_dir()?;
 
     // If --from is given, check if already installed; if not, install first.

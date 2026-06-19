@@ -314,6 +314,7 @@ impl Client {
         persona: &str,
         target: &str,
     ) -> Result<String, ClientError> {
+        validate_persona_name(persona)?;
         let effective_target = if target.is_empty() { "claude" } else { target };
 
         let filename = RENDER_TARGETS
@@ -359,6 +360,13 @@ impl Client {
         lockfile: &Lockfile,
         raw_lock: &str,
     ) -> Result<(), ClientError> {
+        // Validate every persona name before it is joined into the central
+        // store. A name like `../../x` would otherwise escape personas_dir and
+        // drive remove_dir_all/copy against an arbitrary directory below.
+        for persona in &lockfile.personas {
+            validate_persona_name(&persona.name)?;
+        }
+
         ensure_dir(&paths.cache_dir)?;
         ensure_dir(&paths.personas_dir)?;
         // Lock file lives only in the central store -- nothing is written to the project root.
@@ -469,6 +477,48 @@ fn validate_explicit_project_id(project_id: &str) -> Result<(), ClientError> {
     }
 
     Ok(())
+}
+
+/// Validate that `name` is safe to use as a single path component before it is
+/// joined into the central store (where the result is recursively removed and
+/// repopulated). Rejects empty names, a leading `.` (catches `.`/`..`/hidden),
+/// path separators, NUL/control characters, and any name that is not exactly
+/// one normal path component.
+///
+/// This is the engine-level guard against a malicious pack or tampered lockfile
+/// whose persona name (e.g. `../../etc`) would otherwise escape `personas_dir`
+/// during install/sync.
+pub fn validate_persona_name(name: &str) -> Result<(), ClientError> {
+    use std::path::Component;
+
+    let reject = |reason: &'static str| {
+        Err(ClientError::InvalidPersonaName {
+            name: name.to_string(),
+            reason,
+        })
+    };
+
+    if name.is_empty() {
+        return reject("name must not be empty");
+    }
+    if name.starts_with('.') {
+        return reject("name must not start with '.'");
+    }
+    if name.contains('\0') {
+        return reject("name must not contain NUL");
+    }
+    if name.chars().any(|c| c.is_control()) {
+        return reject("name must not contain control characters");
+    }
+    if name.contains('/') || name.contains('\\') {
+        return reject("name must not contain path separators");
+    }
+
+    let mut components = Path::new(name).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(_)), None) => Ok(()),
+        _ => reject("name must be a single normal path component"),
+    }
 }
 
 /// Best-effort migration: if a pre-WS-1 install left `frameshift.toml` or
@@ -885,6 +935,23 @@ fn install_from_registry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// validate_persona_name accepts clean slugs and rejects traversal/separators.
+    #[test]
+    fn validate_persona_name_guards_traversal() {
+        for ok in ["cryptographic", "rust-engineer", "my_persona1"] {
+            assert!(validate_persona_name(ok).is_ok(), "{ok} should be valid");
+        }
+        for bad in ["", ".", "..", "../etc", "a/b", "a\\b", ".hidden", "x\0y"] {
+            assert!(
+                matches!(
+                    validate_persona_name(bad),
+                    Err(ClientError::InvalidPersonaName { .. })
+                ),
+                "{bad:?} should be rejected"
+            );
+        }
+    }
 
     /// Helper: set up a minimal pack and install it, returning the client and project root.
     fn install_test_persona(

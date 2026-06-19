@@ -29,6 +29,17 @@ pub enum ClientError {
     #[error("invalid explicit project_id {0:?}; path separators are not allowed")]
     InvalidProjectId(String),
 
+    /// A persona name (from a lockfile, pack manifest, or caller) is not safe to
+    /// use as a single path component -- it contained a separator, `..`, a
+    /// leading `.`, a control character, or was empty.
+    #[error("invalid persona name {name:?}: {reason}")]
+    InvalidPersonaName {
+        /// The rejected name.
+        name: String,
+        /// Why it was rejected.
+        reason: &'static str,
+    },
+
     #[error(
         "pack manifest did not match requested spec: expected {expected_name}@{expected_version}, got {actual_name}@{actual_version}"
     )]
