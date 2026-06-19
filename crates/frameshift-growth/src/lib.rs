@@ -95,6 +95,14 @@ pub fn append_with_timestamp(
             source,
         })?;
 
+    // Enforce owner-only perms even when appending to a pre-existing file --
+    // growth.md holds local learnings and must never be world-readable.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
+    }
+
     writeln!(file, "---\n<!-- growth: {} -->\n\n{}\n", timestamp, entry_text)
         .map_err(|source| GrowthError::Io {
             path: growth_path,
@@ -432,7 +440,11 @@ pub fn summarize(
     }
 
     let mut selected: Vec<&str> = by_intent.values().map(|e| e.text.as_str()).collect();
-    for entry in no_intent.iter().take(10 - selected.len()) {
+    // Cap the per-intent entries at the summary limit, and use saturating_sub so
+    // more than 10 unique intents cannot underflow `10 - len` (debug panic /
+    // release over-return).
+    selected.truncate(10);
+    for entry in no_intent.iter().take(10usize.saturating_sub(selected.len())) {
         // Simple Jaccard dedup: skip if > 50% token overlap with any selected entry.
         let tokens: std::collections::HashSet<&str> = entry.text.split_whitespace().collect();
         let is_dup = selected.iter().any(|existing| {
