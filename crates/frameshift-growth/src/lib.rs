@@ -240,6 +240,14 @@ pub fn read_entries(
     persona_name: &str,
     scope: Scope,
 ) -> Result<Vec<GrowthEntry>, GrowthError> {
+    // Validate selectors before they are joined into the store path, matching
+    // the append paths -- an untrusted project_id/persona_name like `../..`
+    // could otherwise traverse out and read arbitrary growth logs.
+    validate_path_component(project_id)
+        .map_err(|_| GrowthError::InvalidPersonaName(project_id.to_string()))?;
+    validate_path_component(persona_name)
+        .map_err(|_| GrowthError::InvalidPersonaName(persona_name.to_string()))?;
+
     let path = match scope {
         Scope::Project => data_root
             .join("projects")

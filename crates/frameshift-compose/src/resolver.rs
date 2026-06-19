@@ -50,6 +50,18 @@ fn split_spec(spec: &str) -> Result<(&str, Option<&str>), ComposeError> {
 impl SourceResolver for LocalResolver {
     fn resolve(&self, spec: &str) -> Result<PersonaSource, ComposeError> {
         let (name, _version) = split_spec(spec)?;
+        // Reject names that would escape base_dir before joining. `extends`/
+        // `mixins` spec strings come from persona TOML and are untrusted; a name
+        // like `../../etc` must not load PersonaSource from outside base_dir.
+        if name.is_empty()
+            || name.starts_with('.')
+            || name.contains('/')
+            || name.contains('\\')
+            || name.contains("..")
+            || name.chars().any(char::is_control)
+        {
+            return Err(ComposeError::InvalidSpec(spec.to_string()));
+        }
         let dir = self.base_dir.join(name);
         if !dir.is_dir() {
             return Err(ComposeError::Unresolved {
