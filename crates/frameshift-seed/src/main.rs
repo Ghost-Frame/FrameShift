@@ -445,13 +445,42 @@ fn load_or_create_signing_key(path: &Path) -> Result<SigningKey, SeedError> {
         info!("loaded signing key from {}", path.display());
         Ok(SigningKey::from_bytes(&seed))
     } else {
+        // Persist atomically with `create_new` + 0o600: the secret seed is never
+        // world-readable even momentarily (closes the umask-perms CRITICAL), and
+        // a concurrent seeder cannot replace our freshly written key (closes the
+        // check-then-write race). On a lost race we adopt the winner's key.
         let key = SigningKey::generate(&mut rand_core::OsRng);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, key.to_bytes())?;
-        info!("generated new signing key at {}", path.display());
-        Ok(key)
+
+        let mut open_opts = std::fs::OpenOptions::new();
+        open_opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            open_opts.mode(0o600);
+        }
+
+        match open_opts.open(path) {
+            Ok(mut file) => {
+                use std::io::Write as _;
+                file.write_all(&key.to_bytes())?;
+                info!("generated new signing key at {}", path.display());
+                Ok(key)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let bytes = std::fs::read(path)?;
+                let seed: [u8; 32] = bytes.try_into().map_err(|_| {
+                    SeedError::Io(std::io::Error::other(
+                        "signing key file must be exactly 32 bytes",
+                    ))
+                })?;
+                info!("adopted concurrently-created signing key at {}", path.display());
+                Ok(SigningKey::from_bytes(&seed))
+            }
+            Err(e) => Err(SeedError::Io(e)),
+        }
     }
 }
 
@@ -472,6 +501,17 @@ fn write_synthetic_pack_toml(
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
+
+    // Guard against TOML injection: dir_name (filesystem) and author_handle (env)
+    // are interpolated into quoted TOML strings below. A value containing a quote,
+    // backslash, or control character could inject arbitrary manifest keys.
+    for (field, value) in [("dir_name", dir_name), ("author_handle", author_handle)] {
+        if value.chars().any(|c| c == '"' || c == '\\' || c.is_control()) {
+            return Err(SeedError::Io(std::io::Error::other(format!(
+                "{field} contains characters not allowed in a pack manifest: {value:?}"
+            ))));
+        }
+    }
 
     let content = format!(
         r#"schema_version = 1
