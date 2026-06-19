@@ -127,6 +127,9 @@ pub trait CatalogBackend: Send + Sync {
     /// - `CatalogError::Conflict` -- `(pack_name, version)` already registered.
     /// - `CatalogError::InvalidArgument` -- `signature` is not 64 bytes.
     /// - `CatalogError::Validation` -- e.g. attempt to publish to a tombstoned pack.
+    /// - `CatalogError::Unauthorized` -- the pack already exists and its
+    ///   `current_author` does not match `record.author_pubkey` (co-publish
+    ///   / name-squat rejection).
     /// - `CatalogError::BackendError` -- unexpected backend failure.
     ///
     /// # Panics
@@ -274,6 +277,28 @@ pub trait CatalogBackend: Send + Sync {
         handle: &str,
         pubkey: Ed25519PublicKey,
     ) -> Result<(), CatalogError>;
+
+    /// Record a single download event for a specific pack version in the audit log.
+    ///
+    /// Inserts one row into the `pack_downloads` audit table with the current
+    /// timestamp. This is the write side of the trending feature; `search_packs`
+    /// with `SortMode::Trending` reads from the same table to compute 7-day
+    /// download velocity.
+    ///
+    /// This method is best-effort: callers SHOULD invoke it after a successful
+    /// object-store fetch, but a failure here MUST NOT prevent the download from
+    /// being served. The recommended pattern is to log and discard the error at
+    /// the call site rather than surfacing it to the end user.
+    ///
+    /// # Errors
+    ///
+    /// - `CatalogError::BackendError` -- unexpected backend failure (e.g. pool
+    ///   exhausted, DB unreachable). The download itself should still be served.
+    ///
+    /// # Panics
+    ///
+    /// Never panics.
+    async fn record_download(&self, pack_name: &str, version: &str) -> Result<(), CatalogError>;
 
     /// Return the current health status of the backend.
     ///

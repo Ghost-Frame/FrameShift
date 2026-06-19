@@ -57,7 +57,7 @@ pub enum HttpAuth {
     },
 
     /// No authentication. Suitable for localhost-only endpoints that do not
-    /// require credentials (e.g. syntheos-memory-gateway with SD2 accepted).
+    /// require credentials (e.g. a local memory gateway with that risk accepted).
     None,
 }
 

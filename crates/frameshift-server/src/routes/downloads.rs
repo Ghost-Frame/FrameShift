@@ -226,7 +226,7 @@ pub async fn stream_signed_download(
 
     let disposition = format!("attachment; filename=\"{hash_hex}.pack\"");
 
-    Response::builder()
+    let response = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .header(
@@ -236,5 +236,10 @@ pub async fn stream_signed_download(
             })?,
         )
         .body(Body::from(bytes))
-        .map_err(|e| AppError::Internal(format!("response builder error: {e}")))
+        .map_err(|e| AppError::Internal(format!("response builder error: {e}")))?;
+
+    // Count successful signed-download responses (alongside direct pack downloads).
+    state.metrics.pack_downloads_total.inc();
+
+    Ok(response)
 }

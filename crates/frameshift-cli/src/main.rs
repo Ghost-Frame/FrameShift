@@ -21,6 +21,7 @@ use cmd::grow::GrowArgs;
 use cmd::migrate::MigrateArgs;
 use cmd::prefs::PrefsArgs;
 use cmd::publish::PublishArgs;
+use cmd::register::RegisterArgs;
 use cmd::render::RenderArgs;
 use cmd::rule::{RuleArgs, RuleCommand};
 use cmd::select::SelectArgs;
@@ -98,6 +99,9 @@ enum Command {
 
     /// Publish a persona pack to a directory or registry.
     Publish(PublishArgs),
+
+    /// Register this machine's author key under a handle at the registry.
+    Register(RegisterArgs),
 
     // ------------------------------------------------------------------
     // M3 -- orchestrator: select, use, automate
@@ -325,6 +329,7 @@ fn run() -> Result<(), RunError> {
         // ------------------------------------------------------------------
         Command::Verify(args) => cmd::verify::run_verify(args).map_err(RunError::from),
         Command::Publish(args) => cmd::publish::run_publish(args).map_err(RunError::from),
+        Command::Register(args) => cmd::register::run_register(args).map_err(RunError::from),
 
         // ------------------------------------------------------------------
         // M3 -- orchestrator: select, use, automate

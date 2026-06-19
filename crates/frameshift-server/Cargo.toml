@@ -46,6 +46,7 @@ flate2 = "1"
 hmac = { workspace = true }
 sha2 = { workspace = true }
 tower_governor = "0.8"
+prometheus = "0.13"
 
 [dev-dependencies]
 tokio = { workspace = true }

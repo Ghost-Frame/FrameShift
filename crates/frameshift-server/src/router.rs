@@ -21,7 +21,9 @@
 //! 4. `CompressionLayer` -- gzip response compression.
 //! 5. `RequestBodyLimitLayer` -- caps request body size BEFORE the rest of
 //!    the stack sees any bytes.
-//! 6. `CorsLayer` -- outermost; handles preflight `OPTIONS` requests and
+//! 6. Security response headers (`X-Content-Type-Options`, `X-Frame-Options`,
+//!    `Referrer-Policy`) -- added to every response if not already present.
+//! 7. `CorsLayer` -- outermost; handles preflight `OPTIONS` requests and
 //!    stamps `Access-Control-Allow-*` headers on responses. Only applied
 //!    when `state.config.cors_allowed_origins` is non-empty.
 //!
@@ -30,28 +32,38 @@
 //! The `download-url` mint endpoint additionally has a per-IP rate-limit
 //! layer (governor) applied only to its sub-router, so the rest of the
 //! API (including the verifier `/dl/{hash}`) is not impacted.
+//!
+//! The mutating endpoints -- `POST /v1/packs`, `POST /v1/authors`, and
+//! `POST /v1/authors/{handle}/rotate` -- carry the Ed25519 signed-request
+//! `route_layer` ([`crate::middleware::auth::require_signed_request`]). It is
+//! applied only to those method-routers, so anonymous reads on the same paths
+//! (e.g. `GET /v1/packs`) never buffer a body or require a signature.
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use axum::http::{header, HeaderName, HeaderValue, Method};
+use axum::routing::post;
 use axum::Router;
 use tower_governor::governor::GovernorConfigBuilder;
-use tower_governor::key_extractor::SmartIpKeyExtractor;
+use tower_governor::key_extractor::{PeerIpKeyExtractor, SmartIpKeyExtractor};
 use tower_governor::GovernorLayer;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::request_id::{PropagateRequestIdLayer, SetRequestIdLayer};
+use tower_http::set_header::SetResponseHeaderLayer;
 
 use crate::mcp::mcp_router;
+use crate::middleware::auth::require_signed_request;
+use crate::middleware::metrics::MetricsLayer;
 use crate::middleware::request_id::RequestIdGenerator;
 use crate::middleware::tracing::make_trace_layer;
-use crate::routes::authors::authors_router;
+use crate::routes::authors::{authors_router, authors_write_router};
 use crate::routes::downloads::{dl_router, pack_download_url_router};
 use crate::routes::handles::handles_router;
 use crate::routes::ops::ops_router;
-use crate::routes::packs::packs_router;
+use crate::routes::packs::{packs_router, publish_pack};
 use crate::state::AppState;
 
 /// Build the complete Axum router for the frameshift HTTP server.
@@ -63,8 +75,8 @@ use crate::state::AppState;
 ///   /healthz    -- ops
 ///   /metrics    -- ops
 ///   /v1
-///     /packs    -- pack read endpoints
-///     /authors  -- author lookup
+///     /packs    -- pack read endpoints + POST publish (signed-request)
+///     /authors  -- author lookup + POST register / POST {handle}/rotate (signed-request)
 ///     /handles  -- handle lookup
 ///   /mcp        -- MCP placeholder (501 for all methods)
 /// ```
@@ -87,15 +99,54 @@ pub fn app(state: AppState) -> Router {
     let max_body = state.config.max_request_bytes;
     let cors = build_cors_layer(&state);
 
+    // Signed-request auth layer for mutating endpoints. Built here (not inside
+    // the route modules) because it needs the live `AppState` -- the config
+    // skew window and the shared replay-nonce cache -- baked into the layer.
+    // `state.clone()` keeps the original `state` available for `.with_state`.
+    let signed = axum::middleware::from_fn_with_state(state.clone(), require_signed_request);
+
+    // Publish (`POST /v1/packs`) carries the signed-request layer. It is merged
+    // with the anonymous read router so GET (search) and POST (publish) share
+    // the `/` path with only the POST gated by auth.
+    let publish = Router::new()
+        .route("/", post(publish_pack))
+        .route_layer(signed.clone());
     let mint_router = build_mint_router(&state);
-    let packs = packs_router().nest("/{name}/versions/{version}/download-url", mint_router);
+    let packs = packs_router()
+        .merge(publish)
+        .nest("/{name}/versions/{version}/download-url", mint_router);
+
+    // Authors: anonymous reads merged with signed-request-gated writes
+    // (registration + key rotation).
+    let authors = authors_router().merge(authors_write_router().route_layer(signed.clone()));
 
     let v1 = Router::new()
         .nest("/packs", packs)
-        .nest("/authors", authors_router())
+        .nest("/authors", authors)
         .nest("/handles", handles_router());
 
     let x_request_id = axum::http::HeaderName::from_static("x-request-id");
+
+    // Static security response headers, applied if not already set by a handler.
+    let hdr_xcto = SetResponseHeaderLayer::if_not_present(
+        axum::http::header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    let hdr_xfo = SetResponseHeaderLayer::if_not_present(
+        HeaderName::from_static("x-frame-options"),
+        HeaderValue::from_static("DENY"),
+    );
+    let hdr_rp = SetResponseHeaderLayer::if_not_present(
+        HeaderName::from_static("referrer-policy"),
+        HeaderValue::from_static("no-referrer"),
+    );
+
+    // MetricsLayer is applied last, making it the outermost layer.  All layers
+    // added to an axum Router via `.layer()` run AFTER the router has matched
+    // the route and stamped MatchedPath into request extensions, so the outermost
+    // position is safe and MatchedPath is always available.  (Unmatched requests
+    // fall back to the "<unmatched>" label inside MetricsService.)
+    let metrics_layer = MetricsLayer::new(std::sync::Arc::clone(&state.metrics));
 
     let mut router = Router::new()
         .merge(ops_router())
@@ -106,7 +157,11 @@ pub fn app(state: AppState) -> Router {
         .layer(SetRequestIdLayer::new(x_request_id, RequestIdGenerator))
         .layer(make_trace_layer())
         .layer(CompressionLayer::new())
-        .layer(RequestBodyLimitLayer::new(max_body));
+        .layer(RequestBodyLimitLayer::new(max_body))
+        .layer(hdr_xcto)
+        .layer(hdr_xfo)
+        .layer(hdr_rp)
+        .layer(metrics_layer);
 
     if let Some(cors) = cors {
         router = router.layer(cors);
@@ -124,9 +179,10 @@ pub fn app(state: AppState) -> Router {
 /// - period = `60 / rate_per_min` seconds (interval between token
 ///   replenishments)
 /// - burst = `rate_per_min` (maximum tokens that can accumulate)
-/// - key extractor = [`SmartIpKeyExtractor`], which reads the leftmost
-///   `X-Forwarded-For` entry (set by Pangolin Traefik) and falls back to
-///   the connection peer when the header is absent
+/// - key extractor = [`PeerIpKeyExtractor`] by default (safe against XFF
+///   spoofing), or [`SmartIpKeyExtractor`] when
+///   `state.config.trust_forwarded_for` is `true` (for deployments where a
+///   trusted proxy rewrites XFF before requests reach this server)
 ///
 /// The layer is applied only at the mint sub-router; it does NOT apply to
 /// the verifier `/dl/{hash}` (HMAC is the gate there) or to any other
@@ -139,13 +195,25 @@ fn build_mint_router(state: &AppState) -> Router<AppState> {
     }
     let burst = NonZeroU32::new(rate).expect("rate > 0 verified above");
     let period_secs = (60u64 / u64::from(rate)).max(1);
-    let conf = GovernorConfigBuilder::default()
-        .period(std::time::Duration::from_secs(period_secs))
-        .burst_size(burst.into())
-        .key_extractor(SmartIpKeyExtractor)
-        .finish()
-        .expect("governor config valid (period > 0, burst > 0)");
-    router.layer(GovernorLayer::new(Arc::new(conf)))
+    // Build separate arms because GovernorConfigBuilder is generic over the
+    // key extractor type, making a runtime branch on the same builder awkward.
+    if state.config.trust_forwarded_for {
+        let conf = GovernorConfigBuilder::default()
+            .period(std::time::Duration::from_secs(period_secs))
+            .burst_size(burst.into())
+            .key_extractor(SmartIpKeyExtractor)
+            .finish()
+            .expect("governor config valid (period > 0, burst > 0)");
+        router.layer(GovernorLayer::new(Arc::new(conf)))
+    } else {
+        let conf = GovernorConfigBuilder::default()
+            .period(std::time::Duration::from_secs(period_secs))
+            .burst_size(burst.into())
+            .key_extractor(PeerIpKeyExtractor)
+            .finish()
+            .expect("governor config valid (period > 0, burst > 0)");
+        router.layer(GovernorLayer::new(Arc::new(conf)))
+    }
 }
 
 /// Build the `CorsLayer` from `state.config.cors_allowed_origins`.

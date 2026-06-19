@@ -91,6 +91,10 @@ pub enum CliError {
     /// Error from the orchestrator subsystem (selection, mode, audit).
     #[error("orchestrator error: {0}")]
     Orchestrator(String),
+
+    /// Publish/register flow error (missing argument, registry rejection hint).
+    #[error("{0}")]
+    Publish(String),
 }
 
 /// Validate that `name` is safe to use as a single directory component.

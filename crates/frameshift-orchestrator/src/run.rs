@@ -182,13 +182,13 @@ pub fn select_rich(inputs: &SelectionInputs<'_>) -> Result<SelectionOutput, Orch
             let matched_tokens: Vec<String> = ctx
                 .task_tokens
                 .iter()
-                .filter(|t| profile.map_or(false, |p| p.keywords.contains(*t)))
+                .filter(|t| profile.is_some_and(|p| p.keywords.contains(*t)))
                 .cloned()
                 .collect();
             let anti_matched: Vec<String> = ctx
                 .task_tokens
                 .iter()
-                .filter(|t| profile.map_or(false, |p| p.anti_keywords.contains(*t)))
+                .filter(|t| profile.is_some_and(|p| p.anti_keywords.contains(*t)))
                 .cloned()
                 .collect();
 

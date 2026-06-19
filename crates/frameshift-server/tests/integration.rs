@@ -39,6 +39,7 @@ use frameshift_catalog::records::{PackRecord, PackVersionRecord};
 use frameshift_catalog::status::PackStatus;
 use frameshift_objects::ObjectHash;
 
+use frameshift_server::metrics::Metrics;
 use frameshift_server::{app, AppState, LogFormat, ServerConfig};
 
 use mocks::catalog::{make_author, MockCatalog};
@@ -70,6 +71,8 @@ fn test_config() -> Arc<ServerConfig> {
         r2_region: "auto".to_string(),
         r2_access_key_id: String::new(),
         r2_secret_access_key: SecretString::new(String::new()),
+        trust_forwarded_for: false,
+        signed_request_max_skew: Duration::from_secs(300),
         memory_backend: "none".to_string(),
         memory_http_endpoint: String::new(),
         memory_http_auth: "none".to_string(),
@@ -86,6 +89,13 @@ fn make_state(catalog: MockCatalog, objects: MockPackStore) -> AppState {
         runtime: None,
         memory: None,
         config: test_config(),
+        // Each test gets its own Metrics instance so counters do not bleed
+        // across test runs (the private registry guarantees isolation).
+        metrics: Arc::new(Metrics::new()),
+        // Fresh nonce cache per test (read paths never touch it).
+        auth_nonces: Arc::new(frameshift_server::auth::NonceCache::new(
+            Duration::from_secs(600),
+        )),
     }
 }
 
@@ -576,6 +586,11 @@ fn dl_state_with_rate(catalog: MockCatalog, objects: MockPackStore, rate: u32) -
         r2_region: "auto".to_string(),
         r2_access_key_id: String::new(),
         r2_secret_access_key: SecretString::new(String::new()),
+        // The rate-limit test keys requests by a stamped X-Forwarded-For header,
+        // which requires the trusted-proxy extractor. Production defaults to
+        // false (peer-IP only); this test opts in deliberately.
+        trust_forwarded_for: true,
+        signed_request_max_skew: Duration::from_secs(300),
         memory_backend: "none".to_string(),
         memory_http_endpoint: String::new(),
         memory_http_auth: "none".to_string(),
@@ -588,6 +603,12 @@ fn dl_state_with_rate(catalog: MockCatalog, objects: MockPackStore, rate: u32) -
         runtime: None,
         memory: None,
         config: Arc::new(cfg),
+        // Fresh registry per test -- see note in make_state.
+        metrics: Arc::new(Metrics::new()),
+        // Fresh nonce cache per test.
+        auth_nonces: Arc::new(frameshift_server::auth::NonceCache::new(
+            Duration::from_secs(600),
+        )),
     }
 }
 

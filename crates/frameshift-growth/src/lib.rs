@@ -8,7 +8,24 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+
 use serde::{Deserialize, Serialize};
+
+/// Build the create+append `OpenOptions` used for every growth file.
+///
+/// Growth logs are strictly local and may reference private infrastructure,
+/// so on Unix the file is created with mode `0o600` (owner-only) to honor the
+/// growth-privacy invariant. The mode applies only when the file is created;
+/// pre-existing files keep their current permissions.
+fn growth_open_options() -> fs::OpenOptions {
+    let mut opts = fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    opts.mode(0o600);
+    opts
+}
 
 /// Errors from growth file operations.
 #[derive(Debug, thiserror::Error)]
@@ -71,9 +88,7 @@ pub fn append_with_timestamp(
         })?;
     }
 
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
+    let mut file = growth_open_options()
         .open(&growth_path)
         .map_err(|source| GrowthError::Io {
             path: growth_path.clone(),
@@ -209,9 +224,7 @@ pub fn append_jsonl(
     })?;
     line.push('\n');
 
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
+    let mut file = growth_open_options()
         .open(&path)
         .map_err(|source| GrowthError::Io { path: path.clone(), source })?;
     file.write_all(line.as_bytes())
@@ -453,6 +466,26 @@ mod tests {
         assert!(path.exists());
         let content = fs::read_to_string(&path).unwrap();
         assert!(content.contains("first entry"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_creates_owner_only_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        append_with_timestamp(
+            tmp.path(),
+            "proj1",
+            "cryptographic",
+            "private infra note",
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
+        let path = tmp
+            .path()
+            .join("projects/proj1/personas/cryptographic/growth.md");
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "growth file must be owner-only readable");
     }
 
     #[test]

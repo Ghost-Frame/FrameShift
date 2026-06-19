@@ -727,8 +727,8 @@ mod tests {
         });
         let profile = PersonaProfile::from_source(&src);
         assert_eq!(profile.primary_intents.len(), 2);
-        assert!(profile.primary_intents.iter().any(|i| *i == crate::intent::Intent::Implementation));
-        assert!(profile.primary_intents.iter().any(|i| *i == crate::intent::Intent::Debugging));
+        assert!(profile.primary_intents.contains(&crate::intent::Intent::Implementation));
+        assert!(profile.primary_intents.contains(&crate::intent::Intent::Debugging));
     }
 
     /// profile_extracts_anti_keywords verifies that anti_keywords from the

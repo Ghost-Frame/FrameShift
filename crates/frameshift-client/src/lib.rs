@@ -1,11 +1,16 @@
 mod error;
 mod model;
+/// Registry publish implementation: pack, sign, and HTTP upload.
+mod publish;
+/// Registry install implementation: HTTP fetch, extraction, and verification.
+mod registry;
 
 pub use error::ClientError;
 pub use model::{
     ClientOptions, GcReport, InstallReport, InstallRequest, InstallSource, LockedPersona, Lockfile,
     PersonaSpec, ProjectConfig, ProjectPaths, SyncReport, SCHEMA_VERSION,
 };
+pub use publish::PublishOutcome;
 
 use base64::{engine::general_purpose, Engine as _};
 use ed25519_dalek::VerifyingKey;
@@ -67,6 +72,50 @@ impl Client {
         &self.data_root
     }
 
+    /// Load (or create on first use) the managed author Ed25519 signing key from
+    /// the central data root. See [`publish::load_or_create_signing_key`].
+    pub fn author_signing_key(&self) -> Result<ed25519_dalek::SigningKey, ClientError> {
+        publish::load_or_create_signing_key(&self.data_root)
+    }
+
+    /// The base64url-no-pad public key string for the managed author key -- the
+    /// value the registry registers a handle against.
+    pub fn author_pubkey_b64(&self) -> Result<String, ClientError> {
+        Ok(publish::public_key_b64(&self.author_signing_key()?))
+    }
+
+    /// The lowercase-hex public key string for the managed author key, used to
+    /// fill the `author_pubkey` field of a synthesized `pack.toml`.
+    pub fn author_pubkey_hex(&self) -> Result<String, ClientError> {
+        Ok(publish::public_key_hex(&self.author_signing_key()?))
+    }
+
+    /// Register the managed author key under `handle` at `server_url`
+    /// (`POST /v1/authors`). Idempotent for the same key+handle; a different
+    /// key claiming a taken handle yields [`ClientError::RegistryRejected`] 409.
+    pub fn register_author(
+        &self,
+        server_url: &str,
+        handle: &str,
+        display_name: Option<&str>,
+    ) -> Result<(), ClientError> {
+        let key = self.author_signing_key()?;
+        publish::register_author(server_url, &key, handle, display_name)
+    }
+
+    /// Pack, sign, and upload the pack directory at `pack_dir` to `server_url`
+    /// under `author_handle` (`POST /v1/packs`). `pack_dir` must contain a
+    /// `pack.toml`. Returns the server's [`PublishOutcome`].
+    pub fn publish_pack_dir(
+        &self,
+        server_url: &str,
+        pack_dir: &Path,
+        author_handle: &str,
+    ) -> Result<PublishOutcome, ClientError> {
+        let key = self.author_signing_key()?;
+        publish::publish_pack_dir(server_url, &key, pack_dir, author_handle)
+    }
+
     pub fn project_id(&self, project_root: &Path) -> Result<String, ClientError> {
         if let Ok(explicit) = std::env::var(PROJECT_ID_ENV) {
             if !explicit.is_empty() {
@@ -113,19 +162,14 @@ impl Client {
                 ensure_cached_pack(pack_dir, &cache_path)?;
                 locked_persona_from_pack(&pack)
             }
-            InstallSource::Registry => return Err(ClientError::RegistryInstallNotImplemented),
+            InstallSource::Registry => {
+                // Fetch, extract, verify, and cache the pack from the HTTP registry.
+                install_from_registry(&request.spec, &paths)?
+            }
         };
 
-        let mut lockfile = load_lockfile(&paths.lock_path)?.unwrap_or_default();
-        upsert_locked_persona(&mut lockfile, locked.clone());
-        let raw_lock = toml::to_string_pretty(&lockfile)?;
-        self.materialize_project_state(&paths, &lockfile, &raw_lock)?;
-
-        Ok(InstallReport {
-            project_id: paths.project_id,
-            cache_path: paths.cache_dir.join(&locked.hash),
-            persona: locked,
-        })
+        // Shared tail: upsert into lockfile and materialize project state.
+        finish_install(self, &paths, locked)
     }
 
     pub fn activate(&self, project_root: &Path, persona: &str) -> Result<(), ClientError> {
@@ -514,7 +558,8 @@ fn hashed_project_id(project_root: &Path) -> Result<String, ClientError> {
     Ok(hex::encode(digest))
 }
 
-fn validate_pack_request(pack: &Pack, spec: &PersonaSpec) -> Result<(), ClientError> {
+/// Verify that the pack manifest matches the requested spec (name and version).
+pub(crate) fn validate_pack_request(pack: &Pack, spec: &PersonaSpec) -> Result<(), ClientError> {
     let manifest = pack.manifest();
     if manifest.name != spec.name || manifest.version != spec.version {
         return Err(ClientError::ManifestMismatch {
@@ -561,7 +606,8 @@ fn parse_verifying_key_bytes(encoded: &str) -> Result<[u8; 32], ClientError> {
     Err(ClientError::InvalidAuthorPublicKey(encoded.to_string()))
 }
 
-fn locked_persona_from_pack(pack: &Pack) -> LockedPersona {
+/// Build a [`LockedPersona`] from the loaded pack's manifest fields and canonical hash.
+pub(crate) fn locked_persona_from_pack(pack: &Pack) -> LockedPersona {
     let manifest = pack.manifest();
     LockedPersona {
         name: manifest.name.clone(),
@@ -605,7 +651,9 @@ fn load_lockfile_with_raw(path: &Path) -> Result<Option<(String, Lockfile)>, Cli
     Ok(Some((raw, lockfile)))
 }
 
-fn ensure_cached_pack(source_dir: &Path, cache_path: &Path) -> Result<(), ClientError> {
+/// Copy `source_dir` into the content-addressed cache at `cache_path` if it is not
+/// already there. Uses a `.tmp` staging path + atomic rename.
+pub(crate) fn ensure_cached_pack(source_dir: &Path, cache_path: &Path) -> Result<(), ClientError> {
     ensure_dir(
         cache_path
             .parent()
@@ -800,6 +848,40 @@ fn read_dir_sorted(path: &Path) -> Result<Vec<fs::DirEntry>, ClientError> {
     Ok(entries)
 }
 
+/// Shared install tail: upsert a [`LockedPersona`] into the lockfile, persist
+/// the lockfile, and materialize project state. Both the LocalPath and Registry
+/// arms call this after producing their locked persona.
+///
+/// Returns an [`InstallReport`] on success.
+fn finish_install(
+    client: &Client,
+    paths: &ProjectPaths,
+    locked: LockedPersona,
+) -> Result<InstallReport, ClientError> {
+    let mut lockfile = load_lockfile(&paths.lock_path)?.unwrap_or_default();
+    upsert_locked_persona(&mut lockfile, locked.clone());
+    let raw_lock = toml::to_string_pretty(&lockfile)?;
+    client.materialize_project_state(paths, &lockfile, &raw_lock)?;
+
+    Ok(InstallReport {
+        project_id: paths.project_id.clone(),
+        cache_path: paths.cache_dir.join(&locked.hash),
+        persona: locked,
+    })
+}
+
+/// Fetch a pack from the HTTP registry, verify its content hash, extract it,
+/// write the signature, verify the Ed25519 signature, cache it by hash, and
+/// return the [`LockedPersona`] to be committed into the lockfile.
+///
+/// This is the complete implementation for [`InstallSource::Registry`].
+fn install_from_registry(
+    spec: &PersonaSpec,
+    paths: &ProjectPaths,
+) -> Result<LockedPersona, ClientError> {
+    registry::fetch_and_install(spec, paths)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -879,7 +961,7 @@ mod tests {
         let content = client
             .rendered_persona(&project_root, "rendtest", "claude")
             .unwrap();
-        assert!(content.contains("rendtest") || content.contains("Rendtest") || content.len() > 0);
+        assert!(content.contains("rendtest") || content.contains("Rendtest") || !content.is_empty());
     }
 
     /// rendered_persona returns an error for an unknown render target.

@@ -69,7 +69,24 @@ enum SeedError {
     Objects(#[from] frameshift_objects::ObjectStoreError),
 }
 
+/// Runtime configuration resolved from environment variables.
+struct SeedConfig {
+    /// PostgreSQL connection URL for the catalog.
+    postgres_url: String,
+    /// Filesystem object-store root used by the live server.
+    object_store_root: String,
+    /// Root directory containing persona subdirectories to seed.
+    personas_root: String,
+    /// Author handle to register and stamp into synthesized pack manifests.
+    author_handle: String,
+    /// Human-readable display name for the seed author.
+    author_display_name: String,
+    /// Path to the persisted Ed25519 seed used for repeatable signatures.
+    signing_key_path: PathBuf,
+}
+
 #[tokio::main]
+/// Boot the async runtime, initialize tracing, and execute the seeder.
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -84,49 +101,43 @@ async fn main() {
     }
 }
 
+/// Load environment configuration and seed the catalog plus object store.
 async fn run() -> Result<(), SeedError> {
-    let postgres_url = std::env::var("POSTGRES_URL")
-        .map_err(|_| SeedError::MissingEnv("POSTGRES_URL"))?;
-
-    let object_store_root = std::env::var("OBJECT_STORE_ROOT")
-        .unwrap_or_else(|_| "/tmp/frameshift-objects".to_string());
-
-    let personas_root = std::env::var("PERSONAS_ROOT")
-        .map_err(|_| SeedError::MissingEnv("PERSONAS_ROOT"))?;
+    let config = SeedConfig::from_env()?;
 
     info!("connecting to postgres");
     let catalog = PostgresCatalog::new(PostgresCatalogConfig {
-        url: SecretString::new(postgres_url.clone()),
+        url: SecretString::new(config.postgres_url.clone()),
         pool_size: 5,
         connect_timeout: Duration::from_secs(10),
         statement_timeout: Duration::from_secs(30),
     })
     .await?;
 
-    info!("opening object store at {object_store_root}");
+    info!("opening object store at {}", config.object_store_root);
     let objects = FsPackStore::new(FsPackStoreConfig {
-        root: PathBuf::from(&object_store_root),
+        root: PathBuf::from(&config.object_store_root),
         verify_on_read: true,
         max_bytes: None,
         fsync_on_put: false,
     })
     .await?;
 
-    let key_path = PathBuf::from(&object_store_root)
-        .parent()
-        .unwrap_or(Path::new("/tmp"))
-        .join("seed-signing-key.bin");
-
-    let signing_key = load_or_create_signing_key(&key_path)?;
+    let signing_key = load_or_create_signing_key(&config.signing_key_path)?;
     let verifying_key = signing_key.verifying_key();
     let author_pubkey = Ed25519PublicKey(verifying_key.to_bytes());
 
     info!("author pubkey: {author_pubkey}");
 
-    let author_handle = "seed-author";
-    register_author(&catalog, author_pubkey, author_handle).await?;
+    register_author(
+        &catalog,
+        author_pubkey,
+        &config.author_handle,
+        &config.author_display_name,
+    )
+    .await?;
 
-    let personas_path = PathBuf::from(&personas_root);
+    let personas_path = PathBuf::from(&config.personas_root);
     let mut seeded = 0usize;
     let mut skipped = 0usize;
 
@@ -156,7 +167,12 @@ async fn run() -> Result<(), SeedError> {
         // Synthesize a pack.toml if one does not exist.
         let pack_toml_path = path.join("pack.toml");
         if !pack_toml_path.exists() {
-            write_synthetic_pack_toml(&pack_toml_path, dir_name, author_handle, &verifying_key)?;
+            write_synthetic_pack_toml(
+                &pack_toml_path,
+                dir_name,
+                &config.author_handle,
+                &verifying_key,
+            )?;
         }
 
         match seed_persona(
@@ -187,37 +203,79 @@ async fn run() -> Result<(), SeedError> {
 
     // Post-seed: update pack descriptions and tags from persona.toml files.
     info!("updating pack descriptions from persona.toml files");
-    update_pack_metadata(&postgres_url, &personas_path).await?;
+    update_pack_metadata(&config.postgres_url, &personas_path).await?;
 
     info!("done");
     Ok(())
 }
 
-/// Register the seed author, treating idempotent re-registration as success.
+/// Resolve seeder configuration from environment variables.
+impl SeedConfig {
+    /// Build a validated configuration from the current process environment.
+    fn from_env() -> Result<Self, SeedError> {
+        let postgres_url = std::env::var("POSTGRES_URL")
+            .map_err(|_| SeedError::MissingEnv("POSTGRES_URL"))?;
+        let object_store_root = std::env::var("OBJECT_STORE_ROOT")
+            .unwrap_or_else(|_| "/tmp/frameshift-objects".to_string());
+        let personas_root = std::env::var("PERSONAS_ROOT")
+            .map_err(|_| SeedError::MissingEnv("PERSONAS_ROOT"))?;
+        let author_handle =
+            std::env::var("SEED_AUTHOR_HANDLE").unwrap_or_else(|_| "seed-author".to_string());
+        let author_display_name = std::env::var("SEED_AUTHOR_DISPLAY_NAME")
+            .unwrap_or_else(|_| "Seed Author".to_string());
+        let signing_key_path = match std::env::var("SEED_SIGNING_KEY_PATH") {
+            Ok(path) => PathBuf::from(path),
+            Err(_) => default_signing_key_path(&object_store_root, &author_handle),
+        };
+
+        Ok(Self {
+            postgres_url,
+            object_store_root,
+            personas_root,
+            author_handle,
+            author_display_name,
+            signing_key_path,
+        })
+    }
+}
+
+/// Derive a stable default key path that is namespaced by author handle.
+fn default_signing_key_path(object_store_root: &str, author_handle: &str) -> PathBuf {
+    PathBuf::from(object_store_root)
+        .parent()
+        .unwrap_or(Path::new("/tmp"))
+        .join(format!("seed-signing-key-{author_handle}.bin"))
+}
+
+/// Register the seed author and populate the handles table for publish lookup.
+///
+/// `register_author` writes the `authors` table but NOT the `handles` table.
+/// `get_handle_pubkey` (called by the publish path) reads the `handles` table.
+/// Both calls are idempotent: re-running the seeder is safe.
 async fn register_author(
     catalog: &PostgresCatalog,
     pubkey: Ed25519PublicKey,
     handle: &str,
+    display_name: &str,
 ) -> Result<(), SeedError> {
     let record = AuthorRecord {
         pubkey,
         handle: handle.to_string(),
-        display_name: Some("Seed Author".to_string()),
+        display_name: Some(display_name.to_string()),
         created_at: Utc::now(),
         oauth_links: vec![],
     };
 
-    match catalog.register_author(record).await {
-        Ok(()) => {
-            info!("registered author: {handle}");
-            Ok(())
-        }
-        Err(CatalogError::Conflict { .. }) | Err(CatalogError::HandleTaken { .. }) => {
-            info!("author {handle} already registered");
-            Ok(())
-        }
-        Err(e) => Err(SeedError::Catalog(e)),
-    }
+    catalog.register_author(record).await?;
+    info!("registered or confirmed author: {handle}");
+
+    // Populate the handles table so the author can be looked up by handle
+    // via get_handle_pubkey (used by the publish path). set_handle_pubkey
+    // is an upsert and is safe to call on every seed run.
+    catalog.set_handle_pubkey(handle, pubkey).await?;
+    info!("set handle pubkey for: {handle}");
+
+    Ok(())
 }
 
 /// Build and seed a single persona directory.
@@ -446,11 +504,22 @@ struct PatternsToml {
 }
 
 /// A single stack category entry.
+///
+/// Only the `category` is read (it becomes a discovery tag); the entry's
+/// `items` list is intentionally not modeled, as serde ignores unknown fields.
 #[derive(Debug, serde::Deserialize)]
 struct StackEntry {
     category: String,
-    #[serde(default)]
-    items: Vec<toml::Value>,
+}
+
+/// Derived metadata for a seeded pack head row.
+struct PackMetadata {
+    /// Pack name used to target the UPDATE statement.
+    name: String,
+    /// Human-readable marketplace description.
+    description: String,
+    /// Discovery tags stored on the pack head record.
+    tags: Vec<String>,
 }
 
 /// Post-seed pass: read persona.toml from each directory, extract description
@@ -475,52 +544,29 @@ async fn update_pack_metadata(postgres_url: &str, personas_root: &Path) -> Resul
             continue;
         }
 
-        let persona_path = path.join("persona.toml");
-        if !persona_path.exists() {
-            continue;
-        }
-
         let dir_name = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("unknown")
             .to_string();
 
-        let persona_content = std::fs::read_to_string(&persona_path)?;
-        let persona: PersonaToml = toml::from_str(&persona_content).map_err(|e| {
-            SeedError::Io(std::io::Error::other(format!(
-                "parse persona.toml for {dir_name}: {e}"
-            )))
-        })?;
-
-        // Derive tags from patterns.toml stack categories.
-        let mut tags: Vec<String> = Vec::new();
-        let patterns_path = path.join("patterns.toml");
-        if patterns_path.exists() {
-            let patterns_content = std::fs::read_to_string(&patterns_path)?;
-            if let Ok(patterns) = toml::from_str::<PatternsToml>(&patterns_content) {
-                for stack in &patterns.stack {
-                    tags.push(stack.category.clone());
-                }
-            }
-        }
-
-        let description = if persona.description.is_empty() {
-            format!("{} persona for AI coding agents", dir_name)
-        } else {
-            persona.description
+        let Some(metadata) = derive_pack_metadata(&path, &dir_name)? else {
+            continue;
         };
 
         let result = client
             .execute(
                 "UPDATE packs SET description = $1, tags = $2 WHERE name = $3",
-                &[&description, &tags, &persona.name],
+                &[&metadata.description, &metadata.tags, &metadata.name],
             )
             .await;
 
         match result {
             Ok(rows) if rows > 0 => {
-                info!("updated metadata for {dir_name}: {} tags", tags.len());
+                info!(
+                    "updated metadata for {dir_name}: {} tags",
+                    metadata.tags.len()
+                );
             }
             Ok(_) => {
                 warn!("no pack row found for {dir_name}, skipping metadata update");
@@ -532,4 +578,95 @@ async fn update_pack_metadata(postgres_url: &str, personas_root: &Path) -> Resul
     }
 
     Ok(())
+}
+
+/// Derive pack metadata from persona.toml when present, otherwise from AGENTS.md.
+fn derive_pack_metadata(path: &Path, dir_name: &str) -> Result<Option<PackMetadata>, SeedError> {
+    let persona_path = path.join("persona.toml");
+    if persona_path.exists() {
+        let persona_content = std::fs::read_to_string(&persona_path)?;
+        let persona: PersonaToml = toml::from_str(&persona_content).map_err(|e| {
+            SeedError::Io(std::io::Error::other(format!(
+                "parse persona.toml for {dir_name}: {e}"
+            )))
+        })?;
+
+        let mut tags = derive_pattern_tags(path)?;
+        if tags.is_empty() {
+            tags = default_tags(dir_name);
+        }
+
+        let description = if persona.description.is_empty() {
+            fallback_description(dir_name)
+        } else {
+            persona.description
+        };
+
+        return Ok(Some(PackMetadata {
+            name: persona.name,
+            description,
+            tags,
+        }));
+    }
+
+    let agents_path = path.join("AGENTS.md");
+    if !agents_path.exists() {
+        return Ok(None);
+    }
+
+    let description = derive_agents_description(&agents_path)
+        .unwrap_or_else(|| fallback_description(dir_name));
+    Ok(Some(PackMetadata {
+        name: dir_name.to_string(),
+        description,
+        tags: default_tags(dir_name),
+    }))
+}
+
+/// Extract stack-category tags from patterns.toml when that file exists.
+fn derive_pattern_tags(path: &Path) -> Result<Vec<String>, SeedError> {
+    let mut tags = Vec::new();
+    let patterns_path = path.join("patterns.toml");
+    if patterns_path.exists() {
+        let patterns_content = std::fs::read_to_string(&patterns_path)?;
+        if let Ok(patterns) = toml::from_str::<PatternsToml>(&patterns_content) {
+            for stack in &patterns.stack {
+                tags.push(stack.category.clone());
+            }
+        }
+    }
+    Ok(tags)
+}
+
+/// Build a sane default description when no structured metadata exists.
+fn fallback_description(dir_name: &str) -> String {
+    format!("{dir_name} persona for AI coding agents")
+}
+
+/// Build minimal discovery tags for AGENTS-only persona directories.
+fn default_tags(dir_name: &str) -> Vec<String> {
+    vec![dir_name.to_string(), "persona".to_string()]
+}
+
+/// Pull the first useful prose line out of AGENTS.md for marketplace display.
+fn derive_agents_description(path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty()
+            || trimmed.starts_with('#')
+            || trimmed.starts_with('<')
+            || trimmed.starts_with('|')
+            || trimmed.starts_with("```")
+            || trimmed.starts_with("- ")
+            || trimmed.starts_with("* ")
+        {
+            continue;
+        }
+        if trimmed.len() < 12 {
+            continue;
+        }
+        return Some(trimmed.to_string());
+    }
+    None
 }

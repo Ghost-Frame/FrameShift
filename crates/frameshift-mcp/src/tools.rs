@@ -530,7 +530,8 @@ fn call_prefs(arguments: &serde_json::Value, client: &Client) -> ToolResult {
     match action {
         "show" => {
             let prefs = Preferences::load(&prefs_path).unwrap_or_default();
-            let text = serde_json::json!({ "bias": prefs.bias }).to_string();
+            let text =
+                serde_json::json!({ "bias": prefs.bias, "entries": prefs.entries }).to_string();
             ok_result(text)
         }
 
@@ -558,8 +559,7 @@ fn call_prefs(arguments: &serde_json::Value, client: &Client) -> ToolResult {
                 None => return err_result("decay requires 'persona' argument".to_string()),
             };
             let mut prefs = Preferences::load(&prefs_path).unwrap_or_default();
-            prefs.record_override(Some(persona), "__manual_decay__");
-            prefs.bias.remove("__manual_decay__");
+            prefs.decay(persona);
             if let Err(e) = prefs.save(&prefs_path) {
                 return err_result(format!("failed to save preferences: {}", e));
             }

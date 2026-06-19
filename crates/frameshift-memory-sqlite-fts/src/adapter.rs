@@ -166,6 +166,24 @@ impl MemoryAdapter for SqliteFtsAdapter {
             return Ok(Vec::new());
         }
 
+        // M1 -- Harden the FTS5 query string before building the phrase expression.
+        //
+        // (a) NUL bytes ('\0') truncate the SQLite C-string and silently change
+        //     query semantics -- reject any query that contains one.
+        if query.contains('\0') {
+            return Err(MemoryError::InvalidQuery(
+                "query must not contain NUL bytes".into(),
+            ));
+        }
+        // (b) Cap query length to prevent SQLite expression-depth exhaustion.
+        /// Maximum allowed FTS5 query length in bytes.
+        const MAX_QUERY_LEN: usize = 1024;
+        if query.len() > MAX_QUERY_LEN {
+            return Err(MemoryError::InvalidQuery(format!(
+                "query exceeds maximum length of {MAX_QUERY_LEN} bytes"
+            )));
+        }
+
         // Escape the user query for FTS5: wrap in double quotes and double any
         // internal double quotes to prevent injection into the FTS5 expression.
         let escaped = query.replace('"', "\"\"");
@@ -230,8 +248,25 @@ impl MemoryAdapter for SqliteFtsAdapter {
                 }
 
                 // Metadata key=value filters using JSON1.
+                //
+                // M2 -- Validate each metadata key before building the JSON path.
+                // An unvalidated key such as `[0]` or `a.b` produces an invalid
+                // or unexpected path that silently disables the filter. Only keys
+                // matching [A-Za-z0-9_] (non-empty) are accepted; any other key
+                // causes the entire search to return an error so callers notice
+                // the malformed input rather than receiving silently unfiltered
+                // results.
                 if let Some(meta_map) = &filters_owned.metadata {
                     for (key, value) in meta_map {
+                        // Reject empty keys or keys containing non-identifier chars.
+                        if key.is_empty()
+                            || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        {
+                            return Err(SqliteFtsError::InvalidQuery(format!(
+                                "metadata filter key {key:?} is invalid; \
+                                 only [A-Za-z0-9_] characters are allowed"
+                            )));
+                        }
                         let json_path = format!("$.{key}");
                         let value_str = value.to_string();
                         // Use json_extract and compare via json(); bind both path and value.
@@ -538,4 +573,169 @@ async fn rows_to_memories(
         memories.push(mem);
     }
     Ok(memories)
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use frameshift_memory::{Filters, MemoryAdapter, MemoryError};
+    use tempfile::TempDir;
+
+    use super::{SqliteFtsAdapter, SqliteFtsConfig};
+
+    /// Build an adapter backed by a temporary file database that is cleaned up
+    /// when `_dir` is dropped.
+    async fn make_adapter() -> (SqliteFtsAdapter, TempDir) {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("test.db");
+        let adapter = SqliteFtsAdapter::new(SqliteFtsConfig {
+            path,
+            pool_size: 2,
+        })
+        .await
+        .expect("adapter init");
+        (adapter, dir)
+    }
+
+    /// M1 -- A query containing a NUL byte must be rejected with InvalidQuery.
+    #[tokio::test]
+    async fn search_rejects_nul_byte_in_query() {
+        let (adapter, _dir) = make_adapter().await;
+        let query = "hello\0world";
+        let result = adapter.search(query, 10, &Filters::default()).await;
+        match result {
+            Err(MemoryError::InvalidQuery(msg)) => {
+                assert!(
+                    msg.contains("NUL"),
+                    "error message should mention NUL: {msg}"
+                );
+            }
+            other => panic!("expected InvalidQuery for NUL byte, got: {other:?}"),
+        }
+    }
+
+    /// M1 -- A query longer than 1024 bytes must be rejected with InvalidQuery.
+    #[tokio::test]
+    async fn search_rejects_overlength_query() {
+        let (adapter, _dir) = make_adapter().await;
+        // Build a query that exceeds the 1024-byte cap.
+        let query = "a".repeat(1025);
+        let result = adapter.search(&query, 10, &Filters::default()).await;
+        match result {
+            Err(MemoryError::InvalidQuery(msg)) => {
+                assert!(
+                    msg.contains("1024"),
+                    "error message should mention the limit: {msg}"
+                );
+            }
+            other => panic!("expected InvalidQuery for overlength query, got: {other:?}"),
+        }
+    }
+
+    /// M1 -- A query exactly at the length cap (1024 bytes) must be accepted
+    /// (no error from the length check itself).
+    #[tokio::test]
+    async fn search_accepts_query_at_length_limit() {
+        let (adapter, _dir) = make_adapter().await;
+        let query = "a".repeat(1024);
+        // We expect either Ok (empty results) or a backend SQLite error, but
+        // NOT an InvalidQuery length error.
+        let result = adapter.search(&query, 10, &Filters::default()).await;
+        match result {
+            Err(MemoryError::InvalidQuery(msg)) if msg.contains("1024") => {
+                panic!("query at exactly 1024 bytes should not be rejected by length check: {msg}");
+            }
+            _ => { /* pass -- may be Ok([]) or a different error */ }
+        }
+    }
+
+    /// M2 -- A metadata filter key containing bracket notation (`[0]`) must
+    /// be rejected with InvalidQuery.
+    #[tokio::test]
+    async fn search_rejects_bracket_metadata_key() {
+        let (adapter, _dir) = make_adapter().await;
+        let mut meta = BTreeMap::new();
+        meta.insert("[0]".to_string(), serde_json::json!("value"));
+        let filters = Filters {
+            metadata: Some(meta),
+            ..Filters::default()
+        };
+        let result = adapter.search("hello", 10, &filters).await;
+        match result {
+            Err(MemoryError::InvalidQuery(msg)) => {
+                assert!(
+                    msg.contains("[0]"),
+                    "error message should include the offending key: {msg}"
+                );
+            }
+            other => panic!("expected InvalidQuery for bracket key, got: {other:?}"),
+        }
+    }
+
+    /// M2 -- A metadata filter key containing a dot (`a.b`) must be rejected
+    /// with InvalidQuery.
+    #[tokio::test]
+    async fn search_rejects_dotted_metadata_key() {
+        let (adapter, _dir) = make_adapter().await;
+        let mut meta = BTreeMap::new();
+        meta.insert("a.b".to_string(), serde_json::json!(42));
+        let filters = Filters {
+            metadata: Some(meta),
+            ..Filters::default()
+        };
+        let result = adapter.search("hello", 10, &filters).await;
+        match result {
+            Err(MemoryError::InvalidQuery(msg)) => {
+                assert!(
+                    msg.contains("a.b"),
+                    "error message should include the offending key: {msg}"
+                );
+            }
+            other => panic!("expected InvalidQuery for dotted key, got: {other:?}"),
+        }
+    }
+
+    /// M2 -- A metadata filter key with only valid identifier characters must
+    /// be accepted (no InvalidQuery error from key validation).
+    #[tokio::test]
+    async fn search_accepts_valid_metadata_key() {
+        let (adapter, _dir) = make_adapter().await;
+        let mut meta = BTreeMap::new();
+        meta.insert("valid_key_123".to_string(), serde_json::json!("ok"));
+        let filters = Filters {
+            metadata: Some(meta),
+            ..Filters::default()
+        };
+        // Expect Ok (empty results -- no stored memories) not an InvalidQuery.
+        let result = adapter.search("hello", 10, &filters).await;
+        match result {
+            Ok(_) => { /* pass */ }
+            Err(MemoryError::InvalidQuery(msg)) => {
+                panic!("valid metadata key should not be rejected: {msg}");
+            }
+            Err(other) => panic!("unexpected error for valid metadata key: {other:?}"),
+        }
+    }
+
+    /// M2 -- An empty metadata filter key must be rejected with InvalidQuery.
+    #[tokio::test]
+    async fn search_rejects_empty_metadata_key() {
+        let (adapter, _dir) = make_adapter().await;
+        let mut meta = BTreeMap::new();
+        meta.insert(String::new(), serde_json::json!("value"));
+        let filters = Filters {
+            metadata: Some(meta),
+            ..Filters::default()
+        };
+        let result = adapter.search("hello", 10, &filters).await;
+        match result {
+            Err(MemoryError::InvalidQuery(_)) => { /* pass */ }
+            other => panic!("expected InvalidQuery for empty metadata key, got: {other:?}"),
+        }
+    }
 }

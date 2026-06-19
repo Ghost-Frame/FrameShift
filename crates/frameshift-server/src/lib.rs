@@ -22,18 +22,28 @@
 //!
 //! ## Milestone scope
 //!
-//! This milestone ships the skeleton only:
+//! Currently shipped:
 //! - READ endpoints for `/v1/packs*`, `/v1/authors/*`, `/v1/handles/*`.
-//! - Operational endpoints: `/healthz`, `/metrics`.
+//! - WRITE endpoints gated by Ed25519 *signed-request* authentication (see
+//!   [`crate::auth`]): `POST /v1/packs` (publish), `POST /v1/authors`
+//!   (handle registration), and `POST /v1/authors/{handle}/rotate` (key
+//!   rotation). Every mutating request carries an Ed25519 signature over
+//!   `method | path | sha256(body) | timestamp | nonce`, with timestamp-skew
+//!   and nonce-replay protection. Publish additionally verifies the pack's own
+//!   content signature against the handle's currently-registered key.
+//! - Signed download URLs: `POST /v1/downloads` (mint) and `GET /dl/{hash}`.
+//! - Operational endpoints: `/healthz`, `/metrics` (real Prometheus registry).
 //! - MCP placeholder: `/mcp/*` returns 501.
 //!
-//! Deferred: publish/write endpoints, signed-request auth, OAuth 2.1,
-//! transparency log, full MCP surface.
+//! Deferred (M5+): OAuth 2.1, transparency log, full MCP surface, and a shared
+//! (cross-instance) replay-nonce store for multi-binary deployments.
 
+pub mod auth;
 pub mod config;
 pub mod download;
 pub mod error;
 pub mod mcp;
+pub mod metrics;
 pub mod middleware;
 pub mod router;
 pub mod routes;

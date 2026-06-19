@@ -98,6 +98,7 @@ impl AppError {
     /// | `InvalidArgument` | `BadRequest` |
     /// | `Validation` | `BadRequest` |
     /// | `BackendError` | `Internal` |
+    /// | `Unauthorized` | `Forbidden` |
     pub fn from_catalog(err: CatalogError, default_kind: &'static str) -> Self {
         match err {
             CatalogError::NotFound { kind, key } => {
@@ -113,6 +114,10 @@ impl AppError {
             CatalogError::Validation(msg) => AppError::BadRequest(msg),
             CatalogError::BackendError(e) => {
                 AppError::Internal(format!("{default_kind} backend error: {e}"))
+            }
+            // A publishing author that does not match the pack owner is a 403.
+            CatalogError::Unauthorized { kind, key } => {
+                AppError::Forbidden(format!("not authorized to write {kind}: {key}"))
             }
         }
     }

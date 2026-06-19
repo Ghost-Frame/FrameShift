@@ -21,7 +21,7 @@ use frameshift_catalog::{
     PackVersionRecord,
 };
 
-use crate::schema::{authors, handles, pack_versions, packs};
+use crate::schema::{authors, handles, pack_downloads, pack_versions, packs};
 
 /// Row struct for the `authors` table.
 ///
@@ -200,6 +200,19 @@ pub(crate) struct NewHandleRow {
     pub handle: String,
     /// Raw 32-byte Ed25519 pubkey.
     pub pubkey: Vec<u8>,
+}
+
+/// Insertable struct for the `pack_downloads` audit table.
+///
+/// `downloaded_at` is omitted; the DB column defaults to `NOW()`.
+/// Used by [`crate::backend::PostgresCatalog::record_download`].
+#[derive(Debug, Insertable)]
+#[diesel(table_name = pack_downloads)]
+pub(crate) struct NewPackDownloadRow {
+    /// Name of the pack that was downloaded.
+    pub pack_name: String,
+    /// Semver version string that was downloaded.
+    pub version: String,
 }
 
 // ── Conversion helpers ──────────────────────────────────────────────────────

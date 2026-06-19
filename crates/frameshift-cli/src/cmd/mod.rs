@@ -10,6 +10,7 @@ pub mod grow;
 pub mod migrate;
 pub mod prefs;
 pub mod publish;
+pub mod register;
 pub mod render;
 pub mod rule;
 pub mod select;

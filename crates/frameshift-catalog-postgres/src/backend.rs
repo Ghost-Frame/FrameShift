@@ -31,11 +31,11 @@ use frameshift_catalog::{
 use crate::config::PostgresCatalogConfig;
 use crate::errors::{map_diesel_error, map_migration_error, map_pool_error};
 use crate::models::{
-    vec_to_pubkey, AuthorRow, HandleRow, NewAuthorRow, NewHandleRow, NewPackRow, NewPackVersionRow,
-    PackRow, PackVersionRow,
+    vec_to_pubkey, AuthorRow, HandleRow, NewAuthorRow, NewHandleRow, NewPackDownloadRow, NewPackRow,
+    NewPackVersionRow, PackRow, PackVersionRow,
 };
 use crate::pool::{build_pool, PgPool};
-use crate::schema::{authors, handles, pack_versions, packs};
+use crate::schema::{authors, handles, pack_downloads, pack_versions, packs};
 
 /// Embedded migration files compiled into the binary at build time.
 ///
@@ -123,7 +123,7 @@ impl PostgresCatalog {
     }
 }
 
-/// PostgreSQL implementation of all 14 [`CatalogBackend`] trait methods.
+/// PostgreSQL implementation of all 15 [`CatalogBackend`] trait methods.
 ///
 /// Each method checks out a connection from the pool, executes the relevant
 /// Diesel DSL or raw SQL query, and maps driver errors to [`CatalogError`].
@@ -276,18 +276,17 @@ impl CatalogBackend for PostgresCatalog {
     ///
     /// Executed inside a single transaction:
     /// 1. Validate `signature` length is exactly 64 bytes.
-    /// 2. Upsert the parent `packs` row (INSERT ... ON CONFLICT DO NOTHING) to
+    /// 2. If the pack head already exists, verify that the publishing author
+    ///    matches the stored `current_author`; mismatches return
+    ///    `CatalogError::Unauthorized` (D5: co-publish / name-squat guard).
+    /// 3. Upsert the parent `packs` row (INSERT ... ON CONFLICT DO NOTHING) to
     ///    ensure the head record exists.
-    /// 3. INSERT the new `pack_versions` row; a `UniqueViolation` on
+    /// 4. INSERT the new `pack_versions` row; a `UniqueViolation` on
     ///    `(pack_name, version)` maps to `CatalogError::Conflict`.
-    /// 4. UPDATE `packs.latest_version` if the new version string is
-    ///    lexicographically greater than the current one.
-    ///
-    /// NOTE: `latest_version` comparison is lexicographic, NOT true semver.
-    /// This works correctly for zero-padded or consistently-formatted semver
-    /// strings (e.g. "1.2.0" vs "1.10.0" would be misordered). A future
-    /// improvement should add a semver-aware comparison when `semver` is added
-    /// as a workspace dependency.
+    /// 5. UPDATE `packs.latest_version` using true semver precedence (D8):
+    ///    the stored `latest_version` is fetched inside the transaction and
+    ///    compared with [`semver_gt`]; the UPDATE only runs when the new
+    ///    version has strictly higher precedence.
     #[instrument(skip(self, record), fields(pack = %record.pack_name, version = %record.version))]
     async fn register_pack_version(&self, record: PackVersionRecord) -> Result<(), CatalogError> {
         if record.signature.len() != 64 {
@@ -345,6 +344,8 @@ impl CatalogBackend for PostgresCatalog {
 
         let pack_name_clone = record.pack_name.clone();
         let version_clone = record.version.clone();
+        // Capture the incoming author bytes for the ownership check inside the tx.
+        let incoming_author_bytes = record.author_pubkey.0.to_vec();
 
         // `diesel_async::AsyncConnection::transaction` requires
         // `E: From<diesel::result::Error>`. We use a local wrapper that carries
@@ -374,7 +375,31 @@ impl CatalogBackend for PostgresCatalog {
                 let new_version = new_version.clone();
                 let pack_name = pack_name_clone.clone();
                 let version = version_clone.clone();
+                let incoming_author = incoming_author_bytes.clone();
                 Box::pin(async move {
+                    // D5: If the pack head already exists, verify the publishing
+                    // author matches the stored current_author. First-publish
+                    // (no existing row) is always allowed.
+                    let existing_pack: Option<PackRow> = packs::table
+                        .filter(packs::name.eq(&pack_name))
+                        .select(PackRow::as_select())
+                        .first(conn)
+                        .await
+                        .optional()
+                        .map_err(|e| {
+                            TxError::Catalog(map_diesel_error(e, "pack", pack_name.clone()))
+                        })?;
+
+                    if let Some(ref existing) = existing_pack {
+                        // Pack already exists -- check ownership.
+                        if existing.current_author != incoming_author {
+                            return Err(TxError::Catalog(CatalogError::Unauthorized {
+                                kind: "pack",
+                                key: pack_name.clone(),
+                            }));
+                        }
+                    }
+
                     // Upsert the parent pack row; do nothing if it already exists.
                     diesel::insert_into(packs::table)
                         .values(&new_pack)
@@ -399,20 +424,35 @@ impl CatalogBackend for PostgresCatalog {
                             ))
                         })?;
 
-                    // Update latest_version if the new version string is lexicographically
-                    // greater than the stored one. NOTE: lexicographic, NOT semver.
-                    diesel::sql_query(
-                        "UPDATE packs SET latest_version = $1 \
-                         WHERE name = $2 \
-                         AND (latest_version IS NULL OR latest_version < $1)",
-                    )
-                    .bind::<diesel::sql_types::Text, _>(version.clone())
-                    .bind::<diesel::sql_types::Text, _>(pack_name.clone())
-                    .execute(conn)
-                    .await
-                    .map_err(|e| {
-                        TxError::Catalog(map_diesel_error(e, "pack", pack_name.clone()))
-                    })?;
+                    // D8: Update latest_version using true semver precedence.
+                    // Read the current stored value (may have changed from the
+                    // row we fetched above if this is a first insert), then
+                    // compare using semver_gt before issuing the UPDATE.
+                    let current_latest: Option<String> = packs::table
+                        .filter(packs::name.eq(&pack_name))
+                        .select(packs::latest_version)
+                        .first(conn)
+                        .await
+                        .map_err(|e| {
+                            TxError::Catalog(map_diesel_error(e, "pack", pack_name.clone()))
+                        })?;
+
+                    // Only update when the new version has strictly higher
+                    // semver precedence than the stored latest.
+                    let should_update = match &current_latest {
+                        None => true,
+                        Some(stored) => semver_gt(&version, stored),
+                    };
+
+                    if should_update {
+                        diesel::update(packs::table.filter(packs::name.eq(&pack_name)))
+                            .set(packs::latest_version.eq(Some(&version)))
+                            .execute(conn)
+                            .await
+                            .map_err(|e| {
+                                TxError::Catalog(map_diesel_error(e, "pack", pack_name.clone()))
+                            })?;
+                    }
 
                     Ok(())
                 })
@@ -514,8 +554,8 @@ impl CatalogBackend for PostgresCatalog {
     /// All filters are ANDed together. Sort modes:
     /// - `TopRated`: `ORDER BY total_downloads DESC, name ASC`
     /// - `Recent`: `ORDER BY created_at DESC, name ASC`
-    /// - `Trending`: falls back to `total_downloads DESC` because v0.1 has no
-    ///   per-day download audit table. See TODO below.
+    /// - `Trending`: ranks by count of `pack_downloads` rows in the last 7 days,
+    ///   `DESC`, with `name ASC` as a deterministic tiebreaker.
     ///
     /// Text query uses `plainto_tsquery('english', $query)` against the GIN FTS
     /// index on `to_tsvector('english', description || ' ' || name)`.
@@ -538,11 +578,6 @@ impl CatalogBackend for PostgresCatalog {
         &self,
         filters: &PackSearchFilters,
     ) -> Result<Vec<PackSearchResult>, CatalogError> {
-        // TODO: SortMode::Trending currently falls back to total_downloads DESC
-        // because there is no per-version downloads audit table in v0.1 of the
-        // schema. Once a `downloads_log(pack_name, version, ts)` table is added,
-        // this should compute downloads in the last 7 days and order by that.
-
         let mut conn = self.pool.get().await.map_err(map_pool_error)?;
 
         let limit_i = i64::from(filters.limit);
@@ -556,7 +591,24 @@ impl CatalogBackend for PostgresCatalog {
             &filters.extends,
         ) {
             (None, None, None, None, None) => match &filters.sort {
-                SortMode::TopRated | SortMode::Trending => packs::table
+                SortMode::Trending => {
+                    // Trending with no additional filters: LEFT JOIN a 7-day
+                    // download count subquery and sort by it.
+                    self.search_trending_raw(
+                        TrendingParams {
+                            tag: None,
+                            target_context: None,
+                            author: None,
+                            query_text: None,
+                            extends: None,
+                            limit: limit_i,
+                            offset: offset_i,
+                        },
+                        &mut conn,
+                    )
+                    .await?
+                }
+                SortMode::TopRated => packs::table
                     .select(PackRow::as_select())
                     .order((packs::total_downloads.desc(), packs::name.asc()))
                     .limit(limit_i)
@@ -575,22 +627,45 @@ impl CatalogBackend for PostgresCatalog {
             },
             _ => {
                 // For combinations involving GIN tag, target_context, author, FTS,
-                // or extends filters, use the raw-SQL helper which binds params safely via
-                // numbered params.
-                self.search_raw(
-                    SearchParams {
-                        tag: filters.tag.as_deref(),
-                        target_context: filters.target_context.as_deref(),
-                        author: filters.author.as_ref(),
-                        query_text: filters.query.as_deref(),
-                        extends: filters.extends.as_deref(),
-                        sort: &filters.sort,
-                        limit: limit_i,
-                        offset: offset_i,
-                    },
-                    &mut conn,
-                )
-                .await?
+                // or extends filters, use the appropriate raw-SQL helper.
+                match &filters.sort {
+                    SortMode::Trending => {
+                        // Trending with additional filters: combine the WHERE
+                        // clauses from the filter set with the 7-day join.
+                        self.search_trending_raw(
+                            TrendingParams {
+                                tag: filters.tag.as_deref(),
+                                target_context: filters.target_context.as_deref(),
+                                author: filters.author.as_ref(),
+                                query_text: filters.query.as_deref(),
+                                extends: filters.extends.as_deref(),
+                                limit: limit_i,
+                                offset: offset_i,
+                            },
+                            &mut conn,
+                        )
+                        .await?
+                    }
+                    _ => {
+                        // For combinations involving GIN tag, target_context, author, FTS,
+                        // or extends filters, use the raw-SQL helper which binds params safely
+                        // via numbered params.
+                        self.search_raw(
+                            SearchParams {
+                                tag: filters.tag.as_deref(),
+                                target_context: filters.target_context.as_deref(),
+                                author: filters.author.as_ref(),
+                                query_text: filters.query.as_deref(),
+                                extends: filters.extends.as_deref(),
+                                sort: &filters.sort,
+                                limit: limit_i,
+                                offset: offset_i,
+                            },
+                            &mut conn,
+                        )
+                        .await?
+                    }
+                }
             }
         };
 
@@ -798,6 +873,33 @@ impl CatalogBackend for PostgresCatalog {
         Ok(())
     }
 
+    /// Record a single download event for the given pack version.
+    ///
+    /// SQL shape:
+    /// ```sql
+    /// INSERT INTO pack_downloads (pack_name, version) VALUES ($1, $2)
+    /// ```
+    /// The `downloaded_at` column defaults to `NOW()` at the DB level.
+    /// This is best-effort: callers SHOULD log and discard errors rather than
+    /// surfacing them to end users.
+    #[instrument(skip(self, pack_name, version), fields(pack = %pack_name, version = %version))]
+    async fn record_download(&self, pack_name: &str, version: &str) -> Result<(), CatalogError> {
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+
+        let row = NewPackDownloadRow {
+            pack_name: pack_name.to_string(),
+            version: version.to_string(),
+        };
+
+        diesel::insert_into(pack_downloads::table)
+            .values(&row)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| map_diesel_error(e, "pack_download", pack_name.to_string()))?;
+
+        Ok(())
+    }
+
     /// Return the current health status of this backend.
     ///
     /// Runs `SELECT 1` with a 1-second deadline. Returns `HealthStatus { healthy: true }`
@@ -857,6 +959,33 @@ impl CatalogBackend for PostgresCatalog {
 }
 
 // ── Internal helpers ────────────────────────────────────────────────────────
+
+/// Number of seconds in 7 days, used as the trending window bound.
+///
+/// Expressed as a constant so the value is clearly documented and appears
+/// only once in the SQL strings below (no user-supplied value; safe to embed).
+const TRENDING_WINDOW_SECONDS: i64 = 7 * 24 * 60 * 60;
+
+/// Parameters for the trending raw query used in [`PostgresCatalog::search_trending_raw`].
+///
+/// All optional filter fields work identically to [`SearchParams`]; the sort
+/// field is omitted because trending always sorts by 7-day download count DESC.
+struct TrendingParams<'a> {
+    /// Tag containment filter; `None` means no tag filter.
+    pub tag: Option<&'a str>,
+    /// Target context filter; `None` means no context filter.
+    pub target_context: Option<&'a str>,
+    /// Author pubkey filter; `None` means no author filter.
+    pub author: Option<&'a Ed25519PublicKey>,
+    /// Full-text search query; `None` means no FTS filter.
+    pub query_text: Option<&'a str>,
+    /// Base persona pack name filter; `None` means no extends filter.
+    pub extends: Option<&'a str>,
+    /// Maximum number of results (SQL LIMIT).
+    pub limit: i64,
+    /// Number of results to skip (SQL OFFSET).
+    pub offset: i64,
+}
 
 /// Parameters for the raw search query used inside [`PostgresCatalog::search_raw`].
 ///
@@ -1257,5 +1386,538 @@ impl PostgresCatalog {
         };
 
         Ok(rows)
+    }
+
+    /// Execute the trending search query, ranking packs by 7-day download count.
+    ///
+    /// The query LEFT JOINs a `pack_downloads` subquery that counts rows with
+    /// `downloaded_at >= NOW() - INTERVAL '7 days'` grouped by `pack_name`.
+    /// Results are ordered by that count DESC with `name ASC` as the tiebreaker.
+    ///
+    /// Optional WHERE filters (tag, target_context, author, FTS, extends) are
+    /// ANDed in exactly as in [`search_raw`]. All user-supplied values are bound
+    /// via Diesel's typed bind API; the 7-day interval is a constant embedded
+    /// as a literal `$n` parameter (not string-interpolated user input).
+    ///
+    /// Because the filter combinations expand to 32 static branches (matching
+    /// the enumeration in `search_raw`), the bind chains are spelled out
+    /// explicitly to satisfy Diesel's static type system.
+    async fn search_trending_raw(
+        &self,
+        params: TrendingParams<'_>,
+        conn: &mut bb8::PooledConnection<
+            '_,
+            diesel_async::pooled_connection::AsyncDieselConnectionManager<
+                diesel_async::AsyncPgConnection,
+            >,
+        >,
+    ) -> Result<Vec<PackRow>, CatalogError> {
+        let TrendingParams {
+            tag,
+            target_context,
+            author,
+            query_text,
+            extends,
+            limit,
+            offset,
+        } = params;
+
+        // Build numbered WHERE clauses for optional filters.
+        // Bind order matches the branch arms below: tag, target_context, author,
+        // query_text, extends. The window interval is bound last before limit/offset.
+        let mut bind_idx: usize = 1;
+        let mut where_parts: Vec<String> = Vec::new();
+
+        if tag.is_some() {
+            where_parts.push(format!("p.tags @> ARRAY[${bind_idx}]::TEXT[]"));
+            bind_idx += 1;
+        }
+        if target_context.is_some() {
+            where_parts.push(format!("p.tags @> ARRAY[${bind_idx}]::TEXT[]"));
+            bind_idx += 1;
+        }
+        if author.is_some() {
+            where_parts.push(format!("p.current_author = ${bind_idx}"));
+            bind_idx += 1;
+        }
+        if query_text.is_some() {
+            where_parts.push(format!(
+                "to_tsvector('english', p.description || ' ' || p.name) \
+                 @@ plainto_tsquery('english', ${bind_idx})"
+            ));
+            bind_idx += 1;
+        }
+        if extends.is_some() {
+            where_parts.push(format!("p.extends = ${bind_idx}"));
+            bind_idx += 1;
+        }
+
+        let where_sql = if where_parts.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", where_parts.join(" AND "))
+        };
+
+        // The subquery interval bound index comes after all filter params.
+        let interval_idx = bind_idx;
+        let limit_idx = bind_idx + 1;
+        let offset_idx = bind_idx + 2;
+
+        // The trending subquery counts pack_downloads rows within the rolling window.
+        // `make_interval(secs => $n)` is used instead of string-interpolated INTERVAL
+        // so the window duration is a bound parameter (even though it is a constant,
+        // keeping it bound makes the pattern consistent with user values above).
+        let sql = format!(
+            "SELECT p.name, p.current_author, p.tags, p.description, p.created_at, \
+             p.latest_version, p.total_downloads, p.extends \
+             FROM packs p \
+             LEFT JOIN ( \
+                 SELECT pack_name, COUNT(*) AS dl_count \
+                 FROM pack_downloads \
+                 WHERE downloaded_at >= NOW() - make_interval(secs => ${interval_idx}) \
+                 GROUP BY pack_name \
+             ) td ON td.pack_name = p.name \
+             {where_sql} \
+             ORDER BY COALESCE(td.dl_count, 0) DESC, p.name ASC \
+             LIMIT ${limit_idx} OFFSET ${offset_idx}"
+        );
+
+        // Enumerate all 32 filter combinations so each call site has fully typed
+        // bind chains. Bind order: tag, target_context, author, query_text, extends,
+        // interval_seconds, limit, offset.
+        let rows: Vec<PackRow> = match (tag, target_context, author, query_text, extends) {
+            (None, None, None, None, None) => diesel::sql_query(&sql)
+                .bind::<diesel::sql_types::BigInt, _>(TRENDING_WINDOW_SECONDS)
+                .bind::<diesel::sql_types::BigInt, _>(limit)
+                .bind::<diesel::sql_types::BigInt, _>(offset)
+                .load(&mut **conn)
+                .await
+                .map_err(|e| map_diesel_error(e, "pack", String::new()))?,
+            (Some(t), None, None, None, None) => diesel::sql_query(&sql)
+                .bind::<diesel::sql_types::Text, _>(t)
+                .bind::<diesel::sql_types::BigInt, _>(TRENDING_WINDOW_SECONDS)
+                .bind::<diesel::sql_types::BigInt, _>(limit)
+                .bind::<diesel::sql_types::BigInt, _>(offset)
+                .load(&mut **conn)
+                .await
+                .map_err(|e| map_diesel_error(e, "pack", String::new()))?,
+            (None, Some(ctx), None, None, None) => diesel::sql_query(&sql)
+                .bind::<diesel::sql_types::Text, _>(ctx)
+                .bind::<diesel::sql_types::BigInt, _>(TRENDING_WINDOW_SECONDS)
+                .bind::<diesel::sql_types::BigInt, _>(limit)
+                .bind::<diesel::sql_types::BigInt, _>(offset)
+                .load(&mut **conn)
+                .await
+                .map_err(|e| map_diesel_error(e, "pack", String::new()))?,
+            (None, None, Some(a), None, None) => diesel::sql_query(&sql)
+                .bind::<diesel::sql_types::Binary, _>(a.0.to_vec())
+                .bind::<diesel::sql_types::BigInt, _>(TRENDING_WINDOW_SECONDS)
+                .bind::<diesel::sql_types::BigInt, _>(limit)
+                .bind::<diesel::sql_types::BigInt, _>(offset)
+                .load(&mut **conn)
+                .await
+                .map_err(|e| map_diesel_error(e, "pack", String::new()))?,
+            (None, None, None, Some(q), None) => diesel::sql_query(&sql)
+                .bind::<diesel::sql_types::Text, _>(q)
+                .bind::<diesel::sql_types::BigInt, _>(TRENDING_WINDOW_SECONDS)
+                .bind::<diesel::sql_types::BigInt, _>(limit)
+                .bind::<diesel::sql_types::BigInt, _>(offset)
+                .load(&mut **conn)
+                .await
+                .map_err(|e| map_diesel_error(e, "pack", String::new()))?,
+            (None, None, None, None, Some(ext)) => diesel::sql_query(&sql)
+                .bind::<diesel::sql_types::Text, _>(ext)
+                .bind::<diesel::sql_types::BigInt, _>(TRENDING_WINDOW_SECONDS)
+                .bind::<diesel::sql_types::BigInt, _>(limit)
+                .bind::<diesel::sql_types::BigInt, _>(offset)
+                .load(&mut **conn)
+                .await
+                .map_err(|e| map_diesel_error(e, "pack", String::new()))?,
+            (Some(t), Some(ctx), None, None, None) => diesel::sql_query(&sql)
+                .bind::<diesel::sql_types::Text, _>(t)
+                .bind::<diesel::sql_types::Text, _>(ctx)
+                .bind::<diesel::sql_types::BigInt, _>(TRENDING_WINDOW_SECONDS)
+                .bind::<diesel::sql_types::BigInt, _>(limit)
+                .bind::<diesel::sql_types::BigInt, _>(offset)
+                .load(&mut **conn)
+                .await
+                .map_err(|e| map_diesel_error(e, "pack", String::new()))?,
+            (Some(t), None, Some(a), None, None) => diesel::sql_query(&sql)
+                .bind::<diesel::sql_types::Text, _>(t)
+                .bind::<diesel::sql_types::Binary, _>(a.0.to_vec())
+                .bind::<diesel::sql_types::BigInt, _>(TRENDING_WINDOW_SECONDS)
+                .bind::<diesel::sql_types::BigInt, _>(limit)
+                .bind::<diesel::sql_types::BigInt, _>(offset)
+                .load(&mut **conn)
+                .await
+                .map_err(|e| map_diesel_error(e, "pack", String::new()))?,
+            (Some(t), None, None, Some(q), None) => diesel::sql_query(&sql)
+                .bind::<diesel::sql_types::Text, _>(t)
+                .bind::<diesel::sql_types::Text, _>(q)
+                .bind::<diesel::sql_types::BigInt, _>(TRENDING_WINDOW_SECONDS)
+                .bind::<diesel::sql_types::BigInt, _>(limit)
+                .bind::<diesel::sql_types::BigInt, _>(offset)
+                .load(&mut **conn)
+                .await
+                .map_err(|e| map_diesel_error(e, "pack", String::new()))?,
+            (Some(t), None, None, None, Some(ext)) => diesel::sql_query(&sql)
+                .bind::<diesel::sql_types::Text, _>(t)
+                .bind::<diesel::sql_types::Text, _>(ext)
+                .bind::<diesel::sql_types::BigInt, _>(TRENDING_WINDOW_SECONDS)
+                .bind::<diesel::sql_types::BigInt, _>(limit)
+                .bind::<diesel::sql_types::BigInt, _>(offset)
+                .load(&mut **conn)
+                .await
+                .map_err(|e| map_diesel_error(e, "pack", String::new()))?,
+            (None, Some(ctx), Some(a), None, None) => diesel::sql_query(&sql)
+                .bind::<diesel::sql_types::Text, _>(ctx)
+                .bind::<diesel::sql_types::Binary, _>(a.0.to_vec())
+                .bind::<diesel::sql_types::BigInt, _>(TRENDING_WINDOW_SECONDS)
+                .bind::<diesel::sql_types::BigInt, _>(limit)
+                .bind::<diesel::sql_types::BigInt, _>(offset)
+                .load(&mut **conn)
+                .await
+                .map_err(|e| map_diesel_error(e, "pack", String::new()))?,
+            (None, Some(ctx), None, Some(q), None) => diesel::sql_query(&sql)
+                .bind::<diesel::sql_types::Text, _>(ctx)
+                .bind::<diesel::sql_types::Text, _>(q)
+                .bind::<diesel::sql_types::BigInt, _>(TRENDING_WINDOW_SECONDS)
+                .bind::<diesel::sql_types::BigInt, _>(limit)
+                .bind::<diesel::sql_types::BigInt, _>(offset)
+                .load(&mut **conn)
+                .await
+                .map_err(|e| map_diesel_error(e, "pack", String::new()))?,
+            (None, Some(ctx), None, None, Some(ext)) => diesel::sql_query(&sql)
+                .bind::<diesel::sql_types::Text, _>(ctx)
+                .bind::<diesel::sql_types::Text, _>(ext)
+                .bind::<diesel::sql_types::BigInt, _>(TRENDING_WINDOW_SECONDS)
+                .bind::<diesel::sql_types::BigInt, _>(limit)
+                .bind::<diesel::sql_types::BigInt, _>(offset)
+                .load(&mut **conn)
+                .await
+                .map_err(|e| map_diesel_error(e, "pack", String::new()))?,
+            (None, None, Some(a), Some(q), None) => diesel::sql_query(&sql)
+                .bind::<diesel::sql_types::Binary, _>(a.0.to_vec())
+                .bind::<diesel::sql_types::Text, _>(q)
+                .bind::<diesel::sql_types::BigInt, _>(TRENDING_WINDOW_SECONDS)
+                .bind::<diesel::sql_types::BigInt, _>(limit)
+                .bind::<diesel::sql_types::BigInt, _>(offset)
+                .load(&mut **conn)
+                .await
+                .map_err(|e| map_diesel_error(e, "pack", String::new()))?,
+            (None, None, Some(a), None, Some(ext)) => diesel::sql_query(&sql)
+                .bind::<diesel::sql_types::Binary, _>(a.0.to_vec())
+                .bind::<diesel::sql_types::Text, _>(ext)
+                .bind::<diesel::sql_types::BigInt, _>(TRENDING_WINDOW_SECONDS)
+                .bind::<diesel::sql_types::BigInt, _>(limit)
+                .bind::<diesel::sql_types::BigInt, _>(offset)
+                .load(&mut **conn)
+                .await
+                .map_err(|e| map_diesel_error(e, "pack", String::new()))?,
+            (None, None, None, Some(q), Some(ext)) => diesel::sql_query(&sql)
+                .bind::<diesel::sql_types::Text, _>(q)
+                .bind::<diesel::sql_types::Text, _>(ext)
+                .bind::<diesel::sql_types::BigInt, _>(TRENDING_WINDOW_SECONDS)
+                .bind::<diesel::sql_types::BigInt, _>(limit)
+                .bind::<diesel::sql_types::BigInt, _>(offset)
+                .load(&mut **conn)
+                .await
+                .map_err(|e| map_diesel_error(e, "pack", String::new()))?,
+            (Some(t), Some(ctx), Some(a), None, None) => diesel::sql_query(&sql)
+                .bind::<diesel::sql_types::Text, _>(t)
+                .bind::<diesel::sql_types::Text, _>(ctx)
+                .bind::<diesel::sql_types::Binary, _>(a.0.to_vec())
+                .bind::<diesel::sql_types::BigInt, _>(TRENDING_WINDOW_SECONDS)
+                .bind::<diesel::sql_types::BigInt, _>(limit)
+                .bind::<diesel::sql_types::BigInt, _>(offset)
+                .load(&mut **conn)
+                .await
+                .map_err(|e| map_diesel_error(e, "pack", String::new()))?,
+            (Some(t), Some(ctx), None, Some(q), None) => diesel::sql_query(&sql)
+                .bind::<diesel::sql_types::Text, _>(t)
+                .bind::<diesel::sql_types::Text, _>(ctx)
+                .bind::<diesel::sql_types::Text, _>(q)
+                .bind::<diesel::sql_types::BigInt, _>(TRENDING_WINDOW_SECONDS)
+                .bind::<diesel::sql_types::BigInt, _>(limit)
+                .bind::<diesel::sql_types::BigInt, _>(offset)
+                .load(&mut **conn)
+                .await
+                .map_err(|e| map_diesel_error(e, "pack", String::new()))?,
+            (Some(t), Some(ctx), None, None, Some(ext)) => diesel::sql_query(&sql)
+                .bind::<diesel::sql_types::Text, _>(t)
+                .bind::<diesel::sql_types::Text, _>(ctx)
+                .bind::<diesel::sql_types::Text, _>(ext)
+                .bind::<diesel::sql_types::BigInt, _>(TRENDING_WINDOW_SECONDS)
+                .bind::<diesel::sql_types::BigInt, _>(limit)
+                .bind::<diesel::sql_types::BigInt, _>(offset)
+                .load(&mut **conn)
+                .await
+                .map_err(|e| map_diesel_error(e, "pack", String::new()))?,
+            (Some(t), None, Some(a), Some(q), None) => diesel::sql_query(&sql)
+                .bind::<diesel::sql_types::Text, _>(t)
+                .bind::<diesel::sql_types::Binary, _>(a.0.to_vec())
+                .bind::<diesel::sql_types::Text, _>(q)
+                .bind::<diesel::sql_types::BigInt, _>(TRENDING_WINDOW_SECONDS)
+                .bind::<diesel::sql_types::BigInt, _>(limit)
+                .bind::<diesel::sql_types::BigInt, _>(offset)
+                .load(&mut **conn)
+                .await
+                .map_err(|e| map_diesel_error(e, "pack", String::new()))?,
+            (Some(t), None, Some(a), None, Some(ext)) => diesel::sql_query(&sql)
+                .bind::<diesel::sql_types::Text, _>(t)
+                .bind::<diesel::sql_types::Binary, _>(a.0.to_vec())
+                .bind::<diesel::sql_types::Text, _>(ext)
+                .bind::<diesel::sql_types::BigInt, _>(TRENDING_WINDOW_SECONDS)
+                .bind::<diesel::sql_types::BigInt, _>(limit)
+                .bind::<diesel::sql_types::BigInt, _>(offset)
+                .load(&mut **conn)
+                .await
+                .map_err(|e| map_diesel_error(e, "pack", String::new()))?,
+            (Some(t), None, None, Some(q), Some(ext)) => diesel::sql_query(&sql)
+                .bind::<diesel::sql_types::Text, _>(t)
+                .bind::<diesel::sql_types::Text, _>(q)
+                .bind::<diesel::sql_types::Text, _>(ext)
+                .bind::<diesel::sql_types::BigInt, _>(TRENDING_WINDOW_SECONDS)
+                .bind::<diesel::sql_types::BigInt, _>(limit)
+                .bind::<diesel::sql_types::BigInt, _>(offset)
+                .load(&mut **conn)
+                .await
+                .map_err(|e| map_diesel_error(e, "pack", String::new()))?,
+            (None, Some(ctx), Some(a), Some(q), None) => diesel::sql_query(&sql)
+                .bind::<diesel::sql_types::Text, _>(ctx)
+                .bind::<diesel::sql_types::Binary, _>(a.0.to_vec())
+                .bind::<diesel::sql_types::Text, _>(q)
+                .bind::<diesel::sql_types::BigInt, _>(TRENDING_WINDOW_SECONDS)
+                .bind::<diesel::sql_types::BigInt, _>(limit)
+                .bind::<diesel::sql_types::BigInt, _>(offset)
+                .load(&mut **conn)
+                .await
+                .map_err(|e| map_diesel_error(e, "pack", String::new()))?,
+            (None, Some(ctx), Some(a), None, Some(ext)) => diesel::sql_query(&sql)
+                .bind::<diesel::sql_types::Text, _>(ctx)
+                .bind::<diesel::sql_types::Binary, _>(a.0.to_vec())
+                .bind::<diesel::sql_types::Text, _>(ext)
+                .bind::<diesel::sql_types::BigInt, _>(TRENDING_WINDOW_SECONDS)
+                .bind::<diesel::sql_types::BigInt, _>(limit)
+                .bind::<diesel::sql_types::BigInt, _>(offset)
+                .load(&mut **conn)
+                .await
+                .map_err(|e| map_diesel_error(e, "pack", String::new()))?,
+            (None, Some(ctx), None, Some(q), Some(ext)) => diesel::sql_query(&sql)
+                .bind::<diesel::sql_types::Text, _>(ctx)
+                .bind::<diesel::sql_types::Text, _>(q)
+                .bind::<diesel::sql_types::Text, _>(ext)
+                .bind::<diesel::sql_types::BigInt, _>(TRENDING_WINDOW_SECONDS)
+                .bind::<diesel::sql_types::BigInt, _>(limit)
+                .bind::<diesel::sql_types::BigInt, _>(offset)
+                .load(&mut **conn)
+                .await
+                .map_err(|e| map_diesel_error(e, "pack", String::new()))?,
+            (None, None, Some(a), Some(q), Some(ext)) => diesel::sql_query(&sql)
+                .bind::<diesel::sql_types::Binary, _>(a.0.to_vec())
+                .bind::<diesel::sql_types::Text, _>(q)
+                .bind::<diesel::sql_types::Text, _>(ext)
+                .bind::<diesel::sql_types::BigInt, _>(TRENDING_WINDOW_SECONDS)
+                .bind::<diesel::sql_types::BigInt, _>(limit)
+                .bind::<diesel::sql_types::BigInt, _>(offset)
+                .load(&mut **conn)
+                .await
+                .map_err(|e| map_diesel_error(e, "pack", String::new()))?,
+            (Some(t), Some(ctx), Some(a), Some(q), None) => diesel::sql_query(&sql)
+                .bind::<diesel::sql_types::Text, _>(t)
+                .bind::<diesel::sql_types::Text, _>(ctx)
+                .bind::<diesel::sql_types::Binary, _>(a.0.to_vec())
+                .bind::<diesel::sql_types::Text, _>(q)
+                .bind::<diesel::sql_types::BigInt, _>(TRENDING_WINDOW_SECONDS)
+                .bind::<diesel::sql_types::BigInt, _>(limit)
+                .bind::<diesel::sql_types::BigInt, _>(offset)
+                .load(&mut **conn)
+                .await
+                .map_err(|e| map_diesel_error(e, "pack", String::new()))?,
+            (Some(t), Some(ctx), Some(a), None, Some(ext)) => diesel::sql_query(&sql)
+                .bind::<diesel::sql_types::Text, _>(t)
+                .bind::<diesel::sql_types::Text, _>(ctx)
+                .bind::<diesel::sql_types::Binary, _>(a.0.to_vec())
+                .bind::<diesel::sql_types::Text, _>(ext)
+                .bind::<diesel::sql_types::BigInt, _>(TRENDING_WINDOW_SECONDS)
+                .bind::<diesel::sql_types::BigInt, _>(limit)
+                .bind::<diesel::sql_types::BigInt, _>(offset)
+                .load(&mut **conn)
+                .await
+                .map_err(|e| map_diesel_error(e, "pack", String::new()))?,
+            (Some(t), Some(ctx), None, Some(q), Some(ext)) => diesel::sql_query(&sql)
+                .bind::<diesel::sql_types::Text, _>(t)
+                .bind::<diesel::sql_types::Text, _>(ctx)
+                .bind::<diesel::sql_types::Text, _>(q)
+                .bind::<diesel::sql_types::Text, _>(ext)
+                .bind::<diesel::sql_types::BigInt, _>(TRENDING_WINDOW_SECONDS)
+                .bind::<diesel::sql_types::BigInt, _>(limit)
+                .bind::<diesel::sql_types::BigInt, _>(offset)
+                .load(&mut **conn)
+                .await
+                .map_err(|e| map_diesel_error(e, "pack", String::new()))?,
+            (Some(t), None, Some(a), Some(q), Some(ext)) => diesel::sql_query(&sql)
+                .bind::<diesel::sql_types::Text, _>(t)
+                .bind::<diesel::sql_types::Binary, _>(a.0.to_vec())
+                .bind::<diesel::sql_types::Text, _>(q)
+                .bind::<diesel::sql_types::Text, _>(ext)
+                .bind::<diesel::sql_types::BigInt, _>(TRENDING_WINDOW_SECONDS)
+                .bind::<diesel::sql_types::BigInt, _>(limit)
+                .bind::<diesel::sql_types::BigInt, _>(offset)
+                .load(&mut **conn)
+                .await
+                .map_err(|e| map_diesel_error(e, "pack", String::new()))?,
+            (None, Some(ctx), Some(a), Some(q), Some(ext)) => diesel::sql_query(&sql)
+                .bind::<diesel::sql_types::Text, _>(ctx)
+                .bind::<diesel::sql_types::Binary, _>(a.0.to_vec())
+                .bind::<diesel::sql_types::Text, _>(q)
+                .bind::<diesel::sql_types::Text, _>(ext)
+                .bind::<diesel::sql_types::BigInt, _>(TRENDING_WINDOW_SECONDS)
+                .bind::<diesel::sql_types::BigInt, _>(limit)
+                .bind::<diesel::sql_types::BigInt, _>(offset)
+                .load(&mut **conn)
+                .await
+                .map_err(|e| map_diesel_error(e, "pack", String::new()))?,
+            (Some(t), Some(ctx), Some(a), Some(q), Some(ext)) => diesel::sql_query(&sql)
+                .bind::<diesel::sql_types::Text, _>(t)
+                .bind::<diesel::sql_types::Text, _>(ctx)
+                .bind::<diesel::sql_types::Binary, _>(a.0.to_vec())
+                .bind::<diesel::sql_types::Text, _>(q)
+                .bind::<diesel::sql_types::Text, _>(ext)
+                .bind::<diesel::sql_types::BigInt, _>(TRENDING_WINDOW_SECONDS)
+                .bind::<diesel::sql_types::BigInt, _>(limit)
+                .bind::<diesel::sql_types::BigInt, _>(offset)
+                .load(&mut **conn)
+                .await
+                .map_err(|e| map_diesel_error(e, "pack", String::new()))?,
+        };
+
+        Ok(rows)
+    }
+}
+
+// ── Semver comparison helper ────────────────────────────────────────────────
+
+/// Parse a semver string into `(major, minor, patch, pre_release)`.
+///
+/// Build metadata (the `+` suffix per semver 2.0.0 §10) is stripped and
+/// ignored. Pre-release is everything after the first `-` in the core
+/// version string. Returns `None` when the input cannot be parsed as a valid
+/// `major.minor.patch` triple.
+fn parse_semver(s: &str) -> Option<(u64, u64, u64, Option<String>)> {
+    // Strip build metadata suffix (e.g. "+build.1").
+    let without_build = s.split('+').next().unwrap_or(s);
+
+    // Split off optional pre-release suffix (e.g. "-rc.1").
+    let (core, pre) = if let Some(idx) = without_build.find('-') {
+        let (c, p) = without_build.split_at(idx);
+        // `p` starts with '-'; drop that leading byte.
+        (c, Some(p[1..].to_string()))
+    } else {
+        (without_build, None)
+    };
+
+    // Parse the three numeric components.
+    let parts: Vec<&str> = core.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+
+    let major = parts[0].parse::<u64>().ok()?;
+    let minor = parts[1].parse::<u64>().ok()?;
+    let patch = parts[2].parse::<u64>().ok()?;
+
+    Some((major, minor, patch, pre))
+}
+
+/// Return `true` when `a` has strictly higher semver precedence than `b`.
+///
+/// Rules (per semver 2.0.0 §11):
+/// - Compare major, minor, patch as unsigned integers in order.
+/// - A release version (no pre-release suffix) has HIGHER precedence than the
+///   same `(major, minor, patch)` with a pre-release tag.
+///   Example: `1.0.0 > 1.0.0-rc.1`.
+/// - When both have a pre-release tag and the numeric triple is equal, the
+///   tags are compared lexicographically.
+///
+/// Unparseable versions are treated as lower than any parseable version.
+/// If both sides are unparseable, returns `false` (not strictly greater).
+fn semver_gt(a: &str, b: &str) -> bool {
+    match (parse_semver(a), parse_semver(b)) {
+        // `a` is unparseable -- can never be greater.
+        (None, _) => false,
+        // `b` is unparseable but `a` is valid -- `a` wins.
+        (Some(_), None) => true,
+        (Some((ma, mia, pa, pre_a)), Some((mb, mib, pb, pre_b))) => {
+            // Numeric major/minor/patch comparison.
+            if ma != mb {
+                return ma > mb;
+            }
+            if mia != mib {
+                return mia > mib;
+            }
+            if pa != pb {
+                return pa > pb;
+            }
+            // Same numeric triple -- compare pre-release presence.
+            // Release (None) > pre-release (Some) per semver.
+            match (pre_a, pre_b) {
+                (None, Some(_)) => true,
+                (Some(_), None) => false,
+                (None, None) => false,
+                (Some(pa_str), Some(pb_str)) => pa_str > pb_str,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+/// Unit tests for the semver comparison helper (D8).
+mod semver_tests {
+    use super::semver_gt;
+
+    #[test]
+    /// 1.10.0 must compare as greater than 1.9.0 (fails under lexicographic ordering).
+    fn semver_gt_minor_numeric() {
+        assert!(semver_gt("1.10.0", "1.9.0"), "1.10.0 should be > 1.9.0");
+    }
+
+    #[test]
+    /// 1.0.0 (release) must compare as greater than 1.0.0-rc.1 (pre-release).
+    fn semver_gt_release_over_prerelease() {
+        assert!(
+            semver_gt("1.0.0", "1.0.0-rc.1"),
+            "1.0.0 should be > 1.0.0-rc.1"
+        );
+    }
+
+    #[test]
+    /// A version is not greater than itself.
+    fn semver_gt_equal_returns_false() {
+        assert!(!semver_gt("1.2.3", "1.2.3"));
+    }
+
+    #[test]
+    /// A larger major wins regardless of minor and patch.
+    fn semver_gt_major() {
+        assert!(semver_gt("2.0.0", "1.99.99"));
+    }
+
+    #[test]
+    /// A larger patch wins when major and minor are equal.
+    fn semver_gt_patch() {
+        assert!(semver_gt("1.2.4", "1.2.3"));
+    }
+
+    #[test]
+    /// Two identical pre-release strings are not strictly greater.
+    fn semver_gt_prerelease_equal_returns_false() {
+        assert!(!semver_gt("1.0.0-alpha", "1.0.0-alpha"));
+    }
+
+    #[test]
+    /// Build metadata suffix is stripped and does not affect comparison.
+    fn semver_gt_build_metadata_stripped() {
+        assert!(!semver_gt("1.0.0+build.1", "1.0.0+build.2"));
     }
 }

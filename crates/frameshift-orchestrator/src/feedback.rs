@@ -106,6 +106,20 @@ impl Preferences {
         }
     }
 
+    /// Push `persona`'s global bias down by one `DECAY` step.
+    ///
+    /// This is the inverse of the bump that `record_override` applies to a
+    /// chosen persona. Both the structured `entries` map and the legacy `bias`
+    /// map are decremented and clamped to `-BIAS_MAX`. Unlike the historical
+    /// implementation it introduces no sentinel persona entries.
+    pub fn decay(&mut self, persona: &str) {
+        let legacy = self.bias.entry(persona.to_string()).or_insert(0.0);
+        *legacy = (*legacy - DECAY).max(-BIAS_MAX);
+
+        let entry = self.entries.entry(persona.to_string()).or_default();
+        entry.global = (entry.global - DECAY).max(-BIAS_MAX);
+    }
+
     /// Return the current additive bias for `persona`.
     ///
     /// Checks `entries` first (global bias), falls back to the legacy `bias` map,

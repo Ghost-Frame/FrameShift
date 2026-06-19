@@ -12,9 +12,9 @@
 //! - typed patch operations (`patch`)
 //! - semantic diff between two `PersonaSource` snapshots (`diff`)
 //!
-//! Most function bodies are `todo!("M1 impl")` -- only the pieces required
-//! for WS-4 scaffolding are implemented (schema serde round-trip, load/write
-//! split, simplest-correct markdown projection).
+//! Schema serde round-trip, the load/write split, markdown projection, typed
+//! patch operations, and semantic diff are all implemented; this module is
+//! past its M1 scaffolding stage.
 
 pub mod diff;
 pub mod error;

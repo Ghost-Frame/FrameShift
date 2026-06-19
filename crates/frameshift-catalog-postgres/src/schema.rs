@@ -111,6 +111,23 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    /// The `pack_downloads` table records individual download events for trending.
+    ///
+    /// Primary key: `id` (bigserial surrogate).
+    /// No FK to `packs` -- see migration comment for rationale.
+    pack_downloads (id) {
+        /// Surrogate primary key; auto-incremented.
+        id -> Int8,
+        /// Name of the pack that was downloaded.
+        pack_name -> Text,
+        /// Semver version string that was downloaded.
+        version -> Text,
+        /// UTC timestamp of the download event.
+        downloaded_at -> Timestamptz,
+    }
+}
+
 // Allow Diesel join inference between packs and authors.
 diesel::joinable!(packs -> authors (current_author));
 // Allow Diesel join inference between pack_versions and packs.
@@ -120,4 +137,4 @@ diesel::joinable!(pack_versions -> authors (author_pubkey));
 // Allow Diesel join inference between handles and authors.
 diesel::joinable!(handles -> authors (pubkey));
 
-diesel::allow_tables_to_appear_in_same_query!(authors, packs, pack_versions, handles,);
+diesel::allow_tables_to_appear_in_same_query!(authors, packs, pack_versions, handles, pack_downloads,);

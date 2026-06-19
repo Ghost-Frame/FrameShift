@@ -24,6 +24,9 @@ pub fn handles_router() -> Router<AppState> {
 ///
 /// Look up a registered author by their unique handle string.
 ///
+/// The `handle` segment is capped at 256 characters; longer values are
+/// rejected with `400 Bad Request` before the catalog is queried.
+///
 /// # Response
 ///
 /// `200 OK` with body `AuthorRecord` serialized as JSON.
@@ -34,6 +37,7 @@ pub fn handles_router() -> Router<AppState> {
 ///
 /// # Errors
 ///
+/// - `400 Bad Request` if `handle` exceeds 256 characters.
 /// - `404 Not Found` if no author is registered with this handle.
 /// - `500 Internal Server Error` on catalog backend failure (request-id only;
 ///   no internal details in body).
@@ -41,6 +45,10 @@ pub async fn get_handle(
     State(state): State<AppState>,
     Path(handle): Path<String>,
 ) -> Result<Json<frameshift_catalog::AuthorRecord>, AppError> {
+    // Reject unreasonably long values before hitting the catalog.
+    if handle.len() > 256 {
+        return Err(AppError::BadRequest("handle exceeds maximum length".to_string()));
+    }
     let author = state
         .catalog
         .lookup_author_by_handle(&handle)

@@ -17,6 +17,7 @@ use frameshift_memory::MemoryAdapter;
 use frameshift_objects::PackStore;
 use frameshift_objects_fs::{FsPackStore, FsPackStoreConfig};
 use frameshift_objects_r2::{R2PackStore, R2PackStoreConfig};
+use frameshift_server::metrics::Metrics;
 use frameshift_server::{AppState, LogFormat, ServerConfig, ServerError};
 
 /// Use mimalloc as the global allocator for improved throughput on
@@ -67,12 +68,24 @@ async fn build_state(config: Arc<ServerConfig>) -> Result<AppState, ServerError>
     let objects = build_object_store(&config).await?;
     let memory = build_memory_adapter(&config).await?;
 
+    // Initialize the Prometheus registry once at startup; all handlers and the
+    // metrics middleware share the same Arc<Metrics> through AppState.
+    let metrics = Arc::new(Metrics::new());
+
+    // Replay-nonce cache for signed-request auth. Retention is 2x the skew
+    // window: once a request's timestamp is more than `max_skew` from now it is
+    // rejected on the timestamp check alone, so the nonce can be forgotten.
+    let nonce_ttl = config.signed_request_max_skew.saturating_mul(2);
+    let auth_nonces = Arc::new(frameshift_server::auth::NonceCache::new(nonce_ttl));
+
     Ok(AppState {
         catalog: Arc::new(catalog),
         objects,
         runtime: None,
         memory,
         config,
+        metrics,
+        auth_nonces,
     })
 }
 
