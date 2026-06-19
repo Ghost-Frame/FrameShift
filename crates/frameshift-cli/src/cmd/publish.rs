@@ -11,7 +11,7 @@ use clap::Args;
 use frameshift_client::{Client, ClientError};
 use frameshift_source::render::{render_to_markdown, RenderTarget};
 
-use crate::util::{CliError, load_persona_by_name};
+use crate::util::{CliError, load_persona_by_name, validate_server_url};
 
 /// Default pack version when a persona source declares none.
 const DEFAULT_PACK_VERSION: &str = "0.1.0";
@@ -84,6 +84,7 @@ pub fn run_publish(args: PublishArgs) -> Result<(), CliError> {
     let Some(server) = args.server.as_deref() else {
         return Ok(());
     };
+    validate_server_url(server)?;
 
     // Uploading requires an author handle to bind the pack to.
     let handle = args.handle.as_deref().ok_or_else(|| {
@@ -127,6 +128,24 @@ fn write_pack_toml(
     handle: &str,
     author_pubkey_hex: &str,
 ) -> Result<(), CliError> {
+    // Guard against TOML injection: every field is interpolated into a quoted
+    // TOML string below, so a value containing a quote, backslash, or control
+    // character (newline included) could inject arbitrary manifest keys (e.g.
+    // spoofing authorship). Reject such values rather than escaping by hand.
+    for (field, value) in [
+        ("name", name),
+        ("version", version),
+        ("handle", handle),
+        ("author_pubkey", author_pubkey_hex),
+    ] {
+        if value.chars().any(|c| c == '"' || c == '\\' || c.is_control()) {
+            return Err(CliError::Publish(format!(
+                "{field} contains characters not allowed in a pack manifest \
+                 (quotes, backslashes, or control characters): {value:?}"
+            )));
+        }
+    }
+
     let content = format!(
         "schema_version = 1\n\
          name = \"{name}\"\n\
@@ -213,5 +232,25 @@ tone = "neutral"
             content.contains("test-persona"),
             "AGENTS.md must reference the persona name"
         );
+    }
+
+    /// write_pack_toml rejects fields that would inject TOML, and accepts clean ones.
+    #[test]
+    fn write_pack_toml_rejects_injection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // A handle that closes the quoted string and injects a new key.
+        let malicious = "evil\"\nauthor_role = \"admin";
+        let bad = write_pack_toml(dir.path(), "demo", "0.1.0", malicious, "deadbeef");
+        assert!(
+            matches!(bad, Err(CliError::Publish(_))),
+            "injection handle must be rejected"
+        );
+
+        // A clean set of fields writes a loadable pack.toml.
+        write_pack_toml(dir.path(), "demo", "0.1.0", "alice", "deadbeef")
+            .expect("clean fields must succeed");
+        let written = std::fs::read_to_string(dir.path().join("pack.toml")).expect("read pack.toml");
+        assert!(written.contains("author_handle = \"alice\""));
     }
 }

@@ -83,7 +83,13 @@ pub fn load_or_create_signing_key(data_root: &Path) -> Result<SigningKey, Client
         return Ok(SigningKey::from_bytes(&seed));
     }
 
-    // First use: generate, persist with restrictive permissions, and return.
+    // First use: generate and persist atomically. `create_new` fails if the
+    // file already exists, which closes the check-then-write race -- two
+    // concurrent first-use callers can no longer each write a different key and
+    // let "last write win" (which would silently change the author identity).
+    // On Unix the 0o600 mode is applied at open() time, so the secret seed is
+    // never world-readable even for an instant. If another process wins the
+    // race (AlreadyExists), we load and use the key it persisted.
     let key = SigningKey::generate(&mut OsRng);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| ClientError::Io {
@@ -91,17 +97,44 @@ pub fn load_or_create_signing_key(data_root: &Path) -> Result<SigningKey, Client
             source,
         })?;
     }
-    fs::write(&path, key.to_bytes()).map_err(|source| ClientError::Io {
-        path: path.clone(),
-        source,
-    })?;
+
+    let mut open_opts = fs::OpenOptions::new();
+    open_opts.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt as _;
-        // Best-effort tightening; the write above already created the file.
-        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+        use std::os::unix::fs::OpenOptionsExt as _;
+        open_opts.mode(0o600);
     }
-    Ok(key)
+
+    match open_opts.open(&path) {
+        Ok(mut file) => {
+            use std::io::Write as _;
+            file.write_all(&key.to_bytes()).map_err(|source| ClientError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            Ok(key)
+        }
+        // Another process created the key between our `exists` check and here;
+        // adopt the winner's key so the author identity stays stable.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let bytes = fs::read(&path).map_err(|source| ClientError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            let seed: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+                ClientError::InvalidSigningKey {
+                    path: path.clone(),
+                    detail: format!("expected 32-byte seed, found {} bytes", bytes.len()),
+                }
+            })?;
+            Ok(SigningKey::from_bytes(&seed))
+        }
+        Err(source) => Err(ClientError::Io {
+            path: path.clone(),
+            source,
+        }),
+    }
 }
 
 /// The base64url-no-pad public key string for a signing key, matching the
