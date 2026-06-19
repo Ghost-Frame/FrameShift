@@ -154,6 +154,22 @@ impl HttpAdapter {
     /// be built. Returns [`MemoryError::Unauthorized`] if mTLS paths are
     /// missing or the certificate cannot be read.
     pub fn new(config: HttpAdapterConfig) -> Result<Self, MemoryError> {
+        // Refuse to send bearer/API-key credentials over a non-TLS connection to
+        // a non-loopback host: the token would otherwise travel in cleartext.
+        if matches!(
+            config.auth,
+            HttpAuth::Bearer(_) | HttpAuth::OAuthBearer(_) | HttpAuth::ApiKey { .. }
+        ) {
+            let host = config.endpoint.host_str().unwrap_or_default();
+            let is_loopback = matches!(host, "localhost" | "127.0.0.1" | "::1");
+            if config.endpoint.scheme() != "https" && !is_loopback {
+                return Err(MemoryError::Configuration(format!(
+                    "refusing to send credentials over {} to non-loopback host {host:?}; use https",
+                    config.endpoint.scheme()
+                )));
+            }
+        }
+
         let mut builder = Client::builder()
             .timeout(config.timeout)
             .user_agent(&config.user_agent)
