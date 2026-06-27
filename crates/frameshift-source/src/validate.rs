@@ -414,6 +414,18 @@ fn scan_patterns(src: &PersonaSource, warnings: &mut Vec<ContentWarning>) {
     for ap in &src.patterns.antipatterns {
         let location = format!("patterns.antipatterns[{}].text", ap.id);
         check_text(&ap.text, &location, warnings);
+
+        // `reasoning` field: optional explanatory prose, still user-supplied.
+        if let Some(reasoning) = &ap.reasoning {
+            let loc = format!("patterns.antipatterns[{}].reasoning", ap.id);
+            check_text(reasoning, &loc, warnings);
+        }
+
+        // `use_instead` field: optional replacement suggestion.
+        if let Some(use_instead) = &ap.use_instead {
+            let loc = format!("patterns.antipatterns[{}].use_instead", ap.id);
+            check_text(use_instead, &loc, warnings);
+        }
     }
 
     for pat in &src.patterns.patterns {
@@ -422,6 +434,18 @@ fn scan_patterns(src: &PersonaSource, warnings: &mut Vec<ContentWarning>) {
     }
 
     for ex in &src.patterns.examples {
+        // `title` field: user-supplied example title.
+        let title_location = format!("patterns.examples[{}].title", ex.id);
+        check_text(&ex.title, &title_location, warnings);
+
+        // `context` field: user-supplied example context prose.
+        let context_location = format!("patterns.examples[{}].context", ex.id);
+        check_text(&ex.context, &context_location, warnings);
+
+        // `language` field: used in fenced code blocks.
+        let lang_location = format!("patterns.examples[{}].language", ex.id);
+        check_text(&ex.language, &lang_location, warnings);
+
         // `bad` field: scan but cap severity at Info -- showing what NOT to do is intentional.
         let bad_location = format!("patterns.examples[{}].bad", ex.id);
         check_text_capped(&ex.bad, &bad_location, Severity::Info, warnings);
@@ -467,6 +491,11 @@ fn scan_persona_fields(src: &PersonaSource, warnings: &mut Vec<ContentWarning>) 
 
     for aq in &p.ambiguity_questions {
         check_text(&aq.text, "persona.ambiguity_question[].text", warnings);
+    }
+
+    // `default_questions[].question` field: user-supplied question text surfaced to agents.
+    for dq in &p.default_questions {
+        check_text(&dq.question, "persona.default_questions[].question", warnings);
     }
 }
 
