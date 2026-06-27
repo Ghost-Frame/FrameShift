@@ -203,7 +203,7 @@ async fn run() -> Result<(), SeedError> {
 
     // Post-seed: update pack descriptions and tags from persona.toml files.
     info!("updating pack descriptions from persona.toml files");
-    update_pack_metadata(&config.postgres_url, &personas_path).await?;
+    update_pack_metadata(&catalog, &personas_path).await?;
 
     info!("done");
     Ok(())
@@ -564,18 +564,27 @@ struct PackMetadata {
 
 /// Post-seed pass: read persona.toml from each directory, extract description
 /// and derive tags from patterns.toml stack categories, then UPDATE the packs
-/// table directly. Uses tokio-postgres for the raw UPDATE since the catalog
-/// trait does not expose a pack metadata update method.
-async fn update_pack_metadata(postgres_url: &str, personas_root: &Path) -> Result<(), SeedError> {
-    let (client, connection) = tokio_postgres::connect(postgres_url, tokio_postgres::NoTls)
-        .await
-        .map_err(|e| SeedError::Io(std::io::Error::other(format!("pg connect: {e}"))))?;
+/// table directly. Reuses the catalog's existing connection pool so both
+/// Postgres connections in the seeder share the same TLS configuration.
+/// The catalog trait does not expose a pack metadata update method, so a
+/// raw diesel sql_query is used here.
+async fn update_pack_metadata(
+    catalog: &PostgresCatalog,
+    personas_root: &Path,
+) -> Result<(), SeedError> {
+    // Only the async `RunQueryDsl::execute` is needed here; pulling in
+    // `diesel::prelude::*` would also import the sync `RunQueryDsl`, making
+    // `.execute` ambiguous (E0034). `sql_query`/`sql_types` are fully qualified
+    // and `.bind` is inherent on the query builder, so no prelude import is required.
+    use diesel_async::RunQueryDsl as _;
 
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            error!("pg connection error: {e}");
-        }
-    });
+    // Check a connection out of the shared pool -- same TLS path as all other
+    // catalog queries opened by PostgresCatalog::new().
+    let mut conn = catalog
+        .pool()
+        .get()
+        .await
+        .map_err(|e| SeedError::Io(std::io::Error::other(format!("pool checkout: {e}"))))?;
 
     for entry in std::fs::read_dir(personas_root)? {
         let entry = entry?;
@@ -594,12 +603,16 @@ async fn update_pack_metadata(postgres_url: &str, personas_root: &Path) -> Resul
             continue;
         };
 
-        let result = client
-            .execute(
-                "UPDATE packs SET description = $1, tags = $2 WHERE name = $3",
-                &[&metadata.description, &metadata.tags, &metadata.name],
-            )
-            .await;
+        // Raw UPDATE: the catalog trait has no update-metadata method, so we
+        // issue the statement directly via diesel's sql_query API.
+        let result = diesel::sql_query(
+            "UPDATE packs SET description = $1, tags = $2 WHERE name = $3",
+        )
+        .bind::<diesel::sql_types::Text, _>(&metadata.description)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(&metadata.tags)
+        .bind::<diesel::sql_types::Text, _>(&metadata.name)
+        .execute(&mut *conn)
+        .await;
 
         match result {
             Ok(rows) if rows > 0 => {

@@ -1502,6 +1502,8 @@ name = "frameshift-seed"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "diesel",
+ "diesel-async",
  "ed25519-dalek",
  "frameshift-catalog",
  "frameshift-catalog-postgres",
@@ -1514,7 +1516,6 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
- "tokio-postgres",
  "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
