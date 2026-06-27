@@ -324,6 +324,10 @@ impl MemoryAdapter for SqliteFtsAdapter {
             .map_err(MemoryError::from)?
             .map_err(MemoryError::from)?;
 
+        // Release the connection before rows_to_memories re-enters the pool via
+        // fetch_tags_for_id. With pool_size == 1 holding conn here deadlocks.
+        drop(conn);
+
         // Fetch tags and assemble Memory values.
         rows_to_memories(rows, &self.pool).await
     }
@@ -364,6 +368,10 @@ impl MemoryAdapter for SqliteFtsAdapter {
             .map_err(SqliteFtsError::from)
             .map_err(MemoryError::from)?
             .map_err(MemoryError::from)?;
+
+        // Release the connection before fetch_tags_for_id re-enters the pool.
+        // With pool_size == 1 holding conn here deadlocks.
+        drop(conn);
 
         match row_opt {
             None => Err(MemoryError::NotFound(id.clone())),
@@ -415,6 +423,10 @@ impl MemoryAdapter for SqliteFtsAdapter {
             .map_err(SqliteFtsError::from)
             .map_err(MemoryError::from)?
             .map_err(MemoryError::from)?;
+
+        // Release the connection before rows_to_memories re-enters the pool via
+        // fetch_tags_for_id. With pool_size == 1 holding conn here deadlocks.
+        drop(conn);
 
         rows_to_memories(rows, &self.pool).await
     }
