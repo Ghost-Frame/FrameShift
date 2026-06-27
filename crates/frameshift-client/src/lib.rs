@@ -64,7 +64,7 @@ impl Client {
     pub fn with_default_data_root() -> Result<Self, ClientError> {
         Ok(Self::new(ClientOptions {
             data_root: default_data_root()?,
-            config_root: Some(default_config_root()),
+            config_root: Some(default_config_root()?),
         }))
     }
 
@@ -456,14 +456,25 @@ fn default_data_root() -> Result<PathBuf, ClientError> {
 }
 
 /// Resolve the XDG config home directory.
-fn default_config_root() -> PathBuf {
+///
+/// Returns an error when neither `XDG_CONFIG_HOME` nor `HOME` is set so the
+/// caller fails closed rather than writing state to a world-traversable `/tmp`
+/// path. Mirrors the error shape used by [`default_data_root`].
+fn default_config_root() -> Result<PathBuf, ClientError> {
     if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
         if !xdg.is_empty() {
-            return PathBuf::from(xdg);
+            return Ok(PathBuf::from(xdg));
         }
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home).join(".config")
+
+    // Fail closed: no /tmp fallback when HOME is absent.
+    let home = std::env::var("HOME")
+        .map(PathBuf::from)
+        .map_err(|source| ClientError::Io {
+            path: PathBuf::from("$HOME"),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, source),
+        })?;
+    Ok(home.join(".config"))
 }
 
 fn validate_explicit_project_id(project_id: &str) -> Result<(), ClientError> {
@@ -963,7 +974,7 @@ mod tests {
         fs::write(
             pack_dir.join("pack.toml"),
             format!(
-                "schema_version = 1\nname = \"{}\"\nauthor_handle = \"test\"\nauthor_pubkey = \"local-unsigned\"\nversion = \"0.1.0\"\n",
+                "schema_version = 1\nname = \"{}\"\nauthor_handle = \"test\"\nauthor_pubkey = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\nversion = \"0.1.0\"\n",
                 name
             ),
         )
@@ -1111,7 +1122,7 @@ mod tests {
         fs::create_dir_all(&pack_dir).unwrap();
         fs::write(
             pack_dir.join("pack.toml"),
-            "schema_version = 1\nname = \"testpersona\"\nauthor_handle = \"test\"\nauthor_pubkey = \"local-unsigned\"\nversion = \"0.1.0\"\n",
+            "schema_version = 1\nname = \"testpersona\"\nauthor_handle = \"test\"\nauthor_pubkey = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\nversion = \"0.1.0\"\n",
         )
         .unwrap();
         fs::write(pack_dir.join("AGENTS.md"), "# Test Persona\n\nBehavior rules here.\n").unwrap();
@@ -1161,7 +1172,7 @@ mod tests {
         fs::create_dir_all(&pack_dir).unwrap();
         fs::write(
             pack_dir.join("pack.toml"),
-            "schema_version = 1\nname = \"noinfratestp\"\nauthor_handle = \"test\"\nauthor_pubkey = \"local-unsigned\"\nversion = \"0.1.0\"\n",
+            "schema_version = 1\nname = \"noinfratestp\"\nauthor_handle = \"test\"\nauthor_pubkey = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\nversion = \"0.1.0\"\n",
         )
         .unwrap();
         fs::write(pack_dir.join("AGENTS.md"), "# Bare Persona\n").unwrap();

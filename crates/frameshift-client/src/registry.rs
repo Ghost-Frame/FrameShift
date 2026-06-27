@@ -42,6 +42,14 @@ const DEFAULT_REGISTRY_URL: &str = "https://frameshift.syntheos.dev";
 /// to the cache. This is a decompression-bomb guard analogous to the server-side limit.
 const MAX_DECOMPRESSED_BYTES: u64 = 16 * 1024 * 1024;
 
+/// Maximum number of compressed (wire) bytes we will read from an HTTP registry response.
+///
+/// Applied via [`LimitedReader`] around the raw HTTP response body *before* `read_to_end`
+/// so an oversized response is rejected during streaming, not after full buffering.
+/// A valid `.tar.gz` archive cannot expand beyond [`MAX_DECOMPRESSED_BYTES`] of useful
+/// content, so the same cap is a safe upper bound on the compressed wire size as well.
+const MAX_ARCHIVE_BYTES: u64 = 16 * 1024 * 1024;
+
 /// Minimal JSON shape returned by `GET /v1/packs/{name}/versions/{version}`.
 ///
 /// Only the fields needed for installation are deserialized. Unknown fields are
@@ -236,8 +244,9 @@ fn ureq_get_bytes(url: &str) -> Result<Vec<u8>, ClientError> {
     }
 
     let mut bytes = Vec::new();
-    response
-        .into_reader()
+    // Wrap in LimitedReader so an oversized body is rejected during streaming,
+    // not after the entire response has been buffered into memory.
+    LimitedReader::new(response.into_reader(), MAX_ARCHIVE_BYTES)
         .read_to_end(&mut bytes)
         .map_err(|source| ClientError::Io {
             path: std::path::PathBuf::from(url),

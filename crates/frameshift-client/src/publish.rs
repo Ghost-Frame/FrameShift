@@ -529,7 +529,7 @@ mod tests {
         let pack = tempfile::tempdir().unwrap();
         fs::write(
             pack.path().join("pack.toml"),
-            b"schema_version = 1\nname = \"demo\"\nauthor_handle = \"alice\"\nauthor_pubkey = \"k\"\nversion = \"0.1.0\"\n",
+            b"schema_version = 1\nname = \"demo\"\nauthor_handle = \"alice\"\nauthor_pubkey = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\nversion = \"0.1.0\"\n",
         )
         .unwrap();
         fs::write(pack.path().join("README.md"), b"hello").unwrap();

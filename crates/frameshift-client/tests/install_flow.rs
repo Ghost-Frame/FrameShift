@@ -21,7 +21,7 @@ fn install_activate_and_sync_materialize_central_state() {
 schema_version = 1
 name = "cryptographic"
 author_handle = "alice"
-author_pubkey = "unsigned-local-pack"
+author_pubkey = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 version = "0.3.1"
 "#,
             ),
@@ -158,7 +158,7 @@ fn gc_removes_unreferenced_cache_entries() {
 schema_version = 1
 name = "cryptographic"
 author_handle = "alice"
-author_pubkey = "unsigned-local-pack"
+author_pubkey = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 version = "0.3.1"
 "#,
             ),
