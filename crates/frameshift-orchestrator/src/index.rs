@@ -201,12 +201,13 @@ impl PersonaProfile {
         let agents_md_path = dir.join("AGENTS.md");
         let body = std::fs::read_to_string(&agents_md_path)?;
 
-        // Read pack.toml if present; silently default on absence or parse failure.
+        // Read pack.toml if present; default on absence, propagate error on parse failure.
+        // A malformed manifest must not silently become an empty (permissive) one.
         let pack: PackManifest = {
             let pack_path = dir.join("pack.toml");
             if pack_path.exists() {
                 let raw = std::fs::read_to_string(&pack_path)?;
-                toml::from_str(&raw).unwrap_or_default()
+                toml::from_str(&raw)?
             } else {
                 PackManifest::default()
             }
