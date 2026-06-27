@@ -658,7 +658,7 @@ mod tests {
     fn make_pack_dir(dir: &std::path::Path, name: &str, version: &str) {
         fs::create_dir_all(dir).unwrap();
         let manifest = format!(
-            "schema_version = 1\nname = \"{}\"\nversion = \"{}\"\nauthor_handle = \"test\"\nauthor_pubkey = \"local-unsigned\"\n",
+            "schema_version = 1\nname = \"{}\"\nversion = \"{}\"\nauthor_handle = \"test\"\nauthor_pubkey = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\n",
             name, version
         );
         fs::write(dir.join("pack.toml"), manifest).unwrap();

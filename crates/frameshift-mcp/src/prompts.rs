@@ -376,7 +376,7 @@ mod tests {
             pack_dir.join("pack.toml"),
             format!(
                 "schema_version = 1\nname = \"{name}\"\nversion = \"0.1.0\"\n\
-                 author_handle = \"test\"\nauthor_pubkey = \"local-unsigned\"\n"
+                 author_handle = \"test\"\nauthor_pubkey = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\n"
             ),
         )
         .unwrap();

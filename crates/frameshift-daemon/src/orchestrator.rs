@@ -246,7 +246,7 @@ mod tests {
         fs::create_dir_all(&pack_dir).unwrap();
         fs::write(
             pack_dir.join("pack.toml"),
-            "schema_version = 1\nname = \"eval-persona\"\nauthor_handle = \"test\"\nauthor_pubkey = \"local-unsigned\"\nversion = \"0.1.0\"\n",
+            "schema_version = 1\nname = \"eval-persona\"\nauthor_handle = \"test\"\nauthor_pubkey = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\nversion = \"0.1.0\"\n",
         )
         .unwrap();
         fs::write(pack_dir.join("AGENTS.md"), "# Eval Persona\n\nTest.\n").unwrap();
@@ -308,7 +308,7 @@ mod tests {
         fs::create_dir_all(&pack_dir).unwrap();
         fs::write(
             pack_dir.join("pack.toml"),
-            "schema_version = 1\nname = \"new-persona\"\nauthor_handle = \"test\"\nauthor_pubkey = \"local-unsigned\"\nversion = \"0.1.0\"\n",
+            "schema_version = 1\nname = \"new-persona\"\nauthor_handle = \"test\"\nauthor_pubkey = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\nversion = \"0.1.0\"\n",
         )
         .unwrap();
         fs::write(pack_dir.join("AGENTS.md"), "# New Persona\n\nTest.\n").unwrap();

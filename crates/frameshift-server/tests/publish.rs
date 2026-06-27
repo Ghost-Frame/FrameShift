@@ -95,7 +95,7 @@ fn make_state(catalog: MockCatalog, objects: MockPackStore) -> AppState {
 /// and author handle.
 fn write_pack(dir: &Path, name: &str, version: &str, handle: &str) {
     let manifest = format!(
-        "schema_version = 1\nname = \"{name}\"\nauthor_handle = \"{handle}\"\nauthor_pubkey = \"placeholder\"\nversion = \"{version}\"\nlicense = \"MIT\"\n"
+        "schema_version = 1\nname = \"{name}\"\nauthor_handle = \"{handle}\"\nauthor_pubkey = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\nversion = \"{version}\"\nlicense = \"MIT\"\n"
     );
     std::fs::create_dir_all(dir).unwrap();
     std::fs::write(dir.join("pack.toml"), manifest).unwrap();

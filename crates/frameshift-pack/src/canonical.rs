@@ -116,11 +116,28 @@ fn collect_recursive(
             return Err(PackError::DuplicatePath(canonical));
         }
 
+        // Stat before read: reject oversized files before allocating a buffer.
+        // This prevents a large file from consuming memory before the size
+        // check fires. The post-read check below handles the TOCTOU case where
+        // the file grows between stat and read.
+        let metadata = std::fs::metadata(&path).map_err(|e| PackError::Io {
+            path: path.clone(),
+            source: e,
+        })?;
+        if metadata.len() > MAX_FILE_SIZE {
+            return Err(PackError::FileSizeExceeded {
+                path: canonical,
+                size: metadata.len(),
+                limit: MAX_FILE_SIZE,
+            });
+        }
+
         let content = std::fs::read(&path).map_err(|e| PackError::Io {
             path: path.clone(),
             source: e,
         })?;
 
+        // Post-read guard: file may have grown between stat and read (TOCTOU).
         if content.len() as u64 > MAX_FILE_SIZE {
             return Err(PackError::FileSizeExceeded {
                 path: canonical,

@@ -182,7 +182,7 @@ mod tests {
         fs::create_dir_all(&pack_dir).unwrap();
         fs::write(
             pack_dir.join("pack.toml"),
-            "schema_version = 1\nname = \"mcp-test\"\nversion = \"0.1.0\"\nauthor_handle = \"test\"\nauthor_pubkey = \"local-unsigned\"\n",
+            "schema_version = 1\nname = \"mcp-test\"\nversion = \"0.1.0\"\nauthor_handle = \"test\"\nauthor_pubkey = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\n",
         )
         .unwrap();
         fs::write(pack_dir.join("AGENTS.md"), "# MCP Test\n").unwrap();
@@ -326,7 +326,7 @@ mod tests {
         fs::create_dir_all(&pack_dir).unwrap();
         fs::write(
             pack_dir.join("pack.toml"),
-            "schema_version = 1\nname = \"growpersona\"\nversion = \"0.1.0\"\nauthor_handle = \"test\"\nauthor_pubkey = \"local-unsigned\"\n",
+            "schema_version = 1\nname = \"growpersona\"\nversion = \"0.1.0\"\nauthor_handle = \"test\"\nauthor_pubkey = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\n",
         )
         .unwrap();
         fs::write(pack_dir.join("AGENTS.md"), "# Grow Persona\n").unwrap();
