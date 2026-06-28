@@ -4,6 +4,8 @@ mod model;
 mod publish;
 /// Registry install implementation: HTTP fetch, extraction, and verification.
 mod registry;
+/// Persona-selection history (local JSONL) and opt-in telemetry.
+mod selection;
 
 pub use error::ClientError;
 pub use model::{
@@ -11,6 +13,7 @@ pub use model::{
     PersonaSpec, ProjectConfig, ProjectPaths, SyncReport, SCHEMA_VERSION,
 };
 pub use publish::PublishOutcome;
+pub use selection::{SelectionEvent, SelectionTelemetry, SELECTION_HISTORY_FILENAME, TELEMETRY_URL_ENV};
 
 use base64::{engine::general_purpose, Engine as _};
 use ed25519_dalek::VerifyingKey;
@@ -181,6 +184,82 @@ impl Client {
         let paths = self.project_paths(project_root)?;
         ensure_dir(&paths.project_state_dir)?;
         write_file(&paths.active_path, persona.as_bytes())
+    }
+
+    /// Read the central project config (`projects/<id>/config.toml`), returning
+    /// `ProjectConfig::default()` when the file does not exist yet.
+    pub fn project_config(&self, project_root: &Path) -> Result<ProjectConfig, ClientError> {
+        let paths = self.project_paths(project_root)?;
+        match fs::read_to_string(&paths.config_path) {
+            Ok(raw) => toml::from_str(&raw).map_err(|source| ClientError::TomlDeserialize {
+                path: paths.config_path.clone(),
+                source,
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(ProjectConfig::default())
+            }
+            Err(source) => Err(ClientError::Io {
+                path: paths.config_path,
+                source,
+            }),
+        }
+    }
+
+    /// Append a persona-selection event to the project's local selection history
+    /// (`projects/<id>/selection-history.jsonl`). Local-only state that the
+    /// intelligent-selection feature learns from; it is never sent anywhere.
+    /// `auto` distinguishes automatic selections from explicit user choices, and
+    /// `reason` is an optional rationale.
+    pub fn record_selection_event(
+        &self,
+        project_root: &Path,
+        persona: &str,
+        session: &str,
+        auto: bool,
+        reason: Option<&str>,
+    ) -> Result<(), ClientError> {
+        validate_persona_name(persona)?;
+        let paths = self.project_paths(project_root)?;
+        ensure_dir(&paths.project_state_dir)?;
+        let history_path = paths
+            .project_state_dir
+            .join(selection::SELECTION_HISTORY_FILENAME);
+        let event = selection::SelectionEvent {
+            persona: persona.to_string(),
+            session: session.to_string(),
+            auto,
+            reason: reason.map(str::to_string),
+            recorded_at_unix: selection::now_unix(),
+        };
+        selection::append_selection_event(&history_path, &event)
+    }
+
+    /// Send anonymous selection telemetry for `persona`, but only when the
+    /// project has opted in (`ProjectConfig.telemetry_opt_in`) and a telemetry
+    /// endpoint is configured via `FRAMESHIFT_TELEMETRY_URL`. When either is
+    /// absent this is a no-op returning `Ok(())`; the client never phones home by
+    /// default. Network failures are returned for the caller to log.
+    pub fn send_telemetry_for_persona(
+        &self,
+        project_root: &Path,
+        persona: &str,
+        session: &str,
+    ) -> Result<(), ClientError> {
+        let config = self.project_config(project_root)?;
+        if !config.telemetry_opt_in {
+            return Ok(());
+        }
+        let Some(endpoint) = selection::telemetry_endpoint() else {
+            return Ok(());
+        };
+        let paths = self.project_paths(project_root)?;
+        let payload = selection::SelectionTelemetry {
+            persona,
+            session,
+            project_id: &paths.project_id,
+            recorded_at_unix: selection::now_unix(),
+        };
+        selection::post_selection_telemetry(&endpoint, &payload)
     }
 
     pub fn sync(&self, project_root: &Path) -> Result<SyncReport, ClientError> {
