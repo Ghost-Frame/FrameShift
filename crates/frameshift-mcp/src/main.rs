@@ -4,7 +4,7 @@
 use frameshift_client::Client;
 use frameshift_mcp::protocol::{error_response, success_response, JsonRpcMessage, JsonRpcResponse};
 use frameshift_mcp::{prompts, tools};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 
 /// Main entry point. Initializes tracing, creates the client, then
 /// runs the stdin JSON-RPC read loop writing responses to stdout.
@@ -16,19 +16,134 @@ async fn main() {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    let client = Client::with_default_data_root().expect("failed to initialize client");
-
-    let reader = BufReader::new(tokio::io::stdin());
-    let mut stdout = BufWriter::new(tokio::io::stdout());
-    let mut lines = reader.lines();
-
-    while let Ok(Some(line)) = lines.next_line().await {
-        if let Some(response) = handle_message(&line, &client) {
-            let json = serde_json::to_string(&response).unwrap_or_default();
-            let _ = stdout.write_all(json.as_bytes()).await;
-            let _ = stdout.write_all(b"\n").await;
-            let _ = stdout.flush().await;
+    let client = match Client::with_default_data_root() {
+        Ok(c) => c,
+        Err(e) => {
+            // stdout is the protocol channel and no request id exists yet, so the
+            // only useful signal is a clear stderr diagnostic and a nonzero exit
+            // rather than a panic that gives the client an unexplained EOF.
+            eprintln!("frameshift-mcp: failed to initialize client: {e}");
+            std::process::exit(1);
         }
+    };
+
+    let mut stdin = tokio::io::stdin();
+    let mut stdout = BufWriter::new(tokio::io::stdout());
+    let mut pending: Vec<u8> = Vec::new();
+    let mut line: Vec<u8> = Vec::new();
+
+    loop {
+        match read_capped_line(&mut stdin, &mut pending, &mut line, MAX_LINE_BYTES).await {
+            Ok(LineRead::Eof) | Err(_) => break,
+            Ok(LineRead::TooLong) => {
+                let response =
+                    error_response(None, -32700, "request line exceeds maximum size".to_string());
+                write_response(&mut stdout, &response).await;
+            }
+            Ok(LineRead::Line) => {
+                let text = String::from_utf8_lossy(&line);
+                if let Some(response) = handle_message(&text, &client) {
+                    write_response(&mut stdout, &response).await;
+                }
+            }
+        }
+    }
+}
+
+/// Maximum size in bytes of a single JSON-RPC line read from stdin. Larger lines
+/// are rejected rather than buffered, bounding memory against a client that never
+/// sends a newline.
+const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Outcome of one capped read from the input stream.
+enum LineRead {
+    /// A complete line (trailing newline stripped) was read into the output buffer.
+    Line,
+    /// The line exceeded the cap and was discarded; the stream is positioned just
+    /// past its terminating newline.
+    TooLong,
+    /// End of input.
+    Eof,
+}
+
+/// Serialize a JSON-RPC response and write it to stdout as one newline-terminated line.
+async fn write_response(stdout: &mut BufWriter<tokio::io::Stdout>, response: &JsonRpcResponse) {
+    let json = serde_json::to_string(response).unwrap_or_default();
+    let _ = stdout.write_all(json.as_bytes()).await;
+    let _ = stdout.write_all(b"\n").await;
+    let _ = stdout.flush().await;
+}
+
+/// Read one newline-delimited line into `out`, capping its length at `max` bytes.
+///
+/// `pending` carries bytes read past the previous line between calls. If a line
+/// exceeds `max` before a newline arrives, the rest of that line is discarded and
+/// `TooLong` is returned, so a client that never sends a newline cannot drive
+/// unbounded memory growth.
+async fn read_capped_line<R>(
+    reader: &mut R,
+    pending: &mut Vec<u8>,
+    out: &mut Vec<u8>,
+    max: usize,
+) -> std::io::Result<LineRead>
+where
+    R: AsyncReadExt + Unpin,
+{
+    out.clear();
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        if let Some(pos) = pending.iter().position(|&b| b == b'\n') {
+            if pos > max {
+                // The completed line is over the cap: discard it, newline included.
+                pending.drain(..=pos);
+                return Ok(LineRead::TooLong);
+            }
+            out.extend_from_slice(&pending[..pos]);
+            pending.drain(..=pos);
+            return Ok(LineRead::Line);
+        }
+        if pending.len() > max {
+            // Over the cap with no newline yet: discard and skip to the next one.
+            return drain_over_long(reader, pending, &mut chunk).await;
+        }
+        let n = reader.read(&mut chunk).await?;
+        if n == 0 {
+            if pending.is_empty() {
+                return Ok(LineRead::Eof);
+            }
+            // Final line with no trailing newline at end of input.
+            if pending.len() > max {
+                pending.clear();
+                return Ok(LineRead::TooLong);
+            }
+            out.extend_from_slice(pending);
+            pending.clear();
+            return Ok(LineRead::Line);
+        }
+        pending.extend_from_slice(&chunk[..n]);
+    }
+}
+
+/// Discard input up to and including the next newline, then report `TooLong`.
+async fn drain_over_long<R>(
+    reader: &mut R,
+    pending: &mut Vec<u8>,
+    chunk: &mut [u8],
+) -> std::io::Result<LineRead>
+where
+    R: AsyncReadExt + Unpin,
+{
+    loop {
+        if let Some(pos) = pending.iter().position(|&b| b == b'\n') {
+            pending.drain(..=pos);
+            return Ok(LineRead::TooLong);
+        }
+        pending.clear();
+        let n = reader.read(chunk).await?;
+        if n == 0 {
+            return Ok(LineRead::TooLong);
+        }
+        pending.extend_from_slice(&chunk[..n]);
     }
 }
 
@@ -369,5 +484,77 @@ mod tests {
         let content_text = serialized["result"]["content"][0]["text"].as_str().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(content_text).unwrap();
         assert_eq!(parsed["appended"], true);
+    }
+
+    /// The capped line reader rejects an over-long line and recovers on the next one.
+    #[tokio::test]
+    async fn read_capped_line_rejects_oversized_then_recovers() {
+        // With max = 8, "toolongline" (11 bytes) exceeds the cap; "ok" does not.
+        let input: &[u8] = b"toolongline\nok\n";
+        let mut reader = input;
+        let mut pending = Vec::new();
+        let mut out = Vec::new();
+        let r1 = read_capped_line(&mut reader, &mut pending, &mut out, 8)
+            .await
+            .unwrap();
+        assert!(
+            matches!(r1, LineRead::TooLong),
+            "over-long line must be rejected"
+        );
+        let r2 = read_capped_line(&mut reader, &mut pending, &mut out, 8)
+            .await
+            .unwrap();
+        assert!(matches!(r2, LineRead::Line));
+        assert_eq!(out, b"ok");
+        let r3 = read_capped_line(&mut reader, &mut pending, &mut out, 8)
+            .await
+            .unwrap();
+        assert!(matches!(r3, LineRead::Eof));
+    }
+
+    /// frameshift_activate rejects a traversal persona name at the MCP boundary.
+    #[test]
+    fn tools_call_activate_rejects_traversal_persona() {
+        let tmp = tempfile::tempdir().unwrap();
+        let client = make_client(&tmp.path().join("data"));
+        let project_root = tmp.path().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0", "id": 30, "method": "tools/call",
+            "params": { "name": "frameshift_activate", "arguments": {
+                "persona": "../evil",
+                "project_root": project_root.to_str().unwrap()
+            }}
+        });
+        let response = handle_message(&msg.to_string(), &client).expect("response");
+        let serialized = serde_json::to_value(&response).unwrap();
+        let text = serialized["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.starts_with("invalid persona name"),
+            "expected boundary rejection, got: {text}"
+        );
+    }
+
+    /// frameshift_use rejects a traversal persona name at the MCP boundary.
+    #[test]
+    fn tools_call_use_rejects_traversal_persona() {
+        let tmp = tempfile::tempdir().unwrap();
+        let client = make_client(&tmp.path().join("data"));
+        let project_root = tmp.path().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0", "id": 31, "method": "tools/call",
+            "params": { "name": "frameshift_use", "arguments": {
+                "project_root": project_root.to_str().unwrap(),
+                "persona": "../evil"
+            }}
+        });
+        let response = handle_message(&msg.to_string(), &client).expect("response");
+        let serialized = serde_json::to_value(&response).unwrap();
+        let text = serialized["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.starts_with("invalid persona name"),
+            "expected boundary rejection, got: {text}"
+        );
     }
 }

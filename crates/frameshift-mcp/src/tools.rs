@@ -235,6 +235,11 @@ fn call_activate(arguments: &serde_json::Value, client: &Client) -> ToolResult {
         Some(s) => s,
         None => return err_result("missing required argument: persona".to_string()),
     };
+    // Validate at the MCP boundary so a traversal name is rejected here with a
+    // clear error, mirroring call_grow_append (the client layer also guards it).
+    if let Err(e) = frameshift_client::validate_persona_name(persona) {
+        return err_result(format!("invalid persona name: {e}"));
+    }
 
     let project_root_str = match arguments.get("project_root").and_then(|v| v.as_str()) {
         Some(s) => s,
@@ -410,6 +415,10 @@ fn call_use(arguments: &serde_json::Value, client: &Client) -> ToolResult {
         Some(s) => s,
         None => return err_result("missing required argument: persona".to_string()),
     };
+    // Validate at the MCP boundary, mirroring call_grow_append/call_activate.
+    if let Err(e) = frameshift_client::validate_persona_name(persona) {
+        return err_result(format!("invalid persona name: {e}"));
+    }
 
     let project_root = match validate_path_arg(project_root_str) {
         Ok(p) => p,
