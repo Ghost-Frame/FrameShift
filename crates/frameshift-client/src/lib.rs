@@ -235,10 +235,11 @@ impl Client {
     }
 
     /// Send anonymous selection telemetry for `persona`, but only when the
-    /// project has opted in (`ProjectConfig.telemetry_opt_in`) and a telemetry
-    /// endpoint is configured via `FRAMESHIFT_TELEMETRY_URL`. When either is
-    /// absent this is a no-op returning `Ok(())`; the client never phones home by
-    /// default. Network failures are returned for the caller to log.
+    /// project has opted in (`ProjectConfig.telemetry_opt_in`). When opt-in is
+    /// disabled this is a no-op returning `Ok(())`, so the client never sends
+    /// anything by default. When enabled, the endpoint is derived from the
+    /// registry base URL (overridable via `FRAMESHIFT_TELEMETRY_URL`). Network
+    /// failures are returned for the caller to log.
     pub fn send_telemetry_for_persona(
         &self,
         project_root: &Path,
@@ -249,9 +250,7 @@ impl Client {
         if !config.telemetry_opt_in {
             return Ok(());
         }
-        let Some(endpoint) = selection::telemetry_endpoint() else {
-            return Ok(());
-        };
+        let endpoint = selection::telemetry_endpoint();
         let paths = self.project_paths(project_root)?;
         let payload = selection::SelectionTelemetry {
             persona,

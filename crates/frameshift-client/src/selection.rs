@@ -16,10 +16,15 @@ use std::path::Path;
 
 use crate::error::ClientError;
 
-/// Environment variable naming the telemetry endpoint. When unset (or blank),
-/// telemetry is disabled regardless of the project's opt-in flag. There is no
-/// default value on purpose: the public client must not ship a phone-home URL.
+/// Environment variable that OVERRIDES the telemetry endpoint. When unset (or
+/// blank), the endpoint is derived from the configured registry base URL so that
+/// opting in works against the same host that serves the registry. Telemetry is
+/// always gated on the project's opt-in flag regardless of this value, so the
+/// client still never sends anything unless the user has explicitly opted in.
 pub const TELEMETRY_URL_ENV: &str = "FRAMESHIFT_TELEMETRY_URL";
+
+/// Path appended to the registry base URL to form the default telemetry endpoint.
+const TELEMETRY_PATH: &str = "/v1/telemetry/selection";
 
 /// Filename of the per-project local selection history, stored as JSON Lines in
 /// the central project state directory.
@@ -88,13 +93,18 @@ pub fn append_selection_event(
     })
 }
 
-/// Resolve the telemetry endpoint from the environment, returning `None` when
-/// the variable is unset or blank (which disables telemetry entirely).
-pub fn telemetry_endpoint() -> Option<String> {
-    std::env::var(TELEMETRY_URL_ENV)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+/// Resolve the telemetry endpoint. An explicit `FRAMESHIFT_TELEMETRY_URL` wins;
+/// otherwise the endpoint is derived from the configured registry base URL. This
+/// returning a URL does not by itself cause anything to be sent: the caller still
+/// gates on `ProjectConfig.telemetry_opt_in`.
+pub fn telemetry_endpoint() -> String {
+    if let Ok(explicit) = std::env::var(TELEMETRY_URL_ENV) {
+        let trimmed = explicit.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    format!("{}{}", crate::registry::registry_base_url(), TELEMETRY_PATH)
 }
 
 /// POST a telemetry payload to `endpoint`. Callers are responsible for the
@@ -150,13 +160,17 @@ mod tests {
         assert_eq!(parsed, event);
     }
 
-    /// telemetry_endpoint is None when the env var is unset or blank.
+    /// Without an override, telemetry_endpoint derives from the registry base URL.
     #[test]
-    fn telemetry_endpoint_absent_by_default() {
-        // The variable is not set in the test environment, so telemetry is off.
-        // (Set/clear is avoided here to keep the test free of global env races.)
+    fn telemetry_endpoint_derives_from_registry_when_no_override() {
+        // Avoid mutating env here to keep the test free of global env races; only
+        // assert the derive path when no override is present.
         if std::env::var(TELEMETRY_URL_ENV).is_err() {
-            assert_eq!(telemetry_endpoint(), None);
+            let endpoint = telemetry_endpoint();
+            assert!(
+                endpoint.ends_with(TELEMETRY_PATH),
+                "derived endpoint should end with the telemetry path, got {endpoint}"
+            );
         }
     }
 }
