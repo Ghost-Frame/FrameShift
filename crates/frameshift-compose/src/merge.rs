@@ -1,6 +1,8 @@
 use frameshift_source::{PatternSet, PersonaSource};
 
-use crate::composed::{ComposedPersona, Layer, Provenance, ProvenancedRule, ProvenancedSkill};
+use crate::composed::{
+    ComposedPersona, IdCollision, Layer, Provenance, ProvenancedRule, ProvenancedSkill,
+};
 use crate::error::ComposeError;
 
 /// The order in which composition layers are stacked.
@@ -53,6 +55,15 @@ pub fn merge_layers(layers: &[MergeLayer<'_>]) -> Result<ComposedPersona, Compos
     let mut skills: Vec<ProvenancedSkill> = Vec::new();
     let mut combined_patterns = PatternSet::default();
 
+    // Track every layer that contributes each rule/skill id so collisions (same
+    // id from more than one layer) survive the last-write-wins merge below and
+    // can be surfaced as diagnostics. Without this, the collapsed result holds
+    // one entry per id and the collision is unrecoverable.
+    let mut rule_layer_map: std::collections::BTreeMap<String, Vec<Layer>> =
+        std::collections::BTreeMap::new();
+    let mut skill_layer_map: std::collections::BTreeMap<String, Vec<Layer>> =
+        std::collections::BTreeMap::new();
+
     for merge_layer in layers {
         let provenance = Provenance {
             layer: merge_layer.layer.clone(),
@@ -60,6 +71,13 @@ pub fn merge_layers(layers: &[MergeLayer<'_>]) -> Result<ComposedPersona, Compos
 
         for rule in merge_layer.source.rules.rules.iter() {
             let id = &rule.id;
+
+            // Record this layer's contribution to the id before resolving the
+            // collision, so every contributing layer is counted.
+            rule_layer_map
+                .entry(rule.id.clone())
+                .or_default()
+                .push(merge_layer.layer.clone());
 
             if let Some(existing_idx) = rules.iter().position(|p| &p.rule.id == id) {
                 let existing = &rules[existing_idx];
@@ -104,6 +122,11 @@ pub fn merge_layers(layers: &[MergeLayer<'_>]) -> Result<ComposedPersona, Compos
 
         for skill in merge_layer.source.skills.skills.iter() {
             let id = &skill.id;
+            // Record this layer's contribution to the id (see rule loop above).
+            skill_layer_map
+                .entry(skill.id.clone())
+                .or_default()
+                .push(merge_layer.layer.clone());
             if let Some(existing) = skills.iter_mut().find(|p| &p.skill.id == id) {
                 // Skills: last-write-wins, no L1 protection.
                 *existing = ProvenancedSkill {
@@ -134,12 +157,28 @@ pub fn merge_layers(layers: &[MergeLayer<'_>]) -> Result<ComposedPersona, Compos
             .extend(src_patterns.patterns.iter().cloned());
     }
 
+    // An id contributed by more than one layer is a collision (diagnostic only;
+    // the merge already resolved it by last-write-wins above).
+    let rule_collisions = collisions_from_map(rule_layer_map);
+    let skill_collisions = collisions_from_map(skill_layer_map);
+
     Ok(ComposedPersona {
         persona: root_persona,
         rules,
         skills,
         patterns: combined_patterns,
+        rule_collisions,
+        skill_collisions,
     })
+}
+
+/// Convert an id -> contributing-layers map into the collision list: only ids
+/// supplied by more than one layer are collisions.
+fn collisions_from_map(map: std::collections::BTreeMap<String, Vec<Layer>>) -> Vec<IdCollision> {
+    map.into_iter()
+        .filter(|(_, layers)| layers.len() > 1)
+        .map(|(id, layers)| IdCollision { id, layers })
+        .collect()
 }
 
 /// Returns a human-readable description of a composition layer for error messages.

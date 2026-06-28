@@ -33,6 +33,21 @@ pub struct ProvenancedSkill {
     pub provenance: Provenance,
 }
 
+/// An id collision recorded during merge: more than one layer supplied a rule
+/// or skill with the same id.
+///
+/// The merge resolves collisions by last-write-wins, leaving a single entry per
+/// id in the merged list, so this record is the only surviving evidence that the
+/// earlier layers also contributed the id. It is captured at merge time because
+/// it cannot be reconstructed from the collapsed result afterwards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdCollision {
+    /// The colliding rule or skill id.
+    pub id: String,
+    /// Every layer that contributed this id, in merge order.
+    pub layers: Vec<Layer>,
+}
+
 /// The merged result of composing a root persona with its base + mixins.
 ///
 /// Same shape as `PersonaSource` from `frameshift-source`, but every rule
@@ -48,4 +63,10 @@ pub struct ComposedPersona {
     pub skills: Vec<ProvenancedSkill>,
     /// Merged patterns from all layers (concatenated, no deduplication).
     pub patterns: PatternSet,
+    /// Rule id collisions observed during merge (diagnostic only; the merge
+    /// itself resolves them by last-write-wins). Empty when no id was supplied
+    /// by more than one layer.
+    pub rule_collisions: Vec<IdCollision>,
+    /// Skill id collisions observed during merge (diagnostic only).
+    pub skill_collisions: Vec<IdCollision>,
 }
