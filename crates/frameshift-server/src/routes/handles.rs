@@ -47,7 +47,9 @@ pub async fn get_handle(
 ) -> Result<Json<frameshift_catalog::AuthorRecord>, AppError> {
     // Reject unreasonably long values before hitting the catalog.
     if handle.len() > 256 {
-        return Err(AppError::BadRequest("handle exceeds maximum length".to_string()));
+        return Err(AppError::BadRequest(
+            "handle exceeds maximum length".to_string(),
+        ));
     }
     let author = state
         .catalog

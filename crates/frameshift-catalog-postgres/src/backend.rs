@@ -31,8 +31,8 @@ use frameshift_catalog::{
 use crate::config::PostgresCatalogConfig;
 use crate::errors::{map_diesel_error, map_migration_error, map_pool_error};
 use crate::models::{
-    vec_to_pubkey, AuthorRow, HandleRow, NewAuthorRow, NewHandleRow, NewPackDownloadRow, NewPackRow,
-    NewPackVersionRow, PackRow, PackVersionRow,
+    vec_to_pubkey, AuthorRow, HandleRow, NewAuthorRow, NewHandleRow, NewPackDownloadRow,
+    NewPackRow, NewPackVersionRow, PackRow, PackVersionRow,
 };
 use crate::pool::{build_pool, PgPool};
 use crate::schema::{authors, handles, pack_downloads, pack_versions, packs};
@@ -861,16 +861,14 @@ impl CatalogBackend for PostgresCatalog {
     ) -> Result<(), CatalogError> {
         let mut conn = self.pool.get().await.map_err(map_pool_error)?;
 
-        let rows_affected = diesel::sql_query(
-            "UPDATE packs SET extends = $1 WHERE name = $2",
-        )
-        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
-            extends.map(str::to_string),
-        )
-        .bind::<diesel::sql_types::Text, _>(pack_name.to_string())
-        .execute(&mut *conn)
-        .await
-        .map_err(|e| map_diesel_error(e, "pack", pack_name.to_string()))?;
+        let rows_affected = diesel::sql_query("UPDATE packs SET extends = $1 WHERE name = $2")
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+                extends.map(str::to_string),
+            )
+            .bind::<diesel::sql_types::Text, _>(pack_name.to_string())
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| map_diesel_error(e, "pack", pack_name.to_string()))?;
 
         if rows_affected == 0 {
             return Err(CatalogError::NotFound {

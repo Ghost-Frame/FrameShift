@@ -82,10 +82,7 @@ type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
 impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for MetricsService<S>
 where
-    S: Service<Request<ReqBody>, Response = axum::http::Response<ResBody>>
-        + Clone
-        + Send
-        + 'static,
+    S: Service<Request<ReqBody>, Response = axum::http::Response<ResBody>> + Clone + Send + 'static,
     S::Future: Send + 'static,
     S::Error: Send + 'static,
     ReqBody: Send + 'static,

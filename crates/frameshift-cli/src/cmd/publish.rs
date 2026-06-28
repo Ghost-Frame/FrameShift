@@ -11,7 +11,7 @@ use clap::Args;
 use frameshift_client::{Client, ClientError};
 use frameshift_source::render::{render_to_markdown, RenderTarget};
 
-use crate::util::{CliError, load_persona_by_name, validate_server_url};
+use crate::util::{load_persona_by_name, validate_server_url, CliError};
 
 /// Default pack version when a persona source declares none.
 const DEFAULT_PACK_VERSION: &str = "0.1.0";
@@ -138,7 +138,10 @@ fn write_pack_toml(
         ("handle", handle),
         ("author_pubkey", author_pubkey_hex),
     ] {
-        if value.chars().any(|c| c == '"' || c == '\\' || c.is_control()) {
+        if value
+            .chars()
+            .any(|c| c == '"' || c == '\\' || c.is_control())
+        {
             return Err(CliError::Publish(format!(
                 "{field} contains characters not allowed in a pack manifest \
                  (quotes, backslashes, or control characters): {value:?}"
@@ -250,7 +253,8 @@ tone = "neutral"
         // A clean set of fields writes a loadable pack.toml.
         write_pack_toml(dir.path(), "demo", "0.1.0", "alice", "deadbeef")
             .expect("clean fields must succeed");
-        let written = std::fs::read_to_string(dir.path().join("pack.toml")).expect("read pack.toml");
+        let written =
+            std::fs::read_to_string(dir.path().join("pack.toml")).expect("read pack.toml");
         assert!(written.contains("author_handle = \"alice\""));
     }
 }

@@ -173,13 +173,10 @@ async fn post_publish(
 ) -> axum::http::Response<Body> {
     let boundary = "frameshifttestboundary";
     let body = build_multipart(boundary, pack_bytes, signature, author_handle);
-    let mut req = Request::builder()
-        .method("POST")
-        .uri("/v1/packs")
-        .header(
-            "content-type",
-            format!("multipart/form-data; boundary={boundary}"),
-        );
+    let mut req = Request::builder().method("POST").uri("/v1/packs").header(
+        "content-type",
+        format!("multipart/form-data; boundary={boundary}"),
+    );
     if let Some(key) = request_key {
         for h in mocks::signing::signed_headers(key, "POST", "/v1/packs", &body) {
             req = req.header(h.name, h.value);
@@ -281,14 +278,22 @@ async fn publish_happy_path_returns_200_and_pack_is_fetchable() {
         Some(&signing),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::OK, "expected 200, got {}", resp.status());
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "expected 200, got {}",
+        resp.status()
+    );
 
     let body = body_json(resp).await;
     assert_eq!(body["name"], "demo-pack");
     assert_eq!(body["version"], "0.1.0");
     assert_eq!(body["author_handle"], "alice");
     assert!(
-        body["pack_hash"].as_str().map(|s| s.len() == 64).unwrap_or(false),
+        body["pack_hash"]
+            .as_str()
+            .map(|s| s.len() == 64)
+            .unwrap_or(false),
         "pack_hash must be a 64-char hex string"
     );
 
@@ -476,7 +481,11 @@ async fn publish_replayed_request_returns_401() {
     };
 
     let resp1 = app(state.clone()).oneshot(build_req()).await.unwrap();
-    assert_eq!(resp1.status(), StatusCode::OK, "first publish should succeed");
+    assert_eq!(
+        resp1.status(),
+        StatusCode::OK,
+        "first publish should succeed"
+    );
 
     let resp2 = app(state).oneshot(build_req()).await.unwrap();
     assert_eq!(

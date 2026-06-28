@@ -205,7 +205,10 @@ pub fn parse_headers(headers: &HeaderMap) -> Result<SignedRequestParams, AppErro
 
     // Nonce: bounded length + base64url charset.
     if nonce_raw.len() < MIN_NONCE_LEN || nonce_raw.len() > MAX_NONCE_LEN {
-        tracing::warn!(len = nonce_raw.len(), "signed request: nonce length out of bounds");
+        tracing::warn!(
+            len = nonce_raw.len(),
+            "signed request: nonce length out of bounds"
+        );
         return Err(auth_failed());
     }
     if !nonce_raw
@@ -222,7 +225,10 @@ pub fn parse_headers(headers: &HeaderMap) -> Result<SignedRequestParams, AppErro
         auth_failed()
     })?;
     let sig_arr: [u8; 64] = sig_bytes.as_slice().try_into().map_err(|_| {
-        tracing::warn!(len = sig_bytes.len(), "signed request: signature not 64 bytes");
+        tracing::warn!(
+            len = sig_bytes.len(),
+            "signed request: signature not 64 bytes"
+        );
         auth_failed()
     })?;
     let signature = Signature::from_bytes(&sig_arr);
@@ -307,7 +313,11 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Result<&'a str, AppErro
         auth_failed()
     })?;
     if s.len() > MAX_HEADER_LEN {
-        tracing::warn!(header = name, len = s.len(), "signed request: header too long");
+        tracing::warn!(
+            header = name,
+            len = s.len(),
+            "signed request: header too long"
+        );
         return Err(auth_failed());
     }
     Ok(s)

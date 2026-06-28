@@ -99,7 +99,12 @@ fn load_signature(dir: &Path) -> Result<Option<Signature>, PackError> {
         // File absent: pack is simply unsigned.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         // Any other I/O error (permissions, device error, etc.) is hard.
-        Err(e) => return Err(PackError::Io { path: sig_path, source: e }),
+        Err(e) => {
+            return Err(PackError::Io {
+                path: sig_path,
+                source: e,
+            })
+        }
     };
     // File present: must be exactly 64 bytes; wrong length is an explicit error.
     let found = bytes.len();

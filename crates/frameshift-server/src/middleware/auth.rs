@@ -69,8 +69,7 @@ pub async fn require_signed_request(
     // can read it; the content-type header (with multipart boundary) survives
     // because we preserve `parts` verbatim.
     let mut req = Request::from_parts(parts, Body::from(bytes));
-    req.extensions_mut()
-        .insert(auth::VerifiedSigner { pubkey });
+    req.extensions_mut().insert(auth::VerifiedSigner { pubkey });
 
     Ok(next.run(req).await)
 }

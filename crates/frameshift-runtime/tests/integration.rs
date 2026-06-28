@@ -6,7 +6,9 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-use frameshift_runtime::{CapabilityManifest, Runtime, RuntimeConfig, RuntimeError, TemplateSource};
+use frameshift_runtime::{
+    CapabilityManifest, Runtime, RuntimeConfig, RuntimeError, TemplateSource,
+};
 use frameshift_vault::{
     Auth, Identity, Preferences, RuntimeMode, VaultBackend, VaultData, VaultError,
 };

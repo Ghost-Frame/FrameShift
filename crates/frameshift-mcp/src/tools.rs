@@ -459,15 +459,23 @@ fn call_automate(arguments: &serde_json::Value, client: &Client) -> ToolResult {
 
     match action {
         "on" => {
-            let state = ModeState { mode: Mode::On, sensitivity: 0.5 };
+            let state = ModeState {
+                mode: Mode::On,
+                sensitivity: 0.5,
+            };
             if let Err(e) = state.save(&mode_path) {
                 return err_result(format!("failed to save mode: {}", e));
             }
-            ok_result(serde_json::json!({ "mode": "on", "sensitivity": state.sensitivity }).to_string())
+            ok_result(
+                serde_json::json!({ "mode": "on", "sensitivity": state.sensitivity }).to_string(),
+            )
         }
 
         "off" => {
-            let state = ModeState { mode: Mode::Off, sensitivity: 0.5 };
+            let state = ModeState {
+                mode: Mode::Off,
+                sensitivity: 0.5,
+            };
             if let Err(e) = state.save(&mode_path) {
                 return err_result(format!("failed to save mode: {}", e));
             }
@@ -860,7 +868,10 @@ mod tests {
             result.content[0].text
         );
         let parsed: serde_json::Value = serde_json::from_str(&result.content[0].text).unwrap();
-        assert!(parsed["bias"].is_object(), "result must have a 'bias' object");
+        assert!(
+            parsed["bias"].is_object(),
+            "result must have a 'bias' object"
+        );
         assert_eq!(
             parsed["bias"].as_object().unwrap().len(),
             0,
@@ -888,9 +899,12 @@ mod tests {
             }),
             &client,
         );
-        assert!(bump.is_error.is_none(), "bump failed: {:?}", bump.content[0].text);
-        let bump_parsed: serde_json::Value =
-            serde_json::from_str(&bump.content[0].text).unwrap();
+        assert!(
+            bump.is_error.is_none(),
+            "bump failed: {:?}",
+            bump.content[0].text
+        );
+        let bump_parsed: serde_json::Value = serde_json::from_str(&bump.content[0].text).unwrap();
         let bumped_bias = bump_parsed["bias"].as_f64().unwrap();
         assert!(bumped_bias > 0.0, "bump must produce a positive bias");
 
@@ -900,8 +914,7 @@ mod tests {
             &serde_json::json!({"project_root": root_str, "action": "show"}),
             &client,
         );
-        let show_parsed: serde_json::Value =
-            serde_json::from_str(&show.content[0].text).unwrap();
+        let show_parsed: serde_json::Value = serde_json::from_str(&show.content[0].text).unwrap();
         assert_eq!(
             show_parsed["bias"]["rust"].as_f64().unwrap(),
             bumped_bias,
@@ -937,8 +950,7 @@ mod tests {
             &client,
         );
         assert!(reset.is_error.is_none());
-        let reset_parsed: serde_json::Value =
-            serde_json::from_str(&reset.content[0].text).unwrap();
+        let reset_parsed: serde_json::Value = serde_json::from_str(&reset.content[0].text).unwrap();
         assert_eq!(reset_parsed["reset"], true);
 
         // Show must now be empty.
@@ -947,8 +959,7 @@ mod tests {
             &serde_json::json!({"project_root": root_str, "action": "show"}),
             &client,
         );
-        let show_parsed: serde_json::Value =
-            serde_json::from_str(&show.content[0].text).unwrap();
+        let show_parsed: serde_json::Value = serde_json::from_str(&show.content[0].text).unwrap();
         assert_eq!(
             show_parsed["bias"].as_object().unwrap().len(),
             0,

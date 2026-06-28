@@ -29,8 +29,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::http::{Request, StatusCode};
-use http_body_util::BodyExt as _;
 use frameshift_catalog::CatalogBackend as _;
+use http_body_util::BodyExt as _;
 use secrecy::SecretString;
 use tower::ServiceExt as _;
 
@@ -613,10 +613,7 @@ fn dl_state_with_rate(catalog: MockCatalog, objects: MockPackStore, rate: u32) -
 }
 
 /// Issue a one-shot POST request with empty body.
-async fn oneshot_post_empty(
-    state: AppState,
-    path: &str,
-) -> axum::http::Response<axum::body::Body> {
+async fn oneshot_post_empty(state: AppState, path: &str) -> axum::http::Response<axum::body::Body> {
     let router = app(state);
     let request = Request::builder()
         .method("POST")
@@ -649,8 +646,11 @@ async fn download_url_mint_then_stream_succeeds() {
     let state = dl_state(catalog, objects);
 
     // Step 1: mint the URL.
-    let resp = oneshot_post_empty(state.clone(), "/v1/packs/dl-pack/versions/1.0.0/download-url")
-        .await;
+    let resp = oneshot_post_empty(
+        state.clone(),
+        "/v1/packs/dl-pack/versions/1.0.0/download-url",
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp).await;
     let url = body["url"].as_str().expect("url field present").to_string();
@@ -779,10 +779,7 @@ async fn download_url_rate_limited_returns_429() {
         statuses.push(resp.status());
     }
 
-    let ok = statuses
-        .iter()
-        .filter(|s| **s == StatusCode::OK)
-        .count();
+    let ok = statuses.iter().filter(|s| **s == StatusCode::OK).count();
     let limited = statuses
         .iter()
         .filter(|s| **s == StatusCode::TOO_MANY_REQUESTS)

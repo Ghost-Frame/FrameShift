@@ -124,7 +124,8 @@ mod tests {
         let path = tmp.path().join("audit.jsonl");
 
         let mut log = AuditLog::load(&path).unwrap();
-        log.append(&path, make_transition(None, "rust-expert")).unwrap();
+        log.append(&path, make_transition(None, "rust-expert"))
+            .unwrap();
         assert_eq!(log.entries.len(), 1);
 
         // Reload and verify persistence.
@@ -141,8 +142,10 @@ mod tests {
 
         let mut log = AuditLog::load(&path).unwrap();
         log.append(&path, make_transition(None, "alpha")).unwrap();
-        log.append(&path, make_transition(Some("alpha"), "beta")).unwrap();
-        log.append(&path, make_transition(Some("beta"), "gamma")).unwrap();
+        log.append(&path, make_transition(Some("alpha"), "beta"))
+            .unwrap();
+        log.append(&path, make_transition(Some("beta"), "gamma"))
+            .unwrap();
 
         let loaded = AuditLog::load(&path).unwrap();
         assert_eq!(loaded.entries.len(), 3);
@@ -157,7 +160,8 @@ mod tests {
 
         let mut log = AuditLog::load(&path).unwrap();
         for i in 0..5 {
-            log.append(&path, make_transition(None, &format!("p{i}"))).unwrap();
+            log.append(&path, make_transition(None, &format!("p{i}")))
+                .unwrap();
         }
 
         let recent = log.recent(2);

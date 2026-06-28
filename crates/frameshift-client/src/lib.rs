@@ -13,7 +13,9 @@ pub use model::{
     PersonaSpec, ProjectConfig, ProjectPaths, SyncReport, SCHEMA_VERSION,
 };
 pub use publish::PublishOutcome;
-pub use selection::{SelectionEvent, SelectionTelemetry, SELECTION_HISTORY_FILENAME, TELEMETRY_URL_ENV};
+pub use selection::{
+    SelectionEvent, SelectionTelemetry, SELECTION_HISTORY_FILENAME, TELEMETRY_URL_ENV,
+};
 
 use base64::{engine::general_purpose, Engine as _};
 use ed25519_dalek::VerifyingKey;
@@ -1043,10 +1045,7 @@ mod tests {
     }
 
     /// Helper: set up a minimal pack and install it, returning the client and project root.
-    fn install_test_persona(
-        tmp: &tempfile::TempDir,
-        name: &str,
-    ) -> (Client, std::path::PathBuf) {
+    fn install_test_persona(tmp: &tempfile::TempDir, name: &str) -> (Client, std::path::PathBuf) {
         let pack_dir = tmp.path().join("pack");
         fs::create_dir_all(&pack_dir).unwrap();
         fs::write(
@@ -1086,11 +1085,12 @@ mod tests {
     fn installed_persona_source_dirs_returns_entries() {
         let tmp = tempfile::tempdir().unwrap();
         let (client, project_root) = install_test_persona(&tmp, "mypersona");
-        let dirs = client
-            .installed_persona_source_dirs(&project_root)
-            .unwrap();
+        let dirs = client.installed_persona_source_dirs(&project_root).unwrap();
         assert_eq!(dirs.len(), 1, "expected exactly one source dir");
-        assert!(dirs[0].ends_with("source"), "source dir should end with 'source'");
+        assert!(
+            dirs[0].ends_with("source"),
+            "source dir should end with 'source'"
+        );
     }
 
     /// installed_persona_source_dirs returns empty vec when no personas installed.
@@ -1103,9 +1103,7 @@ mod tests {
             data_root: tmp.path().join("data"),
             config_root: None,
         });
-        let dirs = client
-            .installed_persona_source_dirs(&project_root)
-            .unwrap();
+        let dirs = client.installed_persona_source_dirs(&project_root).unwrap();
         assert!(dirs.is_empty());
     }
 
@@ -1117,7 +1115,9 @@ mod tests {
         let content = client
             .rendered_persona(&project_root, "rendtest", "claude")
             .unwrap();
-        assert!(content.contains("rendtest") || content.contains("Rendtest") || !content.is_empty());
+        assert!(
+            content.contains("rendtest") || content.contains("Rendtest") || !content.is_empty()
+        );
     }
 
     /// rendered_persona returns an error for an unknown render target.
@@ -1163,7 +1163,10 @@ mod tests {
         assert!(state_dir.exists(), "state dir should exist after install");
         // The path should contain "projects" and the project id.
         let s = state_dir.to_string_lossy();
-        assert!(s.contains("projects"), "state dir path must contain 'projects'");
+        assert!(
+            s.contains("projects"),
+            "state dir path must contain 'projects'"
+        );
     }
 
     #[test]
@@ -1203,7 +1206,11 @@ mod tests {
             "schema_version = 1\nname = \"testpersona\"\nauthor_handle = \"test\"\nauthor_pubkey = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\nversion = \"0.1.0\"\n",
         )
         .unwrap();
-        fs::write(pack_dir.join("AGENTS.md"), "# Test Persona\n\nBehavior rules here.\n").unwrap();
+        fs::write(
+            pack_dir.join("AGENTS.md"),
+            "# Test Persona\n\nBehavior rules here.\n",
+        )
+        .unwrap();
 
         let project_root = tmp.path().join("project");
         fs::create_dir_all(&project_root).unwrap();
@@ -1230,15 +1237,27 @@ mod tests {
             .join("personas/testpersona/rendered/claude/CLAUDE.md");
         let content = fs::read_to_string(&rendered).unwrap();
 
-        assert!(content.contains("# Infrastructure"), "missing infra overlay");
+        assert!(
+            content.contains("# Infrastructure"),
+            "missing infra overlay"
+        );
         assert!(content.contains("Test infra content"), "missing infra body");
-        assert!(content.contains("Active persona: testpersona"), "missing persona context header");
-        assert!(content.contains("# Test Persona"), "missing persona content");
+        assert!(
+            content.contains("Active persona: testpersona"),
+            "missing persona context header"
+        );
+        assert!(
+            content.contains("# Test Persona"),
+            "missing persona content"
+        );
 
         // Infra must come before persona content
         let infra_pos = content.find("# Infrastructure").unwrap();
         let persona_pos = content.find("# Test Persona").unwrap();
-        assert!(infra_pos < persona_pos, "infra overlay must precede persona content");
+        assert!(
+            infra_pos < persona_pos,
+            "infra overlay must precede persona content"
+        );
     }
 
     #[test]
@@ -1280,7 +1299,13 @@ mod tests {
             .join("personas/noinfratestp/rendered/claude/CLAUDE.md");
         let content = fs::read_to_string(&rendered).unwrap();
 
-        assert!(content.contains("# Bare Persona"), "persona content must be present");
-        assert!(!content.contains("Infrastructure"), "no infra overlay expected");
+        assert!(
+            content.contains("# Bare Persona"),
+            "persona content must be present"
+        );
+        assert!(
+            !content.contains("Infrastructure"),
+            "no infra overlay expected"
+        );
     }
 }

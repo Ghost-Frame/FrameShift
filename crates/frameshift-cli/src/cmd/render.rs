@@ -109,7 +109,10 @@ mod tests {
 
         // Verify the source loads; we check the rendered content indirectly
         // by ensuring run_render does not error.
-        let client = Client::new(ClientOptions { data_root, config_root: None });
+        let client = Client::new(ClientOptions {
+            data_root,
+            config_root: None,
+        });
         let args = RenderArgs {
             persona: "render-test".to_string(),
             target: RenderTargetArg(RenderTarget::Generic),

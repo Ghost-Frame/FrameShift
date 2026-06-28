@@ -69,9 +69,9 @@ fn mk_state(catalog: MockCatalog) -> AppState {
         memory: None,
         config: test_config(),
         metrics: Arc::new(Metrics::new()),
-        auth_nonces: Arc::new(frameshift_server::auth::NonceCache::new(Duration::from_secs(
-            600,
-        ))),
+        auth_nonces: Arc::new(frameshift_server::auth::NonceCache::new(
+            Duration::from_secs(600),
+        )),
     }
 }
 

@@ -58,20 +58,19 @@ pub fn run_feedback(client: &Client, args: FeedbackArgs) -> Result<(), CliError>
         }
     });
 
-    prefs.record_override_with_intent(
-        args.auto_pick.as_deref(),
-        &args.chosen,
-        intent,
-    );
+    prefs.record_override_with_intent(args.auto_pick.as_deref(), &args.chosen, intent);
 
-    prefs.save(&prefs_path)
+    prefs
+        .save(&prefs_path)
         .map_err(|e| CliError::Orchestrator(e.to_string()))?;
 
     println!(
         "recorded override: {} -> {}{}",
         args.auto_pick.as_deref().unwrap_or("(none)"),
         args.chosen,
-        args.intent.as_deref().map_or(String::new(), |i| format!(" (intent: {i})")),
+        args.intent
+            .as_deref()
+            .map_or(String::new(), |i| format!(" (intent: {i})")),
     );
 
     Ok(())

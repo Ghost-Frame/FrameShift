@@ -175,15 +175,7 @@ async fn run() -> Result<(), SeedError> {
             )?;
         }
 
-        match seed_persona(
-            &path,
-            &catalog,
-            &objects,
-            &signing_key,
-            author_pubkey,
-        )
-        .await
-        {
+        match seed_persona(&path, &catalog, &objects, &signing_key, author_pubkey).await {
             Ok(()) => {
                 info!("seeded persona: {dir_name}");
                 seeded += 1;
@@ -213,16 +205,16 @@ async fn run() -> Result<(), SeedError> {
 impl SeedConfig {
     /// Build a validated configuration from the current process environment.
     fn from_env() -> Result<Self, SeedError> {
-        let postgres_url = std::env::var("POSTGRES_URL")
-            .map_err(|_| SeedError::MissingEnv("POSTGRES_URL"))?;
+        let postgres_url =
+            std::env::var("POSTGRES_URL").map_err(|_| SeedError::MissingEnv("POSTGRES_URL"))?;
         let object_store_root = std::env::var("OBJECT_STORE_ROOT")
             .unwrap_or_else(|_| "/tmp/frameshift-objects".to_string());
-        let personas_root = std::env::var("PERSONAS_ROOT")
-            .map_err(|_| SeedError::MissingEnv("PERSONAS_ROOT"))?;
+        let personas_root =
+            std::env::var("PERSONAS_ROOT").map_err(|_| SeedError::MissingEnv("PERSONAS_ROOT"))?;
         let author_handle =
             std::env::var("SEED_AUTHOR_HANDLE").unwrap_or_else(|_| "seed-author".to_string());
-        let author_display_name = std::env::var("SEED_AUTHOR_DISPLAY_NAME")
-            .unwrap_or_else(|_| "Seed Author".to_string());
+        let author_display_name =
+            std::env::var("SEED_AUTHOR_DISPLAY_NAME").unwrap_or_else(|_| "Seed Author".to_string());
         let signing_key_path = match std::env::var("SEED_SIGNING_KEY_PATH") {
             Ok(path) => PathBuf::from(path),
             Err(_) => default_signing_key_path(&object_store_root, &author_handle),
@@ -327,7 +319,10 @@ async fn seed_persona(
         parent_hash: None,
         capability_manifest_json: cap_json,
         schema_version: manifest.schema_version,
-        license: manifest.license.clone().unwrap_or_else(|| "UNKNOWN".to_string()),
+        license: manifest
+            .license
+            .clone()
+            .unwrap_or_else(|| "UNKNOWN".to_string()),
         published_at: Utc::now(),
         status: PackStatus::Active,
         size_bytes: canonical_bytes.len() as u64,
@@ -476,7 +471,10 @@ fn load_or_create_signing_key(path: &Path) -> Result<SigningKey, SeedError> {
                         "signing key file must be exactly 32 bytes",
                     ))
                 })?;
-                info!("adopted concurrently-created signing key at {}", path.display());
+                info!(
+                    "adopted concurrently-created signing key at {}",
+                    path.display()
+                );
                 Ok(SigningKey::from_bytes(&seed))
             }
             Err(e) => Err(SeedError::Io(e)),
@@ -506,7 +504,10 @@ fn write_synthetic_pack_toml(
     // are interpolated into quoted TOML strings below. A value containing a quote,
     // backslash, or control character could inject arbitrary manifest keys.
     for (field, value) in [("dir_name", dir_name), ("author_handle", author_handle)] {
-        if value.chars().any(|c| c == '"' || c == '\\' || c.is_control()) {
+        if value
+            .chars()
+            .any(|c| c == '"' || c == '\\' || c.is_control())
+        {
             return Err(SeedError::Io(std::io::Error::other(format!(
                 "{field} contains characters not allowed in a pack manifest: {value:?}"
             ))));
@@ -605,14 +606,13 @@ async fn update_pack_metadata(
 
         // Raw UPDATE: the catalog trait has no update-metadata method, so we
         // issue the statement directly via diesel's sql_query API.
-        let result = diesel::sql_query(
-            "UPDATE packs SET description = $1, tags = $2 WHERE name = $3",
-        )
-        .bind::<diesel::sql_types::Text, _>(&metadata.description)
-        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(&metadata.tags)
-        .bind::<diesel::sql_types::Text, _>(&metadata.name)
-        .execute(&mut *conn)
-        .await;
+        let result =
+            diesel::sql_query("UPDATE packs SET description = $1, tags = $2 WHERE name = $3")
+                .bind::<diesel::sql_types::Text, _>(&metadata.description)
+                .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(&metadata.tags)
+                .bind::<diesel::sql_types::Text, _>(&metadata.name)
+                .execute(&mut *conn)
+                .await;
 
         match result {
             Ok(rows) if rows > 0 => {
@@ -667,8 +667,8 @@ fn derive_pack_metadata(path: &Path, dir_name: &str) -> Result<Option<PackMetada
         return Ok(None);
     }
 
-    let description = derive_agents_description(&agents_path)
-        .unwrap_or_else(|| fallback_description(dir_name));
+    let description =
+        derive_agents_description(&agents_path).unwrap_or_else(|| fallback_description(dir_name));
     Ok(Some(PackMetadata {
         name: dir_name.to_string(),
         description,

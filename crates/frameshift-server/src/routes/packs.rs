@@ -204,8 +204,7 @@ async fn extract_targz(archive_bytes: Vec<u8>, dir: std::path::PathBuf) -> Resul
             .entries()
             .map_err(|e| AppError::BadRequest(format!("tar entries: {e}")))?;
         for entry in entries {
-            let mut entry =
-                entry.map_err(|e| AppError::BadRequest(format!("tar entry: {e}")))?;
+            let mut entry = entry.map_err(|e| AppError::BadRequest(format!("tar entry: {e}")))?;
             // Reject any entry that is not a regular file or directory. Symlinks,
             // hardlinks, and device nodes have no legitimate place in a pack and
             // could be used to plant a link that escapes the extraction dir or
@@ -362,8 +361,7 @@ pub async fn publish_pack(
     // Extract tar.gz into a tempdir, then load the pack from the extracted
     // directory. The TempDir is dropped at the end of the function and the
     // bytes are moved into the object store before that point.
-    let tmp = tempfile::TempDir::new()
-        .map_err(|e| AppError::Internal(format!("tempdir: {e}")))?;
+    let tmp = tempfile::TempDir::new().map_err(|e| AppError::Internal(format!("tempdir: {e}")))?;
     extract_targz(pack_archive.clone(), tmp.path().to_path_buf()).await?;
 
     let pack_root = find_pack_root(tmp.path())?;
