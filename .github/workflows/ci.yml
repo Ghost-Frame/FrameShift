@@ -1,0 +1,101 @@
+# Continuous integration for the Frameshift workspace.
+#
+# Gates every pull request (and pushes to the default branch) on formatting,
+# lints, the unit/integration test suite, the Docker-gated Postgres tests, and
+# a supply-chain advisory scan. Jobs run on the stable toolchain to match the
+# local development environment; the workspace declares rust-version 1.75 but is
+# built on current stable, so a dedicated 1.75 MSRV-verification job is deferred
+# to the later tier rather than risking a spurious MSRV failure.
+name: CI
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+# Only keep the latest run per ref alive; cancel superseded runs to save minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Formatting check. Does not compile anything, so it needs no system libs and
+  # fails fast on style drift.
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  # Lints. clippy compiles the whole workspace (all targets), so it needs
+  # libpq-dev for the diesel/pq-sys-backed catalog crate. -D warnings makes any
+  # lint a hard failure.
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Install libpq
+        run: sudo apt-get update -q && sudo apt-get install -y libpq-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # Unit and integration tests. The Postgres integration tests are gated behind
+  # #[ignore = "requires Docker"], so plain `cargo test --workspace` skips them
+  # and runs fast without a database.
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install libpq
+        run: sudo apt-get update -q && sudo apt-get install -y libpq-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+
+  # The Docker-gated Postgres integration tests. testcontainers starts its own
+  # postgres container against the runner's Docker daemon (no service block or
+  # DATABASE_URL needed); migrations run inside PostgresCatalog::new(). Scoped to
+  # the one crate that owns these tests so --include-ignored stays narrow.
+  test-postgres:
+    name: Test (Postgres integration)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install libpq
+        run: sudo apt-get update -q && sudo apt-get install -y libpq-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p frameshift-catalog-postgres -- --include-ignored
+
+  # Supply-chain advisory scan against the RustSec database. Non-blocking for
+  # now (continue-on-error) so a pre-existing transitive advisory cannot wedge
+  # the pipeline before the backlog is triaged; ratchet to blocking once clean.
+  audit:
+    name: Security audit
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+# Later tier (intentionally not yet wired, tracked in the roadmap):
+#   - cargo-deny (needs a deny.toml: license allowlist, ban list, advisory policy)
+#   - cargo doc --no-deps --workspace to catch broken intra-doc links
+#   - an MSRV verification job pinned to 1.75 (or reconcile the declared rust-version)
+#   - coverage (cargo-llvm-cov) once the currently-untested crates gain tests
+#   - .github/dependabot.yml for weekly Cargo updates
