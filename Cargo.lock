@@ -1333,6 +1333,7 @@ dependencies = [
  "frameshift-client",
  "frameshift-growth",
  "frameshift-orchestrator",
+ "libc",
  "notify",
  "serde",
  "serde_json",

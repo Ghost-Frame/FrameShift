@@ -28,6 +28,27 @@ pub async fn serve(
             accept_result = listener.accept() => {
                 match accept_result {
                     Ok((stream, _addr)) => {
+                        // Authenticate the peer by uid: this daemon mutates the
+                        // owning user's persona state, so only that user's uid may
+                        // drive it. This is defense in depth on top of the 0700
+                        // socket directory created in main.
+                        match stream.peer_cred() {
+                            Ok(cred) => {
+                                let own_uid = unsafe { libc::getuid() };
+                                if cred.uid() != own_uid {
+                                    tracing::warn!(
+                                        peer_uid = cred.uid(),
+                                        own_uid,
+                                        "rejecting IPC connection from foreign uid"
+                                    );
+                                    continue;
+                                }
+                            }
+                            Err(err) => {
+                                tracing::warn!(error = %err, "could not read peer credentials; rejecting connection");
+                                continue;
+                            }
+                        }
                         let client = Arc::clone(&client);
                         let shutdown_tx_clone = shutdown.clone();
                         tokio::spawn(handle_connection(stream, client, shutdown_tx_clone));

@@ -49,6 +49,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
     let socket_dir = std::path::PathBuf::from(&runtime_dir).join("frameshift");
     std::fs::create_dir_all(&socket_dir)?;
+    // Restrict the socket directory to the owner (0700). Critical when
+    // XDG_RUNTIME_DIR is unset and we fall back to the world-writable /tmp:
+    // without this, any local user could reach (and drive) the daemon socket.
+    // Applied unconditionally so a directory left over from a prior run with
+    // looser permissions is tightened.
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o700))?;
     let socket_path = socket_dir.join("daemon.sock");
 
     // Remove a stale socket from a previous run if present.
@@ -57,6 +64,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let listener = UnixListener::bind(&socket_path)?;
+    // Restrict the socket itself to the owner (0600) as a second layer beyond
+    // the directory mode and the per-connection peer-uid check in serve().
+    std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
     tracing::info!(path = %socket_path.display(), "daemon listening");
 
     // Shutdown signalling channel; `serve` watches this for `true`.
@@ -67,8 +77,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // alive by the binding below for the duration of the process.
     let data_root = client.data_root().to_path_buf();
     let watch_client = Arc::clone(&client);
-    match watcher::start_watcher(&data_root) {
-        Ok((_watcher, mut rx)) => {
+    // Hold the watcher handle for the whole process lifetime. Dropping the
+    // handle stops OS file notifications, so it must outlive the serve loop
+    // below. Previously it was bound inside the match arm (`Ok((_watcher, ..))`)
+    // and dropped immediately after startup, silently disabling the watcher.
+    let _watcher_guard = match watcher::start_watcher(&data_root) {
+        Ok((watcher, mut rx)) => {
             // Spawn a task that reacts to file-change events from the data root.
             // Each received path is treated as a project-root hint: we derive the
             // project root by walking up to find a frameshift projects directory,
@@ -90,13 +104,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             });
+            Some(watcher)
         }
         Err(e) => {
             tracing::warn!(error = %e, "failed to start file watcher; orchestrator hook disabled");
+            None
         }
-    }
+    };
 
-    // Drive the JSON-RPC server loop.
+    // Drive the JSON-RPC server loop. The watcher handle above stays alive for
+    // the duration of this call.
     frameshift_daemon::socket::serve(listener, client, shutdown_rx).await;
 
     // Best-effort socket cleanup on graceful shutdown.
