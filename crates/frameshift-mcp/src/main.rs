@@ -36,8 +36,8 @@ async fn main() {
         match read_capped_line(&mut stdin, &mut pending, &mut line, MAX_LINE_BYTES).await {
             Ok(LineRead::Eof) | Err(_) => break,
             Ok(LineRead::TooLong) => {
-                let response =
-                    error_response(None, -32700, "request line exceeds maximum size".to_string());
+                let msg = "request line exceeds maximum size".to_string();
+                let response = error_response(None, -32700, msg);
                 write_response(&mut stdout, &response).await;
             }
             Ok(LineRead::Line) => {
