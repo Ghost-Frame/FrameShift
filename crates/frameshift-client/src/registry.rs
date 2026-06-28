@@ -533,29 +533,52 @@ mod tests {
 
     // ---- Test helpers ----
 
+    /// Serializes all environment-variable mutation across tests. Cargo runs
+    /// tests on multiple threads but the process environment is global, so two
+    /// tests that set and read the same variable concurrently race. Every
+    /// `EnvGuard` holds this lock for its lifetime, ensuring only one env-mutating
+    /// test runs at a time.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// RAII guard that restores or removes an environment variable on drop.
     struct EnvGuard {
         /// The env var key being managed.
         key: &'static str,
         /// Original value, or `None` if the var was not set.
         original: Option<String>,
+        /// Held for the guard's lifetime to serialize env access across threads.
+        /// Declared last so it is released only after the Drop impl restores the
+        /// variable below.
+        _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl EnvGuard {
         /// Set `key` to `value`, remembering the original value for restoration.
         fn set(key: &'static str, value: &str) -> Self {
+            // Recover from a poisoned lock (a prior test panicked) rather than
+            // cascade-failing every subsequent env test.
+            let lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
             let original = std::env::var(key).ok();
-            // SAFETY: test-only, single-threaded context is assumed for env mutation.
+            // SAFETY: ENV_LOCK serializes all env mutation in this test binary.
             unsafe { std::env::set_var(key, value) };
-            Self { key, original }
+            Self {
+                key,
+                original,
+                _lock: lock,
+            }
         }
 
         /// Remove `key` from the environment, remembering the original value.
         fn clear(key: &'static str) -> Self {
+            let lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
             let original = std::env::var(key).ok();
-            // SAFETY: test-only, single-threaded context is assumed for env mutation.
+            // SAFETY: ENV_LOCK serializes all env mutation in this test binary.
             unsafe { std::env::remove_var(key) };
-            Self { key, original }
+            Self {
+                key,
+                original,
+                _lock: lock,
+            }
         }
     }
 
