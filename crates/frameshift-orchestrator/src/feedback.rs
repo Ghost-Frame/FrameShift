@@ -289,7 +289,8 @@ mod tests {
             .filter_map(|e| e.ok())
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
             .collect();
-        assert!(leftovers.is_empty(), "no temp file should remain after save");
+        // No temp file should remain after a successful save.
+        assert!(leftovers.is_empty());
         // And the saved file loads cleanly.
         Preferences::load(&path).unwrap();
     }

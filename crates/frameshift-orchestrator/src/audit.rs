@@ -1,5 +1,6 @@
 //! Explainable audit log of persona transitions.
 
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
@@ -57,8 +58,7 @@ impl AuditLog {
         }
         let file = std::fs::File::open(path)?;
         let reader = BufReader::new(file);
-        let mut entries: std::collections::VecDeque<Transition> =
-            std::collections::VecDeque::new();
+        let mut entries: VecDeque<Transition> = VecDeque::new();
         for line in reader.lines() {
             let line = line?;
             let trimmed = line.trim();
