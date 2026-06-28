@@ -173,36 +173,45 @@ impl CatalogBackend for PostgresCatalog {
             .await
             .map_err(|e| map_diesel_error(e, "author", record.handle.clone()))?;
 
-        // Read back the stored row to check for handle collision.
-        let existing: AuthorRow = authors::table
+        // Reconcile the requested (pubkey, handle) against the stored rows using
+        // optional() so an absent row is None rather than a spurious NotFound.
+        // Re-registering an existing pubkey under a NEW handle leaves no row at
+        // that handle, which previously surfaced as NotFound from the read-back
+        // instead of the correct conflict below.
+
+        // If the requested handle is held by a different pubkey, it is taken.
+        let by_handle: Option<AuthorRow> = authors::table
             .filter(authors::handle.eq(&record.handle))
             .select(AuthorRow::as_select())
             .first(&mut *conn)
             .await
+            .optional()
             .map_err(|e| map_diesel_error(e, "author", record.handle.clone()))?;
-
-        // If handles match but pubkeys differ: someone else owns this handle.
-        if existing.pubkey != record.pubkey.0.to_vec() {
-            let owner = vec_to_pubkey(existing.pubkey)?;
-            return Err(CatalogError::HandleTaken { owner });
+        if let Some(existing) = by_handle {
+            if existing.pubkey != record.pubkey.0.to_vec() {
+                let owner = vec_to_pubkey(existing.pubkey)?;
+                return Err(CatalogError::HandleTaken { owner });
+            }
         }
 
-        // Check for the inverse: same pubkey registered with a different handle.
-        let by_pubkey: AuthorRow = authors::table
+        // A pubkey already bound to a DIFFERENT handle cannot silently re-handle
+        // itself through registration; that is a conflict. The same handle is the
+        // idempotent success case, and no row means the insert above established
+        // the requested (pubkey, handle) for the first time.
+        let by_pubkey: Option<AuthorRow> = authors::table
             .filter(authors::pubkey.eq(record.pubkey.0.to_vec()))
             .select(AuthorRow::as_select())
             .first(&mut *conn)
             .await
+            .optional()
             .map_err(|e| map_diesel_error(e, "author", record.pubkey.to_string()))?;
-
-        if by_pubkey.handle != record.handle {
-            return Err(CatalogError::Conflict {
+        match by_pubkey {
+            Some(existing) if existing.handle != record.handle => Err(CatalogError::Conflict {
                 kind: "author",
                 key: record.pubkey.to_string(),
-            });
+            }),
+            _ => Ok(()),
         }
-
-        Ok(())
     }
 
     /// Look up an author by their Ed25519 public key.
