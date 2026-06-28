@@ -129,16 +129,26 @@ fn walk(
             break;
         }
 
+        // Use the entry's own file type (this does not follow symlinks) so a
+        // planted symlink cannot redirect the walk outside the project tree.
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+
         let path = entry.path();
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
 
-        if path.is_dir() {
+        if file_type.is_dir() {
             if SKIP_DIRS.contains(&name_str.as_ref()) {
                 continue;
             }
             walk(&path, depth + 1, raw_counts, frameworks, file_count);
-        } else if path.is_file() {
+        } else if file_type.is_file() {
             *file_count += 1;
 
             // Check for framework marker files.
@@ -490,5 +500,36 @@ mod tests {
         expand_task_tokens(&mut tokens);
         assert!(tokens.contains(&"security".to_string()));
         assert!(tokens.contains(&"cve".to_string()));
+    }
+
+    /// Symlinked directories are not followed during the project walk.
+    #[cfg(unix)]
+    #[test]
+    fn walk_does_not_follow_symlinks() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+
+        // A directory outside the project, full of rust files.
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        for i in 0..3 {
+            fs::write(outside.join(format!("lib{i}.rs")), "fn x() {}").unwrap();
+        }
+
+        // The project contains one python file and a symlink to `outside`.
+        let project = tmp.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("app.py"), "x = 1").unwrap();
+        symlink(&outside, project.join("linked")).unwrap();
+
+        let sig = sense(&project, None);
+        assert!(
+            sig.languages.contains_key("python"),
+            "the real project file should still be detected"
+        );
+        assert!(
+            !sig.languages.contains_key("rust"),
+            "a symlinked directory must not be followed"
+        );
     }
 }

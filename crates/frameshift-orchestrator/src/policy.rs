@@ -176,7 +176,12 @@ pub fn rank(
             } else {
                 ctx.task_tokens
                     .iter()
-                    .filter(|t| profile.anti_keywords.contains(t))
+                    .filter(|t| {
+                        profile
+                            .anti_keywords
+                            .iter()
+                            .any(|ak| ak.eq_ignore_ascii_case(t.as_str()))
+                    })
                     .count()
             };
             let lex_score = if anti_hit_count > 0 && !ctx.task_tokens.is_empty() {
@@ -462,6 +467,28 @@ mod tests {
         assert!(
             backend_entry.components.lexical < 0.3,
             "anti-keywords should penalize lexical score"
+        );
+    }
+
+    /// Anti-keyword matching is case-insensitive: uppercase manifest entries
+    /// still penalize lowercase task tokens.
+    #[test]
+    fn anti_keywords_penalize_case_insensitive() {
+        let mut persona_a = make_profile("backend", &["rust"], &["rust", "api"]);
+        persona_a.anti_keywords = vec!["CSS".to_string(), "Frontend".to_string()];
+
+        let persona_b = make_profile("frontend", &["typescript"], &["react", "css"]);
+
+        let index = PersonaIndex {
+            profiles: vec![persona_a, persona_b],
+        };
+        let ctx = make_ctx(&[("rust", 1.0)], &["css", "styling", "frontend"]);
+
+        let ranked = rank(&ctx, &index, &PolicyWeights::default(), &Preferences::new());
+        let backend_entry = ranked.iter().find(|s| s.persona == "backend").unwrap();
+        assert!(
+            backend_entry.components.lexical < 0.3,
+            "case-insensitive anti-keywords should penalize lexical score"
         );
     }
 }
