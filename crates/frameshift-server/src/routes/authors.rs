@@ -28,6 +28,7 @@ use chrono::Utc;
 use ed25519_dalek::VerifyingKey;
 use frameshift_catalog::identity::Ed25519PublicKey;
 use frameshift_catalog::records::AuthorRecord;
+use frameshift_catalog::CatalogError;
 use serde::{Deserialize, Serialize};
 
 use crate::auth::VerifiedSigner;
@@ -138,6 +139,25 @@ pub async fn register_author_route(
     Json(body): Json<RegisterAuthorRequest>,
 ) -> Result<Response, AppError> {
     validate_handle(&body.handle)?;
+
+    // Do not let registration hijack an existing handle. `register_author` below
+    // guards the `authors` table, but a handle can exist in the `handles` table
+    // with no matching `authors` row (the seed tool calls `set_handle_pubkey`
+    // directly), so without this check an attacker could register such a handle
+    // and have the `set_handle_pubkey` call below overwrite its owner. Mirror
+    // `rotate_handle_route`: only the current owner may (idempotently) re-point
+    // their own handle; a different owner is a 409. Done before any write so a
+    // rejected registration leaves no partial `authors` row behind.
+    match state.catalog.get_handle_pubkey(&body.handle).await {
+        Ok(current) if current != signer.pubkey => {
+            return Err(AppError::Conflict(format!(
+                "handle already taken by {current}"
+            )));
+        }
+        // Handle is unowned (free) or already owned by this signer: proceed.
+        Ok(_) | Err(CatalogError::NotFound { .. }) => {}
+        Err(e) => return Err(AppError::from_catalog(e, "handle")),
+    }
 
     // Treat empty/whitespace display names as absent; the catalog rejects "".
     let display_name = match body.display_name {

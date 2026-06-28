@@ -181,6 +181,46 @@ async fn register_duplicate_handle_returns_409() {
     );
 }
 
+/// Regression: a handle present only in the `handles` table (e.g. seeded
+/// directly via set_handle_pubkey, with no matching `authors` row) cannot be
+/// hijacked by registering it under a different key. Without the register-route
+/// ownership check, register_author's authors-table guard would miss this and
+/// the follow-up set_handle_pubkey would overwrite the owner.
+#[tokio::test]
+async fn register_handle_owned_only_in_handles_table_returns_409() {
+    let owner = SigningKey::from_bytes(&[40u8; 32]);
+    let attacker = SigningKey::from_bytes(&[41u8; 32]);
+    let owner_pubkey = Ed25519PublicKey(owner.verifying_key().to_bytes());
+    let catalog = MockCatalog::new();
+
+    // Seed the handle into the handles map only, with no authors row.
+    {
+        let mut s = catalog.state.write().unwrap();
+        s.handles.insert("carol".to_string(), owner_pubkey);
+    }
+
+    let resp = post_signed_json(
+        mk_state(catalog.clone()),
+        "/v1/authors",
+        serde_json::json!({ "handle": "carol" }),
+        Some(&attacker),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "registering a handle owned only in the handles table must 409"
+    );
+
+    // The owner mapping must be untouched by the rejected registration.
+    let s = catalog.state.read().unwrap();
+    assert_eq!(
+        s.handles.get("carol").copied(),
+        Some(owner_pubkey),
+        "attacker must not overwrite the existing handle owner"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // rotation
 // ---------------------------------------------------------------------------
