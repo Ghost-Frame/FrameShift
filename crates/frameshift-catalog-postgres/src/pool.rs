@@ -46,7 +46,11 @@ pub async fn build_pool(
     // Build the manager with a custom connection setup callback.
     // The callback runs for every new physical connection, before the
     // connection enters the pool's idle queue.
-    let mut manager_config = ManagerConfig::default();
+    //
+    // diesel-async 0.6+ made `ManagerConfig` generic over the connection type,
+    // so the connection type is named explicitly here rather than left to
+    // inference.
+    let mut manager_config = ManagerConfig::<AsyncPgConnection>::default();
     manager_config.custom_setup = Box::new(move |url: &str| {
         let url = url.to_string();
         let timeout_ms = statement_timeout_ms;
