@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use clap::Args;
 use frameshift_client::{Client, ClientError, InstallRequest, InstallSource, PersonaSpec};
+use frameshift_orchestrator::Preferences;
 
 use crate::util::CliError;
 
@@ -76,6 +77,18 @@ pub fn run_use(client: &Client, args: UseArgs) -> Result<(), CliError> {
             other => CliError::Orchestrator(other.to_string()),
         })?;
 
+    // Learn from the explicit choice: nudge future automatic selection toward
+    // the persona the user activated. This writes the same `automate-prefs.json`
+    // that `select` and the daemon read, so the bias actually closes the loop.
+    // Best-effort -- activation has already succeeded, so a preferences failure
+    // must not fail the command.
+    if let Ok(state_dir) = client.orchestrator_state_dir(&project_root) {
+        let prefs_path = state_dir.join("automate-prefs.json");
+        if let Err(e) = record_persona_use(&prefs_path, &args.name) {
+            eprintln!("warning: could not record persona preference: {e}");
+        }
+    }
+
     // Read and print the rendered persona for the claude target.
     let rendered = client.rendered_persona(&project_root, &args.name, "claude")?;
     println!("{}", rendered);
@@ -102,4 +115,54 @@ fn read_pack_version(persona_dir: &Path) -> Option<String> {
         }
     }
     None
+}
+
+/// Record that the user explicitly activated `persona`, nudging future
+/// automatic selection toward it.
+///
+/// Loads the shared `automate-prefs.json` (the same store `select` and the
+/// daemon read), bumps the persona's bias via [`Preferences::record_override`]
+/// (with no auto-pick to penalize -- an explicit `use` is a positive signal,
+/// not a correction of a specific automatic pick), and persists it atomically.
+fn record_persona_use(prefs_path: &Path, persona: &str) -> Result<(), String> {
+    let mut prefs = Preferences::load(prefs_path).map_err(|e| e.to_string())?;
+    prefs.record_override(None, persona);
+    prefs.save(prefs_path).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Recording a use bumps the persona's bias and persists it to the shared
+    /// preferences file so later selection can read it back.
+    #[test]
+    fn record_persona_use_biases_persona() {
+        let tmp = TempDir::new().unwrap();
+        let prefs_path = tmp.path().join("automate-prefs.json");
+
+        record_persona_use(&prefs_path, "rust").unwrap();
+
+        let prefs = Preferences::load(&prefs_path).unwrap();
+        assert!(
+            prefs.bias_for("rust") > 0.0,
+            "an explicit `use` should bias the persona upward"
+        );
+    }
+
+    /// Repeated uses accumulate bias (capped by the feedback layer) and never
+    /// error on an existing preferences file.
+    #[test]
+    fn repeated_use_accumulates_and_persists() {
+        let tmp = TempDir::new().unwrap();
+        let prefs_path = tmp.path().join("automate-prefs.json");
+
+        record_persona_use(&prefs_path, "rust").unwrap();
+        let first = Preferences::load(&prefs_path).unwrap().bias_for("rust");
+        record_persona_use(&prefs_path, "rust").unwrap();
+        let second = Preferences::load(&prefs_path).unwrap().bias_for("rust");
+
+        assert!(second >= first, "bias should not decrease on repeated use");
+    }
 }
