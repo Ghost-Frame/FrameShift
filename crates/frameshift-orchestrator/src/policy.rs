@@ -4,6 +4,15 @@ use crate::context::ContextSignal;
 use crate::feedback::Preferences;
 use crate::index::PersonaIndex;
 
+/// Score added per project-dependency token (from `ContextSignal::context_tokens`)
+/// that matches a persona keyword.
+const CONTEXT_TOKEN_HIT: f32 = 0.04;
+
+/// Maximum total bonus contributed by dependency-token matches. Capped so a
+/// dependency-heavy project cannot let framework matching dominate the language,
+/// lexical, and intent signals.
+const CONTEXT_TOKEN_CAP: f32 = 0.12;
+
 /// Weights controlling the relative contribution of each scoring component.
 ///
 /// Values should sum to 1.0 for predictable score magnitudes, but this is
@@ -43,6 +52,9 @@ pub struct ScoreComponents {
     pub intent: f32,
     /// Capability heuristic component (0..1).
     pub capability: f32,
+    /// Project-dependency match bonus (0..[`CONTEXT_TOKEN_CAP`]), added on top
+    /// of the weighted blend rather than diluting the lexical channel.
+    pub context: f32,
 }
 
 /// A scored persona with rationale and confidence information.
@@ -200,11 +212,25 @@ pub fn rank(
                 0.0
             };
 
-            // Blended score.
+            // Context-token bonus: a small, capped reward for personas whose
+            // keywords match the project's declared dependencies. Kept separate
+            // from the lexical IDF channel so that dependencies which match no
+            // persona cannot dilute task-token scoring.
+            let context_hits = ctx
+                .context_tokens
+                .iter()
+                .filter(|t| profile.keywords.contains(*t))
+                .count();
+            let context_score = (context_hits as f32 * CONTEXT_TOKEN_HIT).min(CONTEXT_TOKEN_CAP);
+
+            // Blended score. The context bonus is additive (not weighted): it can
+            // only raise a persona that matches project dependencies, never lower
+            // others or redistribute the primary weights.
             let blended = weights.language * lang_score
                 + weights.lexical * lex_score
                 + weights.intent * intent_score
-                + weights.capability * cap_score;
+                + weights.capability * cap_score
+                + context_score;
 
             // Apply preference bias and clamp.
             // Use intent-aware lookup when the context carries an inferred intent;
@@ -250,6 +276,19 @@ pub fn rank(
             if cap_score > 0.0 {
                 rationale_parts.push(format!("cap_score={:.2}", cap_score));
             }
+            if context_score > 0.0 {
+                let hit_deps: Vec<&str> = ctx
+                    .context_tokens
+                    .iter()
+                    .filter(|t| profile.keywords.contains(*t))
+                    .map(|t| t.as_str())
+                    .collect();
+                rationale_parts.push(format!(
+                    "deps [{}] match: context_score={:.2}",
+                    hit_deps.join(","),
+                    context_score
+                ));
+            }
             if bias.abs() > f32::EPSILON {
                 rationale_parts.push(format!("pref_bias={:.3}", bias));
             }
@@ -269,6 +308,7 @@ pub fn rank(
                 lexical: lex_score,
                 intent: intent_score,
                 capability: cap_score,
+                context: context_score,
             };
 
             Scored {
@@ -337,6 +377,7 @@ mod tests {
                 .collect::<BTreeMap<_, _>>(),
             frameworks: vec![],
             task_tokens: task_tokens.iter().map(|t| t.to_string()).collect(),
+            context_tokens: vec![],
             inferred_intent: None,
         }
     }
@@ -439,6 +480,7 @@ mod tests {
             },
             frameworks: vec![],
             task_tokens: vec!["debugging".to_string(), "error".to_string()],
+            context_tokens: vec![],
             inferred_intent: Some(Intent::Debugging),
         };
 
@@ -490,5 +532,36 @@ mod tests {
             backend_entry.components.lexical < 0.3,
             "case-insensitive anti-keywords should penalize lexical score"
         );
+    }
+
+    /// A dependency token that matches a persona keyword adds a context bonus
+    /// and breaks a tie against an otherwise-equal persona.
+    #[test]
+    fn context_tokens_bonus_rewards_dependency_match() {
+        let web = make_profile("web-rust", &["rust"], &["rust", "axum"]);
+        let plain = make_profile("plain-rust", &["rust"], &["rust"]);
+        let index = PersonaIndex {
+            profiles: vec![plain, web],
+        };
+        let mut ctx = make_ctx(&[("rust", 1.0)], &[]);
+        ctx.context_tokens = vec!["axum".to_string(), "tokio".to_string()];
+
+        let ranked = rank(&ctx, &index, &PolicyWeights::default(), &Preferences::new());
+        assert_eq!(
+            ranked[0].persona, "web-rust",
+            "the axum dependency should boost the axum-keyworded persona"
+        );
+        let web_entry = ranked.iter().find(|s| s.persona == "web-rust").unwrap();
+        assert!(web_entry.components.context > 0.0);
+    }
+
+    /// An empty context_tokens set contributes no bonus (regression guard).
+    #[test]
+    fn empty_context_tokens_add_no_bonus() {
+        let p = make_profile("rust-expert", &["rust"], &["rust", "axum"]);
+        let index = PersonaIndex { profiles: vec![p] };
+        let ctx = make_ctx(&[("rust", 1.0)], &[]);
+        let ranked = rank(&ctx, &index, &PolicyWeights::default(), &Preferences::new());
+        assert_eq!(ranked[0].components.context, 0.0);
     }
 }

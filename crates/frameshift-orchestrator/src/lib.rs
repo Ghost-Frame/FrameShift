@@ -136,6 +136,7 @@ mod tests {
             },
             frameworks: vec![],
             task_tokens: vec![],
+            context_tokens: vec![],
             inferred_intent: None,
         };
         // With only one persona and confidence depends on scoring; just verify no panic.
