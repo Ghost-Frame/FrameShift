@@ -20,6 +20,20 @@ const SKIP_DIRS: &[&str] = &[
     ".svn",
 ];
 
+/// Weight assigned to languages present in the active git working set.
+///
+/// Sits above the file-count census ceiling (1.0) but below the prose sentinel
+/// (2.0, see [`augment_languages_from_task`]) so that what the user is actively
+/// editing outranks the static census without overriding an explicit
+/// prose-writing signal.
+const ACTIVE_LANGUAGE_WEIGHT: f32 = 1.5;
+
+/// Upper bound on changed-file paths processed from `git status` output.
+///
+/// Bounds work on pathological repos (e.g. a freshly checked-out tree reported
+/// as fully untracked); far more than enough to characterize the active set.
+const MAX_CHANGED_FILES: usize = 5000;
+
 /// A snapshot of the inferred work context for a project directory.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContextSignal {
@@ -90,6 +104,12 @@ pub fn sense(project_root: &Path, task_hint: Option<&str>) -> ContextSignal {
     // writing-domain terms, inject a "prose" language signal so writer-type
     // personas can compete with code-language personas on equal footing.
     let languages = augment_languages_from_task(languages, &task_tokens);
+
+    // Emphasize the languages of the active git working set (best-effort): the
+    // files the user is editing right now are a stronger signal than the static
+    // whole-repo census. Non-git directories degrade to the census unchanged.
+    let changed_languages = changed_file_languages(&git_changed_paths(project_root));
+    let languages = augment_languages_from_git(languages, &changed_languages);
 
     // Classify the inferred task intent from task token analysis.
     let inferred_intent = crate::intent::classify(&task_tokens);
@@ -371,6 +391,90 @@ fn augment_languages_from_task(
     languages
 }
 
+/// Best-effort list of files in the active git working set for `project_root`.
+///
+/// Runs `git status --porcelain` (which reports staged, unstaged, and untracked
+/// changes) with the project as the working directory. Returns an empty vector
+/// on any failure -- not a git repository, git not installed, or a non-zero
+/// exit -- so callers degrade gracefully to the static project census.
+fn git_changed_paths(project_root: &Path) -> Vec<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args(["status", "--porcelain", "--untracked-files=all"])
+        .output();
+    match output {
+        Ok(o) if o.status.success() => {
+            parse_porcelain_paths(&String::from_utf8_lossy(&o.stdout))
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Extract file paths from `git status --porcelain` (v1) output.
+///
+/// Each line is `XY <path>`: a two-character status code, a space, then the
+/// path. Rename and copy entries use `XY <old> -> <new>`; the destination path
+/// is taken. Surrounding quotes (added by git for paths with special
+/// characters) are stripped -- extension mapping still works on the suffix.
+/// Capped at [`MAX_CHANGED_FILES`] entries.
+fn parse_porcelain_paths(porcelain: &str) -> Vec<String> {
+    porcelain
+        .lines()
+        .filter_map(|line| {
+            // Need at least the 2 status chars, a space, and one path char.
+            if line.len() < 4 {
+                return None;
+            }
+            let rest = &line[3..];
+            // Rename/copy: "old -> new" keeps the destination path.
+            let path = match rest.rsplit_once(" -> ") {
+                Some((_, new)) => new,
+                None => rest,
+            };
+            let path = path.trim().trim_matches('"');
+            if path.is_empty() {
+                None
+            } else {
+                Some(path.to_string())
+            }
+        })
+        .take(MAX_CHANGED_FILES)
+        .collect()
+}
+
+/// Map a set of changed file paths to per-language hit counts using the same
+/// extension table as the project census ([`ext_to_language`]). Paths whose
+/// extension does not map to a tracked language are ignored.
+pub(crate) fn changed_file_languages(paths: &[String]) -> BTreeMap<String, usize> {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for path in paths {
+        if let Some(ext) = Path::new(path).extension().and_then(|e| e.to_str()) {
+            if let Some(lang) = ext_to_language(ext) {
+                *counts.entry(lang.to_string()).or_insert(0) += 1;
+            }
+        }
+    }
+    counts
+}
+
+/// Raise the weight of every language in the active git working set to
+/// [`ACTIVE_LANGUAGE_WEIGHT`], so files the user is currently editing outrank
+/// the static file-count census. A language already weighted higher (e.g. the
+/// prose sentinel) is left untouched.
+fn augment_languages_from_git(
+    mut languages: BTreeMap<String, f32>,
+    changed: &BTreeMap<String, usize>,
+) -> BTreeMap<String, f32> {
+    for lang in changed.keys() {
+        let entry = languages.entry(lang.clone()).or_insert(0.0);
+        if *entry < ACTIVE_LANGUAGE_WEIGHT {
+            *entry = ACTIVE_LANGUAGE_WEIGHT;
+        }
+    }
+    languages
+}
+
 /// Push `value` into `vec` only if not already present (cheap dedup during walk).
 fn push_unique(vec: &mut Vec<String>, value: &str) {
     if !vec.iter().any(|v| v == value) {
@@ -530,6 +634,124 @@ mod tests {
         assert!(
             !sig.languages.contains_key("rust"),
             "a symlinked directory must not be followed"
+        );
+    }
+
+    /// changed_file_languages maps recognized extensions and ignores the rest.
+    #[test]
+    fn changed_file_languages_maps_extensions() {
+        let paths = vec![
+            "src/main.rs".to_string(),
+            "web/app.py".to_string(),
+            "README".to_string(),
+            "notes.rs".to_string(),
+        ];
+        let langs = changed_file_languages(&paths);
+        assert_eq!(langs.get("rust").copied(), Some(2));
+        assert_eq!(langs.get("python").copied(), Some(1));
+        // README has no extension and contributes nothing.
+        assert_eq!(langs.len(), 2);
+    }
+
+    /// parse_porcelain_paths handles status codes, untracked, and renames.
+    #[test]
+    fn parse_porcelain_extracts_paths() {
+        let out = " M src/main.rs\n?? new.py\nA  staged.go\nR  old.rs -> renamed.rs\n";
+        let paths = parse_porcelain_paths(out);
+        assert!(paths.contains(&"src/main.rs".to_string()));
+        assert!(paths.contains(&"new.py".to_string()));
+        assert!(paths.contains(&"staged.go".to_string()));
+        // Rename keeps the destination, not the source.
+        assert!(paths.contains(&"renamed.rs".to_string()));
+        assert!(!paths.iter().any(|p| p.contains("old.rs")));
+    }
+
+    /// The git boost lifts an actively-edited minority language above the
+    /// census-dominant one.
+    #[test]
+    fn git_boost_lifts_minority_language() {
+        use std::collections::BTreeMap;
+        let mut census = BTreeMap::new();
+        census.insert("javascript".to_string(), 1.0_f32);
+        census.insert("rust".to_string(), 0.3_f32);
+        let mut changed = BTreeMap::new();
+        changed.insert("rust".to_string(), 2_usize);
+
+        let boosted = augment_languages_from_git(census, &changed);
+        assert_eq!(boosted.get("rust").copied(), Some(ACTIVE_LANGUAGE_WEIGHT));
+        assert!(boosted["rust"] > boosted["javascript"]);
+    }
+
+    /// The git boost never lowers a language already weighted above the active
+    /// weight (e.g. the prose sentinel).
+    #[test]
+    fn git_boost_preserves_prose_sentinel() {
+        use std::collections::BTreeMap;
+        let mut census = BTreeMap::new();
+        census.insert("prose".to_string(), 2.0_f32);
+        let mut changed = BTreeMap::new();
+        changed.insert("rust".to_string(), 1_usize);
+
+        let boosted = augment_languages_from_git(census, &changed);
+        assert_eq!(boosted.get("prose").copied(), Some(2.0));
+        assert_eq!(boosted.get("rust").copied(), Some(ACTIVE_LANGUAGE_WEIGHT));
+    }
+
+    /// A non-git directory yields no boost: the census weight (<= 1.0) stands
+    /// and sense() does not panic.
+    #[test]
+    fn sense_on_non_git_dir_does_not_boost() {
+        let tmp = make_rust_project();
+        let sig = sense(tmp.path(), None);
+        let rust_w = sig.languages.get("rust").copied().unwrap_or(0.0);
+        assert!(
+            rust_w > 0.0 && rust_w <= 1.0,
+            "expected census weight, not the active boost: {rust_w}"
+        );
+    }
+
+    /// In a real repo, an actively-edited Rust file outranks a census-dominant
+    /// JavaScript majority. Skipped if git is unavailable in the environment.
+    #[test]
+    fn sense_boosts_git_changed_languages() {
+        use std::process::Command;
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .expect("git invocation");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "tester"]);
+
+        // Census-dominant language: three committed JavaScript files.
+        for i in 0..3 {
+            fs::write(root.join(format!("a{i}.js")), "var x = 1;").unwrap();
+        }
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "init"]);
+
+        // Active edit: a single untracked Rust file.
+        fs::write(root.join("lib.rs"), "fn x() {}").unwrap();
+
+        let sig = sense(root, None);
+        let rust_w = sig.languages.get("rust").copied().unwrap_or(0.0);
+        let js_w = sig.languages.get("javascript").copied().unwrap_or(0.0);
+        assert!(
+            rust_w >= ACTIVE_LANGUAGE_WEIGHT,
+            "the actively-edited rust file should boost rust, got {rust_w}"
+        );
+        assert!(
+            rust_w > js_w,
+            "actively-edited rust ({rust_w}) should outrank census-dominant js ({js_w})"
         );
     }
 }
