@@ -52,8 +52,9 @@ pub struct ScoreComponents {
     pub intent: f32,
     /// Capability heuristic component (0..1).
     pub capability: f32,
-    /// Project-dependency match bonus (0..[`CONTEXT_TOKEN_CAP`]), added on top
-    /// of the weighted blend rather than diluting the lexical channel.
+    /// Project-signal match bonus (0..[`CONTEXT_TOKEN_CAP`]) from dependency and
+    /// build-framework matches, added on top of the weighted blend rather than
+    /// diluting the lexical channel.
     pub context: f32,
 }
 
@@ -207,13 +208,16 @@ pub fn rank(
                 0.0
             };
 
-            // Context-token bonus: a small, capped reward for personas whose
-            // keywords match the project's declared dependencies. Kept separate
-            // from the lexical IDF channel so that dependencies which match no
-            // persona cannot dilute task-token scoring.
+            // Context-signal bonus: a small, capped reward for personas whose
+            // keywords match a project signal -- either a declared dependency
+            // (`context_tokens`) or a detected build framework (`frameworks`,
+            // e.g. cargo/npm/go/python). Kept separate from the lexical IDF
+            // channel so that signals matching no persona cannot dilute
+            // task-token scoring.
             let context_hits = ctx
                 .context_tokens
                 .iter()
+                .chain(ctx.frameworks.iter())
                 .filter(|t| profile.keywords.contains(*t))
                 .count();
             let context_score = (context_hits as f32 * CONTEXT_TOKEN_HIT).min(CONTEXT_TOKEN_CAP);
@@ -272,15 +276,16 @@ pub fn rank(
                 rationale_parts.push(format!("cap_score={:.2}", cap_score));
             }
             if context_score > 0.0 {
-                let hit_deps: Vec<&str> = ctx
+                let hit_signals: Vec<&str> = ctx
                     .context_tokens
                     .iter()
+                    .chain(ctx.frameworks.iter())
                     .filter(|t| profile.keywords.contains(*t))
                     .map(|t| t.as_str())
                     .collect();
                 rationale_parts.push(format!(
-                    "deps [{}] match: context_score={:.2}",
-                    hit_deps.join(","),
+                    "project signals [{}] match: context_score={:.2}",
+                    hit_signals.join(","),
                     context_score
                 ));
             }
@@ -558,5 +563,26 @@ mod tests {
         let ctx = make_ctx(&[("rust", 1.0)], &[]);
         let ranked = rank(&ctx, &index, &PolicyWeights::default(), &Preferences::new());
         assert_eq!(ranked[0].components.context, 0.0);
+    }
+
+    /// A detected build framework (e.g. `cargo`) contributes the same context
+    /// bonus as a dependency when it matches a persona keyword.
+    #[test]
+    fn framework_marker_contributes_context_bonus() {
+        let rust_dev = make_profile("rust-dev", &["rust"], &["rust", "cargo"]);
+        let plain = make_profile("plain", &["rust"], &["rust"]);
+        let index = PersonaIndex {
+            profiles: vec![plain, rust_dev],
+        };
+        let mut ctx = make_ctx(&[("rust", 1.0)], &[]);
+        ctx.frameworks = vec!["cargo".to_string()];
+
+        let ranked = rank(&ctx, &index, &PolicyWeights::default(), &Preferences::new());
+        let entry = ranked.iter().find(|s| s.persona == "rust-dev").unwrap();
+        assert!(
+            entry.components.context > 0.0,
+            "the cargo build framework should give the cargo-keyworded persona a bonus"
+        );
+        assert_eq!(ranked[0].persona, "rust-dev");
     }
 }
