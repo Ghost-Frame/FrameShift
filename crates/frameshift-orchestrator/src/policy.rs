@@ -684,8 +684,7 @@ mod tests {
         let baseline = rank(&ctx, &index, &weights, &Preferences::new());
 
         let emb = BagOfWordsEmbedder;
-        let ranked =
-            rank_with_embedder(&ctx, &index, &weights, &Preferences::new(), Some(&emb));
+        let ranked = rank_with_embedder(&ctx, &index, &weights, &Preferences::new(), Some(&emb));
 
         assert!(
             ranked[0].components.semantic > 0.0,
