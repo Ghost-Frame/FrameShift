@@ -30,7 +30,9 @@ members = [
 
 [workspace.package]
 edition = "2021"
-rust-version = "1.75"
+# diesel 2.3 requires 1.86 and the diesel-async 0.9 transaction API uses async
+# closures (stable since 1.85); 1.86 is the real floor after those bumps.
+rust-version = "1.86"
 license = "Elastic-2.0"
 
 [workspace.dependencies]
@@ -60,12 +62,12 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "compression-gzip", "request-id", "limit", "cors", "set-header"] }
 tokio = { version = "1", features = ["full"] }
 http-body-util = "0.1"
-diesel = { version = "2.2", features = ["postgres", "chrono", "serde_json", "uuid"] }
-diesel-async = { version = "0.5", features = ["postgres", "bb8"] }
-diesel_migrations = { version = "2.2", features = ["postgres"] }
-bb8 = "0.8"
-testcontainers = "0.23"
-testcontainers-modules = { version = "0.11", features = ["postgres"] }
+diesel = { version = "2.3.8", features = ["postgres", "chrono", "serde_json", "uuid"] }
+diesel-async = { version = "0.9", features = ["postgres", "bb8"] }
+diesel_migrations = { version = "2.3", features = ["postgres"] }
+bb8 = "0.9"
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15", features = ["postgres"] }
 figment = { version = "0.10", features = ["env", "toml"] }
 mimalloc = "0.1"
 clap = { version = "4", features = ["derive"] }
