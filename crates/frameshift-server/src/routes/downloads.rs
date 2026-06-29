@@ -253,5 +253,12 @@ pub async fn stream_signed_download(
     // Count successful signed-download responses (alongside direct pack downloads).
     state.metrics.pack_downloads_total.inc();
 
+    // NOTE: total_downloads is NOT incremented here. This path has only a
+    // content hash -- pack name and version are not available, so
+    // increment_download_counter cannot be called. The official client
+    // (frameshift-client) downloads via `/v1/packs/{name}/versions/{version}/pack`,
+    // which does increment total_downloads. Callers that want counted downloads
+    // should use that route.
+
     Ok(response)
 }

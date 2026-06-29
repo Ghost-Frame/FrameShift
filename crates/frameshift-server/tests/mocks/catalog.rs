@@ -48,6 +48,12 @@ pub struct MockState {
 
     /// When `true`, the next mutating call returns `CatalogError::Conflict`.
     pub inject_conflict: bool,
+
+    /// Number of `increment_download_counter` calls per `(pack_name, version)`.
+    ///
+    /// Tests read this to assert that the cumulative download counter was
+    /// incremented after a successful download response.
+    pub download_counter_increments: HashMap<(String, String), u64>,
 }
 
 /// In-memory [`CatalogBackend`] for integration tests.
@@ -259,13 +265,23 @@ impl CatalogBackend for MockCatalog {
         Ok(results)
     }
 
-    /// Increment download counter (no-op in mock).
+    /// Increment the download counter for a pack version.
+    ///
+    /// Records the call in `state.download_counter_increments` so tests can
+    /// assert that `download_pack_bytes` actually invoked this method.
     async fn increment_download_counter(
         &self,
-        _name: &str,
-        _version: &str,
+        name: &str,
+        version: &str,
     ) -> Result<u64, CatalogError> {
-        Ok(0)
+        let mut state = self
+            .state
+            .write()
+            .map_err(|e| CatalogError::BackendError(e.to_string().into()))?;
+        let key = (name.to_string(), version.to_string());
+        let count = state.download_counter_increments.entry(key).or_insert(0);
+        *count += 1;
+        Ok(*count)
     }
 
     /// Tombstone a pack version (no-op in mock).
