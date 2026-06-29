@@ -395,7 +395,8 @@ fn git_changed_paths(project_root: &Path) -> Vec<String> {
         .output();
     match output {
         Ok(o) if o.status.success() => {
-            parse_porcelain_paths(&String::from_utf8_lossy(&o.stdout))
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            parse_porcelain_paths(&stdout)
         }
         _ => Vec::new(),
     }
