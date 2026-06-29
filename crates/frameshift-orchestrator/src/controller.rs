@@ -178,6 +178,47 @@ impl SwitchController {
         &self.state
     }
 
+    /// Return the name of the persona the controller currently tracks as active.
+    ///
+    /// Returns `Some` when the controller is `Active` or `Locked` on a named
+    /// persona, and `None` when `Off`, `Armed`, or `Locked` with no name. The
+    /// daemon uses this as its "last auto-pick" to detect when the on-disk
+    /// active marker has been changed out from under it (a manual override).
+    pub fn active_persona(&self) -> Option<&str> {
+        match &self.state {
+            AutomateState::Active { persona, .. } | AutomateState::Locked { persona } => {
+                if persona.is_empty() {
+                    None
+                } else {
+                    Some(persona.as_str())
+                }
+            }
+            AutomateState::Off | AutomateState::Armed => None,
+        }
+    }
+
+    /// Adopt an externally-applied persona as the new active baseline.
+    ///
+    /// Used when something outside the controller (a user manual switch) has
+    /// already changed the active persona. The controller records `persona` as
+    /// `Active` so subsequent `decide` calls apply hysteresis from the user's
+    /// choice rather than the controller's stale auto-pick, and so the same
+    /// override is not detected and re-learned on every tick. Debounce and
+    /// challenger tracking are reset. A user-asserted choice is treated as
+    /// maximally confident; the stored confidence is informational only and is
+    /// not read by `decide`. Locked state is left untouched.
+    pub fn adopt_active(&mut self, persona: &str) {
+        if matches!(self.state, AutomateState::Locked { .. }) {
+            return;
+        }
+        self.state = AutomateState::Active {
+            persona: persona.to_string(),
+            confidence: 1.0,
+        };
+        self.debounce_count = 0;
+        self.challenger = None;
+    }
+
     /// Evaluate a fresh ranking and decide whether to switch personas.
     ///
     /// Logic:
@@ -318,6 +359,7 @@ mod tests {
                 intent: 0.0,
                 capability: 0.0,
                 context: 0.0,
+                semantic: 0.0,
             },
         }
     }
