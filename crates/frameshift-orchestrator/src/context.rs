@@ -34,6 +34,19 @@ const ACTIVE_LANGUAGE_WEIGHT: f32 = 1.5;
 /// as fully untracked); far more than enough to characterize the active set.
 const MAX_CHANGED_FILES: usize = 5000;
 
+/// Upper bound on dependency-name tokens harvested from project manifests.
+///
+/// Keeps the additive context-token signal bounded on dependency-heavy projects.
+const MAX_DEP_TOKENS: usize = 100;
+
+/// Manifest section headers under which a TOML key names a dependency.
+const CARGO_DEP_SECTIONS: &[&str] = &[
+    "[dependencies]",
+    "[dev-dependencies]",
+    "[build-dependencies]",
+    "[workspace.dependencies]",
+];
+
 /// A snapshot of the inferred work context for a project directory.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContextSignal {
@@ -52,6 +65,12 @@ pub struct ContextSignal {
     /// Normalized, lowercase tokens extracted from `task_hint`.
     /// Used by the policy scorer for lexical matching against persona keywords.
     pub task_tokens: Vec<String>,
+
+    /// Lowercase dependency names parsed from project manifests (Cargo.toml,
+    /// package.json). Scored by the policy as a small additive bonus when they
+    /// match persona keywords -- they sharpen framework-level matching (e.g.
+    /// `axum` vs `actix`) without diluting the task-token lexical score.
+    pub context_tokens: Vec<String>,
 
     /// The inferred task intent from task token analysis, if any.
     pub inferred_intent: Option<crate::intent::Intent>,
@@ -111,6 +130,10 @@ pub fn sense(project_root: &Path, task_hint: Option<&str>) -> ContextSignal {
     let changed_languages = changed_file_languages(&git_changed_paths(project_root));
     let languages = augment_languages_from_git(languages, &changed_languages);
 
+    // Harvest dependency names from project manifests (best-effort). These feed
+    // the policy as a small additive bonus, sharpening framework-level matching.
+    let context_tokens = manifest_dependency_tokens(project_root);
+
     // Classify the inferred task intent from task token analysis.
     let inferred_intent = crate::intent::classify(&task_tokens);
 
@@ -119,6 +142,7 @@ pub fn sense(project_root: &Path, task_hint: Option<&str>) -> ContextSignal {
         languages,
         frameworks,
         task_tokens,
+        context_tokens,
         inferred_intent,
     }
 }
@@ -466,6 +490,160 @@ fn augment_languages_from_git(
     languages
 }
 
+/// Best-effort dependency-name tokens harvested from the project's root
+/// manifests (`Cargo.toml` and `package.json`).
+///
+/// Returns lowercase, deduplicated names (length >= 2) capped at
+/// [`MAX_DEP_TOKENS`], in first-seen order. Missing or unreadable manifests
+/// contribute nothing, so non-manifest projects yield an empty list.
+fn manifest_dependency_tokens(project_root: &Path) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    if let Some(content) = read_capped(&project_root.join("Cargo.toml")) {
+        names.extend(parse_cargo_dependencies(&content));
+    }
+    if let Some(content) = read_capped(&project_root.join("package.json")) {
+        names.extend(parse_package_json_dependencies(&content));
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    names
+        .into_iter()
+        .map(|n| n.to_lowercase())
+        .filter(|n| n.len() >= 2 && seen.insert(n.clone()))
+        .take(MAX_DEP_TOKENS)
+        .collect()
+}
+
+/// Read a file to a string, returning `None` on any error and truncating (at a
+/// char boundary) to a bounded size so a pathological manifest cannot blow up
+/// the scan. Manifests are normally tiny; the cap is purely defensive.
+fn read_capped(path: &Path) -> Option<String> {
+    const MAX_MANIFEST_BYTES: usize = 256 * 1024;
+    let mut content = std::fs::read_to_string(path).ok()?;
+    if content.len() > MAX_MANIFEST_BYTES {
+        let mut end = MAX_MANIFEST_BYTES;
+        while end > 0 && !content.is_char_boundary(end) {
+            end -= 1;
+        }
+        content.truncate(end);
+    }
+    Some(content)
+}
+
+/// Extract dependency names from `Cargo.toml` content via a line scan.
+///
+/// Tracks the current `[section]` header and, while inside a dependency section
+/// ([`CARGO_DEP_SECTIONS`]), takes the key to the left of `=` on each entry. The
+/// `name.workspace = true` / `name.version = ".."` forms yield `name` (the part
+/// before the first dot). The `[dependencies.NAME]` sub-table header yields
+/// `NAME`. This is a best-effort scan, not a full TOML parse -- unusual
+/// formatting simply yields fewer names.
+fn parse_cargo_dependencies(content: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut in_dep_section = false;
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') {
+            in_dep_section = CARGO_DEP_SECTIONS.contains(&line);
+            if let Some(name) = cargo_subtable_dep(line) {
+                if is_valid_dep_name(&name) {
+                    names.push(name);
+                }
+            }
+            continue;
+        }
+        if !in_dep_section {
+            continue;
+        }
+        if let Some((key, _)) = line.split_once('=') {
+            // `name.workspace`/`name.version` -> take the leading segment.
+            let name = key
+                .trim()
+                .split('.')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .trim_matches('"');
+            if is_valid_dep_name(name) {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names
+}
+
+/// Extract the dependency name from a `[dependencies.NAME]` style sub-table
+/// header, or `None` if the header is not a dependency sub-table.
+fn cargo_subtable_dep(header: &str) -> Option<String> {
+    let inner = header.strip_prefix('[')?.strip_suffix(']')?;
+    for prefix in [
+        "dependencies.",
+        "dev-dependencies.",
+        "build-dependencies.",
+        "workspace.dependencies.",
+    ] {
+        if let Some(rest) = inner.strip_prefix(prefix) {
+            let name = rest.split('.').next().unwrap_or("").trim();
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
+/// Extract dependency names from `package.json` content via a line scan.
+///
+/// Tracks whether the scan is inside a dependency object (`dependencies`,
+/// `devDependencies`, `peerDependencies`, `optionalDependencies`) and takes the
+/// quoted key from each `"name": "range"` entry, stopping at the closing brace.
+/// Best-effort for the conventional pretty-printed layout (one dependency per
+/// line); a minified single-line file yields little or nothing.
+fn parse_package_json_dependencies(content: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut in_deps = false;
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.contains("\"dependencies\"")
+            || line.contains("\"devDependencies\"")
+            || line.contains("\"peerDependencies\"")
+            || line.contains("\"optionalDependencies\"")
+        {
+            in_deps = true;
+            continue;
+        }
+        if !in_deps {
+            continue;
+        }
+        if line.starts_with('}') {
+            in_deps = false;
+            continue;
+        }
+        // Entry form: `"name": "range",`.
+        if let Some(rest) = line.strip_prefix('"') {
+            if let Some((key, _)) = rest.split_once('"') {
+                if is_valid_dep_name(key) {
+                    names.push(key.to_string());
+                }
+            }
+        }
+    }
+    names
+}
+
+/// Whether `name` looks like a real dependency identifier rather than a parsing
+/// artifact: non-empty, bounded length, made of name characters, and containing
+/// at least one alphanumeric. Allows the npm scope/path characters `@` and `/`.
+fn is_valid_dep_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '/' | '@' | '.'))
+        && name.chars().any(|c| c.is_ascii_alphanumeric())
+}
+
 /// Push `value` into `vec` only if not already present (cheap dedup during walk).
 fn push_unique(vec: &mut Vec<String>, value: &str) {
     if !vec.iter().any(|v| v == value) {
@@ -744,5 +922,77 @@ mod tests {
             rust_w > js_w,
             "actively-edited rust ({rust_w}) should outrank census-dominant js ({js_w})"
         );
+    }
+
+    /// parse_cargo_dependencies pulls names from dependency sections only.
+    #[test]
+    fn parse_cargo_deps_extracts_names() {
+        let toml = "[package]\nname = \"x\"\n\n[dependencies]\nserde = \"1\"\n\
+                    axum = { version = \"0.7\" }\ntokio.workspace = true\n\n\
+                    [dev-dependencies]\ntempfile = \"3\"\n";
+        let deps = parse_cargo_dependencies(toml);
+        assert!(deps.contains(&"serde".to_string()));
+        assert!(deps.contains(&"axum".to_string()));
+        assert!(deps.contains(&"tokio".to_string()));
+        assert!(deps.contains(&"tempfile".to_string()));
+        // The [package] name field is not a dependency.
+        assert!(!deps.contains(&"name".to_string()));
+    }
+
+    /// parse_cargo_dependencies handles `[dependencies.NAME]` sub-tables and does
+    /// not treat their fields as dependencies.
+    #[test]
+    fn parse_cargo_deps_handles_subtables() {
+        let toml = "[dependencies.bb8]\nversion = \"0.9\"\n[dependencies]\nserde = \"1\"\n";
+        let deps = parse_cargo_dependencies(toml);
+        assert!(deps.contains(&"bb8".to_string()));
+        assert!(deps.contains(&"serde".to_string()));
+        assert!(!deps.contains(&"version".to_string()));
+    }
+
+    /// parse_package_json_dependencies pulls names from dependency objects only.
+    #[test]
+    fn parse_package_json_deps_extracts_names() {
+        let json = "{\n  \"name\": \"app\",\n  \"dependencies\": {\n    \
+                    \"react\": \"^18\",\n    \"next\": \"14\"\n  },\n  \
+                    \"devDependencies\": {\n    \"vitest\": \"^1\"\n  }\n}\n";
+        let deps = parse_package_json_dependencies(json);
+        assert!(deps.contains(&"react".to_string()));
+        assert!(deps.contains(&"next".to_string()));
+        assert!(deps.contains(&"vitest".to_string()));
+        // The top-level package name is not a dependency.
+        assert!(!deps.contains(&"name".to_string()));
+    }
+
+    /// manifest_dependency_tokens lowercases and deduplicates harvested names.
+    #[test]
+    fn manifest_tokens_lowercases_and_dedups() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[dependencies]\naxum = \"0.7\"\nSERDE = \"1\"\naxum = \"0.7\"\n",
+        )
+        .unwrap();
+        let tokens = manifest_dependency_tokens(tmp.path());
+        assert!(tokens.contains(&"axum".to_string()));
+        assert!(tokens.contains(&"serde".to_string()));
+        assert_eq!(
+            tokens.iter().filter(|t| *t == "axum").count(),
+            1,
+            "duplicate dependency names are collapsed"
+        );
+    }
+
+    /// sense() exposes manifest dependency names via context_tokens.
+    #[test]
+    fn sense_populates_context_tokens_from_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\n[dependencies]\naxum = \"0.7\"\n",
+        )
+        .unwrap();
+        let sig = sense(tmp.path(), None);
+        assert!(sig.context_tokens.contains(&"axum".to_string()));
     }
 }
