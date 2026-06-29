@@ -1,12 +1,21 @@
 //! Scoring policy: rank personas against a context signal.
 
 use crate::context::ContextSignal;
+use crate::embed::{semantic_similarity, Embedder};
 use crate::feedback::Preferences;
-use crate::index::PersonaIndex;
+use crate::index::{PersonaIndex, PersonaProfile};
 
 /// Score added per project-dependency token (from `ContextSignal::context_tokens`)
 /// that matches a persona keyword.
 const CONTEXT_TOKEN_HIT: f32 = 0.04;
+
+/// Maximum additive bonus contributed by the semantic-similarity channel.
+///
+/// The cosine similarity in `[0, 1]` is scaled by this weight and added on top
+/// of the weighted blend, mirroring the context bonus: it can lift a persona
+/// whose meaning matches the task but never penalizes others or redistributes
+/// the primary weights. Contributes `0.0` when no embedder is supplied.
+const SEMANTIC_WEIGHT: f32 = 0.15;
 
 /// Maximum total bonus contributed by dependency-token matches. Capped so a
 /// dependency-heavy project cannot let framework matching dominate the language,
@@ -56,6 +65,10 @@ pub struct ScoreComponents {
     /// build-framework matches, added on top of the weighted blend rather than
     /// diluting the lexical channel.
     pub context: f32,
+    /// Semantic-similarity bonus (0..[`SEMANTIC_WEIGHT`]) from cosine distance
+    /// between the task text and the persona text, when an embedder is supplied.
+    /// `0.0` when no embedder is in use (the default), so it is inert by default.
+    pub semantic: f32,
 }
 
 /// A scored persona with rationale and confidence information.
@@ -78,7 +91,35 @@ pub struct Scored {
     pub components: ScoreComponents,
 }
 
-/// Rank all personas in `index` for the given `ctx`.
+/// Rank all personas in `index` for the given `ctx` without a semantic embedder.
+///
+/// Thin wrapper over [`rank_with_embedder`] with the embedder disabled. This is
+/// the default entry point; the semantic channel contributes `0.0`, so results
+/// are identical to the scorer before semantic matching was added.
+pub fn rank(
+    ctx: &ContextSignal,
+    index: &PersonaIndex,
+    weights: &PolicyWeights,
+    prefs: &Preferences,
+) -> Vec<Scored> {
+    rank_with_embedder(ctx, index, weights, prefs, None)
+}
+
+/// Build the text used to embed a persona for semantic matching.
+///
+/// Concatenates the persona's optional description with its keyword set so the
+/// embedder sees both the prose summary and the discriminating terms. Keyword
+/// order is unspecified (it is a set), which suits bag-of-words style embedders.
+fn persona_text(profile: &PersonaProfile) -> String {
+    let mut text = profile.description.clone().unwrap_or_default();
+    for kw in &profile.keywords {
+        text.push(' ');
+        text.push_str(kw);
+    }
+    text
+}
+
+/// Rank all personas in `index` for the given `ctx`, optionally using `embedder`.
 ///
 /// Scoring:
 /// - Language score: sum of `ctx.languages` weights for languages present in
@@ -87,16 +128,21 @@ pub struct Scored {
 ///   keywords; 0.0 if there are no task tokens.
 /// - Capability score: small bonus if the persona has no required tools and
 ///   no network egress (i.e. "safe" / simple persona).
+/// - Semantic score: when `embedder` is `Some` and the task has tokens, the
+///   cosine similarity between the task text and each persona's text, scaled by
+///   [`SEMANTIC_WEIGHT`] and added to the blend. `None` contributes `0.0`, so
+///   the default path has no semantic component and no behavior change.
 /// - Per-persona preference bias from `prefs` is added after blending and
 ///   clamped to [0.0, 1.0].
 ///
 /// Returns results sorted descending by blended score. Confidence is computed
 /// after sorting based on the top-vs-runner-up gap and absolute score.
-pub fn rank(
+pub fn rank_with_embedder(
     ctx: &ContextSignal,
     index: &PersonaIndex,
     weights: &PolicyWeights,
     prefs: &Preferences,
+    embedder: Option<&dyn Embedder>,
 ) -> Vec<Scored> {
     // Precompute IDF for each task token: tokens that appear in fewer persona
     // keyword sets are weighted higher (rare tokens are more discriminating).
@@ -227,14 +273,30 @@ pub fn rank(
                 .count();
             let context_score = (context_hits as f32 * CONTEXT_TOKEN_HIT).min(CONTEXT_TOKEN_CAP);
 
-            // Blended score. The context bonus is additive (not weighted): it can
-            // only raise a persona that matches project dependencies, never lower
-            // others or redistribute the primary weights.
+            // Semantic-similarity bonus: when an embedder is supplied, reward
+            // personas whose text is close in MEANING to the task -- catching
+            // matches the exact-token lexical channel misses. Additive and capped
+            // by SEMANTIC_WEIGHT, like the context bonus. The task text is the
+            // normalized task tokens; Phase 2 may embed the raw task hint instead.
+            // No embedder (the default) yields 0.0, so there is no regression.
+            let semantic_score = match embedder {
+                Some(emb) if !ctx.task_tokens.is_empty() => {
+                    let task_text = ctx.task_tokens.join(" ");
+                    let sim = semantic_similarity(emb, &task_text, &persona_text(profile));
+                    SEMANTIC_WEIGHT * sim
+                }
+                _ => 0.0,
+            };
+
+            // Blended score. The context and semantic bonuses are additive (not
+            // weighted): they can only raise a persona that matches the project
+            // or the task meaning, never lower others or redistribute the weights.
             let blended = weights.language * lang_score
                 + weights.lexical * lex_score
                 + weights.intent * intent_score
                 + weights.capability * cap_score
-                + context_score;
+                + context_score
+                + semantic_score;
 
             // Apply preference bias and clamp.
             // Use intent-aware lookup when the context carries an inferred intent;
@@ -294,6 +356,9 @@ pub fn rank(
                     context_score
                 ));
             }
+            if semantic_score > 0.0 {
+                rationale_parts.push(format!("semantic_score={:.2}", semantic_score));
+            }
             if bias.abs() > f32::EPSILON {
                 rationale_parts.push(format!("pref_bias={:.3}", bias));
             }
@@ -314,6 +379,7 @@ pub fn rank(
                 intent: intent_score,
                 capability: cap_score,
                 context: context_score,
+                semantic: semantic_score,
             };
 
             Scored {
@@ -589,5 +655,45 @@ mod tests {
             "the cargo build framework should give the cargo-keyworded persona a bonus"
         );
         assert_eq!(ranked[0].persona, "rust-dev");
+    }
+
+    /// Without an embedder the semantic channel is inert: `rank` (and any caller
+    /// passing `None`) yields a semantic component of exactly 0.0. Regression
+    /// guard against the semantic bonus leaking into the default scoring path.
+    #[test]
+    fn semantic_channel_is_zero_without_embedder() {
+        let p = make_profile("rust-dev", &["rust"], &["rust", "cargo", "ownership"]);
+        let index = PersonaIndex { profiles: vec![p] };
+        let ctx = make_ctx(&[("rust", 1.0)], &["ownership"]);
+        let ranked = rank(&ctx, &index, &PolicyWeights::default(), &Preferences::new());
+        assert_eq!(ranked[0].components.semantic, 0.0);
+    }
+
+    /// With a (mock) embedder, a task hint that overlaps a persona's text earns a
+    /// positive semantic bonus that lifts the blended score above the no-embedder
+    /// baseline.
+    #[test]
+    fn semantic_channel_rewards_related_hint() {
+        use crate::embed::BagOfWordsEmbedder;
+
+        let p = make_profile("rust-dev", &["rust"], &["rust", "cargo", "ownership"]);
+        let index = PersonaIndex { profiles: vec![p] };
+        let ctx = make_ctx(&[("rust", 1.0)], &["ownership", "cargo"]);
+        let weights = PolicyWeights::default();
+
+        let baseline = rank(&ctx, &index, &weights, &Preferences::new());
+
+        let emb = BagOfWordsEmbedder;
+        let ranked =
+            rank_with_embedder(&ctx, &index, &weights, &Preferences::new(), Some(&emb));
+
+        assert!(
+            ranked[0].components.semantic > 0.0,
+            "an overlapping hint should produce a semantic bonus"
+        );
+        assert!(
+            ranked[0].score >= baseline[0].score,
+            "the semantic bonus must not lower the score"
+        );
     }
 }
