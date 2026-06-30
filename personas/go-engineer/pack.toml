@@ -3,6 +3,8 @@ name = "go-engineer"
 author_handle = "ghost-frame"
 author_pubkey = "UNSIGNED"
 version = "0.1.0"
+description = "Idiomatic Go services, concurrency, and backend engineering."
+tags = ["go", "backend", "concurrency", "services"]
 license = "Elastic-2.0"
 
 [capability_manifest]

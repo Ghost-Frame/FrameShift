@@ -3,6 +3,8 @@ name = "commit-curator"
 author_handle = "ghost-frame"
 author_pubkey = "UNSIGNED"
 version = "0.1.0"
+description = "Clean commit shaping, diff curation, and history hygiene."
+tags = ["git", "commits", "diffs", "hygiene"]
 license = "Elastic-2.0"
 
 [capability_manifest]

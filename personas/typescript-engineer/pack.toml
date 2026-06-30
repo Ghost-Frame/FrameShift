@@ -3,6 +3,8 @@ name = "typescript-engineer"
 author_handle = "ghost-frame"
 author_pubkey = "UNSIGNED"
 version = "0.1.0"
+description = "TypeScript applications, APIs, and typed full-stack work."
+tags = ["typescript", "javascript", "full-stack", "web"]
 license = "Elastic-2.0"
 
 [capability_manifest]

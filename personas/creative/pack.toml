@@ -3,6 +3,8 @@ name = "creative"
 author_handle = "ghost-frame"
 author_pubkey = "UNSIGNED"
 version = "0.1.0"
+description = "Idea generation, naming, concept work, and creative exploration."
+tags = ["creative", "brainstorming", "ideation", "concepts"]
 license = "Elastic-2.0"
 
 [capability_manifest]

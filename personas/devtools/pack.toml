@@ -3,6 +3,8 @@ name = "devtools"
 author_handle = "ghost-frame"
 author_pubkey = "UNSIGNED"
 version = "0.1.0"
+description = "Developer tooling, workflow automation, and local productivity systems."
+tags = ["tooling", "developer-experience", "automation", "workflows"]
 license = "Elastic-2.0"
 
 [capability_manifest]
