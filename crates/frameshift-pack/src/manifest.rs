@@ -54,6 +54,15 @@ pub struct PackManifest {
     /// scores below baseline on the OLD bundle, the upgrade is blocked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conformance_baseline: Option<ConformanceBaseline>,
+    /// One-line human-readable summary of what the persona is for. Consumed by the
+    /// orchestrator's selection scoring (lexical corpus now, semantic matching later)
+    /// and surfaced in marketplace/CLI listings. Optional for backward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Free-form topical tags (e.g. "rust", "backend") used to bias persona selection
+    /// and to power marketplace search/filtering. Defaults to empty for legacy manifests.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize, PartialEq)]
@@ -211,6 +220,8 @@ version = "0.1.0"
                 score: 0.85,
                 bundle_hash: "deadbeef".to_string(),
             }),
+            description: Some("A composed child persona for testing.".to_string()),
+            tags: vec!["test".to_string(), "composition".to_string()],
         };
 
         let serialized = toml::to_string(&original).unwrap();
@@ -235,11 +246,15 @@ version = "0.1.0"
             extends: None,
             mixin: Vec::new(),
             conformance_baseline: None,
+            description: None,
+            tags: Vec::new(),
         };
 
         let serialized = toml::to_string(&minimal).unwrap();
         assert!(!serialized.contains("extends"));
         assert!(!serialized.contains("mixin"));
         assert!(!serialized.contains("conformance_baseline"));
+        assert!(!serialized.contains("description"));
+        assert!(!serialized.contains("tags"));
     }
 }

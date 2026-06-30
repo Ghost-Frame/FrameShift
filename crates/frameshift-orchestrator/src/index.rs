@@ -64,6 +64,10 @@ struct PackManifest {
     #[serde(default)]
     description: Option<String>,
 
+    /// Topical tags that bias persona selection toward matching tasks.
+    #[serde(default)]
+    tags: Vec<String>,
+
     /// Optional capability manifest section.
     #[serde(default)]
     capability_manifest: Option<PackCapabilityManifest>,
@@ -230,6 +234,17 @@ impl PersonaProfile {
         // Include the persona name itself for self-match.
         corpus.push(' ');
         corpus.push_str(&name);
+        // Fold curated pack.toml metadata into the corpus so the persona's
+        // description and topical tags bias keyword-based selection alongside
+        // the AGENTS.md body. Empty values contribute nothing.
+        if let Some(desc) = &pack.description {
+            corpus.push(' ');
+            corpus.push_str(desc);
+        }
+        for tag in &pack.tags {
+            corpus.push(' ');
+            corpus.push_str(tag);
+        }
 
         let mut keywords = extract_keywords(&corpus);
         // Ensure the persona name (as a keyword token) is always present.

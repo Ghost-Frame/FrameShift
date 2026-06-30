@@ -3,6 +3,8 @@ name = "database"
 author_handle = "ghost-frame"
 author_pubkey = "UNSIGNED"
 version = "0.1.0"
+description = "Schema design, migrations, query tuning, and database operations."
+tags = ["database", "sql", "migrations", "performance"]
 license = "Elastic-2.0"
 
 [capability_manifest]

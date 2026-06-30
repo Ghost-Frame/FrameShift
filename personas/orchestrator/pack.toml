@@ -3,6 +3,8 @@ name = "orchestrator"
 author_handle = "ghost-frame"
 author_pubkey = "UNSIGNED"
 version = "0.1.0"
+description = "Task decomposition, subagent coordination, and workflow control."
+tags = ["orchestration", "coordination", "planning", "agents"]
 license = "Elastic-2.0"
 
 [capability_manifest]

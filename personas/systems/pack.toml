@@ -3,6 +3,8 @@ name = "systems"
 author_handle = "ghost-frame"
 author_pubkey = "UNSIGNED"
 version = "0.1.0"
+description = "Systems engineering across machines, services, shells, and operations."
+tags = ["systems", "operations", "shell", "services"]
 license = "Elastic-2.0"
 
 [capability_manifest]

@@ -3,6 +3,8 @@ name = "devops"
 author_handle = "ghost-frame"
 author_pubkey = "UNSIGNED"
 version = "0.1.0"
+description = "CI/CD, infrastructure automation, and operational delivery work."
+tags = ["devops", "ci-cd", "infrastructure", "operations"]
 license = "Elastic-2.0"
 
 [capability_manifest]

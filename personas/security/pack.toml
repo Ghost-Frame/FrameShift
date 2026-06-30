@@ -3,6 +3,8 @@ name = "security"
 author_handle = "ghost-frame"
 author_pubkey = "UNSIGNED"
 version = "0.1.0"
+description = "Security review, hardening, and threat-focused engineering."
+tags = ["security", "hardening", "auth", "threat-modeling"]
 license = "Elastic-2.0"
 
 [capability_manifest]
