@@ -29,6 +29,8 @@
 //! | `R2_REGION` | `auto` | S3 region (R2 always uses `auto`) |
 //! | `R2_ACCESS_KEY_ID` | `""` | Access key ID for the bucket |
 //! | `R2_SECRET_ACCESS_KEY` | `""` | Secret access key (supplied via a secrets manager in production) |
+//! | `TRUST_FORWARDED_FOR` | `false` | Trust `X-Forwarded-For` for rate-limit key extraction; set `true` only behind a trusted proxy |
+//! | `SIGNED_REQUEST_MAX_SKEW_SECS` | `300` | Max allowed clock skew (seconds) between a signed write request's timestamp and server time; also bounds the replay-nonce retention window |
 //!
 //! Env var names match the struct field names verbatim (figment maps
 //! `download_secret` <-> `DOWNLOAD_SECRET`); shorter aliases would require an
@@ -184,11 +186,30 @@ pub struct ServerConfig {
     /// appear in `Debug` output. Supplied via a secrets manager in production.
     pub r2_secret_access_key: SecretString,
 
+    /// Whether to trust the `X-Forwarded-For` header for rate-limit key extraction.
+    ///
+    /// Set `true` only when a trusted reverse proxy (e.g. Pangolin Traefik)
+    /// rewrites XFF before requests reach this server. When `false` (default),
+    /// the raw socket peer IP is used, preventing rate-limit bypass by clients
+    /// spoofing the XFF header.
+    pub trust_forwarded_for: bool,
+
+    /// Maximum allowed clock skew between a signed write request's timestamp
+    /// and the server's wall clock.
+    ///
+    /// Requests whose `X-Frameshift-Timestamp` is more than this far from
+    /// `now` (in either direction) are rejected with `401`. This bounds the
+    /// replay window: a captured signed request can only be re-sent for at
+    /// most `2 * signed_request_max_skew` before the nonce can be safely
+    /// forgotten. Applies to publish, author registration, and key rotation.
+    /// Default: 300 seconds (5 minutes).
+    pub signed_request_max_skew: Duration,
+
     /// Memory backend selector: `"none"` (default), `"http"`, or `"sqlite"`.
     ///
     /// - `"none"` -- no memory adapter; personas that require memory will fail
     ///   to load with a hard capability error.
-    /// - `"http"` -- connects to an HTTP memory endpoint (e.g. syntheos-memory-gateway).
+    /// - `"http"` -- connects to an HTTP memory gateway endpoint.
     /// - `"sqlite"` -- uses a local SQLite FTS5 database.
     pub memory_backend: String,
 
@@ -283,6 +304,8 @@ impl std::fmt::Debug for ServerConfig {
             .field("r2_region", &self.r2_region)
             .field("r2_access_key_id", &self.r2_access_key_id)
             .field("r2_secret_access_key", &"[REDACTED]")
+            .field("trust_forwarded_for", &self.trust_forwarded_for)
+            .field("signed_request_max_skew", &self.signed_request_max_skew)
             .field("memory_backend", &self.memory_backend)
             .field("memory_http_endpoint", &self.memory_http_endpoint)
             .field("memory_http_auth", &"[REDACTED]")
@@ -357,6 +380,13 @@ struct RawConfig {
     /// R2 secret access key (raw string, wrapped in `SecretString` on convert).
     r2_secret_access_key: String,
 
+    /// Whether to trust XFF for rate limiting (maps to `TRUST_FORWARDED_FOR`).
+    trust_forwarded_for: bool,
+
+    /// Max signed-request clock skew in seconds (maps to
+    /// `SIGNED_REQUEST_MAX_SKEW_SECS`).
+    signed_request_max_skew_secs: u64,
+
     /// Memory backend selector.
     memory_backend: String,
     /// HTTP memory endpoint URL.
@@ -396,6 +426,8 @@ impl RawConfig {
             r2_region: self.r2_region,
             r2_access_key_id: self.r2_access_key_id,
             r2_secret_access_key: SecretString::new(self.r2_secret_access_key),
+            trust_forwarded_for: self.trust_forwarded_for,
+            signed_request_max_skew: Duration::from_secs(self.signed_request_max_skew_secs),
             memory_backend: self.memory_backend,
             memory_http_endpoint: self.memory_http_endpoint,
             memory_http_auth: self.memory_http_auth,
@@ -431,6 +463,8 @@ fn default_raw_config() -> RawConfig {
         r2_region: "auto".to_string(),
         r2_access_key_id: String::new(),
         r2_secret_access_key: String::new(),
+        trust_forwarded_for: false,
+        signed_request_max_skew_secs: 300,
         memory_backend: "none".to_string(),
         memory_http_endpoint: String::new(),
         memory_http_auth: "none".to_string(),
@@ -495,6 +529,8 @@ mod tests {
             r2_region: "auto".to_string(),
             r2_access_key_id: String::new(),
             r2_secret_access_key: SecretString::new(String::new()),
+            trust_forwarded_for: false,
+            signed_request_max_skew: Duration::from_secs(300),
             memory_backend: "none".to_string(),
             memory_http_endpoint: String::new(),
             memory_http_auth: "none".to_string(),
@@ -532,6 +568,8 @@ mod tests {
             r2_region: "auto".to_string(),
             r2_access_key_id: String::new(),
             r2_secret_access_key: SecretString::new(String::new()),
+            trust_forwarded_for: false,
+            signed_request_max_skew: Duration::from_secs(300),
             memory_backend: "none".to_string(),
             memory_http_endpoint: String::new(),
             memory_http_auth: "none".to_string(),
@@ -565,6 +603,8 @@ mod tests {
             r2_region: "auto".to_string(),
             r2_access_key_id: String::new(),
             r2_secret_access_key: SecretString::new(String::new()),
+            trust_forwarded_for: false,
+            signed_request_max_skew: Duration::from_secs(300),
             memory_backend: "none".to_string(),
             memory_http_endpoint: String::new(),
             memory_http_auth: "none".to_string(),
@@ -625,6 +665,8 @@ mod tests {
             r2_region: "auto".to_string(),
             r2_access_key_id: String::new(),
             r2_secret_access_key: SecretString::new(String::new()),
+            trust_forwarded_for: false,
+            signed_request_max_skew: Duration::from_secs(300),
             memory_backend: "none".to_string(),
             memory_http_endpoint: String::new(),
             memory_http_auth: "none".to_string(),

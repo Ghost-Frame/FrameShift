@@ -21,45 +21,41 @@
 
 use axum::body::Body;
 use axum::extract::{Multipart, Path, Query, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use chrono::Utc;
 use ed25519_dalek::{Signature, VerifyingKey};
 use frameshift_catalog::filters::{PackSearchFilters, SortMode};
 use frameshift_catalog::records::PackVersionRecord;
 use frameshift_catalog::status::PackStatus;
 use frameshift_catalog::CatalogError;
+use frameshift_catalog::Ed25519PublicKey;
 use frameshift_objects::{ObjectHash, ObjectStoreError};
 use frameshift_pack::Pack;
 use serde::{Deserialize, Serialize};
 
+use crate::auth::VerifiedSigner;
 use crate::error::AppError;
 use crate::state::AppState;
 
-/// HTTP header used to carry the session token for publish endpoints.
+/// Build the packs **read** sub-router, mounted at `/v1/packs`.
 ///
-/// TODO(M5): real session token verification. For now any non-empty value is
-/// accepted to gate the endpoint without coupling to a full auth system.
-pub const SESSION_HEADER: &str = "x-frameshift-session";
-
-/// Build the packs sub-router, mounted at `/v1/packs`.
-///
-/// Routes:
+/// Routes (all anonymous):
 /// - `GET /` -> [`search_packs`]
 /// - `GET /{name}` -> [`get_pack`]
 /// - `GET /{name}/versions` -> [`list_pack_versions`]
 /// - `GET /{name}/versions/{version}` -> [`get_pack_version`]
 /// - `GET /{name}/versions/{version}/pack` -> [`download_pack_bytes`]
+///
+/// The mutating `POST /v1/packs` ([`publish_pack`]) is wired separately in
+/// [`crate::router::app`] so it can carry the signed-request auth layer; it is
+/// deliberately NOT part of this read router.
 pub fn packs_router() -> Router<AppState> {
     Router::new()
-        .route("/", get(search_packs).post(publish_pack))
+        .route("/", get(search_packs))
         .route("/{name}", get(get_pack))
-        .route(
-            "/{name}/telemetry",
-            get(crate::routes::telemetry::get_pack_telemetry),
-        )
         .route("/{name}/versions", get(list_pack_versions))
         .route("/{name}/versions/{version}", get(get_pack_version))
         .route("/{name}/versions/{version}/pack", get(download_pack_bytes))
@@ -99,28 +95,6 @@ struct PublishFields {
     signature: Option<Vec<u8>>,
     /// The handle of the publishing author, used to look up the registered key.
     author_handle: Option<String>,
-}
-
-/// Verify that a non-empty `X-Frameshift-Session` header is present.
-///
-/// Returns `Ok(())` if the header exists and contains at least one
-/// non-whitespace character. Returns `AppError::BadRequest` with a
-/// `401`-shaped message via `unauthorized` otherwise.
-///
-/// TODO(M5): real session token verification (currently accepts any
-/// non-empty value).
-pub fn verify_session_header(headers: &HeaderMap) -> Result<(), AppError> {
-    let token = headers
-        .get(SESSION_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    if token.is_none() {
-        return Err(AppError::Unauthorized(
-            "missing or empty X-Frameshift-Session header".to_string(),
-        ));
-    }
-    Ok(())
 }
 
 /// Stream a multipart body into [`PublishFields`].
@@ -166,6 +140,50 @@ async fn collect_multipart(mut multipart: Multipart) -> Result<PublishFields, Ap
     Ok(fields)
 }
 
+/// A [`std::io::Read`] adapter that fails once more than `limit` total bytes
+/// have been pulled from the underlying reader.
+///
+/// This is the decompression-bomb guard. It counts the *actual* bytes read
+/// through the gzip decoder, so a tar entry that lies about its size in the
+/// header (e.g. declares `size = 0` while carrying megabytes of data) cannot
+/// bypass the ceiling -- the cap is enforced on real decompressed throughput,
+/// not on the attacker-controlled header field.
+struct LimitedReader<R> {
+    /// The wrapped reader (the gzip-decompressed tar byte stream).
+    inner: R,
+    /// Maximum number of bytes allowed to be read in total.
+    limit: u64,
+    /// Running count of bytes read so far.
+    read: u64,
+}
+
+impl<R: std::io::Read> LimitedReader<R> {
+    /// Wrap `inner`, allowing at most `limit` total bytes to be read.
+    fn new(inner: R, limit: u64) -> Self {
+        Self {
+            inner,
+            limit,
+            read: 0,
+        }
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for LimitedReader<R> {
+    /// Read into `buf`, returning an error once the cumulative byte count would
+    /// exceed `limit`.
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.read = self.read.saturating_add(n as u64);
+        if self.read > self.limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "pack archive exceeds maximum decompressed size",
+            ));
+        }
+        Ok(n)
+    }
+}
+
 /// Extract a `.tar.gz` archive into `dir`, enforcing
 /// [`MAX_DECOMPRESSED_BYTES`] across all entries.
 ///
@@ -174,23 +192,28 @@ async fn collect_multipart(mut multipart: Multipart) -> Result<PublishFields, Ap
 async fn extract_targz(archive_bytes: Vec<u8>, dir: std::path::PathBuf) -> Result<(), AppError> {
     tokio::task::spawn_blocking(move || -> Result<(), AppError> {
         let gz = flate2::read::GzDecoder::new(std::io::Cursor::new(archive_bytes));
-        let mut archive = tar::Archive::new(gz);
+        // Cap the actual decompressed byte count (not the attacker-controlled
+        // tar header `size` field) so a forged header cannot exhaust the temp
+        // directory.
+        let limited = LimitedReader::new(gz, MAX_DECOMPRESSED_BYTES);
+        let mut archive = tar::Archive::new(limited);
         archive.set_preserve_permissions(false);
         archive.set_overwrite(true);
 
-        let mut total: u64 = 0;
         let entries = archive
             .entries()
             .map_err(|e| AppError::BadRequest(format!("tar entries: {e}")))?;
         for entry in entries {
-            let mut entry =
-                entry.map_err(|e| AppError::BadRequest(format!("tar entry: {e}")))?;
-            let size = entry.header().size().unwrap_or(0);
-            total = total.saturating_add(size);
-            if total > MAX_DECOMPRESSED_BYTES {
-                return Err(AppError::BadRequest(format!(
-                    "pack archive exceeds maximum decompressed size of {MAX_DECOMPRESSED_BYTES} bytes"
-                )));
+            let mut entry = entry.map_err(|e| AppError::BadRequest(format!("tar entry: {e}")))?;
+            // Reject any entry that is not a regular file or directory. Symlinks,
+            // hardlinks, and device nodes have no legitimate place in a pack and
+            // could be used to plant a link that escapes the extraction dir or
+            // is later read through.
+            let entry_type = entry.header().entry_type();
+            if !(entry_type.is_file() || entry_type.is_dir()) {
+                return Err(AppError::BadRequest(
+                    "pack archive contains a non-regular file entry".to_string(),
+                ));
             }
             // Path-traversal protection: only allow paths relative to dir.
             let path = entry
@@ -250,8 +273,16 @@ fn find_pack_root(extract_dir: &std::path::Path) -> Result<std::path::PathBuf, A
 ///   registered Ed25519 public key in the catalog; the signature is verified
 ///   against that key.
 ///
-/// Requires a non-empty `X-Frameshift-Session` header. Real session token
-/// verification is deferred (TODO(M5)).
+/// # Authentication
+///
+/// The mutating route carries the signed-request layer
+/// ([`crate::middleware::auth::require_signed_request`]), so by the time this
+/// handler runs a [`VerifiedSigner`] extension is present, proving the live
+/// request was signed by some Ed25519 key. This handler additionally enforces
+/// **authorization**: the verified signer MUST be the key currently registered
+/// for `author_handle`, and the pack's own content signature MUST verify
+/// against that same key. A live request signed by a different key than the
+/// handle's owner is rejected as `401`.
 ///
 /// # Response
 ///
@@ -262,17 +293,16 @@ fn find_pack_root(extract_dir: &std::path::Path) -> Result<std::path::PathBuf, A
 /// - `400 Bad Request` -- missing required multipart field, malformed pack
 ///   archive, signature is not 64 bytes, or the pack's declared author handle
 ///   does not match the supplied `author_handle`.
-/// - `401 Unauthorized` -- session header missing/empty, author handle not
-///   registered, or signature does not verify against the registered key.
+/// - `401 Unauthorized` -- author handle not registered, the verified request
+///   signer is not the handle's owner, or the pack content signature does not
+///   verify against the registered key.
 /// - `409 Conflict` -- `(name, version)` already published.
 /// - `500 Internal Server Error` -- catalog or object store backend failure.
 pub async fn publish_pack(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    Extension(signer): Extension<VerifiedSigner>,
     multipart: Multipart,
 ) -> Result<Response, AppError> {
-    verify_session_header(&headers)?;
-
     let fields = collect_multipart(multipart).await?;
 
     let pack_archive = fields
@@ -303,12 +333,28 @@ pub async fn publish_pack(
     let pubkey = match state.catalog.get_handle_pubkey(&author_handle).await {
         Ok(k) => k,
         Err(CatalogError::NotFound { .. }) => {
-            return Err(AppError::Unauthorized(format!(
-                "author handle not registered: {author_handle}"
-            )));
+            // Log the handle internally but return a fixed message so the
+            // response cannot be used to enumerate which handles are registered.
+            tracing::warn!(handle = %author_handle, "publish attempt for unregistered author handle");
+            return Err(AppError::Unauthorized("authentication failed".to_string()));
         }
         Err(e) => return Err(AppError::from_catalog(e, "handle")),
     };
+
+    // Authorization: the live, signed request MUST come from the key that owns
+    // this handle. The signed-request middleware proved the caller controls
+    // `signer.pubkey`; here we bind that identity to the claimed handle so a
+    // caller cannot publish under a handle they do not control. The message is
+    // the same opaque "authentication failed" returned elsewhere.
+    if signer.pubkey != pubkey {
+        tracing::warn!(
+            handle = %author_handle,
+            signer = %signer.pubkey,
+            "publish attempt where request signer is not the handle owner"
+        );
+        return Err(AppError::Unauthorized("authentication failed".to_string()));
+    }
+
     let verifying_key = VerifyingKey::from_bytes(&pubkey.0)
         .map_err(|e| AppError::Internal(format!("invalid registered pubkey: {e}")))?;
 
@@ -333,7 +379,7 @@ pub async fn publish_pack(
     use ed25519_dalek::Verifier as _;
     verifying_key
         .verify(&pack.canonical_hash(), &signature)
-        .map_err(|_| AppError::Unauthorized("signature verification failed".to_string()))?;
+        .map_err(|_| AppError::Unauthorized("authentication failed".to_string()))?;
 
     let manifest = pack.manifest().clone();
 
@@ -399,14 +445,6 @@ pub async fn publish_pack(
         parent_hash,
         capability_manifest_json,
         schema_version: manifest.schema_version,
-        conformance_score: manifest
-            .conformance_baseline
-            .as_ref()
-            .map(|baseline| baseline.score),
-        conformance_bundle_hash: manifest
-            .conformance_baseline
-            .as_ref()
-            .map(|baseline| baseline.bundle_hash.clone()),
         license: manifest.license.clone().unwrap_or_default(),
         published_at: Utc::now(),
         status: PackStatus::Active,
@@ -440,6 +478,11 @@ pub async fn publish_pack(
     // resolves. The catalog trait does not expose a separate "upsert pack" call,
     // so we rely on backends that auto-create the parent record on
     // `register_pack_version` (per the trait's documented invariant).
+
+    // Increment the publish counter after all catalog and object-store calls
+    // have succeeded. Failures above return early via `?`, so reaching this
+    // point guarantees a fully committed publish.
+    state.metrics.packs_published_total.inc();
 
     let response = PublishResponse {
         pack_hash: canonical_hex,
@@ -628,10 +671,21 @@ pub async fn search_packs(
     let clamped = raw_limit.min(max);
     let was_clamped = clamped < raw_limit;
 
+    // Decode the optional author filter (base64url-no-pad Ed25519 public key).
+    // An invalid value is a client error rather than a silently-ignored filter.
+    let author = match q.author.as_deref() {
+        Some(s) => Some(s.parse::<Ed25519PublicKey>().map_err(|_| {
+            AppError::BadRequest(
+                "author must be a base64url-encoded Ed25519 public key".to_string(),
+            )
+        })?),
+        None => None,
+    };
+
     let filters = PackSearchFilters {
         query: q.query,
         tag: q.tag,
-        author: None, // author pubkey decoding deferred; pass None for now
+        author,
         target_context: None,
         extends: q.extends,
         sort,
@@ -644,6 +698,9 @@ pub async fn search_packs(
         .search_packs(&filters)
         .await
         .map_err(|e| AppError::from_catalog(e, "pack"))?;
+
+    // Increment the search counter after a successful catalog call.
+    state.metrics.searches_total.inc();
 
     let body = Json(SearchResponse { results });
 
@@ -743,6 +800,7 @@ pub async fn get_pack_version(
     Path((name, version)): Path<(String, String)>,
 ) -> Result<Json<frameshift_catalog::PackVersionRecord>, AppError> {
     validate_pack_name(&name)?;
+    validate_pack_version(&version)?;
     let record = state
         .catalog
         .get_pack_version(&name, &version)
@@ -800,6 +858,16 @@ pub async fn download_pack_bytes(
         .await
         .map_err(|e| AppError::from_catalog(e, "pack_version"))?;
 
+    // Do not serve tombstoned (taken-down) versions, even via the direct URL.
+    // Search already hides them; this closes the direct-download bypass so a
+    // takedown is effective on every path. A 404 (not 403) avoids confirming
+    // that the version ever existed.
+    if !matches!(version_record.status, PackStatus::Active) {
+        return Err(AppError::NotFound(format!(
+            "pack version not found: {name}@{version}"
+        )));
+    }
+
     // Step 2: fetch bytes from the object store.
     // A NotFound here means catalog/objects are inconsistent -> 502.
     let bytes = state
@@ -821,6 +889,15 @@ pub async fn download_pack_bytes(
         )
         .body(Body::from(bytes))
         .map_err(|e| AppError::Internal(format!("response builder error: {e}")))?;
+
+    // Count successful direct-download responses.
+    state.metrics.pack_downloads_total.inc();
+
+    // Record the download for trending ranking. Best-effort: a failure here must
+    // not fail the download the client already received.
+    if let Err(e) = state.catalog.record_download(&name, &version).await {
+        tracing::warn!(pack = %name, version = %version, error = %e, "record_download failed");
+    }
 
     Ok(response)
 }

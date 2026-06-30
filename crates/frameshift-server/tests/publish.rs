@@ -34,6 +34,7 @@ use frameshift_catalog::identity::Ed25519PublicKey;
 use frameshift_catalog::records::{AuthorRecord, PackRecord};
 use frameshift_pack::Pack;
 
+use frameshift_server::metrics::Metrics;
 use frameshift_server::{app, AppState, LogFormat, ServerConfig};
 
 use mocks::catalog::MockCatalog;
@@ -50,6 +51,8 @@ fn test_config() -> Arc<ServerConfig> {
         log_format: LogFormat::Text,
         max_request_bytes: 4 * 1024 * 1024,
         max_search_limit: 100,
+        trust_forwarded_for: false,
+        signed_request_max_skew: Duration::from_secs(300),
         shutdown_grace: Duration::from_secs(1),
         cors_allowed_origins: String::new(),
         download_secret: SecretString::new(String::new()),
@@ -79,6 +82,12 @@ fn make_state(catalog: MockCatalog, objects: MockPackStore) -> AppState {
         runtime: None,
         memory: None,
         config: test_config(),
+        // Each test gets its own registry for counter isolation.
+        metrics: Arc::new(Metrics::new()),
+        // Fresh replay-nonce cache per state.
+        auth_nonces: Arc::new(frameshift_server::auth::NonceCache::new(
+            Duration::from_secs(600),
+        )),
     }
 }
 
@@ -86,7 +95,7 @@ fn make_state(catalog: MockCatalog, objects: MockPackStore) -> AppState {
 /// and author handle.
 fn write_pack(dir: &Path, name: &str, version: &str, handle: &str) {
     let manifest = format!(
-        "schema_version = 1\nname = \"{name}\"\nauthor_handle = \"{handle}\"\nauthor_pubkey = \"placeholder\"\nversion = \"{version}\"\nlicense = \"MIT\"\n"
+        "schema_version = 1\nname = \"{name}\"\nauthor_handle = \"{handle}\"\nauthor_pubkey = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\nversion = \"{version}\"\nlicense = \"MIT\"\n"
     );
     std::fs::create_dir_all(dir).unwrap();
     std::fs::write(dir.join("pack.toml"), manifest).unwrap();
@@ -151,24 +160,27 @@ fn build_multipart(
 }
 
 /// Issue a `POST /v1/packs` multipart request and return the response.
+///
+/// When `request_key` is `Some`, the request is signed with that Ed25519 key
+/// using the signed-request envelope (the only accepted auth). When `None`, no
+/// auth headers are sent -- used to assert the unauthenticated rejection.
 async fn post_publish(
     state: AppState,
     pack_bytes: &[u8],
     signature: &[u8],
     author_handle: &str,
-    session: Option<&str>,
+    request_key: Option<&SigningKey>,
 ) -> axum::http::Response<Body> {
     let boundary = "frameshifttestboundary";
     let body = build_multipart(boundary, pack_bytes, signature, author_handle);
-    let mut req = Request::builder()
-        .method("POST")
-        .uri("/v1/packs")
-        .header(
-            "content-type",
-            format!("multipart/form-data; boundary={boundary}"),
-        );
-    if let Some(token) = session {
-        req = req.header("x-frameshift-session", token);
+    let mut req = Request::builder().method("POST").uri("/v1/packs").header(
+        "content-type",
+        format!("multipart/form-data; boundary={boundary}"),
+    );
+    if let Some(key) = request_key {
+        for h in mocks::signing::signed_headers(key, "POST", "/v1/packs", &body) {
+            req = req.header(h.name, h.value);
+        }
     }
     let req = req.body(Body::from(body)).unwrap();
     app(state).oneshot(req).await.unwrap()
@@ -263,17 +275,25 @@ async fn publish_happy_path_returns_200_and_pack_is_fetchable() {
         &prepared.targz,
         &prepared.signature,
         "alice",
-        Some("any-token"),
+        Some(&signing),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::OK, "expected 200, got {}", resp.status());
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "expected 200, got {}",
+        resp.status()
+    );
 
     let body = body_json(resp).await;
     assert_eq!(body["name"], "demo-pack");
     assert_eq!(body["version"], "0.1.0");
     assert_eq!(body["author_handle"], "alice");
     assert!(
-        body["pack_hash"].as_str().map(|s| s.len() == 64).unwrap_or(false),
+        body["pack_hash"]
+            .as_str()
+            .map(|s| s.len() == 64)
+            .unwrap_or(false),
         "pack_hash must be a 64-char hex string"
     );
 
@@ -317,7 +337,7 @@ async fn publish_bad_signature_returns_401() {
         &prepared.targz,
         &wrong_sig_bytes,
         "bob",
-        Some("any-token"),
+        Some(&signing),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -341,7 +361,7 @@ async fn publish_unregistered_author_returns_401() {
         &prepared.targz,
         &prepared.signature,
         "ghost",
-        Some("any-token"),
+        Some(&signing),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -365,7 +385,7 @@ async fn publish_duplicate_returns_409() {
         &prepared.targz,
         &prepared.signature,
         "carol",
-        Some("any-token"),
+        Some(&signing),
     )
     .await;
     assert_eq!(resp1.status(), StatusCode::OK);
@@ -376,19 +396,20 @@ async fn publish_duplicate_returns_409() {
         &prepared.targz,
         &prepared.signature,
         "carol",
-        Some("any-token"),
+        Some(&signing),
     )
     .await;
     assert_eq!(resp2.status(), StatusCode::CONFLICT);
 }
 
 // ---------------------------------------------------------------------------
-// missing session header
+// missing signed-request auth
 // ---------------------------------------------------------------------------
 
-/// POST without the `X-Frameshift-Session` header -> 401.
+/// POST without any signed-request auth headers -> 401 (the middleware rejects
+/// it before the handler runs).
 #[tokio::test]
-async fn publish_missing_session_returns_401() {
+async fn publish_missing_auth_returns_401() {
     let signing = SigningKey::from_bytes(&[12u8; 32]);
     let (catalog, _pubkey) = catalog_with_author(&signing, "dave");
     let prepared = prepare_pack("demo-pack", "0.1.0", "dave", &signing);
@@ -396,4 +417,80 @@ async fn publish_missing_session_returns_401() {
     let state = make_state(catalog, MockPackStore::new());
     let resp = post_publish(state, &prepared.targz, &prepared.signature, "dave", None).await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ---------------------------------------------------------------------------
+// request signed by a non-owner key
+// ---------------------------------------------------------------------------
+
+/// The pack is correctly signed by the handle owner, but the *live request* is
+/// signed by a different key. The handler's authorization check (signer must be
+/// the handle owner) rejects it -> 401. This is the core property the old
+/// "any non-empty session token" stub could not enforce.
+#[tokio::test]
+async fn publish_request_signed_by_non_owner_returns_401() {
+    let owner = SigningKey::from_bytes(&[20u8; 32]);
+    let (catalog, _pubkey) = catalog_with_author(&owner, "erin");
+    // The pack itself is validly signed by the owner key.
+    let prepared = prepare_pack("demo-pack", "0.1.0", "erin", &owner);
+
+    // But the HTTP request is signed by an unrelated key.
+    let attacker = SigningKey::from_bytes(&[21u8; 32]);
+
+    let state = make_state(catalog, MockPackStore::new());
+    let resp = post_publish(
+        state,
+        &prepared.targz,
+        &prepared.signature,
+        "erin",
+        Some(&attacker),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ---------------------------------------------------------------------------
+// replayed request
+// ---------------------------------------------------------------------------
+
+/// Replaying the exact same signed publish request (identical nonce) against
+/// the same server instance is rejected by the nonce cache -> 401.
+#[tokio::test]
+async fn publish_replayed_request_returns_401() {
+    let signing = SigningKey::from_bytes(&[22u8; 32]);
+    let (catalog, _pubkey) = catalog_with_author(&signing, "frank");
+    let objects = MockPackStore::new();
+    let prepared = prepare_pack("demo-pack", "0.1.0", "frank", &signing);
+
+    // One shared state so the nonce cache persists across both requests.
+    let state = make_state(catalog, objects);
+
+    let boundary = "frameshifttestboundary";
+    let body = build_multipart(boundary, &prepared.targz, &prepared.signature, "frank");
+    // Build a single set of signed headers and replay it verbatim.
+    let headers = mocks::signing::signed_headers(&signing, "POST", "/v1/packs", &body);
+    let build_req = || {
+        let mut req = Request::builder().method("POST").uri("/v1/packs").header(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}"),
+        );
+        for h in &headers {
+            req = req.header(h.name, h.value.clone());
+        }
+        req.body(Body::from(body.clone())).unwrap()
+    };
+
+    let resp1 = app(state.clone()).oneshot(build_req()).await.unwrap();
+    assert_eq!(
+        resp1.status(),
+        StatusCode::OK,
+        "first publish should succeed"
+    );
+
+    let resp2 = app(state).oneshot(build_req()).await.unwrap();
+    assert_eq!(
+        resp2.status(),
+        StatusCode::UNAUTHORIZED,
+        "replay with the same nonce must be rejected"
+    );
 }

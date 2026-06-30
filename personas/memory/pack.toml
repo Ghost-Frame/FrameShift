@@ -3,8 +3,6 @@ name = "memory"
 author_handle = "ghost-frame"
 author_pubkey = "UNSIGNED"
 version = "0.1.0"
-description = "Memory systems, retrieval, storage, and recall workflow design."
-tags = ["memory", "retrieval", "storage", "recall"]
 license = "Elastic-2.0"
 
 [capability_manifest]

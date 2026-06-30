@@ -5,9 +5,9 @@
 
 /// MCP server error types.
 pub mod error;
-/// JSON-RPC 2.0 protocol types and response helpers.
-pub mod protocol;
 /// Prompt definitions and dispatch logic (`prompts/list`, `prompts/get`).
 pub mod prompts;
+/// JSON-RPC 2.0 protocol types and response helpers.
+pub mod protocol;
 /// Tool definitions and dispatch logic (`tools/list`, `tools/call`).
 pub mod tools;

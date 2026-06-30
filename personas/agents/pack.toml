@@ -3,8 +3,6 @@ name = "agents"
 author_handle = "ghost-frame"
 author_pubkey = "UNSIGNED"
 version = "0.1.0"
-description = "Multi-agent coordination, delegation, and parallel execution workflows."
-tags = ["agents", "coordination", "delegation", "parallel"]
 license = "Elastic-2.0"
 
 [capability_manifest]

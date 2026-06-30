@@ -8,7 +8,24 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+
 use serde::{Deserialize, Serialize};
+
+/// Build the create+append `OpenOptions` used for every growth file.
+///
+/// Growth logs are strictly local and may reference private infrastructure,
+/// so on Unix the file is created with mode `0o600` (owner-only) to honor the
+/// growth-privacy invariant. The mode applies only when the file is created;
+/// pre-existing files keep their current permissions.
+fn growth_open_options() -> fs::OpenOptions {
+    let mut opts = fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    opts.mode(0o600);
+    opts
+}
 
 /// Errors from growth file operations.
 #[derive(Debug, thiserror::Error)]
@@ -71,14 +88,20 @@ pub fn append_with_timestamp(
         })?;
     }
 
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
+    let mut file = growth_open_options()
         .open(&growth_path)
         .map_err(|source| GrowthError::Io {
             path: growth_path.clone(),
             source,
         })?;
+
+    // Enforce owner-only perms even when appending to a pre-existing file --
+    // growth.md holds local learnings and must never be world-readable.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
+    }
 
     writeln!(
         file,
@@ -118,11 +141,6 @@ fn format_utc_now() -> String {
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
         year, month, day, hours, minutes, seconds
     )
-}
-
-/// Format the current UTC time as an RFC3339 timestamp for cross-crate callers.
-pub fn current_timestamp() -> String {
-    format_utc_now()
 }
 
 /// Convert days since Unix epoch to (year, month, day).
@@ -218,9 +236,7 @@ pub fn append_jsonl(
     })?;
     line.push('\n');
 
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
+    let mut file = growth_open_options()
         .open(&path)
         .map_err(|source| GrowthError::Io {
             path: path.clone(),
@@ -239,6 +255,14 @@ pub fn read_entries(
     persona_name: &str,
     scope: Scope,
 ) -> Result<Vec<GrowthEntry>, GrowthError> {
+    // Validate selectors before they are joined into the store path, matching
+    // the append paths -- an untrusted project_id/persona_name like `../..`
+    // could otherwise traverse out and read arbitrary growth logs.
+    validate_path_component(project_id)
+        .map_err(|_| GrowthError::InvalidPersonaName(project_id.to_string()))?;
+    validate_path_component(persona_name)
+        .map_err(|_| GrowthError::InvalidPersonaName(persona_name.to_string()))?;
+
     let path = match scope {
         Scope::Project => data_root
             .join("projects")
@@ -424,7 +448,14 @@ pub fn summarize(
     }
 
     let mut selected: Vec<&str> = by_intent.values().map(|e| e.text.as_str()).collect();
-    for entry in no_intent.iter().take(10 - selected.len()) {
+    // Cap the per-intent entries at the summary limit, and use saturating_sub so
+    // more than 10 unique intents cannot underflow `10 - len` (debug panic /
+    // release over-return).
+    selected.truncate(10);
+    for entry in no_intent
+        .iter()
+        .take(10usize.saturating_sub(selected.len()))
+    {
         // Simple Jaccard dedup: skip if > 50% token overlap with any selected entry.
         let tokens: std::collections::HashSet<&str> = entry.text.split_whitespace().collect();
         let is_dup = selected.iter().any(|existing| {
@@ -469,6 +500,26 @@ mod tests {
         assert!(path.exists());
         let content = fs::read_to_string(&path).unwrap();
         assert!(content.contains("first entry"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_creates_owner_only_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        append_with_timestamp(
+            tmp.path(),
+            "proj1",
+            "cryptographic",
+            "private infra note",
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
+        let path = tmp
+            .path()
+            .join("projects/proj1/personas/cryptographic/growth.md");
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "growth file must be owner-only readable");
     }
 
     #[test]

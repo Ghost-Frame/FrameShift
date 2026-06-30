@@ -26,8 +26,11 @@ impl MemoryId {
 }
 
 impl Default for MemoryId {
+    /// Returns a fixed nil (all-zeroes) sentinel UUID.
+    ///
+    /// Use [`MemoryId::new()`] to generate a unique random id.
     fn default() -> Self {
-        Self::new()
+        Self(uuid::Uuid::nil())
     }
 }
 

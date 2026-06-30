@@ -10,7 +10,15 @@ const MAX_FILES: usize = 2000;
 const MAX_DEPTH: usize = 6;
 
 /// Directories to skip entirely during the walk.
-const SKIP_DIRS: &[&str] = &[".git", "target", "node_modules", ".cache", "__pycache__", ".hg", ".svn"];
+const SKIP_DIRS: &[&str] = &[
+    ".git",
+    "target",
+    "node_modules",
+    ".cache",
+    "__pycache__",
+    ".hg",
+    ".svn",
+];
 
 /// A snapshot of the inferred work context for a project directory.
 #[derive(Debug, Clone, PartialEq)]
@@ -53,7 +61,13 @@ pub fn sense(project_root: &Path, task_hint: Option<&str>) -> ContextSignal {
     let mut frameworks: Vec<String> = Vec::new();
     let mut file_count = 0usize;
 
-    walk(project_root, 0, &mut raw_counts, &mut frameworks, &mut file_count);
+    walk(
+        project_root,
+        0,
+        &mut raw_counts,
+        &mut frameworks,
+        &mut file_count,
+    );
 
     // Deduplicate frameworks (marker files may appear at multiple levels).
     frameworks.sort();
@@ -173,25 +187,111 @@ fn detect_markers(
 /// cluster become available for matching. This closes vocabulary gaps
 /// between task descriptions and persona keyword sets.
 const DOMAIN_CLUSTERS: &[&[&str]] = &[
-    &["debug", "debugging", "error", "crash", "panic", "backtrace",
-      "stacktrace", "fix", "trace", "segfault", "coredump"],
-    &["security", "vulnerability", "cve", "audit", "pentest", "exploit",
-      "hardening", "threat", "compliance", "owasp"],
-    &["test", "testing", "unittest", "integration", "coverage", "assertion",
-      "mock", "fixture", "snapshot", "e2e"],
-    &["docs", "documentation", "readme", "tutorial", "changelog", "prose",
-      "copywriting", "draft", "publish", "article"],
-    &["perf", "performance", "benchmark", "profiling", "flamegraph",
-      "latency", "throughput", "optimization", "hotpath"],
-    &["deploy", "deployment", "infrastructure", "ci", "cd", "pipeline",
-      "container", "docker", "kubernetes", "systemd", "nginx"],
-    &["refactor", "refactoring", "cleanup", "restructure", "extract",
-      "inline", "rename", "decompose"],
+    &[
+        "debug",
+        "debugging",
+        "error",
+        "crash",
+        "panic",
+        "backtrace",
+        "stacktrace",
+        "fix",
+        "trace",
+        "segfault",
+        "coredump",
+    ],
+    &[
+        "security",
+        "vulnerability",
+        "cve",
+        "audit",
+        "pentest",
+        "exploit",
+        "hardening",
+        "threat",
+        "compliance",
+        "owasp",
+    ],
+    &[
+        "test",
+        "testing",
+        "unittest",
+        "integration",
+        "coverage",
+        "assertion",
+        "mock",
+        "fixture",
+        "snapshot",
+        "e2e",
+    ],
+    &[
+        "docs",
+        "documentation",
+        "readme",
+        "tutorial",
+        "changelog",
+        "prose",
+        "copywriting",
+        "draft",
+        "publish",
+        "article",
+    ],
+    &[
+        "perf",
+        "performance",
+        "benchmark",
+        "profiling",
+        "flamegraph",
+        "latency",
+        "throughput",
+        "optimization",
+        "hotpath",
+    ],
+    &[
+        "deploy",
+        "deployment",
+        "infrastructure",
+        "ci",
+        "cd",
+        "pipeline",
+        "container",
+        "docker",
+        "kubernetes",
+        "systemd",
+        "nginx",
+    ],
+    &[
+        "refactor",
+        "refactoring",
+        "cleanup",
+        "restructure",
+        "extract",
+        "inline",
+        "rename",
+        "decompose",
+    ],
     &["review", "reviewing", "pullrequest", "approve", "critique"],
-    &["implement", "implementing", "build", "create", "feature",
-      "scaffold", "wire", "integrate"],
-    &["design", "architect", "architecture", "plan", "planning",
-      "spec", "specification", "rfc", "proposal"],
+    &[
+        "implement",
+        "implementing",
+        "build",
+        "create",
+        "feature",
+        "scaffold",
+        "wire",
+        "integrate",
+    ],
+    &[
+        "design",
+        "architect",
+        "architecture",
+        "plan",
+        "planning",
+        "spec",
+        "specification",
+        "rfc",
+        "proposal",
+    ],
 ];
 
 /// Expand task tokens with domain cluster members.
@@ -223,10 +323,25 @@ fn expand_task_tokens(tokens: &mut Vec<String>) {
 /// These terms must be specific enough to identify a writing task without
 /// triggering for incidental mentions in code-focused personas.
 const PROSE_TASK_TRIGGERS: &[&str] = &[
-    "docs", "doc", "documentation", "changelog", "changelogs",
-    "readme", "tutorial", "tutorials", "release", "notes",
-    "prose", "writing", "copywriting", "blog", "post",
-    "draft", "publish", "article", "essay",
+    "docs",
+    "doc",
+    "documentation",
+    "changelog",
+    "changelogs",
+    "readme",
+    "tutorial",
+    "tutorials",
+    "release",
+    "notes",
+    "prose",
+    "writing",
+    "copywriting",
+    "blog",
+    "post",
+    "draft",
+    "publish",
+    "article",
+    "essay",
 ];
 
 /// Augment `languages` with a `prose` entry if the task tokens mention writing
@@ -307,8 +422,14 @@ mod tests {
     fn sense_rust_project() {
         let tmp = make_rust_project();
         let sig = sense(tmp.path(), None);
-        assert!(sig.languages.contains_key("rust"), "expected rust in languages");
-        assert!(sig.frameworks.contains(&"cargo".to_string()), "expected cargo framework");
+        assert!(
+            sig.languages.contains_key("rust"),
+            "expected rust in languages"
+        );
+        assert!(
+            sig.frameworks.contains(&"cargo".to_string()),
+            "expected cargo framework"
+        );
     }
 
     /// Task hint tokens are normalized and deduplicated.

@@ -33,6 +33,10 @@ pub struct UseArgs {
 /// first, then writes the active marker) and reads and prints the rendered
 /// output for the `claude` target.
 pub fn run_use(client: &Client, args: UseArgs) -> Result<(), CliError> {
+    // Reject unsafe names before `args.name` is joined to `--from` (or any
+    // central-store path); consistent with every other subcommand.
+    crate::util::validate_persona_name(&args.name)?;
+
     let project_root = std::env::current_dir()?;
 
     // If --from is given, check if already installed; if not, install first.
@@ -71,19 +75,6 @@ pub fn run_use(client: &Client, args: UseArgs) -> Result<(), CliError> {
             ClientError::PersonaNotInstalled(name) => CliError::PersonaNotFound { name },
             other => CliError::Orchestrator(other.to_string()),
         })?;
-
-    let session = format!("cli:{}", std::process::id());
-    client
-        .record_selection_event(&project_root, &args.name, &session, false, None)
-        .map_err(|e| CliError::Growth(e.to_string()))?;
-
-    if let Ok(registry_session) = std::env::var("FRAMESHIFT_SESSION") {
-        if !registry_session.trim().is_empty() {
-            client
-                .send_telemetry_for_persona(&project_root, &args.name, &registry_session)
-                .map_err(CliError::Client)?;
-        }
-    }
 
     // Read and print the rendered persona for the claude target.
     let rendered = client.rendered_persona(&project_root, &args.name, "claude")?;

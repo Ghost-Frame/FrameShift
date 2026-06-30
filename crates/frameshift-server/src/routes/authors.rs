@@ -1,25 +1,63 @@
-//! `GET /v1/authors/{pubkey}` -- author lookup by Ed25519 public key.
+//! Author endpoints under `/v1/authors`.
 //!
-//! The `{pubkey}` path segment is a base64url-no-padding encoded 32-byte
-//! Ed25519 public key. Invalid encodings and wrong-length keys are rejected
-//! with `400 Bad Request` before the catalog is queried.
+//! # Read (anonymous)
+//!
+//! - `GET /{pubkey}` -> [`get_author`] -- look up an author by base64url
+//!   Ed25519 public key.
+//!
+//! # Write (Ed25519 signed-request authenticated)
+//!
+//! These carry the signed-request layer (wired in [`crate::router::app`]), so a
+//! verified [`crate::auth::VerifiedSigner`] identifies the live caller:
+//!
+//! - `POST /` -> [`register_author_route`] -- claim a handle for the *signing*
+//!   key. The new author's pubkey is taken from the verified signer, so a
+//!   caller can only register a handle for a key they actually control.
+//! - `POST /{handle}/rotate` -> [`rotate_handle_route`] -- repoint a handle to
+//!   a new key. The request MUST be signed by the handle's *current* owner key
+//!   (the old key authorizes its own replacement).
 
 use axum::extract::{Path, State};
-use axum::routing::get;
-use axum::{Json, Router};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Extension, Json, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
+use chrono::Utc;
+use ed25519_dalek::VerifyingKey;
 use frameshift_catalog::identity::Ed25519PublicKey;
+use frameshift_catalog::records::AuthorRecord;
+use frameshift_catalog::CatalogError;
+use serde::{Deserialize, Serialize};
 
+use crate::auth::VerifiedSigner;
 use crate::error::AppError;
 use crate::state::AppState;
 
-/// Build the authors sub-router, mounted at `/v1/authors`.
+/// Build the authors **read** sub-router, mounted at `/v1/authors`.
 ///
 /// Routes:
 /// - `GET /{pubkey}` -> [`get_author`]
+///
+/// The mutating routes are built by [`authors_write_router`] and wired with the
+/// signed-request layer in [`crate::router::app`].
 pub fn authors_router() -> Router<AppState> {
     Router::new().route("/{pubkey}", get(get_author))
+}
+
+/// Build the authors **write** sub-router (mutating routes only).
+///
+/// Returned without any auth layer; [`crate::router::app`] applies the
+/// signed-request `route_layer` before merging it with [`authors_router`].
+///
+/// Routes:
+/// - `POST /` -> [`register_author_route`]
+/// - `POST /{handle}/rotate` -> [`rotate_handle_route`]
+pub fn authors_write_router() -> Router<AppState> {
+    Router::new()
+        .route("/", post(register_author_route))
+        .route("/{handle}/rotate", post(rotate_handle_route))
 }
 
 /// `GET /v1/authors/{pubkey}`
@@ -33,10 +71,6 @@ pub fn authors_router() -> Router<AppState> {
 /// # Response
 ///
 /// `200 OK` with body `AuthorRecord` serialized as JSON.
-///
-/// # Backend calls
-///
-/// - `catalog.lookup_author(pubkey)` -- single catalog read.
 ///
 /// # Errors
 ///
@@ -58,11 +92,242 @@ pub async fn get_author(
     Ok(Json(author))
 }
 
+/// Request body for `POST /v1/authors`.
+#[derive(Debug, Deserialize)]
+pub struct RegisterAuthorRequest {
+    /// The handle to claim (e.g. `"alice"`). Validated by [`validate_handle`].
+    pub handle: String,
+    /// Optional human-readable display name. An empty/whitespace-only string is
+    /// treated as `None` (the catalog rejects empty display names).
+    #[serde(default)]
+    pub display_name: Option<String>,
+}
+
+/// Response body for a successful author registration.
+#[derive(Debug, Serialize)]
+pub struct RegisterAuthorResponse {
+    /// The handle that was registered.
+    pub handle: String,
+    /// The base64url-no-pad Ed25519 public key the handle now maps to (the
+    /// verified request signer).
+    pub pubkey: String,
+}
+
+/// `POST /v1/authors`
+///
+/// Register a new author and claim a handle for the **signing key**.
+///
+/// The author's public key is taken from the verified signed-request signer
+/// ([`VerifiedSigner`]) -- the request body does NOT carry a key -- so a caller
+/// can only ever register a handle for a key they actually control. The handle
+/// is also written to the handles table (mirroring the offline seed tool) so
+/// the publish path resolves it via `get_handle_pubkey`.
+///
+/// # Response
+///
+/// `201 Created` with body [`RegisterAuthorResponse`].
+///
+/// # Errors
+///
+/// - `400 Bad Request` -- the handle fails [`validate_handle`].
+/// - `409 Conflict` -- the handle is already owned by a different key, or the
+///   signing key is already registered under a different handle.
+/// - `500 Internal Server Error` -- catalog backend failure.
+pub async fn register_author_route(
+    State(state): State<AppState>,
+    Extension(signer): Extension<VerifiedSigner>,
+    Json(body): Json<RegisterAuthorRequest>,
+) -> Result<Response, AppError> {
+    validate_handle(&body.handle)?;
+
+    // Do not let registration hijack an existing handle. `register_author` below
+    // guards the `authors` table, but a handle can exist in the `handles` table
+    // with no matching `authors` row (the seed tool calls `set_handle_pubkey`
+    // directly), so without this check an attacker could register such a handle
+    // and have the `set_handle_pubkey` call below overwrite its owner. Mirror
+    // `rotate_handle_route`: only the current owner may (idempotently) re-point
+    // their own handle; a different owner is a 409. Done before any write so a
+    // rejected registration leaves no partial `authors` row behind.
+    match state.catalog.get_handle_pubkey(&body.handle).await {
+        Ok(current) if current != signer.pubkey => {
+            return Err(AppError::Conflict(format!(
+                "handle already taken by {current}"
+            )));
+        }
+        // Handle is unowned (free) or already owned by this signer: proceed.
+        Ok(_) | Err(CatalogError::NotFound { .. }) => {}
+        Err(e) => return Err(AppError::from_catalog(e, "handle")),
+    }
+
+    // Treat empty/whitespace display names as absent; the catalog rejects "".
+    let display_name = match body.display_name {
+        Some(s) if s.trim().is_empty() => None,
+        other => other,
+    };
+
+    let record = AuthorRecord {
+        pubkey: signer.pubkey,
+        handle: body.handle.clone(),
+        display_name,
+        created_at: Utc::now(),
+        oauth_links: vec![],
+    };
+
+    state
+        .catalog
+        .register_author(record)
+        .await
+        .map_err(|e| AppError::from_catalog(e, "author"))?;
+
+    // Populate the handles table so `get_handle_pubkey` (publish path) resolves
+    // the new handle to this key.
+    state
+        .catalog
+        .set_handle_pubkey(&body.handle, signer.pubkey)
+        .await
+        .map_err(|e| AppError::from_catalog(e, "handle"))?;
+
+    let resp = RegisterAuthorResponse {
+        handle: body.handle,
+        pubkey: signer.pubkey.to_string(),
+    };
+    Ok((StatusCode::CREATED, Json(resp)).into_response())
+}
+
+/// Request body for `POST /v1/authors/{handle}/rotate`.
+#[derive(Debug, Deserialize)]
+pub struct RotateHandleRequest {
+    /// The base64url-no-pad Ed25519 public key the handle should point to next.
+    pub new_pubkey: String,
+}
+
+/// Response body for a successful key rotation.
+#[derive(Debug, Serialize)]
+pub struct RotateHandleResponse {
+    /// The handle that was rotated.
+    pub handle: String,
+    /// The base64url-no-pad new owner key the handle now maps to.
+    pub new_pubkey: String,
+}
+
+/// `POST /v1/authors/{handle}/rotate`
+///
+/// Repoint `handle` to a new Ed25519 key. The request MUST be signed by the
+/// handle's **current** owner key (verified by the signed-request layer); the
+/// old key thereby authorizes its own replacement. After rotation, the publish
+/// path (which resolves the owner via `get_handle_pubkey`) follows the new key.
+///
+/// # Response
+///
+/// `200 OK` with body [`RotateHandleResponse`].
+///
+/// # Errors
+///
+/// - `400 Bad Request` -- the handle is malformed, `new_pubkey` is not a valid
+///   Ed25519 key, or `new_pubkey` equals the current key.
+/// - `403 Forbidden` -- the verified signer is not the handle's current owner.
+/// - `404 Not Found` -- the handle does not exist.
+/// - `500 Internal Server Error` -- catalog backend failure.
+pub async fn rotate_handle_route(
+    State(state): State<AppState>,
+    Path(handle): Path<String>,
+    Extension(signer): Extension<VerifiedSigner>,
+    Json(body): Json<RotateHandleRequest>,
+) -> Result<Response, AppError> {
+    validate_handle(&handle)?;
+    let new_pubkey = parse_pubkey(&body.new_pubkey)?;
+
+    // Reject a structurally-32-byte value that is not a valid curve point: it
+    // could never verify a future signature, so accepting it would brick the
+    // handle.
+    VerifyingKey::from_bytes(&new_pubkey.0).map_err(|_| {
+        AppError::BadRequest("new_pubkey is not a valid Ed25519 public key".to_string())
+    })?;
+
+    // Current owner. Handle existence is already public via `GET /v1/handles`,
+    // so a 404 here discloses nothing new.
+    let current = state
+        .catalog
+        .get_handle_pubkey(&handle)
+        .await
+        .map_err(|e| AppError::from_catalog(e, "handle"))?;
+
+    // Authorization: only the current owner key may rotate the handle.
+    if signer.pubkey != current {
+        tracing::warn!(
+            handle = %handle,
+            signer = %signer.pubkey,
+            "rotate attempt by a key that does not own the handle"
+        );
+        return Err(AppError::Forbidden(format!(
+            "signer does not own handle {handle}"
+        )));
+    }
+
+    if new_pubkey == current {
+        return Err(AppError::BadRequest(
+            "new_pubkey must differ from the current key".to_string(),
+        ));
+    }
+
+    state
+        .catalog
+        .set_handle_pubkey(&handle, new_pubkey)
+        .await
+        .map_err(|e| AppError::from_catalog(e, "handle"))?;
+
+    let resp = RotateHandleResponse {
+        handle,
+        new_pubkey: new_pubkey.to_string(),
+    };
+    Ok((StatusCode::OK, Json(resp)).into_response())
+}
+
+/// Validate a handle string.
+///
+/// Accepted: 1..=64 characters from `[A-Za-z0-9_-]`. Returns
+/// [`AppError::BadRequest`] otherwise.
+fn validate_handle(handle: &str) -> Result<(), AppError> {
+    if handle.is_empty() || handle.len() > 64 {
+        return Err(AppError::BadRequest(
+            "handle must be between 1 and 64 characters".to_string(),
+        ));
+    }
+    if !handle
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(AppError::BadRequest(
+            "handle must match [A-Za-z0-9_-]+".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Parse a base64url-no-padding string into an [`Ed25519PublicKey`].
 ///
-/// Returns `AppError::BadRequest` if the string is not valid base64url or if
-/// the decoded byte slice is not exactly 32 bytes.
+/// Returns `AppError::BadRequest` if:
+/// - the string exceeds 256 characters (length cap),
+/// - any character is outside the base64url alphabet `[A-Za-z0-9_-]`
+///   (charset guard -- avoids injecting arbitrary bytes into the catalog key),
+/// - the string is not valid base64url, or
+/// - the decoded byte slice is not exactly 32 bytes.
 fn parse_pubkey(b64: &str) -> Result<Ed25519PublicKey, AppError> {
+    // Length cap -- reject obviously oversized inputs before any allocation.
+    if b64.len() > 256 {
+        return Err(AppError::BadRequest(
+            "pubkey exceeds maximum length".to_string(),
+        ));
+    }
+    // Charset guard -- only allow base64url characters ([A-Za-z0-9_-]).
+    if !b64
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(AppError::BadRequest(
+            "pubkey contains characters outside the base64url alphabet".to_string(),
+        ));
+    }
     let bytes = URL_SAFE_NO_PAD
         .decode(b64)
         .map_err(|_| AppError::BadRequest("pubkey is not valid base64url".to_string()))?;

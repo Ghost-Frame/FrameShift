@@ -29,7 +29,7 @@ impl Pack {
             std::str::from_utf8(&manifest_entry.content).map_err(|_| PackError::MissingManifest)?;
         let manifest: PackManifest = toml::from_str(manifest_str)?;
 
-        let signature = load_signature(dir);
+        let signature = load_signature(dir)?;
 
         Ok(Self {
             dir: dir.to_path_buf(),
@@ -86,11 +86,32 @@ impl Pack {
 }
 
 /// Try to load signature.sig from a pack directory.
-fn load_signature(dir: &Path) -> Option<Signature> {
+///
+/// Returns `Ok(None)` when the file is absent (unsigned pack is valid).
+/// Returns `Err(PackError::MalformedSignature)` when the file exists but is
+/// not exactly 64 bytes -- a present-but-wrong-length file is never silently
+/// treated as unsigned, because that would mask a corrupted or truncated sig.
+/// Returns `Err(PackError::Io)` on any other I/O failure reading the file.
+fn load_signature(dir: &Path) -> Result<Option<Signature>, PackError> {
     let sig_path = dir.join("signature.sig");
-    let bytes = std::fs::read(&sig_path).ok()?;
-    let bytes: [u8; 64] = bytes.try_into().ok()?;
-    Signature::from_bytes(&bytes).into()
+    let bytes = match std::fs::read(&sig_path) {
+        Ok(b) => b,
+        // File absent: pack is simply unsigned.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        // Any other I/O error (permissions, device error, etc.) is hard.
+        Err(e) => {
+            return Err(PackError::Io {
+                path: sig_path,
+                source: e,
+            })
+        }
+    };
+    // File present: must be exactly 64 bytes; wrong length is an explicit error.
+    let found = bytes.len();
+    let arr: [u8; 64] = bytes
+        .try_into()
+        .map_err(|_| PackError::MalformedSignature { found })?;
+    Ok(Some(Signature::from_bytes(&arr)))
 }
 
 /// Encode a byte slice as a lowercase hex string.
@@ -105,7 +126,7 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    const MANIFEST: &[u8] = b"schema_version = 1\nname = \"test\"\nauthor_handle = \"t\"\nauthor_pubkey = \"k\"\nversion = \"0.1.0\"\n";
+    const MANIFEST: &[u8] = b"schema_version = 1\nname = \"test\"\nauthor_handle = \"t\"\nauthor_pubkey = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\nversion = \"0.1.0\"\n";
 
     fn write_pack(dir: &Path, files: &[(&str, &[u8])]) {
         for (path, content) in files {
@@ -204,6 +225,28 @@ mod tests {
 
         let reloaded = Pack::from_dir(tmp.path()).unwrap();
         assert!(reloaded.verify(&verifying).is_err());
+    }
+
+    #[test]
+    fn malformed_signature_wrong_length_is_error() {
+        // A present-but-truncated signature.sig must produce MalformedSignature,
+        // not silently become an unsigned pack.
+        let tmp = TempDir::new().unwrap();
+        write_pack(tmp.path(), &[("pack.toml", MANIFEST)]);
+
+        let sig_path = tmp.path().join("signature.sig");
+        // Write 32 bytes -- half the required 64.
+        fs::write(&sig_path, vec![0xffu8; 32]).unwrap();
+
+        // Match rather than `unwrap_err()` so the test does not require `Pack: Debug`.
+        let err = match Pack::from_dir(tmp.path()) {
+            Ok(_) => panic!("expected MalformedSignature error, got an Ok pack"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, PackError::MalformedSignature { found: 32 }),
+            "expected MalformedSignature{{found:32}}, got {err:?}"
+        );
     }
 
     #[test]

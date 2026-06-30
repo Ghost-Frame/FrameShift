@@ -39,6 +39,7 @@ use frameshift_catalog::records::{PackRecord, PackVersionRecord};
 use frameshift_catalog::status::PackStatus;
 use frameshift_objects::ObjectHash;
 
+use frameshift_server::metrics::Metrics;
 use frameshift_server::{app, AppState, LogFormat, ServerConfig};
 
 use mocks::catalog::{make_author, MockCatalog};
@@ -70,6 +71,8 @@ fn test_config() -> Arc<ServerConfig> {
         r2_region: "auto".to_string(),
         r2_access_key_id: String::new(),
         r2_secret_access_key: SecretString::new(String::new()),
+        trust_forwarded_for: false,
+        signed_request_max_skew: Duration::from_secs(300),
         memory_backend: "none".to_string(),
         memory_http_endpoint: String::new(),
         memory_http_auth: "none".to_string(),
@@ -86,6 +89,13 @@ fn make_state(catalog: MockCatalog, objects: MockPackStore) -> AppState {
         runtime: None,
         memory: None,
         config: test_config(),
+        // Each test gets its own Metrics instance so counters do not bleed
+        // across test runs (the private registry guarantees isolation).
+        metrics: Arc::new(Metrics::new()),
+        // Fresh nonce cache per test (read paths never touch it).
+        auth_nonces: Arc::new(frameshift_server::auth::NonceCache::new(
+            Duration::from_secs(600),
+        )),
     }
 }
 
@@ -224,8 +234,6 @@ fn make_version(
         parent_hash: None,
         capability_manifest_json: "{}".to_string(),
         schema_version: 1,
-        conformance_score: None,
-        conformance_bundle_hash: None,
         license: "MIT".to_string(),
         published_at: Utc::now(),
         status: PackStatus::Active,
@@ -578,6 +586,11 @@ fn dl_state_with_rate(catalog: MockCatalog, objects: MockPackStore, rate: u32) -
         r2_region: "auto".to_string(),
         r2_access_key_id: String::new(),
         r2_secret_access_key: SecretString::new(String::new()),
+        // The rate-limit test keys requests by a stamped X-Forwarded-For header,
+        // which requires the trusted-proxy extractor. Production defaults to
+        // false (peer-IP only); this test opts in deliberately.
+        trust_forwarded_for: true,
+        signed_request_max_skew: Duration::from_secs(300),
         memory_backend: "none".to_string(),
         memory_http_endpoint: String::new(),
         memory_http_auth: "none".to_string(),
@@ -590,6 +603,12 @@ fn dl_state_with_rate(catalog: MockCatalog, objects: MockPackStore, rate: u32) -
         runtime: None,
         memory: None,
         config: Arc::new(cfg),
+        // Fresh registry per test -- see note in make_state.
+        metrics: Arc::new(Metrics::new()),
+        // Fresh nonce cache per test.
+        auth_nonces: Arc::new(frameshift_server::auth::NonceCache::new(
+            Duration::from_secs(600),
+        )),
     }
 }
 
@@ -602,124 +621,6 @@ async fn oneshot_post_empty(state: AppState, path: &str) -> axum::http::Response
         .body(axum::body::Body::empty())
         .unwrap();
     router.oneshot(request).await.unwrap()
-}
-
-/// Issue a one-shot POST request with a JSON body and optional session header.
-async fn oneshot_post_json(
-    state: AppState,
-    path: &str,
-    body: serde_json::Value,
-    session: Option<&str>,
-) -> axum::http::Response<axum::body::Body> {
-    let router = app(state);
-    let mut builder = Request::builder()
-        .method("POST")
-        .uri(path)
-        .header("content-type", "application/json");
-    if let Some(session) = session {
-        builder = builder.header("x-frameshift-session", session);
-    }
-    let request = builder
-        .body(axum::body::Body::from(body.to_string()))
-        .unwrap();
-    router.oneshot(request).await.unwrap()
-}
-
-/// `POST /v1/telemetry` accepts a valid batch and `GET /v1/packs/{name}/telemetry`
-/// returns the accumulated pack signals.
-#[tokio::test]
-async fn telemetry_ingest_then_get_pack_telemetry_succeeds() {
-    let state = make_state(MockCatalog::new(), MockPackStore::new());
-    let body = serde_json::json!([
-        {
-            "pack_name": "alpha-pack",
-            "version": "1.2.3",
-            "kind": "selection_count",
-            "key": "",
-            "count": 2
-        },
-        {
-            "pack_name": "alpha-pack",
-            "version": "1.2.3",
-            "kind": "selection_count",
-            "key": "",
-            "count": 3
-        },
-        {
-            "pack_name": "alpha-pack",
-            "version": "1.2.3",
-            "kind": "conformance_score",
-            "key": "bundle-abc",
-            "count": 1,
-            "value": 0.94
-        },
-        {
-            "pack_name": "beta-pack",
-            "version": "9.9.9",
-            "kind": "selection_count",
-            "key": "",
-            "count": 99
-        }
-    ]);
-
-    let resp = oneshot_post_json(state.clone(), "/v1/telemetry", body, Some("session-123")).await;
-    assert_eq!(resp.status(), StatusCode::ACCEPTED);
-
-    let resp = oneshot_get(state, "/v1/packs/alpha-pack/telemetry").await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = body_json(resp).await;
-
-    assert_eq!(
-        body,
-        serde_json::json!([
-            {
-                "pack_name": "alpha-pack",
-                "version": "1.2.3",
-                "kind": "selection_count",
-                "key": "",
-                "count": 5,
-                "value": null
-            },
-            {
-                "pack_name": "alpha-pack",
-                "version": "1.2.3",
-                "kind": "conformance_score",
-                "key": "bundle-abc",
-                "count": 1,
-                "value": 0.94
-            }
-        ])
-    );
-}
-
-/// `POST /v1/telemetry` requires a non-empty session header and rejects
-/// anonymous ingest with `401 Unauthorized`.
-#[tokio::test]
-async fn telemetry_ingest_without_session_header_returns_401() {
-    let state = make_state(MockCatalog::new(), MockPackStore::new());
-    let body = serde_json::json!([
-        {
-            "pack_name": "alpha-pack",
-            "version": "1.2.3",
-            "kind": "selection_count",
-            "key": "",
-            "count": 1
-        }
-    ]);
-
-    let resp = oneshot_post_json(state, "/v1/telemetry", body, None).await;
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-}
-
-/// `GET /v1/packs/{name}/telemetry` returns an empty list when no telemetry
-/// has been recorded for the requested pack.
-#[tokio::test]
-async fn get_pack_telemetry_returns_empty_when_pack_has_no_signals() {
-    let state = make_state(MockCatalog::new(), MockPackStore::new());
-    let resp = oneshot_get(state, "/v1/packs/no-signals/telemetry").await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = body_json(resp).await;
-    assert_eq!(body, serde_json::json!([]));
 }
 
 /// Happy path: POST mints a token, GET /dl/{hash} validates it and streams the blob.

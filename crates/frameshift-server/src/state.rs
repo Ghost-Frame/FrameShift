@@ -10,7 +10,9 @@ use frameshift_catalog::CatalogBackend;
 use frameshift_memory::MemoryAdapter;
 use frameshift_objects::PackStore;
 
+use crate::auth::NonceCache;
 use crate::config::ServerConfig;
+use crate::metrics::Metrics;
 
 /// Shared application state for the frameshift HTTP server.
 ///
@@ -22,7 +24,6 @@ use crate::config::ServerConfig;
 ///
 /// Follow-up milestones will add fields here:
 /// - `transparency_log: Option<Arc<dyn TransparencyLog>>` for append-only audit.
-/// - `metrics: Arc<PrometheusHandle>` when the Prometheus registry is wired up.
 /// - `oauth: Option<Arc<OAuthConfig>>` for OAuth 2.1 endpoints.
 ///
 /// Because `AppState` is `Clone` (cheap Arc clone), adding new `Arc`-wrapped
@@ -60,4 +61,17 @@ pub struct AppState {
     /// Stored behind `Arc` so that `ServerConfig` does not need to be `Copy`
     /// or have its `SecretString` fields re-cloned on every handler invocation.
     pub config: Arc<ServerConfig>,
+
+    /// Prometheus metrics registry and all named collectors.
+    ///
+    /// Shared via `Arc` so cloning `AppState` only increments a reference
+    /// count. Handlers and middleware both access collectors through this field.
+    pub metrics: Arc<Metrics>,
+
+    /// Replay-nonce cache for Ed25519 signed-request authentication.
+    ///
+    /// The signed-request middleware records each verified request nonce here
+    /// to reject replays within the timestamp-skew window. Shared via `Arc`;
+    /// see [`crate::auth::NonceCache`] for the single-process caveat.
+    pub auth_nonces: Arc<NonceCache>,
 }

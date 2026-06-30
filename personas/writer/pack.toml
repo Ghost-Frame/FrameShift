@@ -3,8 +3,6 @@ name = "writer"
 author_handle = "ghost-frame"
 author_pubkey = "UNSIGNED"
 version = "0.1.0"
-description = "Clear prose, documentation, prompts, and user-facing copy."
-tags = ["writing", "documentation", "copy", "prompts"]
 license = "Elastic-2.0"
 
 [capability_manifest]

@@ -37,4 +37,14 @@ pub enum PackError {
 
     #[error("pack has no signature")]
     NoSignature,
+
+    /// signature.sig is present on disk but has the wrong byte length.
+    ///
+    /// Ed25519 signatures must be exactly 64 bytes. A file of any other length
+    /// is not silently treated as unsigned -- callers should inspect and repair it.
+    #[error("signature.sig is present but malformed: expected 64 bytes, found {found}")]
+    MalformedSignature {
+        /// Actual byte length of the file that was read.
+        found: usize,
+    },
 }

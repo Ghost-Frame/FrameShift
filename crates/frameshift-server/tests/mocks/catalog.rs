@@ -20,7 +20,7 @@ use frameshift_catalog::backend::CatalogBackend;
 use frameshift_catalog::error::{CatalogError, HealthStatus};
 use frameshift_catalog::filters::{PackSearchFilters, PackSearchResult};
 use frameshift_catalog::identity::Ed25519PublicKey;
-use frameshift_catalog::records::{AuthorRecord, PackRecord, PackVersionRecord, TelemetrySignal};
+use frameshift_catalog::records::{AuthorRecord, PackRecord, PackVersionRecord};
 use frameshift_catalog::status::TombstoneRecord;
 
 /// Shared mutable state for [`MockCatalog`].
@@ -32,17 +32,19 @@ pub struct MockState {
     /// Registered authors, keyed by base64url-encoded pubkey.
     pub authors: HashMap<String, AuthorRecord>,
 
+    /// Handle -> current owner pubkey mapping (the publish authority).
+    ///
+    /// `set_handle_pubkey` writes here and `get_handle_pubkey` reads here first,
+    /// so handle key rotation is observable in tests. When a handle is absent
+    /// from this map, `get_handle_pubkey` falls back to scanning `authors` by
+    /// handle (the pre-rotation registration path).
+    pub handles: HashMap<String, Ed25519PublicKey>,
+
     /// Top-level pack records, keyed by pack name.
     pub packs: HashMap<String, PackRecord>,
 
     /// Pack version records, keyed by `(pack_name, version)`.
     pub versions: HashMap<(String, String), PackVersionRecord>,
-
-    /// In-memory telemetry signals accumulated by ingest calls.
-    pub telemetry: Vec<TelemetrySignal>,
-
-    /// Conformance scores recorded for pack versions.
-    pub scores: HashMap<(String, String), (f32, String)>,
 
     /// When `true`, the next mutating call returns `CatalogError::Conflict`.
     pub inject_conflict: bool,
@@ -81,7 +83,12 @@ impl Default for MockCatalog {
 
 #[async_trait]
 impl CatalogBackend for MockCatalog {
-    /// Register an author or detect a conflict if `inject_conflict` is set.
+    /// Register an author, enforcing the trait's uniqueness contract.
+    ///
+    /// - identical `(pubkey, handle)` -> idempotent `Ok(())`.
+    /// - handle owned by a different pubkey -> `HandleTaken`.
+    /// - pubkey already registered under a different handle -> `Conflict`.
+    /// - `inject_conflict` flag -> forced `Conflict` (legacy test hook).
     async fn register_author(&self, record: AuthorRecord) -> Result<(), CatalogError> {
         let mut state = self
             .state
@@ -94,7 +101,26 @@ impl CatalogBackend for MockCatalog {
                 key: record.handle.clone(),
             });
         }
+        // Handle owned by a different key?
+        if let Some(existing) = state.authors.values().find(|a| a.handle == record.handle) {
+            if existing.pubkey != record.pubkey {
+                return Err(CatalogError::HandleTaken {
+                    owner: existing.pubkey,
+                });
+            }
+        }
         let key = record.pubkey.to_string();
+        // Pubkey already registered under a different handle?
+        if let Some(existing) = state.authors.get(&key) {
+            if existing.handle != record.handle {
+                return Err(CatalogError::Conflict {
+                    kind: "author",
+                    key: record.pubkey.to_string(),
+                });
+            }
+            // Identical (pubkey, handle): idempotent no-op.
+            return Ok(());
+        }
         state.authors.insert(key, record);
         Ok(())
     }
@@ -242,69 +268,6 @@ impl CatalogBackend for MockCatalog {
         Ok(0)
     }
 
-    /// Accumulate telemetry signals in memory for integration tests.
-    async fn ingest_telemetry(&self, signals: Vec<TelemetrySignal>) -> Result<(), CatalogError> {
-        let mut state = self
-            .state
-            .write()
-            .map_err(|e| CatalogError::BackendError(e.to_string().into()))?;
-
-        for signal in signals {
-            if let Some(existing) = state.telemetry.iter_mut().find(|entry| {
-                entry.pack_name == signal.pack_name
-                    && entry.version == signal.version
-                    && entry.kind == signal.kind
-                    && entry.key == signal.key
-            }) {
-                existing.count += signal.count;
-                existing.value = signal.value;
-            } else {
-                state.telemetry.push(signal);
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Read telemetry signals for a pack, optionally filtered to one version.
-    async fn get_telemetry(
-        &self,
-        name: &str,
-        version: Option<&str>,
-    ) -> Result<Vec<TelemetrySignal>, CatalogError> {
-        let state = self
-            .state
-            .read()
-            .map_err(|e| CatalogError::BackendError(e.to_string().into()))?;
-
-        Ok(state
-            .telemetry
-            .iter()
-            .filter(|entry| entry.pack_name == name)
-            .filter(|entry| version.is_none_or(|wanted| entry.version == wanted))
-            .cloned()
-            .collect())
-    }
-
-    /// Store a conformance score in the mock state for test assertions.
-    async fn set_conformance_score(
-        &self,
-        name: &str,
-        version: &str,
-        score: f32,
-        bundle_hash: &str,
-    ) -> Result<(), CatalogError> {
-        let mut state = self
-            .state
-            .write()
-            .map_err(|e| CatalogError::BackendError(e.to_string().into()))?;
-        state.scores.insert(
-            (name.to_string(), version.to_string()),
-            (score, bundle_hash.to_string()),
-        );
-        Ok(())
-    }
-
     /// Tombstone a pack version (no-op in mock).
     async fn tombstone_pack(
         &self,
@@ -316,11 +279,18 @@ impl CatalogBackend for MockCatalog {
     }
 
     /// Get the public key for a handle.
+    ///
+    /// Reads the `handles` map first (so rotation via `set_handle_pubkey` is
+    /// reflected), then falls back to scanning `authors` by handle for setups
+    /// that only pre-populated author records.
     async fn get_handle_pubkey(&self, handle: &str) -> Result<Ed25519PublicKey, CatalogError> {
         let state = self
             .state
             .read()
             .map_err(|e| CatalogError::BackendError(e.to_string().into()))?;
+        if let Some(pubkey) = state.handles.get(handle) {
+            return Ok(*pubkey);
+        }
         state
             .authors
             .values()
@@ -332,12 +302,17 @@ impl CatalogBackend for MockCatalog {
             })
     }
 
-    /// Set the public key for a handle (no-op in mock).
+    /// Set the public key for a handle (writes the `handles` map).
     async fn set_handle_pubkey(
         &self,
-        _handle: &str,
-        _pubkey: Ed25519PublicKey,
+        handle: &str,
+        pubkey: Ed25519PublicKey,
     ) -> Result<(), CatalogError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|e| CatalogError::BackendError(e.to_string().into()))?;
+        state.handles.insert(handle.to_string(), pubkey);
         Ok(())
     }
 
@@ -369,6 +344,12 @@ impl CatalogBackend for MockCatalog {
                 key: pack_name.to_string(),
             }),
         }
+    }
+
+    /// Record a download for trending. The mock accepts any call and is a no-op
+    /// (trending ranking is exercised by the Postgres adapter integration tests).
+    async fn record_download(&self, _pack_name: &str, _version: &str) -> Result<(), CatalogError> {
+        Ok(())
     }
 }
 

@@ -28,4 +28,5 @@ ed25519-dalek = { workspace = true }
 rand_core = { version = "0.6", features = ["getrandom"] }
 unicode-normalization = { workspace = true }
 toml = { workspace = true }
-tokio-postgres = "0.7"
+diesel = { workspace = true }
+diesel-async = { workspace = true }

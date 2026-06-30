@@ -19,7 +19,7 @@ pub struct TestCase {
 pub enum ExpectedBehavior {
     /// Response must contain this substring (Unicode-naive, case-sensitive).
     Contains { value: String },
-    /// Response must match this regex. M4: real regex compilation.
+    /// Response must match this regex (compiled via the `regex` crate at scoring time).
     Matches { pattern: String },
     /// Response must parse as JSON whose shape matches this template.
     JsonShape { shape: serde_json::Value },

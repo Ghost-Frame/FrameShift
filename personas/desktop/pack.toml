@@ -3,8 +3,6 @@ name = "desktop"
 author_handle = "ghost-frame"
 author_pubkey = "UNSIGNED"
 version = "0.1.0"
-description = "Desktop application UX, packaging, and native integration work."
-tags = ["desktop", "native", "ux", "packaging"]
 license = "Elastic-2.0"
 
 [capability_manifest]

@@ -3,13 +3,11 @@ name = "kleos-archaeologist"
 author_handle = "ghost-frame"
 author_pubkey = "UNSIGNED"
 version = "0.1.0"
-description = "Kleos memory search, context recovery, and historical reconstruction."
-tags = ["kleos", "memory", "search", "context"]
 license = "Elastic-2.0"
 
 [capability_manifest]
 required_tools = ["Read", "Edit", "Write", "Bash", "Grep", "Glob"]
 network_egress = false
 filesystem_scope = "project-only"
-memory_required = "hard"
+memory_required = "required"
 memory_required_ops = ["search", "recall", "context"]

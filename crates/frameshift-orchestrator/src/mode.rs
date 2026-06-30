@@ -44,7 +44,10 @@ impl ModeState {
     /// Returns `ModeState { mode: Mode::Off }` if the file does not exist.
     pub fn load(path: &Path) -> Result<Self, OrchestratorError> {
         if !path.exists() {
-            return Ok(ModeState { mode: Mode::Off, sensitivity: default_sensitivity() });
+            return Ok(ModeState {
+                mode: Mode::Off,
+                sensitivity: default_sensitivity(),
+            });
         }
         let data = std::fs::read_to_string(path)?;
         let state = serde_json::from_str(&data)?;
@@ -81,7 +84,10 @@ mod tests {
     fn save_load_roundtrip_on() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("mode.json");
-        let state = ModeState { mode: Mode::On, sensitivity: 0.5 };
+        let state = ModeState {
+            mode: Mode::On,
+            sensitivity: 0.5,
+        };
         state.save(&path).unwrap();
         let loaded = ModeState::load(&path).unwrap();
         assert_eq!(loaded.mode, Mode::On);
@@ -93,7 +99,10 @@ mod tests {
     fn save_load_roundtrip_off() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("mode.json");
-        let state = ModeState { mode: Mode::Off, sensitivity: 0.5 };
+        let state = ModeState {
+            mode: Mode::Off,
+            sensitivity: 0.5,
+        };
         state.save(&path).unwrap();
         let loaded = ModeState::load(&path).unwrap();
         assert_eq!(loaded.mode, Mode::Off);

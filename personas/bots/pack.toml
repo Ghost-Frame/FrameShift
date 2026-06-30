@@ -3,8 +3,6 @@ name = "bots"
 author_handle = "ghost-frame"
 author_pubkey = "UNSIGNED"
 version = "0.1.0"
-description = "Bot building, workflow automation, and agent-driven interaction design."
-tags = ["bots", "automation", "agents", "workflows"]
 license = "Elastic-2.0"
 
 [capability_manifest]

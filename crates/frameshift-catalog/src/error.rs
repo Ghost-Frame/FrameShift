@@ -74,6 +74,22 @@ pub enum CatalogError {
     /// structural argument problems.
     #[error("validation error: {0}")]
     Validation(String),
+
+    /// The caller is not permitted to perform the requested operation.
+    ///
+    /// Used when the requesting author's pubkey does not match the stored
+    /// owner, e.g. a co-publish / name-squat attempt on a pack owned by
+    /// another author.
+    ///
+    /// `kind` names the guarded entity type (e.g. `"pack"`).
+    /// `key` is the entity key involved (e.g. the pack name).
+    #[error("unauthorized: {kind} {key}")]
+    Unauthorized {
+        /// The entity type for which authorization was denied.
+        kind: &'static str,
+        /// The key of the entity that was accessed.
+        key: String,
+    },
 }
 
 /// Health status reported by [`crate::backend::CatalogBackend::health`].

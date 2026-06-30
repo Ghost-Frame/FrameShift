@@ -99,8 +99,6 @@ fn make_version(
         parent_hash: None,
         capability_manifest_json: r#"{"permissions":[]}"#.to_string(),
         schema_version: 1,
-        conformance_score: None,
-        conformance_bundle_hash: None,
         license: "Apache-2.0".to_string(),
         published_at: chrono::Utc::now(),
         status: PackStatus::Active,
@@ -506,6 +504,140 @@ async fn test_health_returns_healthy() {
         "expected healthy=true, got detail={}",
         status.detail
     );
+}
+
+/// D5: A second author cannot publish to a pack already owned by another author.
+///
+/// Author A registers `ownership-guard-pack@1.0.0`. Author B attempting to
+/// publish `ownership-guard-pack@1.1.0` must be rejected with `Unauthorized`.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn test_register_pack_version_ownership_guard() {
+    let (catalog, _container) = setup_catalog().await;
+
+    // Register two distinct authors with different pubkeys and handles.
+    catalog
+        .register_author(make_author(30, "author-a"))
+        .await
+        .expect("register author A failed");
+    catalog
+        .register_author(make_author(31, "author-b"))
+        .await
+        .expect("register author B failed");
+
+    // Author A publishes the first version.
+    let v1 = make_version("ownership-guard-pack", "1.0.0", 30, 80);
+    catalog
+        .register_pack_version(v1)
+        .await
+        .expect("author A publishing 1.0.0 should succeed");
+
+    // Author B attempts to publish a subsequent version -- must be rejected.
+    let v2 = make_version("ownership-guard-pack", "1.1.0", 31, 81);
+    let err = catalog
+        .register_pack_version(v2)
+        .await
+        .expect_err("author B should be rejected with Unauthorized");
+
+    assert!(
+        matches!(err, CatalogError::Unauthorized { kind: "pack", .. }),
+        "expected Unauthorized{{kind=pack}}, got {err:?}"
+    );
+}
+
+/// `record_download` records an event; `SortMode::Trending` ranks the more-downloaded pack first.
+///
+/// Two packs are registered with the same author. Three downloads are recorded
+/// for "hot-pack" and one for "cold-pack". A trending search MUST return
+/// "hot-pack" before "cold-pack" because it has more downloads in the 7-day window.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn test_trending_orders_by_recent_downloads() {
+    let (catalog, _container) = setup_catalog().await;
+
+    // Register a shared author for both packs.
+    catalog
+        .register_author(make_author(40, "trend-author"))
+        .await
+        .expect("register trend-author failed");
+
+    // Register both packs.
+    catalog
+        .register_pack_version(make_version("hot-pack", "1.0.0", 40, 90))
+        .await
+        .expect("register hot-pack failed");
+    catalog
+        .register_pack_version(make_version("cold-pack", "1.0.0", 40, 91))
+        .await
+        .expect("register cold-pack failed");
+
+    // Record three downloads for hot-pack; one for cold-pack.
+    catalog
+        .record_download("hot-pack", "1.0.0")
+        .await
+        .expect("record_download hot 1 failed");
+    catalog
+        .record_download("hot-pack", "1.0.0")
+        .await
+        .expect("record_download hot 2 failed");
+    catalog
+        .record_download("hot-pack", "1.0.0")
+        .await
+        .expect("record_download hot 3 failed");
+    catalog
+        .record_download("cold-pack", "1.0.0")
+        .await
+        .expect("record_download cold 1 failed");
+
+    // Trending search over all packs (no extra filters).
+    let results = catalog
+        .search_packs(&PackSearchFilters {
+            sort: SortMode::Trending,
+            limit: 10,
+            offset: 0,
+            ..Default::default()
+        })
+        .await
+        .expect("search_packs (trending) failed");
+
+    // Both packs must appear.
+    assert!(
+        results.len() >= 2,
+        "expected >= 2 trending results, got {}",
+        results.len()
+    );
+
+    // Locate positions of hot-pack and cold-pack in the result list.
+    let hot_pos = results
+        .iter()
+        .position(|r| r.pack.name == "hot-pack")
+        .expect("hot-pack not found in trending results");
+    let cold_pos = results
+        .iter()
+        .position(|r| r.pack.name == "cold-pack")
+        .expect("cold-pack not found in trending results");
+
+    assert!(
+        hot_pos < cold_pos,
+        "hot-pack (3 downloads) should rank before cold-pack (1 download) in trending; \
+         got hot_pos={hot_pos}, cold_pos={cold_pos}"
+    );
+}
+
+/// `record_download` returns Ok even for an unrecognised pack name.
+///
+/// The method is best-effort and has no FK constraint to `packs`, so
+/// recording a download for an unknown pack name must not return an error.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn test_record_download_unknown_pack_is_ok() {
+    let (catalog, _container) = setup_catalog().await;
+
+    // No pack registered -- but record_download has no FK and must not error.
+    catalog
+        .record_download("no-such-pack", "1.0.0")
+        .await
+        .expect("record_download for unknown pack should succeed (best-effort)");
 }
 
 /// Search packs with FTS query text.

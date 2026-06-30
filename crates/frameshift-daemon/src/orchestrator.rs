@@ -125,11 +125,6 @@ pub fn evaluate_and_apply(client: &Client, controller: &mut SwitchController, pr
             return;
         }
 
-        let session = format!("daemon:{}", std::process::id());
-        if let Err(e) = client.record_selection_event(project_root, &to, &session, true, None) {
-            tracing::warn!(error = %e, persona = %to, "orchestrator: failed to record selection event");
-        }
-
         // Append an audit transition with the previous persona recorded.
         let mut audit = AuditLog::load(&audit_path).unwrap_or_default();
         let transition = Transition {
@@ -257,7 +252,7 @@ mod tests {
         fs::create_dir_all(&pack_dir).unwrap();
         fs::write(
             pack_dir.join("pack.toml"),
-            "schema_version = 1\nname = \"eval-persona\"\nauthor_handle = \"test\"\nauthor_pubkey = \"local-unsigned\"\nversion = \"0.1.0\"\n",
+            "schema_version = 1\nname = \"eval-persona\"\nauthor_handle = \"test\"\nauthor_pubkey = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\nversion = \"0.1.0\"\n",
         )
         .unwrap();
         fs::write(pack_dir.join("AGENTS.md"), "# Eval Persona\n\nTest.\n").unwrap();
@@ -322,7 +317,7 @@ mod tests {
         fs::create_dir_all(&pack_dir).unwrap();
         fs::write(
             pack_dir.join("pack.toml"),
-            "schema_version = 1\nname = \"new-persona\"\nauthor_handle = \"test\"\nauthor_pubkey = \"local-unsigned\"\nversion = \"0.1.0\"\n",
+            "schema_version = 1\nname = \"new-persona\"\nauthor_handle = \"test\"\nauthor_pubkey = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\nversion = \"0.1.0\"\n",
         )
         .unwrap();
         fs::write(pack_dir.join("AGENTS.md"), "# New Persona\n\nTest.\n").unwrap();

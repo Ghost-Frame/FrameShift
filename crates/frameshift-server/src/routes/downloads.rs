@@ -29,6 +29,7 @@ use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use frameshift_catalog::status::PackStatus;
 use frameshift_pack::ObjectHash;
 use serde::{Deserialize, Serialize};
 
@@ -121,6 +122,17 @@ pub async fn mint_download_url(
         .get_pack_version(&name, &version)
         .await
         .map_err(|e| AppError::from_catalog(e, "pack_version"))?;
+
+    // Do not mint download tokens for tombstoned (taken-down) versions. The
+    // signed /dl/{hash} path verifies only the HMAC token, not status, so a
+    // token minted here would let a taken-down pack be fetched indefinitely,
+    // bypassing the takedown. A 404 (not 403) avoids confirming the version
+    // ever existed, matching the direct-download route.
+    if !matches!(version_record.status, PackStatus::Active) {
+        return Err(AppError::NotFound(format!(
+            "pack version not found: {name}@{version}"
+        )));
+    }
 
     let ttl_secs: i64 = state
         .config
@@ -226,7 +238,7 @@ pub async fn stream_signed_download(
 
     let disposition = format!("attachment; filename=\"{hash_hex}.pack\"");
 
-    Response::builder()
+    let response = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .header(
@@ -236,5 +248,10 @@ pub async fn stream_signed_download(
             })?,
         )
         .body(Body::from(bytes))
-        .map_err(|e| AppError::Internal(format!("response builder error: {e}")))
+        .map_err(|e| AppError::Internal(format!("response builder error: {e}")))?;
+
+    // Count successful signed-download responses (alongside direct pack downloads).
+    state.metrics.pack_downloads_total.inc();
+
+    Ok(response)
 }

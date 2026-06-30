@@ -63,45 +63,29 @@ pub fn detect_conflicts(composed: &ComposedPersona) -> Vec<Conflict> {
     conflicts
 }
 
-/// Scan the composed rule list for id collisions across layers.
+/// Report rule id collisions captured during merge.
 ///
-/// A collision exists when the same rule id appears in the provenanced rule
-/// list sourced from more than one distinct layer. After merge, each id
-/// appears at most once (last-write-wins), so we detect this by checking
-/// whether the surviving entry's layer differs from earlier-seen layers.
+/// Collisions cannot be recovered by scanning `composed.rules`: the merge
+/// resolves them by last-write-wins, leaving a single entry per id. They are
+/// therefore recorded at merge time in `composed.rule_collisions`, which this
+/// reads. (The earlier implementation scanned the collapsed list and so was
+/// always a no-op, since every id appeared exactly once.)
 fn detect_rule_collisions(composed: &ComposedPersona, out: &mut Vec<Conflict>) {
-    use std::collections::HashMap;
-    // Map rule id -> list of layers that contributed it.
-    let mut seen: HashMap<String, Vec<Layer>> = HashMap::new();
-
-    for pr in &composed.rules {
-        seen.entry(pr.rule.id.clone())
-            .or_default()
-            .push(pr.provenance.layer.clone());
-    }
-
-    for (id, layers) in seen {
-        if layers.len() > 1 {
-            out.push(Conflict::RuleIdCollision { id, layers });
-        }
+    for collision in &composed.rule_collisions {
+        out.push(Conflict::RuleIdCollision {
+            id: collision.id.clone(),
+            layers: collision.layers.clone(),
+        });
     }
 }
 
-/// Scan the composed skill list for id collisions across layers.
+/// Report skill id collisions captured during merge (see `detect_rule_collisions`).
 fn detect_skill_collisions(composed: &ComposedPersona, out: &mut Vec<Conflict>) {
-    use std::collections::HashMap;
-    let mut seen: HashMap<String, Vec<Layer>> = HashMap::new();
-
-    for ps in &composed.skills {
-        seen.entry(ps.skill.id.clone())
-            .or_default()
-            .push(ps.provenance.layer.clone());
-    }
-
-    for (id, layers) in seen {
-        if layers.len() > 1 {
-            out.push(Conflict::SkillIdCollision { id, layers });
-        }
+    for collision in &composed.skill_collisions {
+        out.push(Conflict::SkillIdCollision {
+            id: collision.id.clone(),
+            layers: collision.layers.clone(),
+        });
     }
 }
 
@@ -140,14 +124,47 @@ mod tests {
 
     use crate::composed::ComposedPersona;
 
-    /// Builds a minimal `ComposedPersona` with the given `PatternSet` and no rules/skills.
+    /// Builds a minimal `ComposedPersona` with the given `PatternSet` and no
+    /// rules/skills/collisions.
     fn persona_with_patterns(patterns: PatternSet) -> ComposedPersona {
         ComposedPersona {
             persona: Persona::new("test"),
             rules: vec![],
             skills: vec![],
             patterns,
+            rule_collisions: vec![],
+            skill_collisions: vec![],
         }
+    }
+
+    #[test]
+    fn rule_and_skill_collisions_are_reported() {
+        use crate::composed::IdCollision;
+        // A rule id contributed by base + root, and a skill id by two mixins.
+        let composed = ComposedPersona {
+            persona: Persona::new("test"),
+            rules: vec![],
+            skills: vec![],
+            patterns: PatternSet::default(),
+            rule_collisions: vec![IdCollision {
+                id: "no-unwrap".to_string(),
+                layers: vec![Layer::Base("rust".to_string()), Layer::Root],
+            }],
+            skill_collisions: vec![IdCollision {
+                id: "tdd".to_string(),
+                layers: vec![Layer::Mixin("a".to_string()), Layer::Mixin("b".to_string())],
+            }],
+        };
+
+        let conflicts = detect_conflicts(&composed);
+        assert!(conflicts.contains(&Conflict::RuleIdCollision {
+            id: "no-unwrap".to_string(),
+            layers: vec![Layer::Base("rust".to_string()), Layer::Root],
+        }));
+        assert!(conflicts.contains(&Conflict::SkillIdCollision {
+            id: "tdd".to_string(),
+            layers: vec![Layer::Mixin("a".to_string()), Layer::Mixin("b".to_string()),],
+        }));
     }
 
     #[test]

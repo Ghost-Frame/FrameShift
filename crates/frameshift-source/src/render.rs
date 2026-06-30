@@ -239,14 +239,23 @@ fn render_concrete_patterns(src: &PersonaSource, out: &mut String) {
     }
 
     for ex in &p.examples {
+        // Sanitize language tag: allow only [a-zA-Z0-9_+-] to prevent
+        // fence-break injection via a crafted language field. An empty
+        // result renders as a bare ``` fence.
+        let safe_lang: String = ex
+            .language
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '+' | '-'))
+            .collect();
+
         let _ = writeln!(out, "### {}\n", ex.title);
         let _ = writeln!(out, "{}\n", ex.context);
         let _ = writeln!(out, "**Bad:**");
-        let _ = writeln!(out, "```{}", ex.language);
+        let _ = writeln!(out, "```{}", safe_lang);
         let _ = writeln!(out, "{}", ex.bad);
         let _ = writeln!(out, "```\n");
         let _ = writeln!(out, "**Good:**");
-        let _ = writeln!(out, "```{}", ex.language);
+        let _ = writeln!(out, "```{}", safe_lang);
         let _ = writeln!(out, "{}", ex.good);
         let _ = writeln!(out, "```\n");
     }

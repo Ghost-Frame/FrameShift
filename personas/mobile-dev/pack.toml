@@ -3,8 +3,6 @@ name = "mobile-dev"
 author_handle = "ghost-frame"
 author_pubkey = "UNSIGNED"
 version = "0.1.0"
-description = "Mobile product engineering across native and hybrid stacks."
-tags = ["mobile", "ios", "android", "product"]
 license = "Elastic-2.0"
 
 [capability_manifest]

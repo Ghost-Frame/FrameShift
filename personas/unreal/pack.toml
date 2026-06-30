@@ -3,8 +3,6 @@ name = "unreal"
 author_handle = "ghost-frame"
 author_pubkey = "UNSIGNED"
 version = "0.1.0"
-description = "Unreal Engine gameplay, tooling, and engine integration work."
-tags = ["unreal", "game-dev", "engine", "c-plus-plus"]
 license = "Elastic-2.0"
 
 [capability_manifest]

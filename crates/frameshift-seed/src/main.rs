@@ -1,10 +1,10 @@
 //! One-shot seeder for the frameshift catalog and object store.
 //!
 //! Reads persona directories from a configurable root path, builds a pack for
-//! each directory that contains a `pack.toml` or legacy `persona.toml`
-//! manifest, signs it with a generated Ed25519 key, stores the canonical pack
-//! bytes in the object store, and registers the pack version and author in the
-//! catalog.
+//! each directory that contains an `AGENTS.md` file plus a `pack.toml` manifest
+//! (or synthesizes one), signs it with a generated Ed25519 key, stores the
+//! canonical pack bytes in the object store, and registers the pack version and
+//! author in the catalog.
 //!
 //! # Usage
 //!
@@ -32,7 +32,6 @@
 //! `CatalogError::Conflict` when the (pack_name, version) pair already exists --
 //! the seeder logs a warning and continues to the next persona.
 
-/// Main seeder implementation and metadata helpers.
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -149,7 +148,9 @@ async fn run() -> Result<(), SeedError> {
             continue;
         }
 
-        if !is_seedable_persona_dir(&path) {
+        let persona_toml = path.join("persona.toml");
+        let agents_md = path.join("AGENTS.md");
+        if !persona_toml.exists() && !agents_md.exists() {
             continue;
         }
 
@@ -192,9 +193,9 @@ async fn run() -> Result<(), SeedError> {
 
     info!("pack versions seeded: seeded={seeded} skipped={skipped}");
 
-    // Post-seed: update pack descriptions and tags from persona metadata files.
-    info!("updating pack descriptions from persona metadata files");
-    update_pack_metadata(&config.postgres_url, &personas_path).await?;
+    // Post-seed: update pack descriptions and tags from persona.toml files.
+    info!("updating pack descriptions from persona.toml files");
+    update_pack_metadata(&catalog, &personas_path).await?;
 
     info!("done");
     Ok(())
@@ -238,12 +239,11 @@ fn default_signing_key_path(object_store_root: &str, author_handle: &str) -> Pat
         .join(format!("seed-signing-key-{author_handle}.bin"))
 }
 
-/// Return whether a directory contains enough manifest material to seed.
-fn is_seedable_persona_dir(path: &Path) -> bool {
-    path.join("pack.toml").exists() || path.join("persona.toml").exists()
-}
-
-/// Register the seed author, treating idempotent re-registration as success.
+/// Register the seed author and populate the handles table for publish lookup.
+///
+/// `register_author` writes the `authors` table but NOT the `handles` table.
+/// `get_handle_pubkey` (called by the publish path) reads the `handles` table.
+/// Both calls are idempotent: re-running the seeder is safe.
 async fn register_author(
     catalog: &PostgresCatalog,
     pubkey: Ed25519PublicKey,
@@ -260,6 +260,13 @@ async fn register_author(
 
     catalog.register_author(record).await?;
     info!("registered or confirmed author: {handle}");
+
+    // Populate the handles table so the author can be looked up by handle
+    // via get_handle_pubkey (used by the publish path). set_handle_pubkey
+    // is an upsert and is safe to call on every seed run.
+    catalog.set_handle_pubkey(handle, pubkey).await?;
+    info!("set handle pubkey for: {handle}");
+
     Ok(())
 }
 
@@ -312,14 +319,6 @@ async fn seed_persona(
         parent_hash: None,
         capability_manifest_json: cap_json,
         schema_version: manifest.schema_version,
-        conformance_score: manifest
-            .conformance_baseline
-            .as_ref()
-            .map(|baseline| baseline.score),
-        conformance_bundle_hash: manifest
-            .conformance_baseline
-            .as_ref()
-            .map(|baseline| baseline.bundle_hash.clone()),
         license: manifest
             .license
             .clone()
@@ -441,13 +440,45 @@ fn load_or_create_signing_key(path: &Path) -> Result<SigningKey, SeedError> {
         info!("loaded signing key from {}", path.display());
         Ok(SigningKey::from_bytes(&seed))
     } else {
+        // Persist atomically with `create_new` + 0o600: the secret seed is never
+        // world-readable even momentarily (closes the umask-perms CRITICAL), and
+        // a concurrent seeder cannot replace our freshly written key (closes the
+        // check-then-write race). On a lost race we adopt the winner's key.
         let key = SigningKey::generate(&mut rand_core::OsRng);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, key.to_bytes())?;
-        info!("generated new signing key at {}", path.display());
-        Ok(key)
+
+        let mut open_opts = std::fs::OpenOptions::new();
+        open_opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            open_opts.mode(0o600);
+        }
+
+        match open_opts.open(path) {
+            Ok(mut file) => {
+                use std::io::Write as _;
+                file.write_all(&key.to_bytes())?;
+                info!("generated new signing key at {}", path.display());
+                Ok(key)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let bytes = std::fs::read(path)?;
+                let seed: [u8; 32] = bytes.try_into().map_err(|_| {
+                    SeedError::Io(std::io::Error::other(
+                        "signing key file must be exactly 32 bytes",
+                    ))
+                })?;
+                info!(
+                    "adopted concurrently-created signing key at {}",
+                    path.display()
+                );
+                Ok(SigningKey::from_bytes(&seed))
+            }
+            Err(e) => Err(SeedError::Io(e)),
+        }
     }
 }
 
@@ -468,6 +499,20 @@ fn write_synthetic_pack_toml(
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
+
+    // Guard against TOML injection: dir_name (filesystem) and author_handle (env)
+    // are interpolated into quoted TOML strings below. A value containing a quote,
+    // backslash, or control character could inject arbitrary manifest keys.
+    for (field, value) in [("dir_name", dir_name), ("author_handle", author_handle)] {
+        if value
+            .chars()
+            .any(|c| c == '"' || c == '\\' || c.is_control())
+        {
+            return Err(SeedError::Io(std::io::Error::other(format!(
+                "{field} contains characters not allowed in a pack manifest: {value:?}"
+            ))));
+        }
+    }
 
     let content = format!(
         r#"schema_version = 1
@@ -492,16 +537,6 @@ struct PersonaToml {
     description: String,
 }
 
-/// Minimal pack.toml structure for metadata extraction.
-#[derive(Debug, serde::Deserialize)]
-struct MinimalPackToml {
-    name: String,
-    #[serde(default)]
-    description: Option<String>,
-    #[serde(default)]
-    tags: Vec<String>,
-}
-
 /// Minimal patterns.toml structure for extracting stack categories as tags.
 #[derive(Debug, serde::Deserialize)]
 struct PatternsToml {
@@ -510,11 +545,12 @@ struct PatternsToml {
 }
 
 /// A single stack category entry.
+///
+/// Only the `category` is read (it becomes a discovery tag); the entry's
+/// `items` list is intentionally not modeled, as serde ignores unknown fields.
 #[derive(Debug, serde::Deserialize)]
 struct StackEntry {
     category: String,
-    #[serde(default)]
-    items: Vec<toml::Value>,
 }
 
 /// Derived metadata for a seeded pack head row.
@@ -527,20 +563,29 @@ struct PackMetadata {
     tags: Vec<String>,
 }
 
-/// Post-seed pass: read pack metadata from each directory, derive discovery
-/// tags from patterns.toml stack categories, then UPDATE the packs table
-/// directly. Uses tokio-postgres for the raw UPDATE since the catalog trait
-/// does not expose a pack metadata update method.
-async fn update_pack_metadata(postgres_url: &str, personas_root: &Path) -> Result<(), SeedError> {
-    let (client, connection) = tokio_postgres::connect(postgres_url, tokio_postgres::NoTls)
-        .await
-        .map_err(|e| SeedError::Io(std::io::Error::other(format!("pg connect: {e}"))))?;
+/// Post-seed pass: read persona.toml from each directory, extract description
+/// and derive tags from patterns.toml stack categories, then UPDATE the packs
+/// table directly. Reuses the catalog's existing connection pool so both
+/// Postgres connections in the seeder share the same TLS configuration.
+/// The catalog trait does not expose a pack metadata update method, so a
+/// raw diesel sql_query is used here.
+async fn update_pack_metadata(
+    catalog: &PostgresCatalog,
+    personas_root: &Path,
+) -> Result<(), SeedError> {
+    // Only the async `RunQueryDsl::execute` is needed here; pulling in
+    // `diesel::prelude::*` would also import the sync `RunQueryDsl`, making
+    // `.execute` ambiguous (E0034). `sql_query`/`sql_types` are fully qualified
+    // and `.bind` is inherent on the query builder, so no prelude import is required.
+    use diesel_async::RunQueryDsl as _;
 
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            error!("pg connection error: {e}");
-        }
-    });
+    // Check a connection out of the shared pool -- same TLS path as all other
+    // catalog queries opened by PostgresCatalog::new().
+    let mut conn = catalog
+        .pool()
+        .get()
+        .await
+        .map_err(|e| SeedError::Io(std::io::Error::other(format!("pool checkout: {e}"))))?;
 
     for entry in std::fs::read_dir(personas_root)? {
         let entry = entry?;
@@ -559,12 +604,15 @@ async fn update_pack_metadata(postgres_url: &str, personas_root: &Path) -> Resul
             continue;
         };
 
-        let result = client
-            .execute(
-                "UPDATE packs SET description = $1, tags = $2 WHERE name = $3",
-                &[&metadata.description, &metadata.tags, &metadata.name],
-            )
-            .await;
+        // Raw UPDATE: the catalog trait has no update-metadata method, so we
+        // issue the statement directly via diesel's sql_query API.
+        let result =
+            diesel::sql_query("UPDATE packs SET description = $1, tags = $2 WHERE name = $3")
+                .bind::<diesel::sql_types::Text, _>(&metadata.description)
+                .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(&metadata.tags)
+                .bind::<diesel::sql_types::Text, _>(&metadata.name)
+                .execute(&mut *conn)
+                .await;
 
         match result {
             Ok(rows) if rows > 0 => {
@@ -585,8 +633,7 @@ async fn update_pack_metadata(postgres_url: &str, personas_root: &Path) -> Resul
     Ok(())
 }
 
-/// Derive pack metadata from persona.toml when present, otherwise from
-/// pack.toml alone with fallback defaults.
+/// Derive pack metadata from persona.toml when present, otherwise from AGENTS.md.
 fn derive_pack_metadata(path: &Path, dir_name: &str) -> Result<Option<PackMetadata>, SeedError> {
     let persona_path = path.join("persona.toml");
     if persona_path.exists() {
@@ -615,37 +662,18 @@ fn derive_pack_metadata(path: &Path, dir_name: &str) -> Result<Option<PackMetada
         }));
     }
 
-    let pack_path = path.join("pack.toml");
-    if pack_path.exists() {
-        let pack_content = std::fs::read_to_string(&pack_path)?;
-        let pack: MinimalPackToml = toml::from_str(&pack_content).map_err(|e| {
-            SeedError::Io(std::io::Error::other(format!(
-                "parse pack.toml for {dir_name}: {e}"
-            )))
-        })?;
-
-        let mut tags = if pack.tags.is_empty() {
-            derive_pattern_tags(path)?
-        } else {
-            pack.tags
-        };
-        if tags.is_empty() {
-            tags = default_tags(dir_name);
-        }
-
-        let description = pack
-            .description
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| fallback_description(dir_name));
-
-        return Ok(Some(PackMetadata {
-            name: pack.name,
-            description,
-            tags,
-        }));
+    let agents_path = path.join("AGENTS.md");
+    if !agents_path.exists() {
+        return Ok(None);
     }
 
-    Ok(None)
+    let description =
+        derive_agents_description(&agents_path).unwrap_or_else(|| fallback_description(dir_name));
+    Ok(Some(PackMetadata {
+        name: dir_name.to_string(),
+        description,
+        tags: default_tags(dir_name),
+    }))
 }
 
 /// Extract stack-category tags from patterns.toml when that file exists.
@@ -668,111 +696,30 @@ fn fallback_description(dir_name: &str) -> String {
     format!("{dir_name} persona for AI coding agents")
 }
 
-/// Build minimal discovery tags for persona directories without explicit tags.
+/// Build minimal discovery tags for AGENTS-only persona directories.
 fn default_tags(dir_name: &str) -> Vec<String> {
     vec![dir_name.to_string(), "persona".to_string()]
 }
 
-#[cfg(test)]
-/// Focused regression tests for persona discovery and metadata extraction.
-mod tests {
-    use super::*;
-    use std::fs;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    /// Monotonic counter used to generate unique temporary test directories.
-    static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    /// Create a unique temporary directory for a seeder unit test.
-    fn make_temp_dir(label: &str) -> PathBuf {
-        let unique = TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "frameshift-seed-{label}-{}-{unique}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&path).unwrap();
-        path
-    }
-
-    /// Remove a temporary test directory tree after a test finishes.
-    fn remove_temp_dir(path: &Path) {
-        if path.exists() {
-            fs::remove_dir_all(path).unwrap();
+/// Pull the first useful prose line out of AGENTS.md for marketplace display.
+fn derive_agents_description(path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty()
+            || trimmed.starts_with('#')
+            || trimmed.starts_with('<')
+            || trimmed.starts_with('|')
+            || trimmed.starts_with("```")
+            || trimmed.starts_with("- ")
+            || trimmed.starts_with("* ")
+        {
+            continue;
         }
+        if trimmed.len() < 12 {
+            continue;
+        }
+        return Some(trimmed.to_string());
     }
-
-    #[test]
-    /// pack.toml-only persona directories are considered seedable.
-    fn pack_toml_only_directory_is_seedable() {
-        let dir = make_temp_dir("pack-seedable");
-        fs::write(
-            dir.join("pack.toml"),
-            "schema_version = 1\nname = \"agents\"\nauthor_handle = \"ghost-frame\"\nauthor_pubkey = \"UNSIGNED\"\nversion = \"0.1.0\"\n",
-        )
-        .unwrap();
-
-        assert!(is_seedable_persona_dir(&dir));
-
-        remove_temp_dir(&dir);
-    }
-
-    #[test]
-    /// Directories without any manifest artifacts are skipped.
-    fn plain_directory_is_not_seedable() {
-        let dir = make_temp_dir("not-seedable");
-
-        assert!(!is_seedable_persona_dir(&dir));
-
-        remove_temp_dir(&dir);
-    }
-
-    #[test]
-    /// pack.toml-only personas still produce fallback marketplace metadata.
-    fn derive_pack_metadata_supports_pack_toml_only_directories() {
-        let dir = make_temp_dir("pack-metadata");
-        fs::write(
-            dir.join("pack.toml"),
-            "schema_version = 1\nname = \"agents\"\nauthor_handle = \"ghost-frame\"\nauthor_pubkey = \"UNSIGNED\"\nversion = \"0.1.0\"\n",
-        )
-        .unwrap();
-
-        let metadata = derive_pack_metadata(&dir, "agents")
-            .unwrap()
-            .expect("metadata should exist");
-
-        assert_eq!(metadata.name, "agents");
-        assert_eq!(metadata.description, "agents persona for AI coding agents");
-        assert_eq!(
-            metadata.tags,
-            vec!["agents".to_string(), "persona".to_string()]
-        );
-
-        remove_temp_dir(&dir);
-    }
-
-    #[test]
-    /// pack.toml metadata fields override the generic fallback values.
-    fn derive_pack_metadata_prefers_pack_toml_description_and_tags() {
-        let dir = make_temp_dir("pack-metadata-explicit");
-        fs::write(
-            dir.join("pack.toml"),
-            "schema_version = 1\nname = \"agents\"\nauthor_handle = \"ghost-frame\"\nauthor_pubkey = \"UNSIGNED\"\nversion = \"0.1.0\"\ndescription = \"A sharp operator for multi-agent planning and execution.\"\ntags = [\"agents\", \"planning\"]\n",
-        )
-        .unwrap();
-
-        let metadata = derive_pack_metadata(&dir, "agents")
-            .unwrap()
-            .expect("metadata should exist");
-
-        assert_eq!(
-            metadata.description,
-            "A sharp operator for multi-agent planning and execution."
-        );
-        assert_eq!(
-            metadata.tags,
-            vec!["agents".to_string(), "planning".to_string()]
-        );
-
-        remove_temp_dir(&dir);
-    }
+    None
 }

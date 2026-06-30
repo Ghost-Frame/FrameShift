@@ -1,17 +1,35 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// Serde deserializer for `author_pubkey`.
+///
+/// Accepts only exactly 64 lowercase hex characters, which is the canonical
+/// encoding of a 32-byte Ed25519 verifying key used throughout the workspace
+/// (see `frameshift_client::publish::public_key_hex` and the seed tool).
+fn deserialize_author_pubkey<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+    let s = String::deserialize(d)?;
+    // Must be exactly 64 characters of lowercase hex (32 bytes * 2 hex digits).
+    if s.len() != 64 || !s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err(serde::de::Error::custom(
+            "author_pubkey must be 64 lowercase hex characters (32-byte Ed25519 public key)",
+        ));
+    }
+    Ok(s)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PackManifest {
     pub schema_version: u32,
     pub name: String,
     pub author_handle: String,
+    /// Ed25519 verifying key of the author; exactly 64 lowercase hex characters.
+    #[serde(deserialize_with = "deserialize_author_pubkey")]
     pub author_pubkey: String,
     pub version: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -109,10 +127,8 @@ mod tests {
 schema_version = 1
 name = "zenpilot"
 author_handle = "alice"
-author_pubkey = "age1test..."
+author_pubkey = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 version = "1.2.0"
-description = "A thoughtful architectural review persona"
-tags = ["architecture", "review"]
 parent_hash = "sha256:abc123"
 license = "CC-BY-SA-4.0"
 
@@ -141,14 +157,6 @@ optional = true
         assert_eq!(manifest.name, "zenpilot");
         assert_eq!(manifest.schema_version, 1);
         assert_eq!(manifest.author_handle, "alice");
-        assert_eq!(
-            manifest.description,
-            Some("A thoughtful architectural review persona".to_string())
-        );
-        assert_eq!(
-            manifest.tags,
-            vec!["architecture".to_string(), "review".to_string()]
-        );
         assert_eq!(manifest.parent_hash, Some("sha256:abc123".to_string()));
 
         let cap = manifest.capability_manifest.unwrap();
@@ -172,7 +180,7 @@ optional = true
 schema_version = 1
 name = "minimal"
 author_handle = "test"
-author_pubkey = "age1minimal..."
+author_pubkey = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 version = "0.1.0"
 "#;
         let manifest: PackManifest = toml::from_str(toml_str).unwrap();
@@ -181,8 +189,6 @@ version = "0.1.0"
         assert!(manifest.requires.is_none());
         assert!(manifest.tokens_required.is_none());
         assert!(manifest.parent_hash.is_none());
-        assert!(manifest.description.is_none());
-        assert!(manifest.tags.is_empty());
     }
 
     #[test]
@@ -191,10 +197,9 @@ version = "0.1.0"
             schema_version: 1,
             name: "child".to_string(),
             author_handle: "alice".to_string(),
-            author_pubkey: "age1test...".to_string(),
+            author_pubkey: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+                .to_string(),
             version: "1.0.0".to_string(),
-            description: Some("Child persona".to_string()),
-            tags: vec!["child".to_string(), "mixin".to_string()],
             parent_hash: None,
             license: None,
             capability_manifest: None,
@@ -219,10 +224,9 @@ version = "0.1.0"
             schema_version: 1,
             name: "minimal".to_string(),
             author_handle: "t".to_string(),
-            author_pubkey: "k".to_string(),
+            author_pubkey: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+                .to_string(),
             version: "0.1.0".to_string(),
-            description: None,
-            tags: Vec::new(),
             parent_hash: None,
             license: None,
             capability_manifest: None,
@@ -237,7 +241,5 @@ version = "0.1.0"
         assert!(!serialized.contains("extends"));
         assert!(!serialized.contains("mixin"));
         assert!(!serialized.contains("conformance_baseline"));
-        assert!(!serialized.contains("description"));
-        assert!(!serialized.contains("tags"));
     }
 }

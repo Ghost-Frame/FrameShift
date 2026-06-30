@@ -32,25 +32,23 @@ pub fn score_test(test: &TestCase, response: &str) -> Score {
             _ => Score::ZERO,
         },
         ScorerKind::Regex => match &test.expected {
-            ExpectedBehavior::Matches { pattern } => {
-                match regex::Regex::new(pattern) {
-                    Ok(re) => {
-                        if re.is_match(response) {
-                            Score::PERFECT
-                        } else {
-                            Score::ZERO
-                        }
-                    }
-                    Err(_) => {
-                        tracing::warn!(
-                            pattern = %pattern,
-                            "invalid regex in test case {}",
-                            test.id
-                        );
+            ExpectedBehavior::Matches { pattern } => match regex::Regex::new(pattern) {
+                Ok(re) => {
+                    if re.is_match(response) {
+                        Score::PERFECT
+                    } else {
                         Score::ZERO
                     }
                 }
-            }
+                Err(_) => {
+                    tracing::warn!(
+                        pattern = %pattern,
+                        "invalid regex in test case {}",
+                        test.id
+                    );
+                    Score::ZERO
+                }
+            },
             _ => Score::ZERO,
         },
         ScorerKind::ExactJson => match &test.expected {
@@ -78,16 +76,51 @@ pub fn score_test(test: &TestCase, response: &str) -> Score {
     }
 }
 
-/// Average per-test score across the bundle. Empty bundles score 0.
-pub fn bundle_score(_bundle: &TestBundle, results: &[(TestCase, String)]) -> Score {
-    if results.is_empty() {
+/// Average per-test score across the bundle's declared test set.
+///
+/// Scoring iterates the bundle's canonical `tests` and matches each to a
+/// response by test id. This closes two gaming vectors in the prior
+/// average-over-results implementation:
+///
+/// - A test with no corresponding result scores [`Score::ZERO`], so omitting a
+///   failing test from the results cannot raise the average.
+/// - Only the first response per test id is counted, so padding the results
+///   with extra passing entries (or duplicating one) cannot raise it either.
+///
+/// Each test is scored with the bundle's authoritative [`TestCase`], never a
+/// client-supplied one carried alongside the response. Empty bundles score
+/// [`Score::ZERO`].
+pub fn bundle_score(bundle: &TestBundle, results: &[(TestCase, String)]) -> Score {
+    if bundle.tests.is_empty() {
         return Score::ZERO;
     }
-    let total: f32 = results
+    // First response wins per id, so duplicate result entries cannot skew the average.
+    let responses = first_response_per_id(results);
+    let total: f32 = bundle
+        .tests
         .iter()
-        .map(|(case, response)| score_test(case, response).0)
+        .map(|test| match responses.get(test.id.as_str()) {
+            Some(response) => score_test(test, response).0,
+            None => Score::ZERO.0,
+        })
         .sum();
-    Score(total / results.len() as f32)
+    Score(total / bundle.tests.len() as f32)
+}
+
+/// Build an id -> response map from runner results, keeping only the first
+/// response seen for each test id. Shared by [`bundle_score`] and
+/// [`crate::caller::score_bundle_with_caller`] so both resist omitted and
+/// duplicated result entries identically.
+pub(crate) fn first_response_per_id(
+    results: &[(TestCase, String)],
+) -> std::collections::HashMap<&str, &str> {
+    let mut responses: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for (case, response) in results {
+        responses
+            .entry(case.id.as_str())
+            .or_insert(response.as_str());
+    }
+    responses
 }
 
 #[cfg(test)]
@@ -123,7 +156,9 @@ mod tests {
     fn regex_scorer_matches_substring() {
         let case = make_case(
             "t1",
-            ExpectedBehavior::Matches { pattern: "hello".to_string() },
+            ExpectedBehavior::Matches {
+                pattern: "hello".to_string(),
+            },
             ScorerKind::Regex,
         );
         assert_eq!(score_test(&case, "say hello"), Score::PERFECT);
@@ -134,7 +169,9 @@ mod tests {
     fn regex_scorer_no_match() {
         let case = make_case(
             "t2",
-            ExpectedBehavior::Matches { pattern: "goodbye".to_string() },
+            ExpectedBehavior::Matches {
+                pattern: "goodbye".to_string(),
+            },
             ScorerKind::Regex,
         );
         assert_eq!(score_test(&case, "hello"), Score::ZERO);
@@ -145,7 +182,9 @@ mod tests {
     fn regex_scorer_anchored() {
         let case = make_case(
             "t3",
-            ExpectedBehavior::Matches { pattern: "^hello".to_string() },
+            ExpectedBehavior::Matches {
+                pattern: "^hello".to_string(),
+            },
             ScorerKind::Regex,
         );
         assert_eq!(score_test(&case, "say hello"), Score::ZERO);
@@ -156,7 +195,9 @@ mod tests {
     fn regex_scorer_invalid_pattern() {
         let case = make_case(
             "t4",
-            ExpectedBehavior::Matches { pattern: "[unclosed".to_string() },
+            ExpectedBehavior::Matches {
+                pattern: "[unclosed".to_string(),
+            },
             ScorerKind::Regex,
         );
         assert_eq!(score_test(&case, "anything"), Score::ZERO);
@@ -219,7 +260,9 @@ mod tests {
     fn caller_returns_zero_in_score_test() {
         let case = make_case(
             "c1",
-            ExpectedBehavior::Custom { id: "my-judge".to_string() },
+            ExpectedBehavior::Custom {
+                id: "my-judge".to_string(),
+            },
             ScorerKind::Caller,
         );
         assert_eq!(score_test(&case, "any response"), Score::ZERO);
@@ -238,15 +281,76 @@ mod tests {
     #[test]
     /// score_bundle_with_caller delegates Caller cases to the CallerScorer.
     fn bundle_with_caller_trait() {
-        let bundle = make_bundle();
-        let case = make_case(
+        // The case must be part of the bundle's canonical test set to be scored.
+        let mut bundle = make_bundle();
+        bundle.tests.push(make_case(
             "c2",
-            ExpectedBehavior::Custom { id: "judge".to_string() },
+            ExpectedBehavior::Custom {
+                id: "judge".to_string(),
+            },
             ScorerKind::Caller,
-        );
-        let results = vec![(case, "response".to_string())];
+        ));
+        let results = vec![(
+            make_case(
+                "c2",
+                ExpectedBehavior::Custom {
+                    id: "judge".to_string(),
+                },
+                ScorerKind::Caller,
+            ),
+            "response".to_string(),
+        )];
         let scorer = AlwaysPerfect;
         let score = score_bundle_with_caller(&bundle, &results, &scorer);
         assert_eq!(score, Score::PERFECT);
+    }
+
+    #[test]
+    /// Omitting a failing test's result cannot inflate the score: the bundle
+    /// declares two substring tests, but only the passing one is reported. The
+    /// missing one must score ZERO, yielding 0.5 rather than a gamed 1.0.
+    fn omitted_result_scores_zero() {
+        let pass = make_case(
+            "p",
+            ExpectedBehavior::Contains {
+                value: "ok".to_string(),
+            },
+            ScorerKind::Substring,
+        );
+        let fail = make_case(
+            "f",
+            ExpectedBehavior::Contains {
+                value: "ok".to_string(),
+            },
+            ScorerKind::Substring,
+        );
+        let mut bundle = make_bundle();
+        bundle.tests.push(pass.clone());
+        bundle.tests.push(fail);
+        // Only the passing test's result is supplied; the failing one is omitted.
+        let results = vec![(pass, "ok".to_string())];
+        assert_eq!(bundle_score(&bundle, &results), Score(0.5));
+    }
+
+    #[test]
+    /// Duplicated passing results cannot inflate the score: a single declared
+    /// test scored against three identical passing results still yields 1.0
+    /// (counted once), and padding does not change the denominator.
+    fn duplicated_results_counted_once() {
+        let pass = make_case(
+            "p",
+            ExpectedBehavior::Contains {
+                value: "ok".to_string(),
+            },
+            ScorerKind::Substring,
+        );
+        let mut bundle = make_bundle();
+        bundle.tests.push(pass.clone());
+        let results = vec![
+            (pass.clone(), "ok".to_string()),
+            (pass.clone(), "ok".to_string()),
+            (pass, "ok".to_string()),
+        ];
+        assert_eq!(bundle_score(&bundle, &results), Score::PERFECT);
     }
 }

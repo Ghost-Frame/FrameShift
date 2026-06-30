@@ -3,8 +3,6 @@ name = "architecture"
 author_handle = "ghost-frame"
 author_pubkey = "UNSIGNED"
 version = "0.1.0"
-description = "System architecture, boundaries, and long-range technical design."
-tags = ["architecture", "systems", "design", "strategy"]
 license = "Elastic-2.0"
 
 [capability_manifest]

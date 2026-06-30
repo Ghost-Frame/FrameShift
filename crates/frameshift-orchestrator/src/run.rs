@@ -182,13 +182,13 @@ pub fn select_rich(inputs: &SelectionInputs<'_>) -> Result<SelectionOutput, Orch
             let matched_tokens: Vec<String> = ctx
                 .task_tokens
                 .iter()
-                .filter(|t| profile.map_or(false, |p| p.keywords.contains(*t)))
+                .filter(|t| profile.is_some_and(|p| p.keywords.contains(*t)))
                 .cloned()
                 .collect();
             let anti_matched: Vec<String> = ctx
                 .task_tokens
                 .iter()
-                .filter(|t| profile.map_or(false, |p| p.anti_keywords.contains(*t)))
+                .filter(|t| profile.is_some_and(|p| p.anti_keywords.contains(*t)))
                 .cloned()
                 .collect();
 
@@ -363,7 +363,11 @@ tone = "precise"
     fn selection_output_serializes_to_json() {
         let tmp = TempDir::new().unwrap();
         let dir_a = tmp.path().join("alpha");
-        make_freeform_persona(&dir_a, "alpha", "# Alpha\n\nRust cargo clippy. Debugging and implementation.\n");
+        make_freeform_persona(
+            &dir_a,
+            "alpha",
+            "# Alpha\n\nRust cargo clippy. Debugging and implementation.\n",
+        );
 
         let project = TempDir::new().unwrap();
         let inputs = SelectionInputs {

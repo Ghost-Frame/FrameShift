@@ -10,6 +10,9 @@ pub enum GateDecision {
     FailRegression { delta: f32 },
     /// Bundle hash changed, so the baseline cannot be compared directly.
     FailBundleChanged,
+    /// A score was non-finite or outside `0.0..=1.0`; the gate fails closed
+    /// rather than letting a malformed baseline or buggy scorer slip through.
+    FailInvalidScore,
 }
 
 /// Stateless evaluator. The runtime constructs one per upgrade attempt.
@@ -29,6 +32,13 @@ impl RegressionGate {
         new_score: Score,
         new_bundle_hash: &str,
     ) -> GateDecision {
+        // Fail closed on non-finite or out-of-range scores: a NaN comparison
+        // returns false and would otherwise fall through to Pass, letting a
+        // malformed baseline or buggy custom scorer bypass regression blocking.
+        let valid = |s: f32| s.is_finite() && (0.0..=1.0).contains(&s);
+        if !valid(old_baseline.score) || !valid(new_score.0) {
+            return GateDecision::FailInvalidScore;
+        }
         if old_baseline.bundle_hash != new_bundle_hash {
             return GateDecision::FailBundleChanged;
         }
@@ -50,6 +60,25 @@ mod tests {
             score,
             bundle_hash: hash.to_string(),
         }
+    }
+
+    /// Non-finite or out-of-range scores fail closed.
+    #[test]
+    fn gate_fails_closed_on_invalid_score() {
+        let nan_baseline = baseline(f32::NAN, "abc");
+        assert_eq!(
+            RegressionGate::evaluate_upgrade(&nan_baseline, Score(0.9), "abc"),
+            GateDecision::FailInvalidScore
+        );
+        let ok_baseline = baseline(0.8, "abc");
+        assert_eq!(
+            RegressionGate::evaluate_upgrade(&ok_baseline, Score(f32::INFINITY), "abc"),
+            GateDecision::FailInvalidScore
+        );
+        assert_eq!(
+            RegressionGate::evaluate_upgrade(&ok_baseline, Score(1.5), "abc"),
+            GateDecision::FailInvalidScore
+        );
     }
 
     #[test]

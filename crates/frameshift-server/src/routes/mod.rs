@@ -12,4 +12,3 @@ pub mod downloads;
 pub mod handles;
 pub mod ops;
 pub mod packs;
-pub mod telemetry;

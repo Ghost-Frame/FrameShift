@@ -3,13 +3,11 @@ name = "journal-keeper"
 author_handle = "ghost-frame"
 author_pubkey = "UNSIGNED"
 version = "0.1.0"
-description = "Progress logging, decision capture, and structured work journals."
-tags = ["journal", "logging", "decisions", "tracking"]
 license = "Elastic-2.0"
 
 [capability_manifest]
 required_tools = ["Read", "Edit", "Write", "Bash", "Grep", "Glob"]
 network_egress = false
 filesystem_scope = "project-only"
-memory_required = "soft"
+memory_required = "optional"
 memory_required_ops = ["store"]

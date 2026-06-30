@@ -14,7 +14,10 @@ fn project_id_env_override_is_used_verbatim() {
     fs::create_dir_all(&project_root).expect("create project");
 
     std::env::set_var("FRAMESHIFT_PROJECT_ID", "team-alpha");
-    let client = Client::new(ClientOptions { data_root, config_root: None });
+    let client = Client::new(ClientOptions {
+        data_root,
+        config_root: None,
+    });
     let result = client.project_id(&project_root);
     std::env::remove_var("FRAMESHIFT_PROJECT_ID");
 

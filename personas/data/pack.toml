@@ -3,8 +3,6 @@ name = "data"
 author_handle = "ghost-frame"
 author_pubkey = "UNSIGNED"
 version = "0.1.0"
-description = "Data pipelines, transformation, analytics, and structured data workflows."
-tags = ["data", "pipelines", "analytics", "transforms"]
 license = "Elastic-2.0"
 
 [capability_manifest]

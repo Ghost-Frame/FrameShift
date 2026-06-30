@@ -196,12 +196,6 @@ pub struct PackVersionRecord {
     /// deserialization path.
     pub schema_version: u32,
 
-    /// Author-side conformance score for this version, when a baseline was shipped.
-    pub conformance_score: Option<f32>,
-
-    /// Bundle hash the conformance score was computed against, when available.
-    pub conformance_bundle_hash: Option<String>,
-
     /// The SPDX license identifier for this pack (e.g. `"MIT"`, `"Apache-2.0"`).
     pub license: String,
 
@@ -218,66 +212,6 @@ pub struct PackVersionRecord {
     ///
     /// Reflects the size of the packed artifact as stored in the object store.
     pub size_bytes: u64,
-}
-
-/// A templated telemetry signal keyed by pack, version, kind, and sub-key.
-///
-/// The `count` field accumulates monotonically for counters while `value`
-/// stores the latest scalar payload for the same key.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct TelemetrySignal {
-    /// The pack name this signal belongs to.
-    pub pack_name: String,
-
-    /// The pack version string this signal belongs to.
-    pub version: String,
-
-    /// The accepted telemetry kind.
-    pub kind: TelemetryKind,
-
-    /// The optional signal key (rule id, skill name, bundle hash, or empty).
-    pub key: String,
-
-    /// The accumulated count for this signal row.
-    pub count: u64,
-
-    /// The latest scalar value associated with this signal row.
-    pub value: Option<f64>,
-}
-
-/// The closed set of accepted telemetry kinds.
-///
-/// Unknown kinds are rejected at ingest by serde and by the Postgres adapter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TelemetryKind {
-    /// Whole-pack or per-version selection count.
-    SelectionCount,
-
-    /// Whole-pack or per-version auto-selection count.
-    AutoSelectCount,
-
-    /// Author-side conformance score emitted from the signed baseline.
-    ConformanceScore,
-
-    /// Rule citation count keyed by rule id.
-    RuleCited,
-
-    /// Skill friction signal keyed by skill name.
-    SkillFriction,
-}
-
-impl TelemetryKind {
-    /// Return the canonical snake_case wire representation for this kind.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::SelectionCount => "selection_count",
-            Self::AutoSelectCount => "auto_select_count",
-            Self::ConformanceScore => "conformance_score",
-            Self::RuleCited => "rule_cited",
-            Self::SkillFriction => "skill_friction",
-        }
-    }
 }
 
 #[cfg(test)]

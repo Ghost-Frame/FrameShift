@@ -35,6 +35,10 @@ pub enum SqliteFtsError {
     /// The database file path or its parent could not be created.
     #[error("configuration error: {0}")]
     Configuration(String),
+
+    /// A caller-supplied value (query string, filter key, etc.) is invalid.
+    #[error("invalid query: {0}")]
+    InvalidQuery(String),
 }
 
 impl From<SqliteFtsError> for MemoryError {
@@ -47,6 +51,7 @@ impl From<SqliteFtsError> for MemoryError {
             SqliteFtsError::Json(inner) => MemoryError::Backend(inner.to_string()),
             SqliteFtsError::Uuid(inner) => MemoryError::Backend(inner.to_string()),
             SqliteFtsError::Configuration(msg) => MemoryError::Configuration(msg),
+            SqliteFtsError::InvalidQuery(msg) => MemoryError::InvalidQuery(msg),
         }
     }
 }

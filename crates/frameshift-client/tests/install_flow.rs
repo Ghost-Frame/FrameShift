@@ -21,7 +21,7 @@ fn install_activate_and_sync_materialize_central_state() {
 schema_version = 1
 name = "cryptographic"
 author_handle = "alice"
-author_pubkey = "unsigned-local-pack"
+author_pubkey = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 version = "0.3.1"
 "#,
             ),
@@ -158,7 +158,7 @@ fn gc_removes_unreferenced_cache_entries() {
 schema_version = 1
 name = "cryptographic"
 author_handle = "alice"
-author_pubkey = "unsigned-local-pack"
+author_pubkey = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 version = "0.3.1"
 "#,
             ),
@@ -191,75 +191,6 @@ version = "0.3.1"
     assert!(!gc_report.removed_hashes.contains(&report.persona.hash));
     assert!(!stale_dir.exists());
     assert!(report.cache_path.exists());
-}
-
-#[test]
-fn record_selection_event_writes_jsonl_selection_entry() {
-    let temp = TempDir::new().expect("tempdir");
-    let data_root = temp.path().join("data-root");
-    let project_root = temp.path().join("project");
-    let pack_root = temp.path().join("cryptographic-pack");
-
-    fs::create_dir_all(&project_root).expect("create project");
-    write_pack(
-        &pack_root,
-        &[
-            (
-                "pack.toml",
-                r#"
-schema_version = 1
-name = "cryptographic"
-author_handle = "alice"
-author_pubkey = "unsigned-local-pack"
-version = "0.3.1"
-"#,
-            ),
-            ("AGENTS.md", "# cryptographic\n"),
-        ],
-    );
-
-    let client = Client::new(ClientOptions {
-        data_root: data_root.clone(),
-        config_root: None,
-    });
-    client
-        .install(InstallRequest {
-            project_root: project_root.clone(),
-            spec: PersonaSpec {
-                name: "cryptographic".to_string(),
-                version: "0.3.1".to_string(),
-            },
-            source: InstallSource::LocalPath(pack_root),
-        })
-        .expect("install");
-    client
-        .activate(&project_root, "cryptographic")
-        .expect("activate");
-
-    client
-        .record_selection_event(
-            &project_root,
-            "cryptographic",
-            "cli:test",
-            false,
-            Some("review telemetry wiring"),
-        )
-        .expect("record selection");
-
-    let project_id = client.project_id(&project_root).expect("project id");
-    let entries = frameshift_growth::read_entries(
-        client.data_root(),
-        &project_id,
-        "cryptographic",
-        frameshift_growth::Scope::Project,
-    )
-    .expect("read entries");
-
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].session, "cli:test");
-    assert_eq!(entries[0].intent.as_deref(), Some("selection"));
-    assert_eq!(entries[0].task.as_deref(), Some("review telemetry wiring"));
-    assert!(!entries[0].auto_selected);
 }
 
 fn write_pack(root: &Path, files: &[(&str, &str)]) {

@@ -154,7 +154,9 @@ impl SwitchController {
             AutomateState::Locked { persona } => persona.clone(),
             _ => String::new(),
         };
-        self.state = AutomateState::Locked { persona: locked_name };
+        self.state = AutomateState::Locked {
+            persona: locked_name,
+        };
         self.debounce_count = 0;
         self.challenger = None;
     }
@@ -216,7 +218,9 @@ impl SwitchController {
                 }
             }
 
-            AutomateState::Active { persona: current, .. } => {
+            AutomateState::Active {
+                persona: current, ..
+            } => {
                 if top.persona == *current {
                     // Same persona still at top -- reset challenger tracking, hold.
                     self.debounce_count = 0;
@@ -227,7 +231,8 @@ impl SwitchController {
                 // Distribution-aware switching: compute mean and stddev of all scores.
                 let scores: Vec<f32> = ranked.iter().map(|s| s.score).collect();
                 let mean = scores.iter().sum::<f32>() / scores.len() as f32;
-                let variance = scores.iter().map(|s| (s - mean).powi(2)).sum::<f32>() / scores.len() as f32;
+                let variance =
+                    scores.iter().map(|s| (s - mean).powi(2)).sum::<f32>() / scores.len() as f32;
                 let stddev = variance.sqrt().max(f32::EPSILON);
 
                 // Z-score confidence: is the top score a statistical outlier above the mean?
@@ -343,7 +348,11 @@ mod tests {
             scored("gamma", 0.800, 0.4),
         ];
         let d2 = ctrl.decide(&ranked_b);
-        assert_eq!(d2, Decision::Hold, "small normalized gap must not trigger switch");
+        assert_eq!(
+            d2,
+            Decision::Hold,
+            "small normalized gap must not trigger switch"
+        );
     }
 
     /// A sustained clearly-stronger competitor DOES switch after debounce.
@@ -362,7 +371,9 @@ mod tests {
         // Establish alpha as active.
         let ranked_a = vec![scored("alpha", 0.7, 0.65), scored("beta", 0.3, 0.2)];
         ctrl.decide(&ranked_a);
-        assert!(matches!(ctrl.state(), AutomateState::Active { persona, .. } if persona == "alpha"));
+        assert!(
+            matches!(ctrl.state(), AutomateState::Active { persona, .. } if persona == "alpha")
+        );
 
         // Beta clearly stronger: gap = 0.9 - 0.3 = 0.6; range = 0.6; normalized_gap = 1.0 > 0.09.
         // stddev will be large, so z-score may or may not be confident -- but gap is meaningful.
@@ -490,7 +501,11 @@ mod tests {
         assert_eq!(d1, Decision::Hold, "low sensitivity first tick should hold");
 
         let d2 = ctrl.decide(&ranked_b);
-        assert_eq!(d2, Decision::Hold, "low sensitivity second tick should hold");
+        assert_eq!(
+            d2,
+            Decision::Hold,
+            "low sensitivity second tick should hold"
+        );
 
         let d3 = ctrl.decide(&ranked_b);
         assert!(

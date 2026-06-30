@@ -38,21 +38,27 @@ pub fn score_bundle_with_caller(
     results: &[(TestCase, String)],
     caller: &dyn CallerScorer,
 ) -> Score {
-    if results.is_empty() {
+    if bundle.tests.is_empty() {
         return Score::ZERO;
     }
-    let total: f32 = results
+    // Match responses to the bundle's canonical test set by id, first response
+    // wins. Same anti-gaming semantics as `bundle_score`: a declared test with
+    // no result scores ZERO, and duplicate/extra results cannot skew the average.
+    let responses = crate::score::first_response_per_id(results);
+    let total: f32 = bundle
+        .tests
         .iter()
-        .map(|(case, response)| {
-            if case.scorer == ScorerKind::Caller {
-                caller.score(case, response)
-            } else {
-                score_test(case, response)
+        .map(|test| match responses.get(test.id.as_str()) {
+            Some(response) => {
+                if test.scorer == ScorerKind::Caller {
+                    caller.score(test, response)
+                } else {
+                    score_test(test, response)
+                }
             }
+            None => Score::ZERO,
         })
         .map(|s| s.0)
         .sum();
-    // Re-use the same averaging formula as bundle_score to stay consistent.
-    let _ = bundle; // bundle is accepted for API symmetry with bundle_score
-    Score(total / results.len() as f32)
+    Score(total / bundle.tests.len() as f32)
 }

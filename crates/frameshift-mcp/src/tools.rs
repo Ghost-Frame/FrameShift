@@ -146,6 +146,24 @@ fn err_result(text: String) -> ToolResult {
 /// Returns a ToolResult -- errors are represented as is_error results rather than
 /// propagated as Rust errors, matching the MCP protocol's expectation that tools/call
 /// always returns a 200-level JSON-RPC response.
+/// Validate a caller-supplied filesystem path argument.
+///
+/// At the MCP boundary the caller is a local agent, but a prompt-injected tool
+/// call could pass a traversal path. Require the path to be absolute and to
+/// contain no `..` component: this blocks relative/`..` escapes while still
+/// letting the agent address any real project directory by absolute path.
+fn validate_path_arg(raw: &str) -> Result<std::path::PathBuf, String> {
+    use std::path::Component;
+    let path = std::path::PathBuf::from(raw);
+    if !path.is_absolute() {
+        return Err(format!("path must be absolute: {raw:?}"));
+    }
+    if path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(format!("path must not contain '..': {raw:?}"));
+    }
+    Ok(path)
+}
+
 pub fn call_tool(name: &str, arguments: &serde_json::Value, client: &Client) -> ToolResult {
     match name {
         "frameshift_install" => call_install(arguments, client),
@@ -180,10 +198,16 @@ fn call_install(arguments: &serde_json::Value, client: &Client) -> ToolResult {
         Err(e) => return err_result(format!("invalid spec \"{}\": {}", spec_str, e)),
     };
 
-    let project_root = std::path::PathBuf::from(project_root_str);
+    let project_root = match validate_path_arg(project_root_str) {
+        Ok(p) => p,
+        Err(e) => return err_result(e),
+    };
 
     let source = match arguments.get("from_path").and_then(|v| v.as_str()) {
-        Some(p) => InstallSource::LocalPath(std::path::PathBuf::from(p)),
+        Some(p) => match validate_path_arg(p) {
+            Ok(pb) => InstallSource::LocalPath(pb),
+            Err(e) => return err_result(e),
+        },
         None => InstallSource::Registry,
     };
 
@@ -211,13 +235,21 @@ fn call_activate(arguments: &serde_json::Value, client: &Client) -> ToolResult {
         Some(s) => s,
         None => return err_result("missing required argument: persona".to_string()),
     };
+    // Validate at the MCP boundary so a traversal name is rejected here with a
+    // clear error, mirroring call_grow_append (the client layer also guards it).
+    if let Err(e) = frameshift_client::validate_persona_name(persona) {
+        return err_result(format!("invalid persona name: {e}"));
+    }
 
     let project_root_str = match arguments.get("project_root").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => return err_result("missing required argument: project_root".to_string()),
     };
 
-    let project_root = std::path::PathBuf::from(project_root_str);
+    let project_root = match validate_path_arg(project_root_str) {
+        Ok(p) => p,
+        Err(e) => return err_result(e),
+    };
 
     match client.activate(&project_root, persona) {
         Ok(()) => {
@@ -237,7 +269,10 @@ fn call_list(arguments: &serde_json::Value, client: &Client) -> ToolResult {
         None => return err_result("missing required argument: project_root".to_string()),
     };
 
-    let project_root = std::path::PathBuf::from(project_root_str);
+    let project_root = match validate_path_arg(project_root_str) {
+        Ok(p) => p,
+        Err(e) => return err_result(e),
+    };
 
     match client.sync(&project_root) {
         Ok(report) => {
@@ -261,13 +296,21 @@ fn call_grow_append(arguments: &serde_json::Value, client: &Client) -> ToolResul
         Some(s) => s,
         None => return err_result("missing required argument: persona".to_string()),
     };
+    // Validate at the MCP boundary: grow append joins the name into a growth.md
+    // path in the client layer, which does not itself guard this path.
+    if let Err(e) = frameshift_client::validate_persona_name(persona) {
+        return err_result(format!("invalid persona name: {e}"));
+    }
 
     let text = match arguments.get("text").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => return err_result("missing required argument: text".to_string()),
     };
 
-    let project_root = std::path::PathBuf::from(project_root_str);
+    let project_root = match validate_path_arg(project_root_str) {
+        Ok(p) => p,
+        Err(e) => return err_result(e),
+    };
 
     let project_id = match client.project_id(&project_root) {
         Ok(id) => id,
@@ -295,15 +338,21 @@ fn call_select(arguments: &serde_json::Value, client: &Client) -> ToolResult {
         None => return err_result("missing required argument: project_root".to_string()),
     };
 
-    let project_root = std::path::PathBuf::from(project_root_str);
+    let project_root = match validate_path_arg(project_root_str) {
+        Ok(p) => p,
+        Err(e) => return err_result(e),
+    };
     let task_hint = arguments
         .get("task")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    let library = arguments
-        .get("library")
-        .and_then(|v| v.as_str())
-        .map(std::path::PathBuf::from);
+    let library = match arguments.get("library").and_then(|v| v.as_str()) {
+        Some(p) => match validate_path_arg(p) {
+            Ok(pb) => Some(pb),
+            Err(e) => return err_result(e),
+        },
+        None => None,
+    };
 
     // Resolve orchestrator state dir and load preferences.
     let state_dir = match client.orchestrator_state_dir(&project_root) {
@@ -366,8 +415,15 @@ fn call_use(arguments: &serde_json::Value, client: &Client) -> ToolResult {
         Some(s) => s,
         None => return err_result("missing required argument: persona".to_string()),
     };
+    // Validate at the MCP boundary, mirroring call_grow_append/call_activate.
+    if let Err(e) = frameshift_client::validate_persona_name(persona) {
+        return err_result(format!("invalid persona name: {e}"));
+    }
 
-    let project_root = std::path::PathBuf::from(project_root_str);
+    let project_root = match validate_path_arg(project_root_str) {
+        Ok(p) => p,
+        Err(e) => return err_result(e),
+    };
 
     if let Err(e) = client.activate(&project_root, persona) {
         return err_result(format!("activate failed: {}", e));
@@ -396,7 +452,10 @@ fn call_automate(arguments: &serde_json::Value, client: &Client) -> ToolResult {
         None => return err_result("missing required argument: action".to_string()),
     };
 
-    let project_root = std::path::PathBuf::from(project_root_str);
+    let project_root = match validate_path_arg(project_root_str) {
+        Ok(p) => p,
+        Err(e) => return err_result(e),
+    };
 
     let state_dir = match client.orchestrator_state_dir(&project_root) {
         Ok(d) => d,
@@ -409,15 +468,23 @@ fn call_automate(arguments: &serde_json::Value, client: &Client) -> ToolResult {
 
     match action {
         "on" => {
-            let state = ModeState { mode: Mode::On, sensitivity: 0.5 };
+            let state = ModeState {
+                mode: Mode::On,
+                sensitivity: 0.5,
+            };
             if let Err(e) = state.save(&mode_path) {
                 return err_result(format!("failed to save mode: {}", e));
             }
-            ok_result(serde_json::json!({ "mode": "on", "sensitivity": state.sensitivity }).to_string())
+            ok_result(
+                serde_json::json!({ "mode": "on", "sensitivity": state.sensitivity }).to_string(),
+            )
         }
 
         "off" => {
-            let state = ModeState { mode: Mode::Off, sensitivity: 0.5 };
+            let state = ModeState {
+                mode: Mode::Off,
+                sensitivity: 0.5,
+            };
             if let Err(e) = state.save(&mode_path) {
                 return err_result(format!("failed to save mode: {}", e));
             }
@@ -518,7 +585,10 @@ fn call_prefs(arguments: &serde_json::Value, client: &Client) -> ToolResult {
         None => return err_result("missing required argument: action".to_string()),
     };
 
-    let project_root = std::path::PathBuf::from(project_root_str);
+    let project_root = match validate_path_arg(project_root_str) {
+        Ok(p) => p,
+        Err(e) => return err_result(e),
+    };
 
     let state_dir = match client.orchestrator_state_dir(&project_root) {
         Ok(d) => d,
@@ -530,7 +600,8 @@ fn call_prefs(arguments: &serde_json::Value, client: &Client) -> ToolResult {
     match action {
         "show" => {
             let prefs = Preferences::load(&prefs_path).unwrap_or_default();
-            let text = serde_json::json!({ "bias": prefs.bias }).to_string();
+            let text =
+                serde_json::json!({ "bias": prefs.bias, "entries": prefs.entries }).to_string();
             ok_result(text)
         }
 
@@ -558,8 +629,7 @@ fn call_prefs(arguments: &serde_json::Value, client: &Client) -> ToolResult {
                 None => return err_result("decay requires 'persona' argument".to_string()),
             };
             let mut prefs = Preferences::load(&prefs_path).unwrap_or_default();
-            prefs.record_override(Some(persona), "__manual_decay__");
-            prefs.bias.remove("__manual_decay__");
+            prefs.decay(persona);
             if let Err(e) = prefs.save(&prefs_path) {
                 return err_result(format!("failed to save preferences: {}", e));
             }
@@ -592,11 +662,20 @@ mod tests {
     use frameshift_client::{ClientOptions, InstallRequest, InstallSource, PersonaSpec};
     use std::fs;
 
+    /// validate_path_arg accepts clean absolute paths and rejects relative/`..`.
+    #[test]
+    fn validate_path_arg_guards_traversal() {
+        assert!(validate_path_arg("/home/user/project").is_ok());
+        assert!(validate_path_arg("relative/path").is_err());
+        assert!(validate_path_arg("/home/user/../../etc").is_err());
+        assert!(validate_path_arg("..").is_err());
+    }
+
     /// Create a minimal pack directory suitable for install testing.
     fn make_pack_dir(dir: &std::path::Path, name: &str, version: &str) {
         fs::create_dir_all(dir).unwrap();
         let manifest = format!(
-            "schema_version = 1\nname = \"{}\"\nversion = \"{}\"\nauthor_handle = \"test\"\nauthor_pubkey = \"local-unsigned\"\n",
+            "schema_version = 1\nname = \"{}\"\nversion = \"{}\"\nauthor_handle = \"test\"\nauthor_pubkey = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\n",
             name, version
         );
         fs::write(dir.join("pack.toml"), manifest).unwrap();
@@ -798,7 +877,10 @@ mod tests {
             result.content[0].text
         );
         let parsed: serde_json::Value = serde_json::from_str(&result.content[0].text).unwrap();
-        assert!(parsed["bias"].is_object(), "result must have a 'bias' object");
+        assert!(
+            parsed["bias"].is_object(),
+            "result must have a 'bias' object"
+        );
         assert_eq!(
             parsed["bias"].as_object().unwrap().len(),
             0,
@@ -826,9 +908,12 @@ mod tests {
             }),
             &client,
         );
-        assert!(bump.is_error.is_none(), "bump failed: {:?}", bump.content[0].text);
-        let bump_parsed: serde_json::Value =
-            serde_json::from_str(&bump.content[0].text).unwrap();
+        assert!(
+            bump.is_error.is_none(),
+            "bump failed: {:?}",
+            bump.content[0].text
+        );
+        let bump_parsed: serde_json::Value = serde_json::from_str(&bump.content[0].text).unwrap();
         let bumped_bias = bump_parsed["bias"].as_f64().unwrap();
         assert!(bumped_bias > 0.0, "bump must produce a positive bias");
 
@@ -838,8 +923,7 @@ mod tests {
             &serde_json::json!({"project_root": root_str, "action": "show"}),
             &client,
         );
-        let show_parsed: serde_json::Value =
-            serde_json::from_str(&show.content[0].text).unwrap();
+        let show_parsed: serde_json::Value = serde_json::from_str(&show.content[0].text).unwrap();
         assert_eq!(
             show_parsed["bias"]["rust"].as_f64().unwrap(),
             bumped_bias,
@@ -875,8 +959,7 @@ mod tests {
             &client,
         );
         assert!(reset.is_error.is_none());
-        let reset_parsed: serde_json::Value =
-            serde_json::from_str(&reset.content[0].text).unwrap();
+        let reset_parsed: serde_json::Value = serde_json::from_str(&reset.content[0].text).unwrap();
         assert_eq!(reset_parsed["reset"], true);
 
         // Show must now be empty.
@@ -885,8 +968,7 @@ mod tests {
             &serde_json::json!({"project_root": root_str, "action": "show"}),
             &client,
         );
-        let show_parsed: serde_json::Value =
-            serde_json::from_str(&show.content[0].text).unwrap();
+        let show_parsed: serde_json::Value = serde_json::from_str(&show.content[0].text).unwrap();
         assert_eq!(
             show_parsed["bias"].as_object().unwrap().len(),
             0,

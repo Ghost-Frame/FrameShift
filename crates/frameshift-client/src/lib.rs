@@ -1,13 +1,21 @@
 mod error;
 mod model;
-mod telemetry;
+/// Registry publish implementation: pack, sign, and HTTP upload.
+mod publish;
+/// Registry install implementation: HTTP fetch, extraction, and verification.
+mod registry;
+/// Persona-selection history (local JSONL) and opt-in telemetry.
+mod selection;
 
 pub use error::ClientError;
 pub use model::{
     ClientOptions, GcReport, InstallReport, InstallRequest, InstallSource, LockedPersona, Lockfile,
     PersonaSpec, ProjectConfig, ProjectPaths, SyncReport, SCHEMA_VERSION,
 };
-pub use telemetry::flush_for_persona;
+pub use publish::PublishOutcome;
+pub use selection::{
+    SelectionEvent, SelectionTelemetry, SELECTION_HISTORY_FILENAME, TELEMETRY_URL_ENV,
+};
 
 use base64::{engine::general_purpose, Engine as _};
 use ed25519_dalek::VerifyingKey;
@@ -30,8 +38,6 @@ const CENTRAL_LOCK_FILENAME: &str = "lock.toml";
 const ACTIVE_FILENAME: &str = "active";
 /// Env var to override the auto-derived path-hash project_id.
 const PROJECT_ID_ENV: &str = "FRAMESHIFT_PROJECT_ID";
-const REGISTRY_API_ENV: &str = "FRAMESHIFT_API_URL";
-const DEFAULT_REGISTRY_API_BASE: &str = "https://frameshift-api.syntheos.dev/v1";
 
 const RENDER_TARGETS: [(&str, &str); 4] = [
     ("claude", "CLAUDE.md"),
@@ -63,12 +69,56 @@ impl Client {
     pub fn with_default_data_root() -> Result<Self, ClientError> {
         Ok(Self::new(ClientOptions {
             data_root: default_data_root()?,
-            config_root: Some(default_config_root()),
+            config_root: Some(default_config_root()?),
         }))
     }
 
     pub fn data_root(&self) -> &Path {
         &self.data_root
+    }
+
+    /// Load (or create on first use) the managed author Ed25519 signing key from
+    /// the central data root. See [`publish::load_or_create_signing_key`].
+    pub fn author_signing_key(&self) -> Result<ed25519_dalek::SigningKey, ClientError> {
+        publish::load_or_create_signing_key(&self.data_root)
+    }
+
+    /// The base64url-no-pad public key string for the managed author key -- the
+    /// value the registry registers a handle against.
+    pub fn author_pubkey_b64(&self) -> Result<String, ClientError> {
+        Ok(publish::public_key_b64(&self.author_signing_key()?))
+    }
+
+    /// The lowercase-hex public key string for the managed author key, used to
+    /// fill the `author_pubkey` field of a synthesized `pack.toml`.
+    pub fn author_pubkey_hex(&self) -> Result<String, ClientError> {
+        Ok(publish::public_key_hex(&self.author_signing_key()?))
+    }
+
+    /// Register the managed author key under `handle` at `server_url`
+    /// (`POST /v1/authors`). Idempotent for the same key+handle; a different
+    /// key claiming a taken handle yields [`ClientError::RegistryRejected`] 409.
+    pub fn register_author(
+        &self,
+        server_url: &str,
+        handle: &str,
+        display_name: Option<&str>,
+    ) -> Result<(), ClientError> {
+        let key = self.author_signing_key()?;
+        publish::register_author(server_url, &key, handle, display_name)
+    }
+
+    /// Pack, sign, and upload the pack directory at `pack_dir` to `server_url`
+    /// under `author_handle` (`POST /v1/packs`). `pack_dir` must contain a
+    /// `pack.toml`. Returns the server's [`PublishOutcome`].
+    pub fn publish_pack_dir(
+        &self,
+        server_url: &str,
+        pack_dir: &Path,
+        author_handle: &str,
+    ) -> Result<PublishOutcome, ClientError> {
+        let key = self.author_signing_key()?;
+        publish::publish_pack_dir(server_url, &key, pack_dir, author_handle)
     }
 
     pub fn project_id(&self, project_root: &Path) -> Result<String, ClientError> {
@@ -109,24 +159,22 @@ impl Client {
         let paths = self.project_paths(&request.project_root)?;
         let locked = match &request.source {
             InstallSource::LocalPath(pack_dir) => {
-                self.install_from_dir(&paths, pack_dir, &request.spec)?
+                let pack = Pack::from_dir(pack_dir)?;
+                validate_pack_request(&pack, &request.spec)?;
+                verify_pack_signature_if_present(&pack)?;
+                let hash = pack.canonical_hash_hex();
+                let cache_path = paths.cache_dir.join(&hash);
+                ensure_cached_pack(pack_dir, &cache_path)?;
+                locked_persona_from_pack(&pack)
             }
             InstallSource::Registry => {
-                let downloaded = download_registry_pack(&request.spec)?;
-                self.install_from_dir(&paths, &downloaded.pack_root, &request.spec)?
+                // Fetch, extract, verify, and cache the pack from the HTTP registry.
+                install_from_registry(&request.spec, &paths)?
             }
         };
 
-        let mut lockfile = load_lockfile(&paths.lock_path)?.unwrap_or_default();
-        upsert_locked_persona(&mut lockfile, locked.clone());
-        let raw_lock = toml::to_string_pretty(&lockfile)?;
-        self.materialize_project_state(&paths, &lockfile, &raw_lock)?;
-
-        Ok(InstallReport {
-            project_id: paths.project_id,
-            cache_path: paths.cache_dir.join(&locked.hash),
-            persona: locked,
-        })
+        // Shared tail: upsert into lockfile and materialize project state.
+        finish_install(self, &paths, locked)
     }
 
     pub fn activate(&self, project_root: &Path, persona: &str) -> Result<(), ClientError> {
@@ -140,34 +188,79 @@ impl Client {
         write_file(&paths.active_path, persona.as_bytes())
     }
 
-    /// Append a structured project-scope selection event for telemetry and local learning.
+    /// Read the central project config (`projects/<id>/config.toml`), returning
+    /// `ProjectConfig::default()` when the file does not exist yet.
+    pub fn project_config(&self, project_root: &Path) -> Result<ProjectConfig, ClientError> {
+        let paths = self.project_paths(project_root)?;
+        match fs::read_to_string(&paths.config_path) {
+            Ok(raw) => toml::from_str(&raw).map_err(|source| ClientError::TomlDeserialize {
+                path: paths.config_path.clone(),
+                source,
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(ProjectConfig::default())
+            }
+            Err(source) => Err(ClientError::Io {
+                path: paths.config_path,
+                source,
+            }),
+        }
+    }
+
+    /// Append a persona-selection event to the project's local selection history
+    /// (`projects/<id>/selection-history.jsonl`). Local-only state that the
+    /// intelligent-selection feature learns from; it is never sent anywhere.
+    /// `auto` distinguishes automatic selections from explicit user choices, and
+    /// `reason` is an optional rationale.
     pub fn record_selection_event(
         &self,
         project_root: &Path,
         persona: &str,
         session: &str,
-        auto_selected: bool,
-        task: Option<&str>,
+        auto: bool,
+        reason: Option<&str>,
     ) -> Result<(), ClientError> {
-        let project_id = self.project_id(project_root)?;
-        let entry = frameshift_growth::GrowthEntry {
-            ts: frameshift_growth::current_timestamp(),
-            session: session.to_string(),
-            project_id: project_id.clone(),
+        validate_persona_name(persona)?;
+        let paths = self.project_paths(project_root)?;
+        ensure_dir(&paths.project_state_dir)?;
+        let history_path = paths
+            .project_state_dir
+            .join(selection::SELECTION_HISTORY_FILENAME);
+        let event = selection::SelectionEvent {
             persona: persona.to_string(),
-            auto_selected,
-            task: task.map(str::to_string),
-            intent: Some("selection".to_string()),
-            text: if auto_selected {
-                format!("Auto-selected persona '{persona}'")
-            } else {
-                format!("Selected persona '{persona}'")
-            },
-            scope: frameshift_growth::Scope::Project,
+            session: session.to_string(),
+            auto,
+            reason: reason.map(str::to_string),
+            recorded_at_unix: selection::now_unix(),
         };
+        selection::append_selection_event(&history_path, &event)
+    }
 
-        frameshift_growth::append_jsonl(self.data_root(), &project_id, persona, &entry)
-            .map_err(|error| ClientError::Telemetry(error.to_string()))
+    /// Send anonymous selection telemetry for `persona`, but only when the
+    /// project has opted in (`ProjectConfig.telemetry_opt_in`). When opt-in is
+    /// disabled this is a no-op returning `Ok(())`, so the client never sends
+    /// anything by default. When enabled, the endpoint is derived from the
+    /// registry base URL (overridable via `FRAMESHIFT_TELEMETRY_URL`). Network
+    /// failures are returned for the caller to log.
+    pub fn send_telemetry_for_persona(
+        &self,
+        project_root: &Path,
+        persona: &str,
+        session: &str,
+    ) -> Result<(), ClientError> {
+        let config = self.project_config(project_root)?;
+        if !config.telemetry_opt_in {
+            return Ok(());
+        }
+        let endpoint = selection::telemetry_endpoint();
+        let paths = self.project_paths(project_root)?;
+        let payload = selection::SelectionTelemetry {
+            persona,
+            session,
+            project_id: &paths.project_id,
+            recorded_at_unix: selection::now_unix(),
+        };
+        selection::post_selection_telemetry(&endpoint, &payload)
     }
 
     pub fn sync(&self, project_root: &Path) -> Result<SyncReport, ClientError> {
@@ -188,34 +281,6 @@ impl Client {
                 .map(|persona| persona.name.clone())
                 .collect(),
         })
-    }
-
-    /// Load the project configuration from the central store, or defaults when absent.
-    pub fn project_config(&self, project_root: &Path) -> Result<ProjectConfig, ClientError> {
-        let paths = self.project_paths(project_root)?;
-        load_project_config(&paths.config_path)
-    }
-
-    /// Flush opt-in telemetry for one persona using the project's config gate.
-    pub fn send_telemetry_for_persona(
-        &self,
-        project_root: &Path,
-        persona: &str,
-        session_token: &str,
-    ) -> Result<usize, ClientError> {
-        let paths = self.project_paths(project_root)?;
-        let config = load_project_config(&paths.config_path)?;
-        if !config.telemetry_opt_in {
-            return Ok(0);
-        }
-
-        telemetry::flush_for_persona(
-            self.data_root(),
-            &paths.project_id,
-            persona,
-            &registry_api_base(),
-            session_token,
-        )
     }
 
     pub fn gc(&self) -> Result<GcReport, ClientError> {
@@ -329,6 +394,7 @@ impl Client {
         persona: &str,
         target: &str,
     ) -> Result<String, ClientError> {
+        validate_persona_name(persona)?;
         let effective_target = if target.is_empty() { "claude" } else { target };
 
         let filename = RENDER_TARGETS
@@ -374,6 +440,13 @@ impl Client {
         lockfile: &Lockfile,
         raw_lock: &str,
     ) -> Result<(), ClientError> {
+        // Validate every persona name before it is joined into the central
+        // store. A name like `../../x` would otherwise escape personas_dir and
+        // drive remove_dir_all/copy against an arbitrary directory below.
+        for persona in &lockfile.personas {
+            validate_persona_name(&persona.name)?;
+        }
+
         ensure_dir(&paths.cache_dir)?;
         ensure_dir(&paths.personas_dir)?;
         // Lock file lives only in the central store -- nothing is written to the project root.
@@ -444,108 +517,6 @@ impl Client {
 
         Ok(())
     }
-
-    /// Install a pack from an extracted local directory.
-    fn install_from_dir(
-        &self,
-        paths: &ProjectPaths,
-        pack_dir: &Path,
-        spec: &PersonaSpec,
-    ) -> Result<LockedPersona, ClientError> {
-        let pack = Pack::from_dir(pack_dir)?;
-        validate_pack_request(&pack, spec)?;
-        verify_pack_signature_if_present(&pack)?;
-        let hash = pack.canonical_hash_hex();
-        let cache_path = paths.cache_dir.join(&hash);
-        ensure_cached_pack(pack_dir, &cache_path)?;
-        Ok(locked_persona_from_pack(&pack))
-    }
-}
-
-/// Extracted registry pack rooted at the directory that contains `pack.toml`.
-struct DownloadedRegistryPack {
-    /// The tempdir backing the extracted payload.
-    _temp_dir: tempfile::TempDir,
-    /// The extracted pack root directory.
-    pack_root: PathBuf,
-}
-
-/// Download and extract a registry pack for the requested spec.
-fn download_registry_pack(spec: &PersonaSpec) -> Result<DownloadedRegistryPack, ClientError> {
-    let url = format!(
-        "{}/packs/{}/versions/{}/pack",
-        registry_api_base(),
-        spec.name,
-        spec.version
-    );
-    let response = reqwest::blocking::get(&url)
-        .map_err(|error| ClientError::RegistryFetch(format!("download {url}: {error}")))?;
-    if !response.status().is_success() {
-        return Err(ClientError::RegistryFetch(format!(
-            "download failed for {}@{}: HTTP {}",
-            spec.name,
-            spec.version,
-            response.status()
-        )));
-    }
-
-    let bytes = response
-        .bytes()
-        .map_err(|error| ClientError::RegistryFetch(format!("read response body: {error}")))?;
-    let temp_dir =
-        tempfile::tempdir().map_err(|error| ClientError::RegistryFetch(error.to_string()))?;
-    let archive_path = temp_dir.path().join("pack.tar.gz");
-    let extract_dir = temp_dir.path().join("extract");
-
-    fs::write(&archive_path, &bytes).map_err(|source| ClientError::Io {
-        path: archive_path.clone(),
-        source,
-    })?;
-    ensure_dir(&extract_dir)?;
-
-    let archive_file = fs::File::open(&archive_path).map_err(|source| ClientError::Io {
-        path: archive_path.clone(),
-        source,
-    })?;
-    let decoder = flate2::read::GzDecoder::new(archive_file);
-    let mut archive = tar::Archive::new(decoder);
-    archive
-        .unpack(&extract_dir)
-        .map_err(|error| ClientError::RegistryFetch(format!("extract archive: {error}")))?;
-
-    let pack_root = find_pack_root(&extract_dir)?;
-    Ok(DownloadedRegistryPack {
-        _temp_dir: temp_dir,
-        pack_root,
-    })
-}
-
-/// Return the registry base URL used for pack downloads.
-fn registry_api_base() -> String {
-    std::env::var(REGISTRY_API_ENV)
-        .unwrap_or_else(|_| DEFAULT_REGISTRY_API_BASE.to_string())
-        .trim_end_matches('/')
-        .to_string()
-}
-
-/// Find the extracted directory that contains `pack.toml`.
-fn find_pack_root(extract_dir: &Path) -> Result<PathBuf, ClientError> {
-    let root_manifest = extract_dir.join("pack.toml");
-    if root_manifest.is_file() {
-        return Ok(extract_dir.to_path_buf());
-    }
-
-    for entry in read_dir_sorted(extract_dir)? {
-        let path = entry.path();
-        if path.is_dir() && path.join("pack.toml").is_file() {
-            return Ok(path);
-        }
-    }
-
-    Err(ClientError::RegistryFetch(format!(
-        "pack.toml not found in extracted archive under {}",
-        extract_dir.display()
-    )))
 }
 
 fn default_data_root() -> Result<PathBuf, ClientError> {
@@ -565,14 +536,25 @@ fn default_data_root() -> Result<PathBuf, ClientError> {
 }
 
 /// Resolve the XDG config home directory.
-fn default_config_root() -> PathBuf {
+///
+/// Returns an error when neither `XDG_CONFIG_HOME` nor `HOME` is set so the
+/// caller fails closed rather than writing state to a world-traversable `/tmp`
+/// path. Mirrors the error shape used by [`default_data_root`].
+fn default_config_root() -> Result<PathBuf, ClientError> {
     if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
         if !xdg.is_empty() {
-            return PathBuf::from(xdg);
+            return Ok(PathBuf::from(xdg));
         }
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home).join(".config")
+
+    // Fail closed: no /tmp fallback when HOME is absent.
+    let home = std::env::var("HOME")
+        .map(PathBuf::from)
+        .map_err(|source| ClientError::Io {
+            path: PathBuf::from("$HOME"),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, source),
+        })?;
+    Ok(home.join(".config"))
 }
 
 fn validate_explicit_project_id(project_id: &str) -> Result<(), ClientError> {
@@ -586,6 +568,48 @@ fn validate_explicit_project_id(project_id: &str) -> Result<(), ClientError> {
     }
 
     Ok(())
+}
+
+/// Validate that `name` is safe to use as a single path component before it is
+/// joined into the central store (where the result is recursively removed and
+/// repopulated). Rejects empty names, a leading `.` (catches `.`/`..`/hidden),
+/// path separators, NUL/control characters, and any name that is not exactly
+/// one normal path component.
+///
+/// This is the engine-level guard against a malicious pack or tampered lockfile
+/// whose persona name (e.g. `../../etc`) would otherwise escape `personas_dir`
+/// during install/sync.
+pub fn validate_persona_name(name: &str) -> Result<(), ClientError> {
+    use std::path::Component;
+
+    let reject = |reason: &'static str| {
+        Err(ClientError::InvalidPersonaName {
+            name: name.to_string(),
+            reason,
+        })
+    };
+
+    if name.is_empty() {
+        return reject("name must not be empty");
+    }
+    if name.starts_with('.') {
+        return reject("name must not start with '.'");
+    }
+    if name.contains('\0') {
+        return reject("name must not contain NUL");
+    }
+    if name.chars().any(|c| c.is_control()) {
+        return reject("name must not contain control characters");
+    }
+    if name.contains('/') || name.contains('\\') {
+        return reject("name must not contain path separators");
+    }
+
+    let mut components = Path::new(name).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(_)), None) => Ok(()),
+        _ => reject("name must be a single normal path component"),
+    }
 }
 
 /// Best-effort migration: if a pre-WS-1 install left `frameshift.toml` or
@@ -675,7 +699,8 @@ fn hashed_project_id(project_root: &Path) -> Result<String, ClientError> {
     Ok(hex::encode(digest))
 }
 
-fn validate_pack_request(pack: &Pack, spec: &PersonaSpec) -> Result<(), ClientError> {
+/// Verify that the pack manifest matches the requested spec (name and version).
+pub(crate) fn validate_pack_request(pack: &Pack, spec: &PersonaSpec) -> Result<(), ClientError> {
     let manifest = pack.manifest();
     if manifest.name != spec.name || manifest.version != spec.version {
         return Err(ClientError::ManifestMismatch {
@@ -722,7 +747,8 @@ fn parse_verifying_key_bytes(encoded: &str) -> Result<[u8; 32], ClientError> {
     Err(ClientError::InvalidAuthorPublicKey(encoded.to_string()))
 }
 
-fn locked_persona_from_pack(pack: &Pack) -> LockedPersona {
+/// Build a [`LockedPersona`] from the loaded pack's manifest fields and canonical hash.
+pub(crate) fn locked_persona_from_pack(pack: &Pack) -> LockedPersona {
     let manifest = pack.manifest();
     LockedPersona {
         name: manifest.name.clone(),
@@ -753,18 +779,6 @@ fn load_lockfile(path: &Path) -> Result<Option<Lockfile>, ClientError> {
     load_lockfile_with_raw(path).map(|maybe| maybe.map(|(_, lockfile)| lockfile))
 }
 
-fn load_project_config(path: &Path) -> Result<ProjectConfig, ClientError> {
-    if !path.exists() {
-        return Ok(ProjectConfig::default());
-    }
-
-    let raw = read_to_string(path)?;
-    toml::from_str(&raw).map_err(|source| ClientError::TomlDeserialize {
-        path: path.to_path_buf(),
-        source,
-    })
-}
-
 fn load_lockfile_with_raw(path: &Path) -> Result<Option<(String, Lockfile)>, ClientError> {
     if !path.exists() {
         return Ok(None);
@@ -778,7 +792,9 @@ fn load_lockfile_with_raw(path: &Path) -> Result<Option<(String, Lockfile)>, Cli
     Ok(Some((raw, lockfile)))
 }
 
-fn ensure_cached_pack(source_dir: &Path, cache_path: &Path) -> Result<(), ClientError> {
+/// Copy `source_dir` into the content-addressed cache at `cache_path` if it is not
+/// already there. Uses a `.tmp` staging path + atomic rename.
+pub(crate) fn ensure_cached_pack(source_dir: &Path, cache_path: &Path) -> Result<(), ClientError> {
     ensure_dir(
         cache_path
             .parent()
@@ -973,9 +989,60 @@ fn read_dir_sorted(path: &Path) -> Result<Vec<fs::DirEntry>, ClientError> {
     Ok(entries)
 }
 
+/// Shared install tail: upsert a [`LockedPersona`] into the lockfile, persist
+/// the lockfile, and materialize project state. Both the LocalPath and Registry
+/// arms call this after producing their locked persona.
+///
+/// Returns an [`InstallReport`] on success.
+fn finish_install(
+    client: &Client,
+    paths: &ProjectPaths,
+    locked: LockedPersona,
+) -> Result<InstallReport, ClientError> {
+    let mut lockfile = load_lockfile(&paths.lock_path)?.unwrap_or_default();
+    upsert_locked_persona(&mut lockfile, locked.clone());
+    let raw_lock = toml::to_string_pretty(&lockfile)?;
+    client.materialize_project_state(paths, &lockfile, &raw_lock)?;
+
+    Ok(InstallReport {
+        project_id: paths.project_id.clone(),
+        cache_path: paths.cache_dir.join(&locked.hash),
+        persona: locked,
+    })
+}
+
+/// Fetch a pack from the HTTP registry, verify its content hash, extract it,
+/// write the signature, verify the Ed25519 signature, cache it by hash, and
+/// return the [`LockedPersona`] to be committed into the lockfile.
+///
+/// This is the complete implementation for [`InstallSource::Registry`].
+fn install_from_registry(
+    spec: &PersonaSpec,
+    paths: &ProjectPaths,
+) -> Result<LockedPersona, ClientError> {
+    registry::fetch_and_install(spec, paths)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// validate_persona_name accepts clean slugs and rejects traversal/separators.
+    #[test]
+    fn validate_persona_name_guards_traversal() {
+        for ok in ["cryptographic", "rust-engineer", "my_persona1"] {
+            assert!(validate_persona_name(ok).is_ok(), "{ok} should be valid");
+        }
+        for bad in ["", ".", "..", "../etc", "a/b", "a\\b", ".hidden", "x\0y"] {
+            assert!(
+                matches!(
+                    validate_persona_name(bad),
+                    Err(ClientError::InvalidPersonaName { .. })
+                ),
+                "{bad:?} should be rejected"
+            );
+        }
+    }
 
     /// Helper: set up a minimal pack and install it, returning the client and project root.
     fn install_test_persona(tmp: &tempfile::TempDir, name: &str) -> (Client, std::path::PathBuf) {
@@ -984,7 +1051,7 @@ mod tests {
         fs::write(
             pack_dir.join("pack.toml"),
             format!(
-                "schema_version = 1\nname = \"{}\"\nauthor_handle = \"test\"\nauthor_pubkey = \"local-unsigned\"\nversion = \"0.1.0\"\n",
+                "schema_version = 1\nname = \"{}\"\nauthor_handle = \"test\"\nauthor_pubkey = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\nversion = \"0.1.0\"\n",
                 name
             ),
         )
@@ -1048,7 +1115,9 @@ mod tests {
         let content = client
             .rendered_persona(&project_root, "rendtest", "claude")
             .unwrap();
-        assert!(content.contains("rendtest") || content.contains("Rendtest") || content.len() > 0);
+        assert!(
+            content.contains("rendtest") || content.contains("Rendtest") || !content.is_empty()
+        );
     }
 
     /// rendered_persona returns an error for an unknown render target.
@@ -1134,7 +1203,7 @@ mod tests {
         fs::create_dir_all(&pack_dir).unwrap();
         fs::write(
             pack_dir.join("pack.toml"),
-            "schema_version = 1\nname = \"testpersona\"\nauthor_handle = \"test\"\nauthor_pubkey = \"local-unsigned\"\nversion = \"0.1.0\"\n",
+            "schema_version = 1\nname = \"testpersona\"\nauthor_handle = \"test\"\nauthor_pubkey = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\nversion = \"0.1.0\"\n",
         )
         .unwrap();
         fs::write(
@@ -1200,7 +1269,7 @@ mod tests {
         fs::create_dir_all(&pack_dir).unwrap();
         fs::write(
             pack_dir.join("pack.toml"),
-            "schema_version = 1\nname = \"noinfratestp\"\nauthor_handle = \"test\"\nauthor_pubkey = \"local-unsigned\"\nversion = \"0.1.0\"\n",
+            "schema_version = 1\nname = \"noinfratestp\"\nauthor_handle = \"test\"\nauthor_pubkey = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\nversion = \"0.1.0\"\n",
         )
         .unwrap();
         fs::write(pack_dir.join("AGENTS.md"), "# Bare Persona\n").unwrap();

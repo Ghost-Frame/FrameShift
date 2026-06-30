@@ -114,10 +114,14 @@ pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
             healthy: h.healthy,
             detail: h.detail,
         },
-        Err(e) => CatalogHealthSummary {
-            healthy: false,
-            detail: e.to_string(),
-        },
+        Err(e) => {
+            // Log the raw error internally; never expose it in the public response.
+            tracing::warn!(error = %e, "catalog health check failed");
+            CatalogHealthSummary {
+                healthy: false,
+                detail: "backend unavailable".to_string(),
+            }
+        }
     };
 
     let objects_health = match state.objects.health().await {
@@ -127,12 +131,16 @@ pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
             total_bytes: h.total_bytes,
             detail: h.detail,
         },
-        Err(e) => ObjectsHealthSummary {
-            healthy: false,
-            total_objects: None,
-            total_bytes: None,
-            detail: e.to_string(),
-        },
+        Err(e) => {
+            // Log the raw error internally; never expose it in the public response.
+            tracing::warn!(error = %e, "object store health check failed");
+            ObjectsHealthSummary {
+                healthy: false,
+                total_objects: None,
+                total_bytes: None,
+                detail: "backend unavailable".to_string(),
+            }
+        }
     };
 
     let ok = catalog_health.healthy && objects_health.healthy;
@@ -150,26 +158,33 @@ pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
 
 /// `GET /metrics`
 ///
-/// Returns Prometheus-format metrics as plain text.
+/// Returns Prometheus-format metrics as a plain-text exposition document.
 ///
-/// At this milestone the metrics surface is a placeholder that returns an
-/// empty Prometheus text document. A full Prometheus registry integration
-/// is deferred to a follow-up milestone.
+/// # Security note
+///
+/// This endpoint is currently unauthenticated. In production deployments the
+/// endpoint should be restricted to internal monitoring infrastructure (e.g.
+/// via a network policy, a reverse-proxy ACL, or a bearer token check added
+/// here). Exposing internal metric names and counts to the public internet is
+/// low-risk but is nonetheless an information leak that should be revisited
+/// before internet-facing deployment.
 ///
 /// # Response
 ///
-/// `200 OK` with `Content-Type: text/plain; version=0.0.4` and an empty body.
+/// `200 OK` with `Content-Type: text/plain; version=0.0.4` and the current
+/// metric values in the Prometheus text exposition format.
 ///
 /// # Errors
 ///
-/// This handler never returns an HTTP error.
-pub async fn metrics() -> impl IntoResponse {
+/// This handler never returns an HTTP error. If encoding fails internally the
+/// body will be empty (the error is logged via `tracing::error`).
+pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
     (
         StatusCode::OK,
         [(
             axum::http::header::CONTENT_TYPE,
             "text/plain; version=0.0.4",
         )],
-        "",
+        state.metrics.encode_text(),
     )
 }

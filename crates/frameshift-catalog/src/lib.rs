@@ -60,7 +60,5 @@ pub use error::{CatalogError, HealthStatus};
 pub use filters::{PackSearchFilters, PackSearchResult, SortMode};
 pub use frameshift_pack::ObjectHash;
 pub use identity::Ed25519PublicKey;
-pub use records::{
-    AuthorRecord, OauthLink, PackRecord, PackVersionRecord, TelemetryKind, TelemetrySignal,
-};
+pub use records::{AuthorRecord, OauthLink, PackRecord, PackVersionRecord};
 pub use status::{PackStatus, TombstoneReason, TombstoneRecord};

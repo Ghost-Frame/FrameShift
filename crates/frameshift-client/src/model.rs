@@ -9,6 +9,9 @@ pub struct ProjectConfig {
     pub schema_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
+    /// Whether the user has opted in to sharing anonymous persona-selection
+    /// telemetry. Privacy-first: defaults to `false`, so telemetry is only ever
+    /// sent when the user explicitly enables it (and an endpoint is configured).
     #[serde(default)]
     pub telemetry_opt_in: bool,
 }

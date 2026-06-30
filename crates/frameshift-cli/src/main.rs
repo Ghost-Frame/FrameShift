@@ -21,11 +21,11 @@ use cmd::grow::GrowArgs;
 use cmd::migrate::MigrateArgs;
 use cmd::prefs::PrefsArgs;
 use cmd::publish::PublishArgs;
+use cmd::register::RegisterArgs;
 use cmd::render::RenderArgs;
 use cmd::rule::{RuleArgs, RuleCommand};
 use cmd::select::SelectArgs;
 use cmd::skill::{SkillArgs, SkillCommand};
-use cmd::telemetry::TelemetryArgs;
 use cmd::use_persona::UseArgs;
 use cmd::verify::VerifyArgs;
 use util::CliError;
@@ -91,9 +91,6 @@ enum Command {
     /// Append to a persona's local growth log.
     Grow(GrowArgs),
 
-    /// Flush opt-in telemetry signals to the registry.
-    Telemetry(TelemetryArgs),
-
     // ------------------------------------------------------------------
     // M2 -- verify and publish
     // ------------------------------------------------------------------
@@ -102,6 +99,9 @@ enum Command {
 
     /// Publish a persona pack to a directory or registry.
     Publish(PublishArgs),
+
+    /// Register this machine's author key under a handle at the registry.
+    Register(RegisterArgs),
 
     // ------------------------------------------------------------------
     // M3 -- orchestrator: select, use, automate
@@ -323,13 +323,13 @@ fn run() -> Result<(), RunError> {
         // M2 -- grow
         // ------------------------------------------------------------------
         Command::Grow(args) => cmd::grow::run(args).map_err(RunError::from),
-        Command::Telemetry(args) => cmd::telemetry::run(args).map_err(RunError::from),
 
         // ------------------------------------------------------------------
         // M2 -- verify and publish
         // ------------------------------------------------------------------
         Command::Verify(args) => cmd::verify::run_verify(args).map_err(RunError::from),
         Command::Publish(args) => cmd::publish::run_publish(args).map_err(RunError::from),
+        Command::Register(args) => cmd::register::run_register(args).map_err(RunError::from),
 
         // ------------------------------------------------------------------
         // M3 -- orchestrator: select, use, automate

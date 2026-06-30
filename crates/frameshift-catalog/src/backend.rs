@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use crate::error::{CatalogError, HealthStatus};
 use crate::filters::{PackSearchFilters, PackSearchResult};
 use crate::identity::Ed25519PublicKey;
-use crate::records::{AuthorRecord, PackRecord, PackVersionRecord, TelemetrySignal};
+use crate::records::{AuthorRecord, PackRecord, PackVersionRecord};
 use crate::status::TombstoneRecord;
 
 /// Catalog backend for the persona marketplace.
@@ -127,6 +127,9 @@ pub trait CatalogBackend: Send + Sync {
     /// - `CatalogError::Conflict` -- `(pack_name, version)` already registered.
     /// - `CatalogError::InvalidArgument` -- `signature` is not 64 bytes.
     /// - `CatalogError::Validation` -- e.g. attempt to publish to a tombstoned pack.
+    /// - `CatalogError::Unauthorized` -- the pack already exists and its
+    ///   `current_author` does not match `record.author_pubkey` (co-publish
+    ///   / name-squat rejection).
     /// - `CatalogError::BackendError` -- unexpected backend failure.
     ///
     /// # Panics
@@ -275,6 +278,28 @@ pub trait CatalogBackend: Send + Sync {
         pubkey: Ed25519PublicKey,
     ) -> Result<(), CatalogError>;
 
+    /// Record a single download event for a specific pack version in the audit log.
+    ///
+    /// Inserts one row into the `pack_downloads` audit table with the current
+    /// timestamp. This is the write side of the trending feature; `search_packs`
+    /// with `SortMode::Trending` reads from the same table to compute 7-day
+    /// download velocity.
+    ///
+    /// This method is best-effort: callers SHOULD invoke it after a successful
+    /// object-store fetch, but a failure here MUST NOT prevent the download from
+    /// being served. The recommended pattern is to log and discard the error at
+    /// the call site rather than surfacing it to the end user.
+    ///
+    /// # Errors
+    ///
+    /// - `CatalogError::BackendError` -- unexpected backend failure (e.g. pool
+    ///   exhausted, DB unreachable). The download itself should still be served.
+    ///
+    /// # Panics
+    ///
+    /// Never panics.
+    async fn record_download(&self, pack_name: &str, version: &str) -> Result<(), CatalogError>;
+
     /// Return the current health status of the backend.
     ///
     /// A healthy backend returns `HealthStatus { healthy: true, detail: "ok" }`.
@@ -313,44 +338,4 @@ pub trait CatalogBackend: Send + Sync {
         pack_name: &str,
         extends: Option<&str>,
     ) -> Result<(), CatalogError>;
-
-    /// Accumulate telemetry signals for a backend that supports M5 telemetry.
-    ///
-    /// Backends that do not implement telemetry may keep the default behavior,
-    /// which returns `CatalogError::BackendError`.
-    async fn ingest_telemetry(&self, _signals: Vec<TelemetrySignal>) -> Result<(), CatalogError> {
-        Err(CatalogError::BackendError(Box::new(std::io::Error::other(
-            "telemetry ingest is not implemented by this catalog backend",
-        ))))
-    }
-
-    /// Read accumulated telemetry for a pack, optionally filtered to one version.
-    ///
-    /// Backends that do not implement telemetry may keep the default behavior,
-    /// which returns `CatalogError::BackendError`.
-    async fn get_telemetry(
-        &self,
-        _name: &str,
-        _version: Option<&str>,
-    ) -> Result<Vec<TelemetrySignal>, CatalogError> {
-        Err(CatalogError::BackendError(Box::new(std::io::Error::other(
-            "telemetry read is not implemented by this catalog backend",
-        ))))
-    }
-
-    /// Store the conformance score and bundle hash for a published version.
-    ///
-    /// Backends that do not implement this write may keep the default behavior,
-    /// which returns `CatalogError::BackendError`.
-    async fn set_conformance_score(
-        &self,
-        _name: &str,
-        _version: &str,
-        _score: f32,
-        _bundle_hash: &str,
-    ) -> Result<(), CatalogError> {
-        Err(CatalogError::BackendError(Box::new(std::io::Error::other(
-            "conformance score writes are not implemented by this catalog backend",
-        ))))
-    }
 }

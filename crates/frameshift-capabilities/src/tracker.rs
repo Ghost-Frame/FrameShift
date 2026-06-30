@@ -52,8 +52,15 @@ mod tests {
                 .map(String::from)
                 .collect()
         );
-        assert_eq!(report.used, ["Read"].into_iter().map(String::from).collect());
-        let unused: Vec<&str> = report.unused_capabilities().iter().map(|s| s.as_str()).collect();
+        assert_eq!(
+            report.used,
+            ["Read"].into_iter().map(String::from).collect()
+        );
+        let unused: Vec<&str> = report
+            .unused_capabilities()
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
         assert_eq!(unused, vec!["Bash", "Edit"]);
     }
 

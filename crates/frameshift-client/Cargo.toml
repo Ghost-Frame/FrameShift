@@ -7,20 +7,26 @@ license.workspace = true
 description = "Client engine for installing and materializing frameshift packs"
 
 [dependencies]
-frameshift-growth = { path = "../frameshift-growth" }
 frameshift-pack = { path = "../frameshift-pack" }
 base64.workspace = true
 ed25519-dalek.workspace = true
-flate2 = "1"
 hex.workspace = true
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde.workspace = true
+# JSON request bodies (author registration) and publish response parsing.
+serde_json.workspace = true
 sha2.workspace = true
-tar = "0.4"
-tempfile.workspace = true
+# CSPRNG for author signing-key generation and signed-request nonces (mirrors frameshift-seed).
+rand_core = { version = "0.6", features = ["getrandom"] }
 thiserror.workspace = true
 toml.workspace = true
 tracing.workspace = true
+# Blocking HTTP client -- matches the sync `install` fn signature; avoids pulling tokio into this crate.
+# The `json` feature provides `Response::into_json` for deserializing version records.
+ureq = { version = "2", features = ["json"] }
+# Tar/gzip extraction for registry pack archives.
+tar = "0.4"
+flate2 = "1"
+# Temporary directory for registry pack extraction before caching.
+tempfile.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true

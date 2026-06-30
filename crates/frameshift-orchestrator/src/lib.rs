@@ -33,7 +33,9 @@ pub use index::{PersonaIndex, PersonaProfile};
 pub use intent::{classify as classify_intent, Intent};
 pub use mode::{Mode, ModeState};
 pub use policy::{rank, PolicyWeights, ScoreComponents, Scored};
-pub use run::{select, select_rich, CandidateOutput, ContextSnapshot, SelectionInputs, SelectionOutput};
+pub use run::{
+    select, select_rich, CandidateOutput, ContextSnapshot, SelectionInputs, SelectionOutput,
+};
 
 /// Facade that wires together the index, weights, policy, preferences, and controller.
 ///
@@ -91,7 +93,10 @@ mod tests {
         PersonaProfile {
             name: name.to_string(),
             description: None,
-            languages: languages.iter().map(|l| l.to_string()).collect::<BTreeSet<_>>(),
+            languages: languages
+                .iter()
+                .map(|l| l.to_string())
+                .collect::<BTreeSet<_>>(),
             keywords: languages.iter().map(|l| l.to_string()).collect(),
             required_tools: vec![],
             network_egress: false,

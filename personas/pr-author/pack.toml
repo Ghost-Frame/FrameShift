@@ -3,8 +3,6 @@ name = "pr-author"
 author_handle = "ghost-frame"
 author_pubkey = "UNSIGNED"
 version = "0.1.0"
-description = "Polished pull request summaries, reviewer context, and release notes."
-tags = ["pull-requests", "summaries", "reviewers", "communication"]
 license = "Elastic-2.0"
 
 [capability_manifest]

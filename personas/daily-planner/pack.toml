@@ -3,13 +3,11 @@ name = "daily-planner"
 author_handle = "ghost-frame"
 author_pubkey = "UNSIGNED"
 version = "0.1.0"
-description = "Turning goals into concrete, prioritized daily execution plans."
-tags = ["planning", "prioritization", "execution", "daily"]
 license = "Elastic-2.0"
 
 [capability_manifest]
 required_tools = ["Read", "Edit", "Write", "Bash", "Grep", "Glob"]
 network_egress = false
 filesystem_scope = "project-only"
-memory_required = "soft"
+memory_required = "optional"
 memory_required_ops = ["search", "recall"]

@@ -423,28 +423,53 @@ impl PackStore for FsPackStore {
         let hash_owned = *hash;
         let verify = self.config.verify_on_read;
 
-        tokio::task::spawn_blocking(move || match std::fs::read(&path) {
-            Ok(bytes) => {
-                if verify {
-                    let computed = ObjectHash::of(&bytes);
-                    if computed != hash_owned {
-                        return Err(ObjectStoreError::BackendError(
-                            format!(
-                                "object corrupted at {}: expected {}, got {}",
-                                path.display(),
-                                hash_owned,
-                                computed
-                            )
-                            .into(),
-                        ));
-                    }
+        tokio::task::spawn_blocking(move || {
+            // D9: stat without following symlinks before reading.  A symlink at
+            // the object path is not a valid object -- treat it as absent to
+            // prevent an attacker-controlled symlink from redirecting a read to
+            // arbitrary filesystem content.
+            match std::fs::symlink_metadata(&path) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    // Symlink present -- report NotFound, do not follow.
+                    return Err(ObjectStoreError::NotFound { hash: hash_owned });
                 }
-                Ok(bytes)
+                Ok(meta) if !meta.is_file() => {
+                    // Non-regular entry (directory, device, etc.) -- report NotFound.
+                    return Err(ObjectStoreError::NotFound { hash: hash_owned });
+                }
+                Ok(_) => {
+                    // Regular file confirmed; proceed to read below.
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(ObjectStoreError::NotFound { hash: hash_owned });
+                }
+                Err(e) => return Err(io_err(e)),
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                Err(ObjectStoreError::NotFound { hash: hash_owned })
+
+            // Path is a regular file; read its contents.
+            match std::fs::read(&path) {
+                Ok(bytes) => {
+                    if verify {
+                        let computed = ObjectHash::of(&bytes);
+                        if computed != hash_owned {
+                            return Err(ObjectStoreError::BackendError(
+                                format!(
+                                    "object corrupted at {}: expected {}, got {}",
+                                    path.display(),
+                                    hash_owned,
+                                    computed
+                                )
+                                .into(),
+                            ));
+                        }
+                    }
+                    Ok(bytes)
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    Err(ObjectStoreError::NotFound { hash: hash_owned })
+                }
+                Err(e) => Err(io_err(e)),
             }
-            Err(e) => Err(io_err(e)),
         })
         .await
         .map_err(join_err)?
@@ -512,8 +537,14 @@ impl PackStore for FsPackStore {
         let hash_owned = *hash;
 
         let file_len = tokio::task::spawn_blocking(move || {
-            // Read the file size before deleting so we can update the counter.
-            let len = match std::fs::metadata(&path) {
+            // D9: use symlink_metadata so we never follow a symlink planted at the
+            // object path.  If the entry is a symlink, treat it as absent -- we
+            // have no object to delete and must not touch the symlink target.
+            let len = match std::fs::symlink_metadata(&path) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    // Symlink at object path -- treat as absent; no object to remove.
+                    return Err(ObjectStoreError::NotFound { hash: hash_owned });
+                }
                 Ok(meta) => meta.len(),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     return Err(ObjectStoreError::NotFound { hash: hash_owned });
@@ -735,4 +766,60 @@ fn io_err(e: std::io::Error) -> ObjectStoreError {
 /// Convert a [`tokio::task::JoinError`] into [`ObjectStoreError::BackendError`].
 fn join_err(e: tokio::task::JoinError) -> ObjectStoreError {
     ObjectStoreError::BackendError(Box::new(e))
+}
+
+#[cfg(test)]
+/// Unit tests for [`FsPackStore`] security and correctness.
+mod tests {
+    use std::os::unix::fs::symlink;
+
+    use frameshift_objects::ObjectStoreError;
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::path::object_path;
+
+    /// Build a minimal [`FsPackStore`] rooted at `dir` with no quota and no
+    /// verify-on-read, suitable for security-focused unit tests.
+    async fn make_store(dir: &TempDir) -> FsPackStore {
+        FsPackStore::new(FsPackStoreConfig {
+            root: dir.path().to_path_buf(),
+            verify_on_read: false,
+            max_bytes: None,
+            fsync_on_put: false,
+        })
+        .await
+        .expect("store creation must succeed in a writable temp dir")
+    }
+
+    /// A symlink planted at an object path must cause `get()` to return
+    /// `NotFound` rather than reading through the symlink to its target.
+    ///
+    /// This exercises the D9 symlink-rejection guard added to `get()`.
+    #[tokio::test]
+    async fn get_returns_not_found_for_symlink_at_object_path() {
+        let dir = TempDir::new().unwrap();
+        let store = make_store(&dir).await;
+
+        // Create a real file to act as the symlink target.
+        let target = dir.path().join("canary");
+        std::fs::write(&target, b"secret data").unwrap();
+
+        // Compute the object path for an arbitrary hash and plant a symlink
+        // there pointing at the canary file.
+        let hash = ObjectHash::of(b"symlink test payload");
+        let obj_path = object_path(store.root(), &hash);
+
+        // Ensure the shard directory exists before creating the symlink.
+        std::fs::create_dir_all(obj_path.parent().unwrap()).unwrap();
+        symlink(&target, &obj_path).expect("symlink creation must succeed");
+
+        // get() must refuse to follow the symlink and return NotFound.
+        let result = store.get(&hash).await;
+        assert!(
+            matches!(result, Err(ObjectStoreError::NotFound { hash: h }) if h == hash),
+            "expected NotFound for symlink at object path, got: {:?}",
+            result
+        );
+    }
 }

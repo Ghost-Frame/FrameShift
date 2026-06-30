@@ -91,6 +91,25 @@ pub enum CliError {
     /// Error from the orchestrator subsystem (selection, mode, audit).
     #[error("orchestrator error: {0}")]
     Orchestrator(String),
+
+    /// Publish/register flow error (missing argument, registry rejection hint).
+    #[error("{0}")]
+    Publish(String),
+}
+
+/// Validate that a registry server URL uses an `http`/`https` scheme.
+///
+/// The URL is handed to the HTTP client as-is; rejecting other schemes here
+/// (e.g. `file://`) keeps a typo or injected value from reaching the client
+/// with surprising behavior.
+pub fn validate_server_url(url: &str) -> Result<(), CliError> {
+    if url.starts_with("https://") || url.starts_with("http://") {
+        Ok(())
+    } else {
+        Err(CliError::Publish(format!(
+            "--server must be an http(s) URL, got: {url:?}"
+        )))
+    }
 }
 
 /// Validate that `name` is safe to use as a single directory component.
