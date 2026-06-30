@@ -170,8 +170,8 @@ impl Preferences {
         days_since_override: u32,
     ) -> f32 {
         let raw = self.bias_for_intent(persona, intent);
-        let decay_multiplier = (1.0 - days_since_override as f32 * DECAY_RATE_PER_DAY)
-            .max(DECAY_FLOOR);
+        let decay_multiplier =
+            (1.0 - days_since_override as f32 * DECAY_RATE_PER_DAY).max(DECAY_FLOOR);
         raw * decay_multiplier
     }
 

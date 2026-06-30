@@ -32,25 +32,23 @@ pub fn score_test(test: &TestCase, response: &str) -> Score {
             _ => Score::ZERO,
         },
         ScorerKind::Regex => match &test.expected {
-            ExpectedBehavior::Matches { pattern } => {
-                match regex::Regex::new(pattern) {
-                    Ok(re) => {
-                        if re.is_match(response) {
-                            Score::PERFECT
-                        } else {
-                            Score::ZERO
-                        }
-                    }
-                    Err(_) => {
-                        tracing::warn!(
-                            pattern = %pattern,
-                            "invalid regex in test case {}",
-                            test.id
-                        );
+            ExpectedBehavior::Matches { pattern } => match regex::Regex::new(pattern) {
+                Ok(re) => {
+                    if re.is_match(response) {
+                        Score::PERFECT
+                    } else {
                         Score::ZERO
                     }
                 }
-            }
+                Err(_) => {
+                    tracing::warn!(
+                        pattern = %pattern,
+                        "invalid regex in test case {}",
+                        test.id
+                    );
+                    Score::ZERO
+                }
+            },
             _ => Score::ZERO,
         },
         ScorerKind::ExactJson => match &test.expected {
@@ -113,10 +111,14 @@ pub fn bundle_score(bundle: &TestBundle, results: &[(TestCase, String)]) -> Scor
 /// response seen for each test id. Shared by [`bundle_score`] and
 /// [`crate::caller::score_bundle_with_caller`] so both resist omitted and
 /// duplicated result entries identically.
-pub(crate) fn first_response_per_id(results: &[(TestCase, String)]) -> std::collections::HashMap<&str, &str> {
+pub(crate) fn first_response_per_id(
+    results: &[(TestCase, String)],
+) -> std::collections::HashMap<&str, &str> {
     let mut responses: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
     for (case, response) in results {
-        responses.entry(case.id.as_str()).or_insert(response.as_str());
+        responses
+            .entry(case.id.as_str())
+            .or_insert(response.as_str());
     }
     responses
 }
@@ -154,7 +156,9 @@ mod tests {
     fn regex_scorer_matches_substring() {
         let case = make_case(
             "t1",
-            ExpectedBehavior::Matches { pattern: "hello".to_string() },
+            ExpectedBehavior::Matches {
+                pattern: "hello".to_string(),
+            },
             ScorerKind::Regex,
         );
         assert_eq!(score_test(&case, "say hello"), Score::PERFECT);
@@ -165,7 +169,9 @@ mod tests {
     fn regex_scorer_no_match() {
         let case = make_case(
             "t2",
-            ExpectedBehavior::Matches { pattern: "goodbye".to_string() },
+            ExpectedBehavior::Matches {
+                pattern: "goodbye".to_string(),
+            },
             ScorerKind::Regex,
         );
         assert_eq!(score_test(&case, "hello"), Score::ZERO);
@@ -176,7 +182,9 @@ mod tests {
     fn regex_scorer_anchored() {
         let case = make_case(
             "t3",
-            ExpectedBehavior::Matches { pattern: "^hello".to_string() },
+            ExpectedBehavior::Matches {
+                pattern: "^hello".to_string(),
+            },
             ScorerKind::Regex,
         );
         assert_eq!(score_test(&case, "say hello"), Score::ZERO);
@@ -187,7 +195,9 @@ mod tests {
     fn regex_scorer_invalid_pattern() {
         let case = make_case(
             "t4",
-            ExpectedBehavior::Matches { pattern: "[unclosed".to_string() },
+            ExpectedBehavior::Matches {
+                pattern: "[unclosed".to_string(),
+            },
             ScorerKind::Regex,
         );
         assert_eq!(score_test(&case, "anything"), Score::ZERO);
@@ -250,7 +260,9 @@ mod tests {
     fn caller_returns_zero_in_score_test() {
         let case = make_case(
             "c1",
-            ExpectedBehavior::Custom { id: "my-judge".to_string() },
+            ExpectedBehavior::Custom {
+                id: "my-judge".to_string(),
+            },
             ScorerKind::Caller,
         );
         assert_eq!(score_test(&case, "any response"), Score::ZERO);
@@ -273,13 +285,17 @@ mod tests {
         let mut bundle = make_bundle();
         bundle.tests.push(make_case(
             "c2",
-            ExpectedBehavior::Custom { id: "judge".to_string() },
+            ExpectedBehavior::Custom {
+                id: "judge".to_string(),
+            },
             ScorerKind::Caller,
         ));
         let results = vec![(
             make_case(
                 "c2",
-                ExpectedBehavior::Custom { id: "judge".to_string() },
+                ExpectedBehavior::Custom {
+                    id: "judge".to_string(),
+                },
                 ScorerKind::Caller,
             ),
             "response".to_string(),
@@ -296,12 +312,16 @@ mod tests {
     fn omitted_result_scores_zero() {
         let pass = make_case(
             "p",
-            ExpectedBehavior::Contains { value: "ok".to_string() },
+            ExpectedBehavior::Contains {
+                value: "ok".to_string(),
+            },
             ScorerKind::Substring,
         );
         let fail = make_case(
             "f",
-            ExpectedBehavior::Contains { value: "ok".to_string() },
+            ExpectedBehavior::Contains {
+                value: "ok".to_string(),
+            },
             ScorerKind::Substring,
         );
         let mut bundle = make_bundle();
@@ -319,7 +339,9 @@ mod tests {
     fn duplicated_results_counted_once() {
         let pass = make_case(
             "p",
-            ExpectedBehavior::Contains { value: "ok".to_string() },
+            ExpectedBehavior::Contains {
+                value: "ok".to_string(),
+            },
             ScorerKind::Substring,
         );
         let mut bundle = make_bundle();

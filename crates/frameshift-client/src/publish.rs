@@ -74,12 +74,14 @@ pub fn load_or_create_signing_key(data_root: &Path) -> Result<SigningKey, Client
             path: path.clone(),
             source,
         })?;
-        let seed: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
-            ClientError::InvalidSigningKey {
-                path: path.clone(),
-                detail: format!("expected 32-byte seed, found {} bytes", bytes.len()),
-            }
-        })?;
+        let seed: [u8; 32] =
+            bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| ClientError::InvalidSigningKey {
+                    path: path.clone(),
+                    detail: format!("expected 32-byte seed, found {} bytes", bytes.len()),
+                })?;
         return Ok(SigningKey::from_bytes(&seed));
     }
 
@@ -109,10 +111,11 @@ pub fn load_or_create_signing_key(data_root: &Path) -> Result<SigningKey, Client
     match open_opts.open(&path) {
         Ok(mut file) => {
             use std::io::Write as _;
-            file.write_all(&key.to_bytes()).map_err(|source| ClientError::Io {
-                path: path.clone(),
-                source,
-            })?;
+            file.write_all(&key.to_bytes())
+                .map_err(|source| ClientError::Io {
+                    path: path.clone(),
+                    source,
+                })?;
             Ok(key)
         }
         // Another process created the key between our `exists` check and here;
@@ -122,12 +125,14 @@ pub fn load_or_create_signing_key(data_root: &Path) -> Result<SigningKey, Client
                 path: path.clone(),
                 source,
             })?;
-            let seed: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
-                ClientError::InvalidSigningKey {
-                    path: path.clone(),
-                    detail: format!("expected 32-byte seed, found {} bytes", bytes.len()),
-                }
-            })?;
+            let seed: [u8; 32] =
+                bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| ClientError::InvalidSigningKey {
+                        path: path.clone(),
+                        detail: format!("expected 32-byte seed, found {} bytes", bytes.len()),
+                    })?;
             Ok(SigningKey::from_bytes(&seed))
         }
         Err(source) => Err(ClientError::Io {
@@ -165,8 +170,8 @@ pub fn register_author(
         "handle": handle,
         "display_name": display_name,
     });
-    let body = serde_json::to_vec(&body_value)
-        .map_err(|e| ClientError::JsonSerialize(e.to_string()))?;
+    let body =
+        serde_json::to_vec(&body_value).map_err(|e| ClientError::JsonSerialize(e.to_string()))?;
 
     let base = server_url.trim_end_matches('/');
     let url = format!("{base}/v1/authors");
@@ -222,11 +227,7 @@ pub fn publish_pack_dir(
 /// Send a prepared signed request body, mapping non-2xx statuses to
 /// [`ClientError::RegistryRejected`] (with the status code preserved) and
 /// transport errors to [`ClientError::RegistryHttp`].
-fn send_signed(
-    req: ureq::Request,
-    url: &str,
-    body: &[u8],
-) -> Result<ureq::Response, ClientError> {
+fn send_signed(req: ureq::Request, url: &str, body: &[u8]) -> Result<ureq::Response, ClientError> {
     match req.send_bytes(body) {
         Ok(response) => Ok(response),
         Err(ureq::Error::Status(status, response)) => {
@@ -572,9 +573,8 @@ mod tests {
             let timestamp = hdr.get("x-frameshift-timestamp").unwrap();
             let nonce = hdr.get("x-frameshift-nonce").unwrap();
             let body_hex = hex::encode(Sha256::digest(&body));
-            let message = format!(
-                "{SIGNING_DOMAIN}\nPOST\n/v1/packs\n{body_hex}\n{timestamp}\n{nonce}"
-            );
+            let message =
+                format!("{SIGNING_DOMAIN}\nPOST\n/v1/packs\n{body_hex}\n{timestamp}\n{nonce}");
             let pk_bytes: [u8; 32] = URL_SAFE_NO_PAD
                 .decode(hdr.get("x-frameshift-pubkey").unwrap())
                 .unwrap()
@@ -617,7 +617,13 @@ mod tests {
         assert_eq!(outcome.pack_hash, "abc123");
 
         let (envelope_ok, fields_ok) = handle.join().unwrap();
-        assert!(envelope_ok, "signed-request envelope must verify on the server side");
-        assert!(fields_ok, "all three multipart fields must reach the server");
+        assert!(
+            envelope_ok,
+            "signed-request envelope must verify on the server side"
+        );
+        assert!(
+            fields_ok,
+            "all three multipart fields must reach the server"
+        );
     }
 }

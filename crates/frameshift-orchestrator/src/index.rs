@@ -10,9 +10,9 @@ use crate::error::OrchestratorError;
 
 /// Stopwords excluded from persona keyword extraction.
 const STOPWORDS: &[&str] = &[
-    "the", "and", "for", "with", "that", "this", "you", "are", "not", "its",
-    "use", "all", "can", "has", "was", "will", "any", "but", "our", "have",
-    "from", "they", "when", "your", "how", "what", "who",
+    "the", "and", "for", "with", "that", "this", "you", "are", "not", "its", "use", "all", "can",
+    "has", "was", "will", "any", "but", "our", "have", "from", "they", "when", "your", "how",
+    "what", "who",
 ];
 
 /// A matchable, pre-processed representation of a single persona.
@@ -214,14 +214,11 @@ impl PersonaProfile {
         };
 
         // Name: pack.toml `name` > directory file_name.
-        let name = pack
-            .name
-            .filter(|n| !n.is_empty())
-            .unwrap_or_else(|| {
-                dir.file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "unknown".to_string())
-            });
+        let name = pack.name.filter(|n| !n.is_empty()).unwrap_or_else(|| {
+            dir.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "unknown".to_string())
+        });
 
         // Build keyword corpus: always include the full body.
         // High-signal sections are included twice for weighting.
@@ -263,21 +260,32 @@ impl PersonaProfile {
         }
 
         // Capability manifest from pack.toml.
-        let (required_tools, network_egress, primary_intents, anti_keywords) = if let Some(cm) = pack.capability_manifest {
-            let intents: Vec<crate::intent::Intent> = cm
-                .primary_intents
-                .iter()
-                .filter_map(|s| parse_intent(s))
-                .collect();
-            let resolved_intents = if intents.is_empty() {
-                infer_intents_from_keywords(&keywords)
+        let (required_tools, network_egress, primary_intents, anti_keywords) =
+            if let Some(cm) = pack.capability_manifest {
+                let intents: Vec<crate::intent::Intent> = cm
+                    .primary_intents
+                    .iter()
+                    .filter_map(|s| parse_intent(s))
+                    .collect();
+                let resolved_intents = if intents.is_empty() {
+                    infer_intents_from_keywords(&keywords)
+                } else {
+                    intents
+                };
+                (
+                    cm.required_tools,
+                    cm.network_egress,
+                    resolved_intents,
+                    cm.anti_keywords,
+                )
             } else {
-                intents
+                (
+                    Vec::new(),
+                    false,
+                    infer_intents_from_keywords(&keywords),
+                    Vec::new(),
+                )
             };
-            (cm.required_tools, cm.network_egress, resolved_intents, cm.anti_keywords)
-        } else {
-            (Vec::new(), false, infer_intents_from_keywords(&keywords), Vec::new())
-        };
 
         Ok(PersonaProfile {
             name,
@@ -378,9 +386,28 @@ const LANGUAGE_LEXICON: &[(&str, &str)] = &[
 
 /// Known language identifiers used for keyword-based language detection.
 const KNOWN_LANGUAGES: &[&str] = &[
-    "rust", "typescript", "javascript", "python", "go", "java", "ruby",
-    "c", "cpp", "markdown", "toml", "shell", "bash", "sql", "yaml",
-    "haskell", "kotlin", "swift", "scala", "elixir", "erlang", "clojure",
+    "rust",
+    "typescript",
+    "javascript",
+    "python",
+    "go",
+    "java",
+    "ruby",
+    "c",
+    "cpp",
+    "markdown",
+    "toml",
+    "shell",
+    "bash",
+    "sql",
+    "yaml",
+    "haskell",
+    "kotlin",
+    "swift",
+    "scala",
+    "elixir",
+    "erlang",
+    "clojure",
     "prose",
 ];
 
@@ -391,8 +418,14 @@ const KNOWN_LANGUAGES: &[&str] = &[
 /// next heading of the same or higher level.
 fn extract_high_signal_sections(body: &str) -> Vec<String> {
     const HIGH_SIGNAL: &[&str] = &[
-        "l2 anchor", "tech stack", "concrete patterns", "operating frame",
-        "who you are", "language", "stack", "tools",
+        "l2 anchor",
+        "tech stack",
+        "concrete patterns",
+        "operating frame",
+        "who you are",
+        "language",
+        "stack",
+        "tools",
     ];
 
     let mut sections: Vec<String> = Vec::new();
@@ -498,9 +531,7 @@ impl PersonaIndex {
         for dir in dirs {
             match PersonaProfile::from_persona_dir(dir) {
                 Ok(profile) => profiles.push(profile),
-                Err(OrchestratorError::Io(e))
-                    if e.kind() == std::io::ErrorKind::NotFound =>
-                {
+                Err(OrchestratorError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
                     tracing::warn!(
                         dir = %dir.display(),
                         "skipping persona dir: no persona.toml or AGENTS.md found"
@@ -545,9 +576,7 @@ impl PersonaIndex {
 
             match PersonaProfile::from_persona_dir(&path) {
                 Ok(profile) => profiles.push(profile),
-                Err(OrchestratorError::Io(e))
-                    if e.kind() == std::io::ErrorKind::NotFound =>
-                {
+                Err(OrchestratorError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
                     tracing::warn!(
                         dir = %path.display(),
                         "skipping catalog dir: no persona.toml or AGENTS.md found"
@@ -623,7 +652,10 @@ mod tests {
     fn profile_detects_language_from_name() {
         let src = minimal_source("rust-expert", "precise and performant");
         let profile = PersonaProfile::from_source(&src);
-        assert!(profile.keywords.iter().any(|k| k == "rust" || k == "expert"));
+        assert!(profile
+            .keywords
+            .iter()
+            .any(|k| k == "rust" || k == "expert"));
     }
 
     /// PersonaIndex::build creates one profile per source.
@@ -662,7 +694,10 @@ mod tests {
             profile.languages
         );
         assert!(
-            profile.keywords.iter().any(|k| k == "rust" || k == "cargo" || k == "clippy"),
+            profile
+                .keywords
+                .iter()
+                .any(|k| k == "rust" || k == "cargo" || k == "clippy"),
             "expected rust/cargo/clippy in keywords; got: {:?}",
             profile.keywords
         );
@@ -707,7 +742,10 @@ mod tests {
         let profile = PersonaProfile::from_persona_dir(&dir).unwrap();
         assert_eq!(profile.name, "writer");
         assert!(
-            profile.keywords.iter().any(|k| k == "documentation" || k == "docs" || k == "writer" || k == "prose"),
+            profile
+                .keywords
+                .iter()
+                .any(|k| k == "documentation" || k == "docs" || k == "writer" || k == "prose"),
             "expected writing-related keywords; got: {:?}",
             profile.keywords
         );
@@ -728,8 +766,12 @@ mod tests {
         });
         let profile = PersonaProfile::from_source(&src);
         assert_eq!(profile.primary_intents.len(), 2);
-        assert!(profile.primary_intents.contains(&crate::intent::Intent::Implementation));
-        assert!(profile.primary_intents.contains(&crate::intent::Intent::Debugging));
+        assert!(profile
+            .primary_intents
+            .contains(&crate::intent::Intent::Implementation));
+        assert!(profile
+            .primary_intents
+            .contains(&crate::intent::Intent::Debugging));
     }
 
     /// profile_extracts_anti_keywords verifies that anti_keywords from the
@@ -758,7 +800,11 @@ mod tests {
         // Valid freeform persona.
         let rust_dir = catalog.join("rust");
         fs::create_dir_all(&rust_dir).unwrap();
-        fs::write(rust_dir.join("AGENTS.md"), "# Rust\n\ncargo clippy rustc ownership\n").unwrap();
+        fs::write(
+            rust_dir.join("AGENTS.md"),
+            "# Rust\n\ncargo clippy rustc ownership\n",
+        )
+        .unwrap();
 
         // Valid typed persona.
         let typed_dir = catalog.join("typed");

@@ -363,7 +363,11 @@ tone = "precise"
     fn selection_output_serializes_to_json() {
         let tmp = TempDir::new().unwrap();
         let dir_a = tmp.path().join("alpha");
-        make_freeform_persona(&dir_a, "alpha", "# Alpha\n\nRust cargo clippy. Debugging and implementation.\n");
+        make_freeform_persona(
+            &dir_a,
+            "alpha",
+            "# Alpha\n\nRust cargo clippy. Debugging and implementation.\n",
+        );
 
         let project = TempDir::new().unwrap();
         let inputs = SelectionInputs {

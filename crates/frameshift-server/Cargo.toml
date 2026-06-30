@@ -46,7 +46,10 @@ flate2 = "1"
 hmac = { workspace = true }
 sha2 = { workspace = true }
 tower_governor = "0.8"
-prometheus = "0.13"
+# default-features disabled to drop the unmaintained protobuf 2.x dependency
+# (RUSTSEC-2024-0437); the server only emits the Prometheus text exposition
+# format via TextEncoder, never the protobuf wire format.
+prometheus = { version = "0.13", default-features = false }
 
 [dev-dependencies]
 tokio = { workspace = true }

@@ -191,7 +191,10 @@ mod tests {
         // Enable mode.
         let state_dir = client.orchestrator_state_dir(&project_root).unwrap();
         fs::create_dir_all(&state_dir).unwrap();
-        let mode = ModeState { mode: Mode::On, sensitivity: 0.5 };
+        let mode = ModeState {
+            mode: Mode::On,
+            sensitivity: 0.5,
+        };
         mode.save(&state_dir.join("automate.json")).unwrap();
 
         // Write lock marker.
@@ -224,7 +227,10 @@ mod tests {
         // Enable mode, no lock.
         let state_dir = client.orchestrator_state_dir(&project_root).unwrap();
         fs::create_dir_all(&state_dir).unwrap();
-        let mode = ModeState { mode: Mode::On, sensitivity: 0.5 };
+        let mode = ModeState {
+            mode: Mode::On,
+            sensitivity: 0.5,
+        };
         mode.save(&state_dir.join("automate.json")).unwrap();
 
         let policy = SwitchPolicy::default();
@@ -268,7 +274,10 @@ mod tests {
 
         // Enable mode.
         let state_dir = client.orchestrator_state_dir(&project_root).unwrap();
-        let mode = ModeState { mode: Mode::On, sensitivity: 0.5 };
+        let mode = ModeState {
+            mode: Mode::On,
+            sensitivity: 0.5,
+        };
         mode.save(&state_dir.join("automate.json")).unwrap();
 
         // Use a lenient policy so the single persona will pass the confidence threshold.
@@ -338,7 +347,10 @@ mod tests {
 
         // Enable mode.
         let state_dir = client.orchestrator_state_dir(&project_root).unwrap();
-        let mode = ModeState { mode: Mode::On, sensitivity: 0.5 };
+        let mode = ModeState {
+            mode: Mode::On,
+            sensitivity: 0.5,
+        };
         mode.save(&state_dir.join("automate.json")).unwrap();
 
         // Lenient policy so the single installed persona crosses the
@@ -359,8 +371,7 @@ mod tests {
         // an entry whose `from` is the pre-seeded persona name.
         let audit_path = state_dir.join("automate-audit.jsonl");
         if audit_path.exists() {
-            let log =
-                AuditLog::load(&audit_path).expect("audit log should load if it exists");
+            let log = AuditLog::load(&audit_path).expect("audit log should load if it exists");
             let recent = log.recent(1);
             if !recent.is_empty() {
                 assert_eq!(

@@ -605,12 +605,9 @@ mod tests {
     async fn make_adapter() -> (SqliteFtsAdapter, TempDir) {
         let dir = TempDir::new().expect("tempdir");
         let path = dir.path().join("test.db");
-        let adapter = SqliteFtsAdapter::new(SqliteFtsConfig {
-            path,
-            pool_size: 2,
-        })
-        .await
-        .expect("adapter init");
+        let adapter = SqliteFtsAdapter::new(SqliteFtsConfig { path, pool_size: 2 })
+            .await
+            .expect("adapter init");
         (adapter, dir)
     }
 

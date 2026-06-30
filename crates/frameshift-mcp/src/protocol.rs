@@ -152,7 +152,10 @@ pub struct PromptContent {
 }
 
 /// Construct a successful JSON-RPC response with the given id and result value.
-pub fn success_response(id: Option<serde_json::Value>, result: serde_json::Value) -> JsonRpcResponse {
+pub fn success_response(
+    id: Option<serde_json::Value>,
+    result: serde_json::Value,
+) -> JsonRpcResponse {
     JsonRpcResponse {
         jsonrpc: "2.0",
         id,
@@ -190,17 +193,18 @@ mod tests {
         });
         let response = success_response(Some(serde_json::json!(1)), result);
         let serialized = serde_json::to_value(&response).unwrap();
-        assert_eq!(
-            serialized["result"]["serverInfo"]["name"],
-            "frameshift-mcp"
-        );
+        assert_eq!(serialized["result"]["serverInfo"]["name"], "frameshift-mcp");
     }
 
     /// Verify the shape of an error response: must have error.code and error.message,
     /// no result field.
     #[test]
     fn error_response_format() {
-        let response = error_response(Some(serde_json::json!(42)), -32601, "method not found".to_string());
+        let response = error_response(
+            Some(serde_json::json!(42)),
+            -32601,
+            "method not found".to_string(),
+        );
         let serialized = serde_json::to_value(&response).unwrap();
         assert_eq!(serialized["jsonrpc"], "2.0");
         assert_eq!(serialized["id"], 42);

@@ -12,9 +12,7 @@
 use std::path::{Path, PathBuf};
 
 use frameshift_client::Client;
-use frameshift_orchestrator::{
-    feedback::Preferences, policy::PolicyWeights, run::SelectionInputs,
-};
+use frameshift_orchestrator::{feedback::Preferences, policy::PolicyWeights, run::SelectionInputs};
 
 use crate::protocol::{PromptArgDef, PromptContent, PromptDef, PromptMessage, PromptResult};
 
@@ -26,10 +24,9 @@ pub fn prompt_definitions() -> Vec<PromptDef> {
     vec![
         PromptDef {
             name: "active_persona".to_string(),
-            description:
-                "Insert the project's active Frameshift persona into the conversation. \
+            description: "Insert the project's active Frameshift persona into the conversation. \
                  Use this at session start to load the persona without any hook glue."
-                    .to_string(),
+                .to_string(),
             arguments: vec![PromptArgDef {
                 name: "project_root".to_string(),
                 description: "Absolute path to the project root.".to_string(),
@@ -38,11 +35,10 @@ pub fn prompt_definitions() -> Vec<PromptDef> {
         },
         PromptDef {
             name: "select_persona".to_string(),
-            description:
-                "Rank Frameshift personas for the current project context and return the \
+            description: "Rank Frameshift personas for the current project context and return the \
                  top candidates with score, confidence, and rationale. Activate the chosen \
                  one with the `frameshift_use` tool."
-                    .to_string(),
+                .to_string(),
             arguments: vec![
                 PromptArgDef {
                     name: "project_root".to_string(),
@@ -51,27 +47,24 @@ pub fn prompt_definitions() -> Vec<PromptDef> {
                 },
                 PromptArgDef {
                     name: "task".to_string(),
-                    description:
-                        "Optional one-line description of the task to steer the ranker."
-                            .to_string(),
+                    description: "Optional one-line description of the task to steer the ranker."
+                        .to_string(),
                     required: false,
                 },
                 PromptArgDef {
                     name: "library".to_string(),
-                    description:
-                        "Optional path to a persona library directory to rank from \
+                    description: "Optional path to a persona library directory to rank from \
                          instead of the project-installed personas."
-                            .to_string(),
+                        .to_string(),
                     required: false,
                 },
             ],
         },
         PromptDef {
             name: "automate_status".to_string(),
-            description:
-                "Report Frameshift automate-mode state for this project: mode (On/Off), \
+            description: "Report Frameshift automate-mode state for this project: mode (On/Off), \
                  active persona, and recent persona transitions from the audit log."
-                    .to_string(),
+                .to_string(),
             arguments: vec![PromptArgDef {
                 name: "project_root".to_string(),
                 description: "Absolute path to the project root.".to_string(),
@@ -192,8 +185,8 @@ fn call_select_persona(
         weights: PolicyWeights::default(),
     };
 
-    let ranked = frameshift_orchestrator::select(&inputs)
-        .map_err(|e| format!("selection failed: {e}"))?;
+    let ranked =
+        frameshift_orchestrator::select(&inputs).map_err(|e| format!("selection failed: {e}"))?;
 
     if ranked.is_empty() {
         return Ok(text_message_result(
@@ -219,7 +212,10 @@ fn call_select_persona(
         ));
     }
 
-    Ok(text_message_result(Some("Frameshift persona ranking".to_string()), body))
+    Ok(text_message_result(
+        Some("Frameshift persona ranking".to_string()),
+        body,
+    ))
 }
 
 /// Handle the `automate_status` prompt.
@@ -302,10 +298,7 @@ fn call_automate_status(
 }
 
 /// Extract a required string argument and convert it to a PathBuf.
-fn get_required_path(
-    arguments: &serde_json::Value,
-    key: &str,
-) -> Result<PathBuf, String> {
+fn get_required_path(arguments: &serde_json::Value, key: &str) -> Result<PathBuf, String> {
     let s = arguments
         .get(key)
         .and_then(|v| v.as_str())
@@ -355,9 +348,7 @@ fn project_root_arg_from_path(p: &Path) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use frameshift_client::{
-        Client, ClientOptions, InstallRequest, InstallSource, PersonaSpec,
-    };
+    use frameshift_client::{Client, ClientOptions, InstallRequest, InstallSource, PersonaSpec};
     use std::fs;
 
     /// Build a Client backed by a temporary data root.
@@ -529,7 +520,10 @@ mod tests {
         )
         .unwrap();
         let text = &result.messages[0].content.text;
-        assert!(text.contains("mode: off"), "expected mode: off, got: {text}");
+        assert!(
+            text.contains("mode: off"),
+            "expected mode: off, got: {text}"
+        );
     }
 
     /// All prompts reject missing project_root with a clear error message.

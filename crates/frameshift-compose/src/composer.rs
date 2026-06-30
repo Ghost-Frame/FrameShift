@@ -186,14 +186,21 @@ mod tests {
         );
         resolver.insert(
             "strict-mixin",
-            source_with_rule("strict-mixin", make_rule("no-panic", SourceLayer::L1, false)),
+            source_with_rule(
+                "strict-mixin",
+                make_rule("no-panic", SourceLayer::L1, false),
+            ),
         );
 
         let composer = Composer::new(resolver);
         let root = PersonaSource::new(Persona::new("root"));
 
         let err = composer
-            .compose(root, Some("base".to_string()), &["strict-mixin".to_string()])
+            .compose(
+                root,
+                Some("base".to_string()),
+                &["strict-mixin".to_string()],
+            )
             .expect_err("mixin L1 override should fail");
 
         assert!(

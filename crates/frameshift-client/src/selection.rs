@@ -78,7 +78,8 @@ pub fn append_selection_event(
 ) -> Result<(), ClientError> {
     use std::io::Write as _;
     // Serialize to a single line; JSONL requires exactly one object per line.
-    let line = serde_json::to_string(event).map_err(|e| ClientError::JsonSerialize(e.to_string()))?;
+    let line =
+        serde_json::to_string(event).map_err(|e| ClientError::JsonSerialize(e.to_string()))?;
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)

@@ -31,8 +31,8 @@ use frameshift_catalog::{
 use crate::config::PostgresCatalogConfig;
 use crate::errors::{map_diesel_error, map_migration_error, map_pool_error};
 use crate::models::{
-    vec_to_pubkey, AuthorRow, HandleRow, NewAuthorRow, NewHandleRow, NewPackDownloadRow, NewPackRow,
-    NewPackVersionRow, PackRow, PackVersionRow,
+    vec_to_pubkey, AuthorRow, HandleRow, NewAuthorRow, NewHandleRow, NewPackDownloadRow,
+    NewPackRow, NewPackVersionRow, PackRow, PackVersionRow,
 };
 use crate::pool::{build_pool, PgPool};
 use crate::schema::{authors, handles, pack_downloads, pack_versions, packs};
@@ -379,92 +379,93 @@ impl CatalogBackend for PostgresCatalog {
 
         use diesel_async::AsyncConnection as _;
         let tx_result = conn
-            .transaction::<(), TxError, _>(|conn| {
-                let new_pack = new_pack.clone();
-                let new_version = new_version.clone();
-                let pack_name = pack_name_clone.clone();
-                let version = version_clone.clone();
-                let incoming_author = incoming_author_bytes.clone();
-                Box::pin(async move {
-                    // D5: If the pack head already exists, verify the publishing
-                    // author matches the stored current_author. First-publish
-                    // (no existing row) is always allowed.
-                    let existing_pack: Option<PackRow> = packs::table
-                        .filter(packs::name.eq(&pack_name))
-                        .select(PackRow::as_select())
-                        .first(conn)
-                        .await
-                        .optional()
-                        .map_err(|e| {
-                            TxError::Catalog(map_diesel_error(e, "pack", pack_name.clone()))
-                        })?;
+            .transaction::<(), TxError, _>(async move |conn| {
+                // diesel-async 0.9 takes an `AsyncFnOnce`, so the old
+                // `|conn| Box::pin(async move { .. })` wrapper is gone -- the body
+                // is now the async closure directly. `new_pack` and `new_version`
+                // are captured by move under their own names; the comparison values
+                // are rebound (by move, no clone) to the short names used below.
+                let pack_name = pack_name_clone;
+                let version = version_clone;
+                let incoming_author = incoming_author_bytes;
+                // D5: If the pack head already exists, verify the publishing
+                // author matches the stored current_author. First-publish
+                // (no existing row) is always allowed.
+                let existing_pack: Option<PackRow> = packs::table
+                    .filter(packs::name.eq(&pack_name))
+                    .select(PackRow::as_select())
+                    .first(conn)
+                    .await
+                    .optional()
+                    .map_err(|e| {
+                        TxError::Catalog(map_diesel_error(e, "pack", pack_name.clone()))
+                    })?;
 
-                    if let Some(ref existing) = existing_pack {
-                        // Pack already exists -- check ownership.
-                        if existing.current_author != incoming_author {
-                            return Err(TxError::Catalog(CatalogError::Unauthorized {
-                                kind: "pack",
-                                key: pack_name.clone(),
-                            }));
-                        }
+                if let Some(ref existing) = existing_pack {
+                    // Pack already exists -- check ownership.
+                    if existing.current_author != incoming_author {
+                        return Err(TxError::Catalog(CatalogError::Unauthorized {
+                            kind: "pack",
+                            key: pack_name.clone(),
+                        }));
                     }
+                }
 
-                    // Upsert the parent pack row; do nothing if it already exists.
-                    diesel::insert_into(packs::table)
-                        .values(&new_pack)
-                        .on_conflict(packs::name)
-                        .do_nothing()
+                // Upsert the parent pack row; do nothing if it already exists.
+                diesel::insert_into(packs::table)
+                    .values(&new_pack)
+                    .on_conflict(packs::name)
+                    .do_nothing()
+                    .execute(conn)
+                    .await
+                    .map_err(|e| {
+                        TxError::Catalog(map_diesel_error(e, "pack", pack_name.clone()))
+                    })?;
+
+                // Insert the version row.
+                diesel::insert_into(pack_versions::table)
+                    .values(&new_version)
+                    .execute(conn)
+                    .await
+                    .map_err(|e| {
+                        TxError::Catalog(map_diesel_error(
+                            e,
+                            "pack_version",
+                            format!("{pack_name}@{version}"),
+                        ))
+                    })?;
+
+                // D8: Update latest_version using true semver precedence.
+                // Read the current stored value (may have changed from the
+                // row we fetched above if this is a first insert), then
+                // compare using semver_gt before issuing the UPDATE.
+                let current_latest: Option<String> = packs::table
+                    .filter(packs::name.eq(&pack_name))
+                    .select(packs::latest_version)
+                    .first(conn)
+                    .await
+                    .map_err(|e| {
+                        TxError::Catalog(map_diesel_error(e, "pack", pack_name.clone()))
+                    })?;
+
+                // Only update when the new version has strictly higher
+                // semver precedence than the stored latest.
+                let should_update = match &current_latest {
+                    None => true,
+                    Some(stored) => semver_gt(&version, stored),
+                };
+
+                if should_update {
+                    diesel::update(packs::table.filter(packs::name.eq(&pack_name)))
+                        .set(packs::latest_version.eq(Some(&version)))
                         .execute(conn)
                         .await
                         .map_err(|e| {
                             TxError::Catalog(map_diesel_error(e, "pack", pack_name.clone()))
                         })?;
+                }
 
-                    // Insert the version row.
-                    diesel::insert_into(pack_versions::table)
-                        .values(&new_version)
-                        .execute(conn)
-                        .await
-                        .map_err(|e| {
-                            TxError::Catalog(map_diesel_error(
-                                e,
-                                "pack_version",
-                                format!("{pack_name}@{version}"),
-                            ))
-                        })?;
-
-                    // D8: Update latest_version using true semver precedence.
-                    // Read the current stored value (may have changed from the
-                    // row we fetched above if this is a first insert), then
-                    // compare using semver_gt before issuing the UPDATE.
-                    let current_latest: Option<String> = packs::table
-                        .filter(packs::name.eq(&pack_name))
-                        .select(packs::latest_version)
-                        .first(conn)
-                        .await
-                        .map_err(|e| {
-                            TxError::Catalog(map_diesel_error(e, "pack", pack_name.clone()))
-                        })?;
-
-                    // Only update when the new version has strictly higher
-                    // semver precedence than the stored latest.
-                    let should_update = match &current_latest {
-                        None => true,
-                        Some(stored) => semver_gt(&version, stored),
-                    };
-
-                    if should_update {
-                        diesel::update(packs::table.filter(packs::name.eq(&pack_name)))
-                            .set(packs::latest_version.eq(Some(&version)))
-                            .execute(conn)
-                            .await
-                            .map_err(|e| {
-                                TxError::Catalog(map_diesel_error(e, "pack", pack_name.clone()))
-                            })?;
-                    }
-
-                    Ok(())
-                })
+                Ok(())
             })
             .await;
 
@@ -861,16 +862,14 @@ impl CatalogBackend for PostgresCatalog {
     ) -> Result<(), CatalogError> {
         let mut conn = self.pool.get().await.map_err(map_pool_error)?;
 
-        let rows_affected = diesel::sql_query(
-            "UPDATE packs SET extends = $1 WHERE name = $2",
-        )
-        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
-            extends.map(str::to_string),
-        )
-        .bind::<diesel::sql_types::Text, _>(pack_name.to_string())
-        .execute(&mut *conn)
-        .await
-        .map_err(|e| map_diesel_error(e, "pack", pack_name.to_string()))?;
+        let rows_affected = diesel::sql_query("UPDATE packs SET extends = $1 WHERE name = $2")
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+                extends.map(str::to_string),
+            )
+            .bind::<diesel::sql_types::Text, _>(pack_name.to_string())
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| map_diesel_error(e, "pack", pack_name.to_string()))?;
 
         if rows_affected == 0 {
             return Err(CatalogError::NotFound {

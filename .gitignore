@@ -30,3 +30,7 @@ data/
 
 # Secrets
 bin/leak-patterns.txt
+
+# Local audit working directories (raw findings, local paths, tool identifiers)
+.audit-fleet/
+.audit-fleet-web/

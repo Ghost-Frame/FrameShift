@@ -297,14 +297,22 @@ mod tests {
     /// Debugging tokens classify to Debugging intent.
     #[test]
     fn classifies_debugging_intent() {
-        let tokens = vec!["debugging".to_string(), "rust".to_string(), "error".to_string()];
+        let tokens = vec![
+            "debugging".to_string(),
+            "rust".to_string(),
+            "error".to_string(),
+        ];
         assert_eq!(classify(&tokens), Some(Intent::Debugging));
     }
 
     /// Mixed security and review tokens classify to the higher-hit intent (Security).
     #[test]
     fn classifies_security_intent() {
-        let tokens = vec!["reviewing".to_string(), "security".to_string(), "vulnerability".to_string()];
+        let tokens = vec![
+            "reviewing".to_string(),
+            "security".to_string(),
+            "vulnerability".to_string(),
+        ];
         assert_eq!(classify(&tokens), Some(Intent::Security));
     }
 

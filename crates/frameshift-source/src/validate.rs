@@ -495,7 +495,11 @@ fn scan_persona_fields(src: &PersonaSource, warnings: &mut Vec<ContentWarning>) 
 
     // `default_questions[].question` field: user-supplied question text surfaced to agents.
     for dq in &p.default_questions {
-        check_text(&dq.question, "persona.default_questions[].question", warnings);
+        check_text(
+            &dq.question,
+            "persona.default_questions[].question",
+            warnings,
+        );
     }
 }
 

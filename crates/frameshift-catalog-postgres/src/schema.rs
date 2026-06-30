@@ -137,4 +137,10 @@ diesel::joinable!(pack_versions -> authors (author_pubkey));
 // Allow Diesel join inference between handles and authors.
 diesel::joinable!(handles -> authors (pubkey));
 
-diesel::allow_tables_to_appear_in_same_query!(authors, packs, pack_versions, handles, pack_downloads,);
+diesel::allow_tables_to_appear_in_same_query!(
+    authors,
+    packs,
+    pack_versions,
+    handles,
+    pack_downloads,
+);

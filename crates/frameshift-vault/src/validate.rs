@@ -118,7 +118,10 @@ mod tests {
             !rendered.contains("super-secret-token"),
             "secret value must not appear: {rendered}"
         );
-        assert!(!rendered.contains("hidden prose"), "overlay value must not appear");
+        assert!(
+            !rendered.contains("hidden prose"),
+            "overlay value must not appear"
+        );
     }
 
     /// A non-http(s) memory endpoint is rejected.
@@ -132,7 +135,10 @@ mod tests {
             auth_method: "api-key".to_owned(),
             auth_value_vault_ref: "memory_api_key".to_owned(),
         });
-        assert!(super::validate(&v).is_err(), "file:// endpoint must be rejected");
+        assert!(
+            super::validate(&v).is_err(),
+            "file:// endpoint must be rejected"
+        );
     }
 
     /// An over-cap overlay value is rejected.
@@ -140,6 +146,9 @@ mod tests {
     fn rejects_oversized_overlay() {
         let mut v = base();
         v.set_overlay("agent.slot".to_owned(), "x".repeat(64 * 1024 + 1));
-        assert!(super::validate(&v).is_err(), "oversized overlay must be rejected");
+        assert!(
+            super::validate(&v).is_err(),
+            "oversized overlay must be rejected"
+        );
     }
 }

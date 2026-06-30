@@ -152,10 +152,7 @@ mod tests {
             }],
             skill_collisions: vec![IdCollision {
                 id: "tdd".to_string(),
-                layers: vec![
-                    Layer::Mixin("a".to_string()),
-                    Layer::Mixin("b".to_string()),
-                ],
+                layers: vec![Layer::Mixin("a".to_string()), Layer::Mixin("b".to_string())],
             }],
         };
 
@@ -166,10 +163,7 @@ mod tests {
         }));
         assert!(conflicts.contains(&Conflict::SkillIdCollision {
             id: "tdd".to_string(),
-            layers: vec![
-                Layer::Mixin("a".to_string()),
-                Layer::Mixin("b".to_string()),
-            ],
+            layers: vec![Layer::Mixin("a".to_string()), Layer::Mixin("b".to_string()),],
         }));
     }
 

@@ -206,10 +206,12 @@ pub fn fetch_and_install(
 /// Returns a structured [`ClientError::RegistryHttp`] on HTTP errors or
 /// deserialization failures.
 fn ureq_get_json<T: serde::de::DeserializeOwned>(url: &str) -> Result<T, ClientError> {
-    let response = ureq::get(url).call().map_err(|err| ClientError::RegistryHttp {
-        url: url.to_string(),
-        detail: err.to_string(),
-    })?;
+    let response = ureq::get(url)
+        .call()
+        .map_err(|err| ClientError::RegistryHttp {
+            url: url.to_string(),
+            detail: err.to_string(),
+        })?;
 
     if response.status() != 200 {
         return Err(ClientError::RegistryHttp {
@@ -231,10 +233,12 @@ fn ureq_get_json<T: serde::de::DeserializeOwned>(url: &str) -> Result<T, ClientE
 /// Returns a structured [`ClientError::RegistryHttp`] on HTTP errors or
 /// read failures.
 fn ureq_get_bytes(url: &str) -> Result<Vec<u8>, ClientError> {
-    let response = ureq::get(url).call().map_err(|err| ClientError::RegistryHttp {
-        url: url.to_string(),
-        detail: err.to_string(),
-    })?;
+    let response = ureq::get(url)
+        .call()
+        .map_err(|err| ClientError::RegistryHttp {
+            url: url.to_string(),
+            detail: err.to_string(),
+        })?;
 
     if response.status() != 200 {
         return Err(ClientError::RegistryHttp {

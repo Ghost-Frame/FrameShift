@@ -101,9 +101,7 @@ async fn build_state(config: Arc<ServerConfig>) -> Result<AppState, ServerError>
 ///
 /// Unknown values produce a [`ServerError::Startup`] so a typo in the env
 /// fails fast rather than silently defaulting.
-async fn build_object_store(
-    config: &ServerConfig,
-) -> Result<Arc<dyn PackStore>, ServerError> {
+async fn build_object_store(config: &ServerConfig) -> Result<Arc<dyn PackStore>, ServerError> {
     match config.object_store_backend.as_str() {
         "fs" => {
             let fs_cfg = FsPackStoreConfig {
@@ -217,9 +215,7 @@ async fn build_memory_adapter(
 /// Accepted formats:
 /// - `"none"` -> `HttpAuth::None`
 /// - `"bearer:<token>"` -> `HttpAuth::Bearer(<token>)`
-fn parse_memory_http_auth(
-    raw: &str,
-) -> Result<frameshift_memory_http::HttpAuth, ServerError> {
+fn parse_memory_http_auth(raw: &str) -> Result<frameshift_memory_http::HttpAuth, ServerError> {
     use frameshift_memory_http::HttpAuth;
 
     if raw == "none" || raw.is_empty() {
@@ -267,4 +263,3 @@ async fn main() {
         std::process::exit(code);
     }
 }
-

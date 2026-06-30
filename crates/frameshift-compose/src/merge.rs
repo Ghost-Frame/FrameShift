@@ -264,8 +264,8 @@ mod tests {
     fn merge_two_empty_sources_yields_empty_composed() {
         let a = empty_fixture("base");
         let b = empty_fixture("root");
-        let composed = merge_sources(MergeOrder::BaseFirst, &[&a, &b])
-            .expect("empty merge should succeed");
+        let composed =
+            merge_sources(MergeOrder::BaseFirst, &[&a, &b]).expect("empty merge should succeed");
         assert!(composed.rules.is_empty());
         assert!(composed.skills.is_empty());
         assert!(composed.patterns.stack.is_empty());
@@ -335,8 +335,8 @@ mod tests {
             },
         ];
 
-        let err = merge_layers(&layers)
-            .expect_err("root without override_inherited should fail for L1");
+        let err =
+            merge_layers(&layers).expect_err("root without override_inherited should fail for L1");
         assert!(
             matches!(&err, ComposeError::L1Override { rule_id, .. } if rule_id == "no-panic"),
             "unexpected error: {err}"

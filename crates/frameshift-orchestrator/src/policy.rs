@@ -160,7 +160,8 @@ pub fn rank(
                 if profile.primary_intents.is_empty() {
                     0.0
                 } else {
-                    profile.primary_intents
+                    profile
+                        .primary_intents
                         .iter()
                         .map(|pi| crate::intent::relatedness(*pi, task_intent))
                         .fold(0.0_f32, f32::max)
@@ -421,7 +422,9 @@ mod tests {
         let mut perf = make_profile("perf-expert", &["rust"], &["rust", "profiling"]);
         perf.primary_intents = vec![Intent::Performance];
 
-        let index = PersonaIndex { profiles: vec![rust, perf] };
+        let index = PersonaIndex {
+            profiles: vec![rust, perf],
+        };
         let ctx = ContextSignal {
             project_name: "test".to_string(),
             languages: {
@@ -435,7 +438,10 @@ mod tests {
         };
 
         let ranked = rank(&ctx, &index, &PolicyWeights::default(), &Preferences::new());
-        assert_eq!(ranked[0].persona, "rust-expert", "debugging intent should boost rust-expert");
+        assert_eq!(
+            ranked[0].persona, "rust-expert",
+            "debugging intent should boost rust-expert"
+        );
     }
 
     /// Anti-keywords penalize the lexical score when task tokens match the blacklist.
@@ -446,11 +452,16 @@ mod tests {
 
         let persona_b = make_profile("frontend", &["typescript"], &["react", "css"]);
 
-        let index = PersonaIndex { profiles: vec![persona_a, persona_b] };
+        let index = PersonaIndex {
+            profiles: vec![persona_a, persona_b],
+        };
         let ctx = make_ctx(&[("rust", 1.0)], &["css", "styling", "frontend"]);
 
         let ranked = rank(&ctx, &index, &PolicyWeights::default(), &Preferences::new());
         let backend_entry = ranked.iter().find(|s| s.persona == "backend").unwrap();
-        assert!(backend_entry.components.lexical < 0.3, "anti-keywords should penalize lexical score");
+        assert!(
+            backend_entry.components.lexical < 0.3,
+            "anti-keywords should penalize lexical score"
+        );
     }
 }

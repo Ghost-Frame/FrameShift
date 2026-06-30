@@ -40,9 +40,8 @@ pub fn run(args: GrowArgs) -> Result<(), CliError> {
 /// Execute grow append -- write a timestamped entry to the persona's growth.md.
 fn run_append(args: AppendArgs) -> Result<(), CliError> {
     let client = frameshift_client::Client::with_default_data_root()?;
-    let project_root = std::env::current_dir().map_err(|e| {
-        CliError::Growth(format!("cannot determine current directory: {}", e))
-    })?;
+    let project_root = std::env::current_dir()
+        .map_err(|e| CliError::Growth(format!("cannot determine current directory: {}", e)))?;
     let project_id = client.project_id(&project_root)?;
 
     frameshift_growth::append(client.data_root(), &project_id, &args.persona, &args.text)

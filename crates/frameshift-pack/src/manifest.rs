@@ -197,7 +197,8 @@ version = "0.1.0"
             schema_version: 1,
             name: "child".to_string(),
             author_handle: "alice".to_string(),
-            author_pubkey: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string(),
+            author_pubkey: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+                .to_string(),
             version: "1.0.0".to_string(),
             parent_hash: None,
             license: None,
@@ -223,7 +224,8 @@ version = "0.1.0"
             schema_version: 1,
             name: "minimal".to_string(),
             author_handle: "t".to_string(),
-            author_pubkey: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string(),
+            author_pubkey: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+                .to_string(),
             version: "0.1.0".to_string(),
             parent_hash: None,
             license: None,
