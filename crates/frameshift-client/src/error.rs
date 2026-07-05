@@ -148,6 +148,12 @@ pub enum ClientError {
     /// returns `Result<_, ClientError>`.
     #[error("persona composition failed: {0}")]
     Compose(#[source] Box<frameshift_compose::ComposeError>),
+
+    /// The registry has a record for `name` but it has no published version
+    /// yet (`latest_version` is `None`), so there is nothing to resolve a
+    /// bare (version-less) install spec to.
+    #[error("pack {0:?} exists in the registry but has no published version")]
+    NoPublishedVersion(String),
 }
 
 /// Box the composition error so `ClientError` stays small while `?` on a bare

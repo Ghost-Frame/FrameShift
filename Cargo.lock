@@ -1355,8 +1355,10 @@ name = "frameshift-client"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "chrono",
  "ed25519-dalek",
  "flate2",
+ "frameshift-catalog",
  "frameshift-compose",
  "frameshift-pack",
  "frameshift-source",

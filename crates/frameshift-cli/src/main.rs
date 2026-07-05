@@ -24,6 +24,7 @@ use cmd::publish::PublishArgs;
 use cmd::register::RegisterArgs;
 use cmd::render::RenderArgs;
 use cmd::rule::{RuleArgs, RuleCommand};
+use cmd::search::SearchArgs;
 use cmd::select::SelectArgs;
 use cmd::skill::{SkillArgs, SkillCommand};
 use cmd::use_persona::UseArgs;
@@ -59,6 +60,15 @@ enum Command {
         /// Name of the persona to activate.
         persona: String,
     },
+
+    /// Remove an installed persona from this project.
+    Uninstall {
+        /// Name of the persona to uninstall.
+        persona: String,
+    },
+
+    /// List personas installed for this project.
+    List,
 
     /// Sync the central store with the current lockfile.
     Sync,
@@ -102,6 +112,9 @@ enum Command {
 
     /// Register this machine's author key under a handle at the registry.
     Register(RegisterArgs),
+
+    /// Search the registry's pack catalog.
+    Search(SearchArgs),
 
     // ------------------------------------------------------------------
     // M3 -- orchestrator: select, use, automate
@@ -198,13 +211,27 @@ fn run() -> Result<(), RunError> {
         // ------------------------------------------------------------------
         Command::Install { spec, from_path } => {
             let client = make_client()?;
-            let spec = spec
-                .parse::<PersonaSpec>()
-                .map_err(|e| RunError::General(e.to_string()))?;
+            let (name, version) =
+                PersonaSpec::parse_loose(&spec).map_err(|e| RunError::General(e.to_string()))?;
             let source = match from_path {
                 Some(path) => InstallSource::LocalPath(path),
                 None => InstallSource::Registry,
             };
+            // A bare name (no `@version`) resolves to the registry's latest
+            // published version; local-path installs require an explicit
+            // version since there is no registry to resolve against.
+            let version = match (version, &source) {
+                (Some(version), _) => version,
+                (None, InstallSource::Registry) => client
+                    .resolve_latest_version(&name)
+                    .map_err(|e| RunError::General(e.to_string()))?,
+                (None, InstallSource::LocalPath(_)) => {
+                    return Err(RunError::General(
+                        "local installs require an explicit version".to_string(),
+                    ));
+                }
+            };
+            let spec = PersonaSpec { name, version };
             let report = client
                 .install(InstallRequest {
                     project_root: current_dir()?,
@@ -228,6 +255,45 @@ fn run() -> Result<(), RunError> {
                 .activate(&current_dir()?, &persona)
                 .map_err(|e| RunError::General(e.to_string()))?;
             println!("activated {persona}");
+            Ok(())
+        }
+
+        // ------------------------------------------------------------------
+        // M0 -- uninstall
+        // ------------------------------------------------------------------
+        Command::Uninstall { persona } => {
+            let client = make_client()?;
+            client
+                .uninstall(&current_dir()?, &persona)
+                .map_err(|e| RunError::General(e.to_string()))?;
+            println!("uninstalled {persona}");
+            Ok(())
+        }
+
+        // ------------------------------------------------------------------
+        // M0 -- list
+        // ------------------------------------------------------------------
+        Command::List => {
+            let client = make_client()?;
+            let project_root = current_dir()?;
+            let personas = client
+                .list_personas(&project_root)
+                .map_err(|e| RunError::General(e.to_string()))?;
+            let active = client
+                .active_persona(&project_root)
+                .map_err(|e| RunError::General(e.to_string()))?;
+            for persona in personas {
+                let marker = if active.as_deref() == Some(persona.name.as_str()) {
+                    " *"
+                } else {
+                    ""
+                };
+                let short_hash = &persona.hash[..persona.hash.len().min(12)];
+                println!(
+                    "{}@{}  {}{}",
+                    persona.name, persona.version, short_hash, marker
+                );
+            }
             Ok(())
         }
 
@@ -330,6 +396,7 @@ fn run() -> Result<(), RunError> {
         Command::Verify(args) => cmd::verify::run_verify(args).map_err(RunError::from),
         Command::Publish(args) => cmd::publish::run_publish(args).map_err(RunError::from),
         Command::Register(args) => cmd::register::run_register(args).map_err(RunError::from),
+        Command::Search(args) => cmd::search::run_search(args).map_err(RunError::from),
 
         // ------------------------------------------------------------------
         // M3 -- orchestrator: select, use, automate

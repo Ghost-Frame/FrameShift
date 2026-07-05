@@ -159,6 +159,127 @@ pub fn registry_base_url() -> String {
     }
 }
 
+/// Optional filters for [`search_registry`].
+///
+/// All fields are optional; an entirely-default query returns the registry's
+/// default (unfiltered, server-side-limited) result page.
+#[derive(Debug, Default, Clone)]
+pub struct RegistrySearchQuery {
+    /// Free-text search term matched against pack name/description/tags.
+    pub query: Option<String>,
+    /// Restrict results to packs carrying this tag.
+    pub tag: Option<String>,
+    /// Maximum number of results to return (server-clamped).
+    pub limit: Option<u32>,
+}
+
+/// A single search hit: a pack summary paired with its relevance score.
+#[derive(Debug, Deserialize)]
+pub struct RegistrySearchResult {
+    /// The matching pack's summary fields.
+    pub pack: RegistryPackSummary,
+    /// Backend-assigned relevance score (higher is more relevant; not
+    /// comparable across backends).
+    pub score: f32,
+}
+
+/// Client-side subset of the server's `PackRecord`, containing only the
+/// fields the CLI needs to display a search result.
+#[derive(Debug, Deserialize)]
+pub struct RegistryPackSummary {
+    /// The pack's unique name.
+    pub name: String,
+    /// Short human-readable description of the pack.
+    pub description: String,
+    /// Tags associated with the pack for search/discovery.
+    pub tags: Vec<String>,
+    /// The most-recently published semver version, or `None` if no version
+    /// has been published yet.
+    pub latest_version: Option<String>,
+    /// Cumulative download count across all versions of the pack.
+    pub total_downloads: u64,
+}
+
+/// Response body for `GET /v1/packs`: `{"results": [RegistrySearchResult, ...]}`.
+#[derive(Debug, Deserialize)]
+struct SearchResponseBody {
+    /// The matching packs, in server-assigned relevance order.
+    results: Vec<RegistrySearchResult>,
+}
+
+/// Search the registry's pack catalog (`GET {base}/v1/packs`).
+///
+/// Applies `q.query`/`q.tag`/`q.limit` as query-string parameters when
+/// present; omitted filters are left off the request entirely so the server
+/// applies its own defaults. Returns a structured [`ClientError::RegistryHttp`]
+/// on a network error, non-2xx status, or a response body that does not
+/// parse as the expected JSON shape.
+pub fn search_registry(
+    base: &str,
+    q: &RegistrySearchQuery,
+) -> Result<Vec<RegistrySearchResult>, ClientError> {
+    let url = format!("{base}/v1/packs");
+    let mut request = http_agent().get(&url);
+    if let Some(query) = &q.query {
+        request = request.query("query", query);
+    }
+    if let Some(tag) = &q.tag {
+        request = request.query("tag", tag);
+    }
+    if let Some(limit) = q.limit {
+        request = request.query("limit", &limit.to_string());
+    }
+
+    let response = request.call().map_err(|err| ClientError::RegistryHttp {
+        url: url.clone(),
+        detail: err.to_string(),
+    })?;
+
+    if response.status() != 200 {
+        return Err(ClientError::RegistryHttp {
+            url: url.clone(),
+            detail: format!("HTTP {}", response.status()),
+        });
+    }
+
+    // Bound the body read the same way ureq_get_json does, so an oversized
+    // response cannot be buffered without limit before serde ever sees it.
+    let limited = LimitedReader::new(response.into_reader(), MAX_ARCHIVE_BYTES);
+    let body: SearchResponseBody =
+        serde_json::from_reader(limited).map_err(|err| ClientError::RegistryHttp {
+            url,
+            detail: format!("failed to deserialize response JSON: {err}"),
+        })?;
+
+    Ok(body.results)
+}
+
+/// Minimal JSON shape used to resolve the latest published version of a pack
+/// from `GET /v1/packs/{name}` (the server's `PackRecord`, of which only
+/// `latest_version` is needed here).
+#[derive(Debug, Deserialize)]
+struct PackHeadRecord {
+    /// The most-recently published semver version, or `None` if the pack
+    /// exists in the registry but has never had a version published.
+    latest_version: Option<String>,
+}
+
+/// Resolve the latest published version for `name` (`GET /v1/packs/{name}`).
+///
+/// Used to expand a version-less install spec (e.g. `frameshift install foo`)
+/// to an explicit `name@version` before installing from the registry.
+///
+/// Returns [`ClientError::NoPublishedVersion`] when the pack record exists
+/// but has no published version yet.
+pub fn resolve_latest_version(name: &str) -> Result<String, ClientError> {
+    let base = registry_base_url();
+    let url = format!("{base}/v1/packs/{name}");
+    let record: PackHeadRecord = ureq_get_json(&url)?;
+    record
+        .latest_version
+        .ok_or_else(|| ClientError::NoPublishedVersion(name.to_string()))
+}
+
 /// Fetch a pack from the registry, verify it, cache it, and return the [`LockedPersona`].
 ///
 /// This is the top-level entry point for [`crate::InstallSource::Registry`].
@@ -452,6 +573,224 @@ impl<R: std::io::Read> std::io::Read for LimitedReader<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead as _, Write as _};
+    use std::net::TcpListener;
+
+    /// Build a real `frameshift_catalog::PackRecord` fixture for serde-pin tests.
+    fn sample_pack_record(
+        name: &str,
+        latest_version: Option<&str>,
+        total_downloads: u64,
+    ) -> frameshift_catalog::PackRecord {
+        frameshift_catalog::PackRecord {
+            name: name.to_string(),
+            current_author: frameshift_catalog::Ed25519PublicKey([7u8; 32]),
+            tags: vec!["demo".to_string()],
+            description: "a demo pack".to_string(),
+            created_at: chrono::Utc::now(),
+            latest_version: latest_version.map(str::to_string),
+            total_downloads,
+            extends: None,
+        }
+    }
+
+    /// The client's `SearchResponseBody`/`RegistrySearchResult` types deserialize
+    /// the exact JSON shape produced by serializing a real server-side
+    /// `frameshift_catalog::PackSearchResult`, and the fields the CLI needs
+    /// round-trip correctly.
+    #[test]
+    fn search_response_body_serde_pin_against_catalog_pack_record() {
+        let pack = sample_pack_record("demo", Some("2.0.0"), 42);
+        let server_result = frameshift_catalog::PackSearchResult { pack, score: 0.9 };
+        let value = serde_json::json!({ "results": [server_result] });
+
+        let body: SearchResponseBody = serde_json::from_value(value).unwrap();
+        assert_eq!(body.results.len(), 1);
+        let hit = &body.results[0];
+        assert_eq!(hit.pack.name, "demo");
+        assert_eq!(hit.pack.latest_version, Some("2.0.0".to_string()));
+        assert_eq!(hit.pack.total_downloads, 42);
+    }
+
+    /// search_registry performs a real HTTP round-trip against a one-shot TCP
+    /// server and parses the single result.
+    #[test]
+    fn search_registry_parses_single_result() {
+        let pack = sample_pack_record("demo", Some("1.0.0"), 3);
+        let server_result = frameshift_catalog::PackSearchResult { pack, score: 1.0 };
+        let json =
+            serde_json::to_string(&serde_json::json!({ "results": [server_result] })).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                json.len(),
+                json
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let base = format!("http://127.0.0.1:{port}");
+        let results = search_registry(&base, &RegistrySearchQuery::default()).unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].pack.name, "demo");
+        assert_eq!(results[0].pack.latest_version, Some("1.0.0".to_string()));
+    }
+
+    /// search_registry maps a non-2xx status to `ClientError::RegistryHttp`.
+    #[test]
+    fn search_registry_maps_500_to_registry_http() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+
+            let body = "internal error";
+            let response = format!(
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let base = format!("http://127.0.0.1:{port}");
+        let err = search_registry(&base, &RegistrySearchQuery::default()).unwrap_err();
+        handle.join().unwrap();
+        assert!(matches!(err, ClientError::RegistryHttp { .. }));
+    }
+
+    /// resolve_latest_version returns the pack's latest_version from a real
+    /// `PackRecord`-shaped response.
+    #[test]
+    fn resolve_latest_version_returns_version() {
+        let record = sample_pack_record("demo", Some("2.0.0"), 0);
+        let json = serde_json::to_string(&record).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                json.len(),
+                json
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let _env = EnvGuard::set(REGISTRY_URL_ENV, &format!("http://127.0.0.1:{port}"));
+        let version = resolve_latest_version("demo").unwrap();
+        handle.join().unwrap();
+        assert_eq!(version, "2.0.0");
+    }
+
+    /// resolve_latest_version returns `NoPublishedVersion` when `latest_version` is null.
+    #[test]
+    fn resolve_latest_version_null_yields_no_published_version() {
+        let record = sample_pack_record("demo", None, 0);
+        let json = serde_json::to_string(&record).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                json.len(),
+                json
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let _env = EnvGuard::set(REGISTRY_URL_ENV, &format!("http://127.0.0.1:{port}"));
+        let err = resolve_latest_version("demo").unwrap_err();
+        handle.join().unwrap();
+        assert!(matches!(err, ClientError::NoPublishedVersion(name) if name == "demo"));
+    }
+
+    /// resolve_latest_version maps a 404 to `ClientError::RegistryHttp`.
+    #[test]
+    fn resolve_latest_version_404_maps_to_registry_http() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            let body = "not found";
+            let response = format!(
+                "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let _env = EnvGuard::set(REGISTRY_URL_ENV, &format!("http://127.0.0.1:{port}"));
+        let err = resolve_latest_version("demo").unwrap_err();
+        handle.join().unwrap();
+        assert!(matches!(err, ClientError::RegistryHttp { .. }));
+    }
 
     /// registry_base_url returns the default when the env var is unset.
     #[test]
