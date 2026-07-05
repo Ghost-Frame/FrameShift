@@ -84,11 +84,26 @@ jobs:
   # advisory backlog has been triaged and the vulnerable dependencies bumped, so
   # a new advisory should fail the pipeline rather than slip in silently.
   #
-  # The single ignore is RUSTSEC-2024-0370 (proc-macro-error unmaintained). It is
-  # a build-time-only proc-macro pulled transitively by age -> i18n-embed-fl; it
-  # never ships in any runtime artifact, and the only way to drop it is to bump
-  # age from 0.10 to the 0.11 BETA, which is unacceptable for the crate that
-  # backs local vault encryption. Re-evaluate when age ships a stable 0.11.
+  # Each ignore below is a transitive advisory with no available fix and no
+  # runtime-reachable attack surface. Re-evaluate each when its upstream ships:
+  #
+  # - RUSTSEC-2024-0370 (proc-macro-error, unmaintained): a build-time-only
+  #   proc-macro pulled transitively by age -> i18n-embed-fl; it never ships in
+  #   any runtime artifact, and the only way to drop it is to bump age from 0.10
+  #   to the 0.11 BETA, unacceptable for the crate backing local vault
+  #   encryption. Re-evaluate when age ships a stable 0.11.
+  #
+  # - RUSTSEC-2026-0194 + RUSTSEC-2026-0195 (quick-xml < 0.41, DoS: quadratic
+  #   duplicate-attribute check and unbounded namespace-declaration allocation):
+  #   pulled ONLY by object_store 0.13 -> frameshift-objects-r2 (R2 storage, aws
+  #   feature) -> frameshift-server. quick-xml parses XML responses from the
+  #   Cloudflare R2 / S3 API, a trusted TLS peer, not attacker-controlled input,
+  #   so the DoS is not reachable by external users. The fix requires object_store
+  #   to bump to quick-xml >= 0.41; the latest object_store (0.14.0) still pins
+  #   ^0.40.1, and 0.41 does not satisfy that range so a [patch] cannot force it.
+  #   quick-xml is mandatory for object_store's aws/cloud feature, so it cannot be
+  #   feature-dropped. Re-evaluate when object_store releases against quick-xml
+  #   >= 0.41 (then bump object_store in frameshift-objects-r2 and drop these two).
   audit:
     name: Security audit
     runs-on: ubuntu-latest
@@ -97,7 +112,7 @@ jobs:
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          ignore: RUSTSEC-2024-0370
+          ignore: RUSTSEC-2024-0370,RUSTSEC-2026-0194,RUSTSEC-2026-0195
 
 # Later tier (intentionally not yet wired, tracked in the roadmap):
 #   - cargo-deny (needs a deny.toml: license allowlist, ban list, advisory policy)

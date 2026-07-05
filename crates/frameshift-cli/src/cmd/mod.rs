@@ -13,6 +13,7 @@ pub mod publish;
 pub mod register;
 pub mod render;
 pub mod rule;
+pub mod search;
 pub mod select;
 pub mod skill;
 pub mod use_persona;

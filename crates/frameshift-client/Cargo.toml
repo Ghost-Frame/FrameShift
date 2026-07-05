@@ -34,3 +34,6 @@ flate2 = "1"
 tempfile.workspace = true
 
 [dev-dependencies]
+# Builds real PackRecord/PackVersionRecord fixtures for registry serde-pin tests.
+frameshift-catalog = { path = "../frameshift-catalog" }
+chrono.workspace = true

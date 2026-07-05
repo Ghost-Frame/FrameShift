@@ -15,6 +15,7 @@ pub use model::{
     PersonaSpec, ProjectConfig, ProjectPaths, SyncReport, SCHEMA_VERSION,
 };
 pub use publish::PublishOutcome;
+pub use registry::{RegistryPackSummary, RegistrySearchQuery, RegistrySearchResult};
 pub use selection::{
     SelectionEvent, SelectionTelemetry, SELECTION_HISTORY_FILENAME, TELEMETRY_URL_ENV,
 };
@@ -123,6 +124,23 @@ impl Client {
         publish::publish_pack_dir(server_url, &key, pack_dir, author_handle)
     }
 
+    /// Search the registry's pack catalog (`GET /v1/packs`) with optional
+    /// query/tag/limit filters. Delegates to [`registry::search_registry`]
+    /// against [`registry::registry_base_url`].
+    pub fn search_registry(
+        &self,
+        query: &RegistrySearchQuery,
+    ) -> Result<Vec<RegistrySearchResult>, ClientError> {
+        registry::search_registry(&registry::registry_base_url(), query)
+    }
+
+    /// Resolve the latest published version for a bare pack name
+    /// (`GET /v1/packs/{name}`). Used by the CLI `install` command to
+    /// expand a version-less spec before installing from the registry.
+    pub fn resolve_latest_version(&self, name: &str) -> Result<String, ClientError> {
+        registry::resolve_latest_version(name)
+    }
+
     pub fn project_id(&self, project_root: &Path) -> Result<String, ClientError> {
         if let Ok(explicit) = std::env::var(PROJECT_ID_ENV) {
             if !explicit.is_empty() {
@@ -188,6 +206,34 @@ impl Client {
         let paths = self.project_paths(project_root)?;
         ensure_dir(&paths.project_state_dir)?;
         write_file(&paths.active_path, persona.as_bytes())
+    }
+
+    /// Remove an installed persona from the project's lockfile and re-materialize
+    /// project state.
+    ///
+    /// Fails with [`ClientError::PersonaNotInstalled`] when the project has no
+    /// lockfile yet or the lockfile does not contain `persona`. On success, the
+    /// persona is dropped from `lockfile.personas` and
+    /// [`Client::materialize_project_state`] is called with the updated
+    /// lockfile, which deletes `personas/<persona>` from the central store and
+    /// clears the `active` marker file if it pointed at the removed persona.
+    /// The content-addressed cache entry is deliberately left in place; use
+    /// [`Client::gc`] to reclaim cache entries no longer referenced by any
+    /// project's lockfile.
+    pub fn uninstall(&self, project_root: &Path, persona: &str) -> Result<(), ClientError> {
+        validate_persona_name(persona)?;
+        let paths = self.project_paths(project_root)?;
+
+        let Some((_, mut lockfile)) = load_lockfile_with_raw(&paths.lock_path)? else {
+            return Err(ClientError::PersonaNotInstalled(persona.to_string()));
+        };
+        if !lockfile.personas.iter().any(|p| p.name == persona) {
+            return Err(ClientError::PersonaNotInstalled(persona.to_string()));
+        }
+
+        lockfile.personas.retain(|p| p.name != persona);
+        let raw_lock = toml::to_string_pretty(&lockfile)?;
+        self.materialize_project_state(&paths, &lockfile, &raw_lock)
     }
 
     /// Read the central project config (`projects/<id>/config.toml`), returning
@@ -263,6 +309,42 @@ impl Client {
             recorded_at_unix: selection::now_unix(),
         };
         selection::post_selection_telemetry(&endpoint, &payload)
+    }
+
+    /// List the personas recorded in the project's lockfile, read-only.
+    ///
+    /// Unlike [`Client::sync`], this never re-materializes project state --
+    /// it only reads `projects/<id>/lock.toml`. Returns an empty vec when the
+    /// project has no lockfile yet.
+    pub fn list_personas(&self, project_root: &Path) -> Result<Vec<LockedPersona>, ClientError> {
+        let paths = self.project_paths(project_root)?;
+        Ok(load_lockfile(&paths.lock_path)?
+            .map(|lockfile| lockfile.personas)
+            .unwrap_or_default())
+    }
+
+    /// Read the name of the currently active persona for this project, read-only.
+    ///
+    /// Returns `Ok(None)` when the `active` marker file does not exist or is
+    /// empty after trimming whitespace. Any other I/O error is propagated as
+    /// [`ClientError::Io`].
+    pub fn active_persona(&self, project_root: &Path) -> Result<Option<String>, ClientError> {
+        let paths = self.project_paths(project_root)?;
+        match fs::read_to_string(&paths.active_path) {
+            Ok(raw) => {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(trimmed.to_string()))
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(ClientError::Io {
+                path: paths.active_path,
+                source,
+            }),
+        }
     }
 
     pub fn sync(&self, project_root: &Path) -> Result<SyncReport, ClientError> {
@@ -1181,6 +1263,105 @@ mod tests {
             .unwrap();
 
         (client, project_root)
+    }
+
+    /// uninstall removes the persona from the lockfile and its materialized
+    /// directory, leaves the cache entry in place, and gc then reclaims it.
+    #[test]
+    fn uninstall_removes_persona_and_gc_reclaims_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (client, project_root) = install_test_persona(&tmp, "keep-me");
+        install_test_persona(&tmp, "drop-me");
+
+        let paths = client.project_paths(&project_root).unwrap();
+        let lockfile_before = load_lockfile(&paths.lock_path).unwrap().unwrap();
+        assert_eq!(lockfile_before.personas.len(), 2);
+        let dropped_hash = lockfile_before
+            .personas
+            .iter()
+            .find(|p| p.name == "drop-me")
+            .unwrap()
+            .hash
+            .clone();
+
+        client.uninstall(&project_root, "drop-me").unwrap();
+
+        let lockfile_after = load_lockfile(&paths.lock_path).unwrap().unwrap();
+        assert_eq!(lockfile_after.personas.len(), 1);
+        assert_eq!(lockfile_after.personas[0].name, "keep-me");
+        assert!(!paths.personas_dir.join("drop-me").exists());
+
+        // The cache entry for the removed persona is left in place until gc.
+        let cache_path = paths.cache_dir.join(&dropped_hash);
+        assert!(cache_path.exists(), "cache entry should survive uninstall");
+
+        let report = client.gc().unwrap();
+        assert!(report.removed_hashes.contains(&dropped_hash));
+        assert!(
+            !cache_path.exists(),
+            "gc should reclaim the orphaned cache entry"
+        );
+    }
+
+    /// uninstall of a persona that is not in the lockfile returns PersonaNotInstalled.
+    #[test]
+    fn uninstall_missing_persona_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (client, project_root) = install_test_persona(&tmp, "onlyone");
+        let err = client.uninstall(&project_root, "ghost").unwrap_err();
+        assert!(matches!(err, ClientError::PersonaNotInstalled(name) if name == "ghost"));
+    }
+
+    /// uninstall of the active persona clears the active marker file.
+    #[test]
+    fn uninstall_active_persona_clears_active_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (client, project_root) = install_test_persona(&tmp, "active-one");
+        client.activate(&project_root, "active-one").unwrap();
+        assert_eq!(
+            client.active_persona(&project_root).unwrap(),
+            Some("active-one".to_string())
+        );
+
+        client.uninstall(&project_root, "active-one").unwrap();
+        assert_eq!(client.active_persona(&project_root).unwrap(), None);
+    }
+
+    /// list_personas returns one entry matching the installed persona.
+    #[test]
+    fn list_personas_returns_installed_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (client, project_root) = install_test_persona(&tmp, "listed");
+        let personas = client.list_personas(&project_root).unwrap();
+        assert_eq!(personas.len(), 1);
+        assert_eq!(personas[0].name, "listed");
+        assert_eq!(personas[0].version, "0.1.0");
+    }
+
+    /// list_personas returns an empty vec for a project with no lockfile.
+    #[test]
+    fn list_personas_empty_for_new_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let client = Client::new(ClientOptions {
+            data_root: tmp.path().join("data"),
+            config_root: None,
+        });
+        assert!(client.list_personas(&project_root).unwrap().is_empty());
+    }
+
+    /// active_persona returns the activated persona's name after activate().
+    #[test]
+    fn active_persona_returns_name_after_activate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (client, project_root) = install_test_persona(&tmp, "act-test");
+        assert_eq!(client.active_persona(&project_root).unwrap(), None);
+        client.activate(&project_root, "act-test").unwrap();
+        assert_eq!(
+            client.active_persona(&project_root).unwrap(),
+            Some("act-test".to_string())
+        );
     }
 
     /// installed_persona_source_dirs returns one entry per installed persona.

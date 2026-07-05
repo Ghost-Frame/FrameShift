@@ -77,6 +77,38 @@ impl std::str::FromStr for PersonaSpec {
     }
 }
 
+impl PersonaSpec {
+    /// Parse a loosely-specified persona spec: either a bare name (`"foo"`)
+    /// or a `name@version` pair (`"foo@1.0.0"`).
+    ///
+    /// Unlike [`PersonaSpec::from_str`] (the strict `FromStr` impl, pinned by
+    /// `rejects_invalid_persona_specs` and unchanged here), a bare name with
+    /// no `@` is accepted and returned with `None` for the version, so the
+    /// caller can resolve it to the registry's latest published version.
+    ///
+    /// Returns `Err(ClientError::InvalidPersonaSpec)` for an empty string, an
+    /// empty name (`"@version"`), or an empty version after `@`
+    /// (`"name@"`).
+    pub fn parse_loose(s: &str) -> Result<(String, Option<String>), crate::ClientError> {
+        match s.split_once('@') {
+            None => {
+                if s.is_empty() {
+                    Err(crate::ClientError::InvalidPersonaSpec(s.to_string()))
+                } else {
+                    Ok((s.to_string(), None))
+                }
+            }
+            Some((name, version)) => {
+                if name.is_empty() || version.is_empty() {
+                    Err(crate::ClientError::InvalidPersonaSpec(s.to_string()))
+                } else {
+                    Ok((name.to_string(), Some(version.to_string())))
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallSource {
     LocalPath(PathBuf),
@@ -136,4 +168,43 @@ pub struct GcReport {
 
 const fn default_schema_version() -> u32 {
     SCHEMA_VERSION
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// parse_loose accepts a bare name and returns `None` for the version.
+    #[test]
+    fn parse_loose_accepts_bare_name() {
+        let (name, version) = PersonaSpec::parse_loose("cryptographic").unwrap();
+        assert_eq!(name, "cryptographic");
+        assert_eq!(version, None);
+    }
+
+    /// parse_loose accepts a `name@version` pair.
+    #[test]
+    fn parse_loose_accepts_versioned_spec() {
+        let (name, version) = PersonaSpec::parse_loose("cryptographic@1.2.3").unwrap();
+        assert_eq!(name, "cryptographic");
+        assert_eq!(version, Some("1.2.3".to_string()));
+    }
+
+    /// parse_loose rejects an empty name before `@`.
+    #[test]
+    fn parse_loose_rejects_empty_name() {
+        assert!(PersonaSpec::parse_loose("@1.0.0").is_err());
+    }
+
+    /// parse_loose rejects an empty version after `@`.
+    #[test]
+    fn parse_loose_rejects_empty_version() {
+        assert!(PersonaSpec::parse_loose("cryptographic@").is_err());
+    }
+
+    /// parse_loose rejects an empty string.
+    #[test]
+    fn parse_loose_rejects_empty_string() {
+        assert!(PersonaSpec::parse_loose("").is_err());
+    }
 }
