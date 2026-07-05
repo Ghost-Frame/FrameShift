@@ -139,4 +139,22 @@ pub enum ClientError {
     /// The requested render target is not a known target.
     #[error("unknown render target '{0}'; known targets: claude, codex, gemini, generic")]
     UnknownRenderTarget(String),
+
+    /// Persona composition (extends/mixin resolution and merge) failed. Per the
+    /// pack manifest contract, a missing base or an L1 override is a hard error.
+    ///
+    /// Boxed to keep `ClientError` small: `ComposeError` is large enough that
+    /// inlining it here trips `clippy::result_large_err` on every function that
+    /// returns `Result<_, ClientError>`.
+    #[error("persona composition failed: {0}")]
+    Compose(#[source] Box<frameshift_compose::ComposeError>),
+}
+
+/// Box the composition error so `ClientError` stays small while `?` on a bare
+/// `ComposeError` still converts transparently.
+impl From<frameshift_compose::ComposeError> for ClientError {
+    /// Wrap a `ComposeError` into the boxed `Compose` variant.
+    fn from(err: frameshift_compose::ComposeError) -> Self {
+        ClientError::Compose(Box::new(err))
+    }
 }

@@ -43,6 +43,7 @@ use frameshift_server::metrics::Metrics;
 use frameshift_server::{app, AppState, LogFormat, ServerConfig};
 
 use mocks::catalog::{make_author, MockCatalog};
+use mocks::memory::MockMemoryAdapter;
 use mocks::objects::MockPackStore;
 
 /// Build a minimal [`ServerConfig`] suitable for tests.
@@ -371,6 +372,57 @@ async fn healthz_returns_200_with_both_backends_healthy() {
     assert_eq!(body["ok"], true);
     assert_eq!(body["catalog"]["healthy"], true);
     assert_eq!(body["objects"]["healthy"], true);
+}
+
+// ---------------------------------------------------------------------------
+// /v1/memory/health
+// ---------------------------------------------------------------------------
+
+/// `GET /v1/memory/health` with no memory backend configured (default state)
+/// returns 200 with `configured: false`.
+#[tokio::test]
+async fn memory_health_unconfigured_returns_configured_false() {
+    let state = make_state(MockCatalog::new(), MockPackStore::new());
+    let resp = oneshot_get(state, "/v1/memory/health").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["configured"], false);
+    assert_eq!(body["healthy"], false);
+}
+
+/// `GET /v1/memory/health` with a configured mock adapter reports the
+/// adapter's own health status.
+#[tokio::test]
+async fn memory_health_configured_reports_adapter_status() {
+    let mut state = make_state(MockCatalog::new(), MockPackStore::new());
+    state.memory = Some(Arc::new(MockMemoryAdapter { healthy: true }));
+    let resp = oneshot_get(state, "/v1/memory/health").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["configured"], true);
+    assert_eq!(body["healthy"], true);
+}
+
+/// `GET /healthz` includes a `memory` summary only when a backend is
+/// configured; its `healthy` flag reflects the adapter's reported status.
+/// When no backend is configured, `memory` is absent/null and `ok` is
+/// unaffected.
+#[tokio::test]
+async fn healthz_includes_memory_when_configured() {
+    let mut state = make_state(MockCatalog::new(), MockPackStore::new());
+    state.memory = Some(Arc::new(MockMemoryAdapter { healthy: true }));
+    let resp = oneshot_get(state, "/healthz").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["memory"]["healthy"], true);
+    assert_eq!(body["ok"], true);
+
+    // Default (unconfigured) state: memory is null and does not affect ok.
+    let unconfigured_state = make_state(MockCatalog::new(), MockPackStore::new());
+    let resp = oneshot_get(unconfigured_state, "/healthz").await;
+    let body = body_json(resp).await;
+    assert!(body["memory"].is_null());
+    assert_eq!(body["ok"], true);
 }
 
 // ---------------------------------------------------------------------------

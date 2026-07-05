@@ -8,6 +8,10 @@ description = "Client engine for installing and materializing frameshift packs"
 
 [dependencies]
 frameshift-pack = { path = "../frameshift-pack" }
+# Persona composition (extends/mixin resolution) used at render time.
+frameshift-compose = { path = "../frameshift-compose" }
+# Typed persona source loading and deterministic markdown rendering.
+frameshift-source = { path = "../frameshift-source" }
 base64.workspace = true
 ed25519-dalek.workspace = true
 hex.workspace = true

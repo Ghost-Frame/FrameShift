@@ -346,6 +346,30 @@ impl CatalogBackend for MockCatalog {
         }
     }
 
+    /// Set the `description` and `tags` fields on the pack head record.
+    ///
+    /// Errors with `NotFound` if the pack is absent; otherwise mutates the
+    /// in-memory record in place.
+    async fn set_pack_metadata(
+        &self,
+        name: &str,
+        description: &str,
+        tags: &[String],
+    ) -> Result<(), CatalogError> {
+        let mut state = self.state.write().unwrap();
+        match state.packs.get_mut(name) {
+            Some(rec) => {
+                rec.description = description.to_string();
+                rec.tags = tags.to_vec();
+                Ok(())
+            }
+            None => Err(CatalogError::NotFound {
+                kind: "pack",
+                key: name.to_string(),
+            }),
+        }
+    }
+
     /// Record a download for trending. The mock accepts any call and is a no-op
     /// (trending ranking is exercised by the Postgres adapter integration tests).
     async fn record_download(&self, _pack_name: &str, _version: &str) -> Result<(), CatalogError> {

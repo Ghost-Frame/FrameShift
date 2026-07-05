@@ -22,6 +22,8 @@ use frameshift_pack::{ObjectHash, Pack};
 use serde::Deserialize;
 use std::io::Read as _;
 use std::path::Path;
+use std::sync::OnceLock;
+use std::time::Duration;
 use tar::Archive;
 use tracing::debug;
 
@@ -111,6 +113,39 @@ mod bytes_as_b64 {
             .decode(&encoded)
             .map_err(serde::de::Error::custom)
     }
+}
+
+/// Connect-phase timeout for the shared HTTP agent ([`http_agent`]).
+///
+/// Bounds how long a TCP connect attempt may take before failing.
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Per-read timeout for the shared HTTP agent ([`http_agent`]).
+///
+/// Bounds how long a single socket read may block, so a registry that accepts
+/// a connection but never sends (or stalls mid-stream) cannot hang the
+/// CLI/daemon/MCP forever. `ureq` 2.x applies no such timeout by default.
+const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Process-wide storage for the shared [`ureq::Agent`] built by [`http_agent`].
+static HTTP_AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+
+/// Return the shared [`ureq::Agent`] used for all client HTTP calls (registry
+/// install, publish, and telemetry).
+///
+/// Configured with [`HTTP_CONNECT_TIMEOUT`] and [`HTTP_READ_TIMEOUT`] so a
+/// hung or slow-loris server cannot block a caller indefinitely. Built once
+/// and reused; `ureq::Agent` is `Arc`-backed internally, so cloning it out of
+/// the `OnceLock` is cheap and shares the same connection pool.
+pub(crate) fn http_agent() -> ureq::Agent {
+    HTTP_AGENT
+        .get_or_init(|| {
+            ureq::AgentBuilder::new()
+                .timeout_connect(HTTP_CONNECT_TIMEOUT)
+                .timeout_read(HTTP_READ_TIMEOUT)
+                .build()
+        })
+        .clone()
 }
 
 /// Resolve the registry base URL.
@@ -206,7 +241,8 @@ pub fn fetch_and_install(
 /// Returns a structured [`ClientError::RegistryHttp`] on HTTP errors or
 /// deserialization failures.
 fn ureq_get_json<T: serde::de::DeserializeOwned>(url: &str) -> Result<T, ClientError> {
-    let response = ureq::get(url)
+    let response = http_agent()
+        .get(url)
         .call()
         .map_err(|err| ClientError::RegistryHttp {
             url: url.to_string(),
@@ -220,12 +256,14 @@ fn ureq_get_json<T: serde::de::DeserializeOwned>(url: &str) -> Result<T, ClientE
         });
     }
 
-    response
-        .into_json::<T>()
-        .map_err(|err| ClientError::RegistryHttp {
-            url: url.to_string(),
-            detail: format!("failed to deserialize response JSON: {err}"),
-        })
+    // Bound the body read the same way ureq_get_bytes does, so an oversized
+    // or endlessly-streaming JSON response cannot be buffered without limit
+    // before serde ever sees it.
+    let limited = LimitedReader::new(response.into_reader(), MAX_ARCHIVE_BYTES);
+    serde_json::from_reader(limited).map_err(|err| ClientError::RegistryHttp {
+        url: url.to_string(),
+        detail: format!("failed to deserialize response JSON: {err}"),
+    })
 }
 
 /// Perform a GET request and return the raw response bytes.
@@ -233,7 +271,8 @@ fn ureq_get_json<T: serde::de::DeserializeOwned>(url: &str) -> Result<T, ClientE
 /// Returns a structured [`ClientError::RegistryHttp`] on HTTP errors or
 /// read failures.
 fn ureq_get_bytes(url: &str) -> Result<Vec<u8>, ClientError> {
-    let response = ureq::get(url)
+    let response = http_agent()
+        .get(url)
         .call()
         .map_err(|err| ClientError::RegistryHttp {
             url: url.to_string(),

@@ -177,7 +177,9 @@ pub fn register_author(
     let url = format!("{base}/v1/authors");
     let headers = signed_headers(key, "POST", "/v1/authors", &body);
 
-    let mut req = ureq::post(&url).set("Content-Type", "application/json");
+    let mut req = crate::registry::http_agent()
+        .post(&url)
+        .set("Content-Type", "application/json");
     for header in &headers {
         req = req.set(header.name, &header.value);
     }
@@ -210,7 +212,9 @@ pub fn publish_pack_dir(
     let headers = signed_headers(key, "POST", "/v1/packs", &body);
     let content_type = format!("multipart/form-data; boundary={boundary}");
 
-    let mut req = ureq::post(&url).set("Content-Type", &content_type);
+    let mut req = crate::registry::http_agent()
+        .post(&url)
+        .set("Content-Type", &content_type);
     for header in &headers {
         req = req.set(header.name, &header.value);
     }

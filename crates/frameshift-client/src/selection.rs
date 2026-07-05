@@ -115,7 +115,8 @@ pub fn post_selection_telemetry(
     endpoint: &str,
     payload: &SelectionTelemetry<'_>,
 ) -> Result<(), ClientError> {
-    match ureq::post(endpoint)
+    match crate::registry::http_agent()
+        .post(endpoint)
         .set("Content-Type", "application/json")
         .send_json(payload)
     {

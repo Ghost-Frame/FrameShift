@@ -474,6 +474,24 @@ pub async fn publish_pack(
         );
     }
 
+    // Record the manifest's description and tags onto the pack head record so
+    // that marketplace full-text search (which ranks on `description`) can find
+    // this pack. Best-effort: if it fails, the pack is still published but will
+    // be invisible to query search and show blank metadata until a follow-up
+    // metadata update succeeds.
+    let description = manifest.description.clone().unwrap_or_default();
+    if let Err(e) = state
+        .catalog
+        .set_pack_metadata(&manifest.name, &description, &manifest.tags)
+        .await
+    {
+        tracing::warn!(
+            pack = %manifest.name,
+            error = %e,
+            "set_pack_metadata failed after successful publish; description/tags not set"
+        );
+    }
+
     // Best-effort: ensure the parent pack record exists so that `GET /v1/packs/{name}`
     // resolves. The catalog trait does not expose a separate "upsert pack" call,
     // so we rely on backends that auto-create the parent record on

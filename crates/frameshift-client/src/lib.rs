@@ -1,3 +1,5 @@
+/// Cache-backed resolver for `extends`/`mixin` persona specs at render time.
+mod compose_support;
 mod error;
 mod model;
 /// Registry publish implementation: pack, sign, and HTTP upload.
@@ -492,11 +494,12 @@ impl Client {
             copy_dir_recursive(&cache_path, &source_dir)?;
 
             let rendered_root = persona_dir.join("rendered");
-            materialize_rendered_outputs(
+            self.materialize_persona_rendered_outputs(
+                &paths.cache_dir,
                 &cache_path,
                 &rendered_root,
                 &persona.name,
-                self.config_root.as_deref(),
+                lockfile,
             )?;
 
             // Growth is local-only and append-only -- a single file per persona, never published upstream.
@@ -516,6 +519,106 @@ impl Client {
         }
 
         Ok(())
+    }
+
+    /// Renders a single persona's output into `rendered_root`, composing with
+    /// its declared `extends`/`mixin` bases when the pack has typed source.
+    ///
+    /// Reads `pack.toml` from `cache_path` to decide which of three paths to
+    /// take:
+    /// - No `extends`/`mixin` declared: unchanged behavior, delegates to
+    ///   [`materialize_rendered_outputs`] (markdown render source).
+    /// - `extends`/`mixin` declared AND `persona.toml` present: composes the
+    ///   root with its resolved bases via `frameshift_compose::Composer`,
+    ///   renders the composed result for every target, and applies the same
+    ///   infra overlay as the non-composition path. Composition failures
+    ///   (missing base, L1 override) propagate as `ClientError::Compose`.
+    /// - `extends`/`mixin` declared but no `persona.toml`: warns and falls
+    ///   back to the markdown-only render path, since there is no typed
+    ///   source for the composer to operate on.
+    fn materialize_persona_rendered_outputs(
+        &self,
+        cache_dir: &Path,
+        cache_path: &Path,
+        rendered_root: &Path,
+        persona_name: &str,
+        lockfile: &Lockfile,
+    ) -> Result<(), ClientError> {
+        let manifest_path = cache_path.join("pack.toml");
+        let manifest_raw =
+            fs::read_to_string(&manifest_path).map_err(|source| ClientError::Io {
+                path: manifest_path.clone(),
+                source,
+            })?;
+        let manifest: frameshift_pack::PackManifest =
+            toml::from_str(&manifest_raw).map_err(|source| ClientError::TomlDeserialize {
+                path: manifest_path,
+                source,
+            })?;
+
+        let has_composition = manifest.extends.is_some() || !manifest.mixin.is_empty();
+        let has_typed_source = cache_path.join("persona.toml").is_file();
+
+        if has_composition && has_typed_source {
+            let root = frameshift_source::PersonaSource::load_from_dir(cache_path)
+                .map_err(frameshift_compose::ComposeError::from)?;
+            let resolver = compose_support::CacheResolver::new(cache_dir, lockfile);
+            let composed = frameshift_compose::Composer::new(resolver).compose(
+                root,
+                manifest.extends.clone(),
+                &manifest.mixin,
+            )?;
+
+            for collision in &composed.rule_collisions {
+                warn!(persona = persona_name, id = %collision.id, layers = ?collision.layers, "rule id collision during composition");
+            }
+            for collision in &composed.skill_collisions {
+                warn!(persona = persona_name, id = %collision.id, layers = ?collision.layers, "skill id collision during composition");
+            }
+
+            let src = composed.into_source();
+            for (target_dir, filename, target) in [
+                (
+                    "claude",
+                    "CLAUDE.md",
+                    frameshift_source::RenderTarget::Claude,
+                ),
+                ("codex", "AGENTS.md", frameshift_source::RenderTarget::Codex),
+                (
+                    "gemini",
+                    "GEMINI.md",
+                    frameshift_source::RenderTarget::Gemini,
+                ),
+                (
+                    "generic",
+                    "AGENTS.md",
+                    frameshift_source::RenderTarget::Generic,
+                ),
+            ] {
+                let markdown = frameshift_source::render_to_markdown(&src, target);
+                let composed_content =
+                    compose_rendered_content(persona_name, &markdown, self.config_root.as_deref());
+                let dir = rendered_root.join(target_dir);
+                ensure_dir(&dir)?;
+                write_file(&dir.join(filename), composed_content.as_bytes())?;
+            }
+
+            return Ok(());
+        }
+
+        if has_composition {
+            warn!(
+                persona = persona_name,
+                "pack declares extends/mixin but has no persona.toml; rendering markdown body without composition"
+            );
+        }
+
+        materialize_rendered_outputs(
+            cache_path,
+            rendered_root,
+            persona_name,
+            self.config_root.as_deref(),
+        )
     }
 }
 
