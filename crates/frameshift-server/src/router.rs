@@ -62,6 +62,7 @@ use crate::middleware::tracing::make_trace_layer;
 use crate::routes::authors::{authors_router, authors_write_router};
 use crate::routes::downloads::{dl_router, pack_download_url_router};
 use crate::routes::handles::handles_router;
+use crate::routes::memory::memory_router;
 use crate::routes::ops::ops_router;
 use crate::routes::packs::{packs_router, publish_pack};
 use crate::routes::telemetry::telemetry_router;
@@ -80,6 +81,7 @@ use crate::state::AppState;
 ///     /authors  -- author lookup + POST register / POST {handle}/rotate (signed-request)
 ///     /handles  -- handle lookup
 ///     /telemetry -- POST /selection opt-in selection telemetry sink
+///     /memory   -- GET /health read-only memory backend health
 ///   /mcp        -- MCP placeholder (501 for all methods)
 /// ```
 ///
@@ -126,7 +128,8 @@ pub fn app(state: AppState) -> Router {
         .nest("/packs", packs)
         .nest("/authors", authors)
         .nest("/handles", handles_router())
-        .nest("/telemetry", telemetry_router());
+        .nest("/telemetry", telemetry_router())
+        .nest("/memory", memory_router());
 
     let x_request_id = axum::http::HeaderName::from_static("x-request-id");
 

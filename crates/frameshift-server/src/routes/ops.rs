@@ -49,6 +49,15 @@ pub struct HealthResponse {
     /// `healthy: false` means pack download requests may fail.
     pub objects: ObjectsHealthSummary,
 
+    /// Health status of the memory backend, when one is configured.
+    ///
+    /// `None` when `state.memory` is `None` (no `MEMORY_BACKEND` configured).
+    /// An absent/unconfigured memory backend never affects `ok`: nothing else
+    /// in the server currently consumes memory, so there is no functionality
+    /// to report as degraded. When `Some`, its `healthy` flag participates in
+    /// `ok` the same way `catalog` and `objects` do.
+    pub memory: Option<MemoryHealthSummary>,
+
     /// The running server version (`CARGO_PKG_VERSION`).
     pub version: &'static str,
 }
@@ -79,6 +88,17 @@ pub struct ObjectsHealthSummary {
     pub detail: String,
 }
 
+/// Health summary for the memory backend, included in [`HealthResponse`]
+/// only when a memory backend is configured.
+#[derive(Debug, Serialize)]
+pub struct MemoryHealthSummary {
+    /// Whether the configured memory backend is fully operational.
+    pub healthy: bool,
+
+    /// Human-readable description of the current health state.
+    pub detail: String,
+}
+
 /// `GET /healthz`
 ///
 /// Returns the health status of all backends. Always responds with `200 OK`
@@ -93,9 +113,14 @@ pub struct ObjectsHealthSummary {
 ///   "ok": true,
 ///   "catalog": { "healthy": true, "detail": "ok" },
 ///   "objects": { "healthy": true, "total_objects": null, "total_bytes": null, "detail": "ok" },
+///   "memory": null,
 ///   "version": "0.1.0"
 /// }
 /// ```
+///
+/// `memory` is `null` when no `MEMORY_BACKEND` is configured; otherwise it is
+/// an object with `healthy` and `detail`, and its `healthy` flag participates
+/// in the top-level `ok` field.
 ///
 /// # Backend calls
 ///
@@ -103,6 +128,8 @@ pub struct ObjectsHealthSummary {
 ///   mapped to `healthy: false`.
 /// - `objects.health()` -- may return `ObjectStoreError::BackendError` which is
 ///   mapped to `healthy: false`.
+/// - `memory.health()` (only when configured) -- may return
+///   `MemoryError` which is mapped to `healthy: false`.
 ///
 /// # Errors
 ///
@@ -143,7 +170,30 @@ pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
         }
     };
 
-    let ok = catalog_health.healthy && objects_health.healthy;
+    // Only probe and fold in memory health when a backend is actually
+    // configured. An unconfigured backend must never flip `ok` to false --
+    // nothing else in the server consumes memory yet.
+    let memory_health = match &state.memory {
+        Some(adapter) => Some(match adapter.health().await {
+            Ok(h) => MemoryHealthSummary {
+                healthy: h.healthy,
+                detail: h.message,
+            },
+            Err(e) => {
+                // Log the raw error internally; never expose it in the public response.
+                tracing::warn!(error = %e, "memory health check failed");
+                MemoryHealthSummary {
+                    healthy: false,
+                    detail: "backend unavailable".to_string(),
+                }
+            }
+        }),
+        None => None,
+    };
+
+    let ok = catalog_health.healthy
+        && objects_health.healthy
+        && memory_health.as_ref().is_none_or(|m| m.healthy);
 
     (
         StatusCode::OK,
@@ -151,6 +201,7 @@ pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
             ok,
             catalog: catalog_health,
             objects: objects_health,
+            memory: memory_health,
             version: env!("CARGO_PKG_VERSION"),
         }),
     )
