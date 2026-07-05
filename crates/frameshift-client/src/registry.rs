@@ -825,6 +825,44 @@ mod tests {
         assert_eq!(url, DEFAULT_REGISTRY_URL);
     }
 
+    /// The client's private `VersionRecord` deserializes the exact JSON shape
+    /// produced by serializing a real server-side `PackVersionRecord`, and the
+    /// three fields `fetch_and_install` relies on (`content_hash`, `signature`,
+    /// `author_pubkey`) round-trip correctly. `VersionRecord` is private to
+    /// this module, so this pin must live here rather than in the
+    /// `tests/registry_install.rs` integration test.
+    #[test]
+    fn version_record_matches_catalog_wire_shape() {
+        use ed25519_dalek::Signer as _;
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+        let content_hash = ObjectHash::of(b"fixture archive bytes");
+        let signature = signing.sign(content_hash.as_bytes()).to_bytes().to_vec();
+        let author_pubkey =
+            frameshift_catalog::Ed25519PublicKey(signing.verifying_key().to_bytes());
+
+        let server_record = frameshift_catalog::PackVersionRecord {
+            pack_name: "demo".to_string(),
+            version: "1.0.0".to_string(),
+            content_hash,
+            signature: signature.clone(),
+            author_pubkey,
+            parent_hash: None,
+            capability_manifest_json: "{}".to_string(),
+            schema_version: 1,
+            license: "MIT".to_string(),
+            published_at: chrono::Utc::now(),
+            status: frameshift_catalog::PackStatus::Active,
+            size_bytes: 123,
+        };
+
+        let value = serde_json::to_value(&server_record).unwrap();
+        let client_record: VersionRecord = serde_json::from_value(value).unwrap();
+
+        assert_eq!(client_record.content_hash, content_hash);
+        assert_eq!(client_record.signature, signature);
+        assert_eq!(client_record.author_pubkey.0, author_pubkey.0);
+    }
+
     /// A hash-mismatch is detected before any extraction is attempted.
     #[test]
     fn content_hash_mismatch_is_detected() {
