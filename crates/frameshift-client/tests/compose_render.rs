@@ -4,7 +4,9 @@
 //! that declares `extends`/`mixin` and ships typed source (`persona.toml`)
 //! is composed with its resolved bases before markdown rendering.
 
-use frameshift_client::{Client, ClientError, ClientOptions, InstallRequest, InstallSource, PersonaSpec};
+use frameshift_client::{
+    Client, ClientError, ClientOptions, InstallRequest, InstallSource, PersonaSpec,
+};
 use frameshift_compose::ComposeError;
 use frameshift_source::{Layer, Persona, PersonaSource, Rule, RuleSet};
 use std::fs;
@@ -171,12 +173,12 @@ extends = "base@0.1.0"
         })
         .expect_err("install must fail when base is not installed");
 
+    let ClientError::Compose(inner) = &err else {
+        panic!("expected ClientError::Compose, got {err}");
+    };
     assert!(
-        matches!(
-            err,
-            ClientError::Compose(ComposeError::Unresolved { .. })
-        ),
-        "expected ClientError::Compose(ComposeError::Unresolved), got {err}"
+        matches!(**inner, ComposeError::Unresolved { .. }),
+        "expected ComposeError::Unresolved, got {err}"
     );
 }
 
@@ -284,11 +286,11 @@ mixin = ["strictmixin@0.1.0"]
         })
         .expect_err("install must fail on L1 override by mixin");
 
+    let ClientError::Compose(inner) = &err else {
+        panic!("expected ClientError::Compose, got {err}");
+    };
     assert!(
-        matches!(
-            &err,
-            ClientError::Compose(ComposeError::L1Override { rule_id, .. }) if rule_id == "no-panic"
-        ),
+        matches!(&**inner, ComposeError::L1Override { rule_id, .. } if rule_id.as_str() == "no-panic"),
         "expected ClientError::Compose(ComposeError::L1Override), got {err}"
     );
 }

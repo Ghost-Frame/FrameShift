@@ -578,10 +578,22 @@ impl Client {
 
             let src = composed.into_source();
             for (target_dir, filename, target) in [
-                ("claude", "CLAUDE.md", frameshift_source::RenderTarget::Claude),
+                (
+                    "claude",
+                    "CLAUDE.md",
+                    frameshift_source::RenderTarget::Claude,
+                ),
                 ("codex", "AGENTS.md", frameshift_source::RenderTarget::Codex),
-                ("gemini", "GEMINI.md", frameshift_source::RenderTarget::Gemini),
-                ("generic", "AGENTS.md", frameshift_source::RenderTarget::Generic),
+                (
+                    "gemini",
+                    "GEMINI.md",
+                    frameshift_source::RenderTarget::Gemini,
+                ),
+                (
+                    "generic",
+                    "AGENTS.md",
+                    frameshift_source::RenderTarget::Generic,
+                ),
             ] {
                 let markdown = frameshift_source::render_to_markdown(&src, target);
                 let composed_content =

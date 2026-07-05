@@ -41,10 +41,7 @@ impl<'a> CacheResolver<'a> {
             .iter()
             .map(|p| (p.name.as_str(), p.hash.as_str()))
             .collect();
-        Self {
-            cache_dir,
-            by_name,
-        }
+        Self { cache_dir, by_name }
     }
 }
 

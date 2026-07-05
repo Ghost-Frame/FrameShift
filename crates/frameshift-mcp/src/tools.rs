@@ -266,7 +266,9 @@ fn parse_tool_entry(entry: &serde_json::Value) -> Option<CapabilityTool> {
         });
     }
     let name = entry.get("name")?.as_str()?.to_string();
-    let required_capabilities = match entry.get("required_capabilities").and_then(|v| v.as_array())
+    let required_capabilities = match entry
+        .get("required_capabilities")
+        .and_then(|v| v.as_array())
     {
         Some(arr) => arr
             .iter()

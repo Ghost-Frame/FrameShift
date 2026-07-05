@@ -97,7 +97,8 @@ mod tests {
     /// succeeds with matching field values.
     #[test]
     fn payload_deserializes_from_client_shaped_json() {
-        let json = r#"{"persona":"rust","session":"sess-1","project_id":"proj-1","recorded_at_unix":42}"#;
+        let json =
+            r#"{"persona":"rust","session":"sess-1","project_id":"proj-1","recorded_at_unix":42}"#;
         let payload: SelectionTelemetryPayload = serde_json::from_str(json).unwrap();
         assert_eq!(payload.persona, "rust");
         assert_eq!(payload.session, "sess-1");

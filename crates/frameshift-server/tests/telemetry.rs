@@ -71,8 +71,7 @@ fn make_state() -> AppState {
 /// A representative telemetry payload matching the client's
 /// `SelectionTelemetry` wire shape exactly (persona, session, project_id,
 /// recorded_at_unix).
-const VALID_PAYLOAD: &str =
-    r#"{"persona":"rust","session":"sess-1","project_id":"proj-abc123","recorded_at_unix":1750000000}"#;
+const VALID_PAYLOAD: &str = r#"{"persona":"rust","session":"sess-1","project_id":"proj-abc123","recorded_at_unix":1750000000}"#;
 
 /// `POST /v1/telemetry/selection` with a well-formed, client-shaped payload
 /// returns a 2xx status.

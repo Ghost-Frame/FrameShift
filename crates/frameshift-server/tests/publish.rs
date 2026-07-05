@@ -375,14 +375,8 @@ async fn publish_pack_description_and_tags_are_searchable() {
     let objects = MockPackStore::new();
     let description = "A helpful pack for testing marketplace search.";
     let tags = ["rust", "testing"];
-    let prepared = prepare_pack_with_metadata(
-        "demo-pack",
-        "0.1.0",
-        "grace",
-        &signing,
-        description,
-        &tags,
-    );
+    let prepared =
+        prepare_pack_with_metadata("demo-pack", "0.1.0", "grace", &signing, description, &tags);
 
     let state = make_state(catalog.clone(), objects.clone());
     let resp = post_publish(
@@ -416,7 +410,9 @@ async fn publish_pack_description_and_tags_are_searchable() {
         .unwrap();
     assert_eq!(search_resp.status(), StatusCode::OK);
     let body = body_json(search_resp).await;
-    let results = body["results"].as_array().expect("results must be an array");
+    let results = body["results"]
+        .as_array()
+        .expect("results must be an array");
     let demo_pack = results
         .iter()
         .find(|r| r["pack"]["name"] == "demo-pack")

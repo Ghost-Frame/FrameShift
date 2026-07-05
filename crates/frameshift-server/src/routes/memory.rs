@@ -59,7 +59,9 @@ pub fn memory_router() -> Router<AppState> {
 /// This handler never returns an HTTP error. Backend failures are represented
 /// as `healthy: false` in the response body; the underlying error is logged
 /// via `tracing::warn` but never included in the body.
-pub async fn memory_health(State(state): State<AppState>) -> (StatusCode, Json<MemoryHealthResponse>) {
+pub async fn memory_health(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<MemoryHealthResponse>) {
     let Some(adapter) = state.memory.as_ref() else {
         return (
             StatusCode::OK,
