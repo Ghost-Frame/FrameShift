@@ -6,9 +6,11 @@
 //! - [`authors`] -- `GET /v1/authors/{pubkey}` lookup.
 //! - [`handles`] -- `GET /v1/handles/{handle}` lookup.
 //! - [`ops`] -- `GET /healthz` and `GET /metrics` operational endpoints.
+//! - [`telemetry`] -- `POST /v1/telemetry/selection` opt-in selection telemetry sink.
 
 pub mod authors;
 pub mod downloads;
 pub mod handles;
 pub mod ops;
 pub mod packs;
+pub mod telemetry;

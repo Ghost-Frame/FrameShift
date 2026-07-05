@@ -64,6 +64,7 @@ use crate::routes::downloads::{dl_router, pack_download_url_router};
 use crate::routes::handles::handles_router;
 use crate::routes::ops::ops_router;
 use crate::routes::packs::{packs_router, publish_pack};
+use crate::routes::telemetry::telemetry_router;
 use crate::state::AppState;
 
 /// Build the complete Axum router for the frameshift HTTP server.
@@ -78,6 +79,7 @@ use crate::state::AppState;
 ///     /packs    -- pack read endpoints + POST publish (signed-request)
 ///     /authors  -- author lookup + POST register / POST {handle}/rotate (signed-request)
 ///     /handles  -- handle lookup
+///     /telemetry -- POST /selection opt-in selection telemetry sink
 ///   /mcp        -- MCP placeholder (501 for all methods)
 /// ```
 ///
@@ -123,7 +125,8 @@ pub fn app(state: AppState) -> Router {
     let v1 = Router::new()
         .nest("/packs", packs)
         .nest("/authors", authors)
-        .nest("/handles", handles_router());
+        .nest("/handles", handles_router())
+        .nest("/telemetry", telemetry_router());
 
     let x_request_id = axum::http::HeaderName::from_static("x-request-id");
 
