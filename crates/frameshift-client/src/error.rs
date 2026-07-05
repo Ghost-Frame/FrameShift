@@ -139,4 +139,9 @@ pub enum ClientError {
     /// The requested render target is not a known target.
     #[error("unknown render target '{0}'; known targets: claude, codex, gemini, generic")]
     UnknownRenderTarget(String),
+
+    /// Persona composition (extends/mixin resolution and merge) failed. Per the
+    /// pack manifest contract, a missing base or an L1 override is a hard error.
+    #[error("persona composition failed: {0}")]
+    Compose(#[from] frameshift_compose::ComposeError),
 }
