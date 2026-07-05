@@ -881,6 +881,40 @@ impl CatalogBackend for PostgresCatalog {
         Ok(())
     }
 
+    /// Set the `description` and `tags` columns on the pack head row.
+    ///
+    /// SQL shape:
+    /// ```sql
+    /// UPDATE packs SET description = $1, tags = $2 WHERE name = $3
+    /// ```
+    /// Same columns the seeder's former raw-SQL workaround wrote directly.
+    async fn set_pack_metadata(
+        &self,
+        name: &str,
+        description: &str,
+        tags: &[String],
+    ) -> Result<(), CatalogError> {
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+
+        let rows_affected =
+            diesel::sql_query("UPDATE packs SET description = $1, tags = $2 WHERE name = $3")
+                .bind::<diesel::sql_types::Text, _>(description.to_string())
+                .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(tags.to_vec())
+                .bind::<diesel::sql_types::Text, _>(name.to_string())
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| map_diesel_error(e, "pack", name.to_string()))?;
+
+        if rows_affected == 0 {
+            return Err(CatalogError::NotFound {
+                kind: "pack",
+                key: name.to_string(),
+            });
+        }
+
+        Ok(())
+    }
+
     /// Record a single download event for the given pack version.
     ///
     /// SQL shape:

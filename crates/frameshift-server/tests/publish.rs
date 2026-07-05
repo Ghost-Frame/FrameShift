@@ -102,6 +102,29 @@ fn write_pack(dir: &Path, name: &str, version: &str, handle: &str) {
     std::fs::write(dir.join("README.md"), b"# test pack\n").unwrap();
 }
 
+/// Like [`write_pack`], but also sets `description` and `tags` in the
+/// manifest so publish-time metadata propagation can be exercised.
+fn write_pack_with_metadata(
+    dir: &Path,
+    name: &str,
+    version: &str,
+    handle: &str,
+    description: &str,
+    tags: &[&str],
+) {
+    let tags_toml = tags
+        .iter()
+        .map(|t| format!("\"{t}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let manifest = format!(
+        "schema_version = 1\nname = \"{name}\"\nauthor_handle = \"{handle}\"\nauthor_pubkey = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\nversion = \"{version}\"\nlicense = \"MIT\"\ndescription = \"{description}\"\ntags = [{tags_toml}]\n"
+    );
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(dir.join("pack.toml"), manifest).unwrap();
+    std::fs::write(dir.join("README.md"), b"# test pack\n").unwrap();
+}
+
 /// Pack a directory tree into a gzipped tar archive and return the bytes.
 ///
 /// The archive entries are placed at the root (no top-level directory) so the
@@ -255,6 +278,28 @@ fn prepare_pack(name: &str, version: &str, handle: &str, signing: &SigningKey) -
     }
 }
 
+/// Like [`prepare_pack`], but the manifest also declares `description` and
+/// `tags`, exercising the publish-time metadata propagation path.
+fn prepare_pack_with_metadata(
+    name: &str,
+    version: &str,
+    handle: &str,
+    signing: &SigningKey,
+    description: &str,
+    tags: &[&str],
+) -> PreparedPack {
+    let tmp = tempfile::TempDir::new().unwrap();
+    write_pack_with_metadata(tmp.path(), name, version, handle, description, tags);
+    let pack = Pack::from_dir(tmp.path()).unwrap();
+    let canonical_hash = pack.canonical_hash();
+    let sig = signing.sign(&canonical_hash);
+    let targz = make_targz(tmp.path());
+    PreparedPack {
+        targz,
+        signature: sig.to_bytes().to_vec(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // happy path
 // ---------------------------------------------------------------------------
@@ -312,6 +357,73 @@ async fn publish_happy_path_returns_200_and_pack_is_fetchable() {
     assert_eq!(resp2.status(), StatusCode::OK);
     let archive_bytes = resp2.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(archive_bytes.as_ref(), prepared.targz.as_slice());
+}
+
+// ---------------------------------------------------------------------------
+// description / tags propagation (P0-2 regression test)
+// ---------------------------------------------------------------------------
+
+/// Publish a pack whose manifest declares `description` and `tags`, then
+/// assert the pack head record returned by `GET /v1/packs` (the search/list
+/// path) carries the same description and tags rather than being blank. This
+/// is the regression test for the bug where `publish_pack` registered the
+/// version but never wrote manifest metadata onto the pack head row.
+#[tokio::test]
+async fn publish_pack_description_and_tags_are_searchable() {
+    let signing = SigningKey::from_bytes(&[40u8; 32]);
+    let (catalog, _pubkey) = catalog_with_author(&signing, "grace");
+    let objects = MockPackStore::new();
+    let description = "A helpful pack for testing marketplace search.";
+    let tags = ["rust", "testing"];
+    let prepared = prepare_pack_with_metadata(
+        "demo-pack",
+        "0.1.0",
+        "grace",
+        &signing,
+        description,
+        &tags,
+    );
+
+    let state = make_state(catalog.clone(), objects.clone());
+    let resp = post_publish(
+        state,
+        &prepared.targz,
+        &prepared.signature,
+        "grace",
+        Some(&signing),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "expected 200, got {}",
+        resp.status()
+    );
+
+    // Search/list path: the mock's `search_packs` returns every stored pack
+    // head record, so the description/tags update from `set_pack_metadata`
+    // must be visible here for the search index to be non-blind.
+    let state2 = make_state(catalog, objects);
+    let search_resp = app(state2)
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/packs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(search_resp.status(), StatusCode::OK);
+    let body = body_json(search_resp).await;
+    let results = body["results"].as_array().expect("results must be an array");
+    let demo_pack = results
+        .iter()
+        .find(|r| r["pack"]["name"] == "demo-pack")
+        .expect("demo-pack must be present in search results");
+    assert_eq!(demo_pack["pack"]["description"], description);
+    assert_eq!(demo_pack["pack"]["tags"][0], "rust");
+    assert_eq!(demo_pack["pack"]["tags"][1], "testing");
 }
 
 // ---------------------------------------------------------------------------

@@ -338,4 +338,28 @@ pub trait CatalogBackend: Send + Sync {
         pack_name: &str,
         extends: Option<&str>,
     ) -> Result<(), CatalogError>;
+
+    /// Set the `description` and `tags` fields on the pack head record.
+    ///
+    /// Records the marketplace-facing description and discovery tags from the
+    /// manifest so that `search_packs` (which ranks on `description`) can find
+    /// published packs. This is a best-effort update called after
+    /// `register_pack_version`; the caller MUST ensure the pack row already
+    /// exists (i.e. `register_pack_version` succeeded) before calling this
+    /// method.
+    ///
+    /// # Errors
+    ///
+    /// - `CatalogError::NotFound` (kind `"pack"`) -- the pack does not exist.
+    /// - `CatalogError::BackendError` -- unexpected backend failure.
+    ///
+    /// # Panics
+    ///
+    /// Never panics.
+    async fn set_pack_metadata(
+        &self,
+        name: &str,
+        description: &str,
+        tags: &[String],
+    ) -> Result<(), CatalogError>;
 }
