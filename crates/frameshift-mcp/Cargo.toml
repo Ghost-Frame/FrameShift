@@ -11,13 +11,16 @@ name = "frameshift-mcp"
 path = "src/main.rs"
 
 [dependencies]
+frameshift-capabilities = { path = "../frameshift-capabilities" }
 frameshift-client = { path = "../frameshift-client" }
 frameshift-growth = { path = "../frameshift-growth" }
 frameshift-orchestrator = { path = "../frameshift-orchestrator" }
+frameshift-pack = { path = "../frameshift-pack" }
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["full"] }
 thiserror.workspace = true
+toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

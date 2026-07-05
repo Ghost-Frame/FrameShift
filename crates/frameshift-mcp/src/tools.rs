@@ -1,10 +1,12 @@
 /// Tool definitions and dispatch for the Frameshift MCP server.
 ///
 /// Each tool maps directly to a frameshift-client or frameshift-growth operation.
+use frameshift_capabilities::{CapabilityFilter, Tool as CapabilityTool};
 use frameshift_client::{Client, InstallRequest, InstallSource, PersonaSpec};
 use frameshift_orchestrator::{
     AuditLog, Mode, ModeState, PolicyWeights, Preferences, SelectionInputs,
 };
+use frameshift_pack::{CapabilityManifest, PackManifest};
 
 use crate::protocol::{ToolContent, ToolDef, ToolResult};
 
@@ -101,6 +103,38 @@ pub fn tool_definitions() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
+            name: "frameshift_capabilities".to_string(),
+            description: "Report the resolved persona's declared capability manifest and, when a candidate tool list is given, annotate which of those tools are allowed by it. Advisory only -- never blocks or hides any of this server's own MCP tools (persona `required_tools` names agent-side tools such as Read/Bash, a different namespace).".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "project_root": {"type": "string"},
+                    "persona": {"type": "string"},
+                    "tools": {
+                        "type": "array",
+                        "description": "Candidate tools to evaluate. Each entry is either a bare tool-name string or an object {name, required_capabilities?}; when required_capabilities is omitted it defaults to [name].",
+                        "items": {
+                            "oneOf": [
+                                {"type": "string"},
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": {"type": "string"},
+                                        "required_capabilities": {
+                                            "type": "array",
+                                            "items": {"type": "string"}
+                                        }
+                                    },
+                                    "required": ["name"]
+                                }
+                            ]
+                        }
+                    }
+                },
+                "required": ["project_root"]
+            }),
+        },
+        ToolDef {
             name: "frameshift_prefs".to_string(),
             description: "View and adjust per-persona preference biases. Actions: show, bump, decay, reset.".to_string(),
             input_schema: serde_json::json!({
@@ -164,6 +198,155 @@ fn validate_path_arg(raw: &str) -> Result<std::path::PathBuf, String> {
     Ok(path)
 }
 
+/// Resolve and parse the capability manifest for a persona in a project.
+///
+/// If `persona` is `None`, resolves the currently active persona from
+/// `ProjectPaths.active_path`. Validates the resolved name, then reads and
+/// parses `<personas_dir>/<name>/source/pack.toml`. Returns the resolved
+/// persona name alongside its optional `CapabilityManifest` (a pack may
+/// declare none). All failure modes (missing active persona, invalid name,
+/// missing/unparseable manifest) are surfaced as a `String` error so callers
+/// can decide whether to fail hard (the capabilities tool) or degrade
+/// gracefully (call_use annotation).
+fn load_capability_manifest(
+    client: &Client,
+    project_root: &std::path::Path,
+    persona: Option<&str>,
+) -> Result<(String, Option<CapabilityManifest>), String> {
+    let paths = client
+        .project_paths(project_root)
+        .map_err(|e| format!("project_paths failed: {}", e))?;
+
+    let name = match persona {
+        Some(p) => p.to_string(),
+        None => {
+            if !paths.active_path.exists() {
+                return Err("no active persona and no persona specified".to_string());
+            }
+            std::fs::read_to_string(&paths.active_path)
+                .map_err(|e| format!("failed to read active persona marker: {}", e))?
+                .trim()
+                .to_string()
+        }
+    };
+
+    if let Err(e) = frameshift_client::validate_persona_name(&name) {
+        return Err(format!("invalid persona name: {e}"));
+    }
+
+    let manifest_path = paths
+        .personas_dir
+        .join(&name)
+        .join("source")
+        .join("pack.toml");
+    let raw = std::fs::read_to_string(&manifest_path).map_err(|e| {
+        format!(
+            "failed to read pack manifest at {}: {}",
+            manifest_path.display(),
+            e
+        )
+    })?;
+    let manifest: PackManifest =
+        toml::from_str(&raw).map_err(|e| format!("failed to parse pack manifest: {}", e))?;
+
+    Ok((name, manifest.capability_manifest))
+}
+
+/// Parse a single `tools` array entry into a `frameshift_capabilities::Tool`.
+///
+/// Accepts either a bare tool-name string (required capabilities default to
+/// `[name]`) or an object `{name, required_capabilities?}` (defaulting the
+/// same way when the field is absent). Returns `None` for entries that are
+/// neither a string nor an object with a `name` field.
+fn parse_tool_entry(entry: &serde_json::Value) -> Option<CapabilityTool> {
+    if let Some(name) = entry.as_str() {
+        return Some(CapabilityTool {
+            name: name.to_string(),
+            required_capabilities: vec![name.to_string()],
+        });
+    }
+    let name = entry.get("name")?.as_str()?.to_string();
+    let required_capabilities = match entry.get("required_capabilities").and_then(|v| v.as_array())
+    {
+        Some(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect(),
+        None => vec![name.clone()],
+    };
+    Some(CapabilityTool {
+        name,
+        required_capabilities,
+    })
+}
+
+/// Handle the frameshift_capabilities tool call.
+///
+/// Reports the resolved persona's declared capability manifest. This is an
+/// annotation/reporting channel only -- it never blocks or hides any of this
+/// server's own MCP tools (the 8 management tools above are a different
+/// namespace from the agent-side tool names a persona's `required_tools`
+/// declares, e.g. Read/Bash). When a `tools` array argument is given, each
+/// entry is evaluated against a `CapabilityFilter` built from the manifest and
+/// annotated with `allowed`.
+fn call_capabilities(arguments: &serde_json::Value, client: &Client) -> ToolResult {
+    let project_root_str = match arguments.get("project_root").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => return err_result("missing required argument: project_root".to_string()),
+    };
+    let project_root = match validate_path_arg(project_root_str) {
+        Ok(p) => p,
+        Err(e) => return err_result(e),
+    };
+
+    let persona_arg = arguments.get("persona").and_then(|v| v.as_str());
+
+    let (persona, capability_manifest) =
+        match load_capability_manifest(client, &project_root, persona_arg) {
+            Ok(v) => v,
+            Err(e) => return err_result(e),
+        };
+
+    let capability_manifest = match capability_manifest {
+        None => {
+            let text = serde_json::json!({
+                "persona": persona,
+                "capability_manifest": serde_json::Value::Null,
+                "warning": "persona declares no capability manifest; all tools implicitly allowed",
+            })
+            .to_string();
+            return ok_result(text);
+        }
+        Some(cap) => cap,
+    };
+
+    let filter = CapabilityFilter::from_manifest(&capability_manifest);
+
+    let mut response = serde_json::json!({
+        "persona": persona,
+        "capability_manifest": capability_manifest,
+        "declared": filter.declared(),
+    });
+
+    if let Some(tools_arg) = arguments.get("tools").and_then(|v| v.as_array()) {
+        let annotated: Vec<serde_json::Value> = tools_arg
+            .iter()
+            .filter_map(parse_tool_entry)
+            .map(|tool| {
+                let allowed = filter.allows(&tool);
+                serde_json::json!({
+                    "name": tool.name,
+                    "required_capabilities": tool.required_capabilities,
+                    "allowed": allowed,
+                })
+            })
+            .collect();
+        response["tools"] = serde_json::Value::Array(annotated);
+    }
+
+    ok_result(response.to_string())
+}
+
 pub fn call_tool(name: &str, arguments: &serde_json::Value, client: &Client) -> ToolResult {
     match name {
         "frameshift_install" => call_install(arguments, client),
@@ -174,6 +357,7 @@ pub fn call_tool(name: &str, arguments: &serde_json::Value, client: &Client) -> 
         "frameshift_use" => call_use(arguments, client),
         "frameshift_automate" => call_automate(arguments, client),
         "frameshift_prefs" => call_prefs(arguments, client),
+        "frameshift_capabilities" => call_capabilities(arguments, client),
         _ => err_result(format!("unknown tool: {}", name)),
     }
 }
@@ -434,8 +618,37 @@ fn call_use(arguments: &serde_json::Value, client: &Client) -> ToolResult {
         Err(e) => return err_result(format!("render failed: {}", e)),
     };
 
-    let text = serde_json::json!({ "persona": persona, "rendered": rendered }).to_string();
-    ok_result(text)
+    let mut result = serde_json::json!({ "persona": persona, "rendered": rendered });
+
+    // Best-effort capability annotation: a manifest read/parse failure here must
+    // never fail the activation that already succeeded above -- just log it.
+    match load_capability_manifest(client, &project_root, Some(persona)) {
+        Ok((_, Some(cap))) => {
+            let network_egress = cap.network_egress;
+            match serde_json::to_value(&cap) {
+                Ok(v) => result["capabilities"] = v,
+                Err(e) => tracing::warn!(
+                    "failed to serialize capability manifest for persona {}: {}",
+                    persona,
+                    e
+                ),
+            }
+            if network_egress {
+                result["capability_notes"] =
+                    serde_json::json!(["persona declares network_egress = true"]);
+            }
+        }
+        Ok((_, None)) => {}
+        Err(e) => {
+            tracing::warn!(
+                "failed to load capability manifest for persona {}: {}",
+                persona,
+                e
+            );
+        }
+    }
+
+    ok_result(result.to_string())
 }
 
 /// Handle the frameshift_automate tool call.
@@ -686,6 +899,23 @@ mod tests {
         .unwrap();
     }
 
+    /// Create a pack directory like `make_pack_dir`, but with a
+    /// `[capability_manifest]` table declaring `required_tools = ["Read", "Bash"]`
+    /// and `network_egress = false`.
+    fn make_pack_dir_with_capabilities(dir: &std::path::Path, name: &str, version: &str) {
+        fs::create_dir_all(dir).unwrap();
+        let manifest = format!(
+            "schema_version = 1\nname = \"{}\"\nversion = \"{}\"\nauthor_handle = \"test\"\nauthor_pubkey = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\n\n[capability_manifest]\nrequired_tools = [\"Read\", \"Bash\"]\nnetwork_egress = false\n",
+            name, version
+        );
+        fs::write(dir.join("pack.toml"), manifest).unwrap();
+        fs::write(
+            dir.join("AGENTS.md"),
+            format!("# {}\n\nTest content.\n", name),
+        )
+        .unwrap();
+    }
+
     /// Create a Client pointed at a temporary data root with no config overlay.
     fn make_client(data_root: &std::path::Path) -> Client {
         Client::new(ClientOptions {
@@ -694,11 +924,12 @@ mod tests {
         })
     }
 
-    /// Verify that tool_definitions returns the expected number of tools (4 original + 4 new).
+    /// Verify that tool_definitions returns the expected number of tools
+    /// (4 original + 4 automate/prefs additions + 1 capabilities).
     #[test]
-    fn tool_definitions_returns_eight() {
+    fn tool_definitions_returns_nine() {
         let defs = tool_definitions();
-        assert_eq!(defs.len(), 8);
+        assert_eq!(defs.len(), 9);
     }
 
     /// Verify that calling an unknown tool name returns an is_error result.
@@ -1079,5 +1310,136 @@ mod tests {
         );
         let parsed2: serde_json::Value = serde_json::from_str(&status2.content[0].text).unwrap();
         assert_eq!(parsed2["mode"], "off");
+    }
+
+    /// frameshift_capabilities reports the active persona's manifest and
+    /// annotates a candidate tool list: Read (declared) is allowed, WebFetch
+    /// (undeclared) is not, and the manifest's required_tools is echoed back.
+    #[test]
+    fn tool_call_capabilities_returns_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_root = tmp.path().join("data");
+        let pack_dir = tmp.path().join("pack");
+        make_pack_dir_with_capabilities(&pack_dir, "captest", "0.1.0");
+
+        let project_root = tmp.path().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+
+        let client = make_client(&data_root);
+
+        client
+            .install(InstallRequest {
+                project_root: project_root.clone(),
+                spec: PersonaSpec {
+                    name: "captest".to_string(),
+                    version: "0.1.0".to_string(),
+                },
+                source: InstallSource::LocalPath(pack_dir),
+            })
+            .unwrap();
+        client.activate(&project_root, "captest").unwrap();
+
+        let args = serde_json::json!({
+            "project_root": project_root.to_str().unwrap(),
+            "tools": ["Read", "WebFetch"]
+        });
+        let result = call_tool("frameshift_capabilities", &args, &client);
+        assert!(
+            result.is_error.is_none(),
+            "unexpected error: {:?}",
+            result.content[0].text
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&result.content[0].text).unwrap();
+        assert_eq!(
+            parsed["capability_manifest"]["required_tools"],
+            serde_json::json!(["Read", "Bash"])
+        );
+        let tools = parsed["tools"].as_array().unwrap();
+        let read = tools.iter().find(|t| t["name"] == "Read").unwrap();
+        assert_eq!(read["allowed"], true);
+        let web_fetch = tools.iter().find(|t| t["name"] == "WebFetch").unwrap();
+        assert_eq!(web_fetch["allowed"], false);
+    }
+
+    /// frameshift_capabilities on a persona with no capability manifest
+    /// returns a null manifest and a warning, rather than an error.
+    #[test]
+    fn tool_call_capabilities_no_manifest_warns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_root = tmp.path().join("data");
+        let pack_dir = tmp.path().join("pack");
+        make_pack_dir(&pack_dir, "plaintest", "0.1.0");
+
+        let project_root = tmp.path().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+
+        let client = make_client(&data_root);
+
+        client
+            .install(InstallRequest {
+                project_root: project_root.clone(),
+                spec: PersonaSpec {
+                    name: "plaintest".to_string(),
+                    version: "0.1.0".to_string(),
+                },
+                source: InstallSource::LocalPath(pack_dir),
+            })
+            .unwrap();
+        client.activate(&project_root, "plaintest").unwrap();
+
+        let args = serde_json::json!({
+            "project_root": project_root.to_str().unwrap()
+        });
+        let result = call_tool("frameshift_capabilities", &args, &client);
+        assert!(
+            result.is_error.is_none(),
+            "unexpected error: {:?}",
+            result.content[0].text
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&result.content[0].text).unwrap();
+        assert!(parsed["capability_manifest"].is_null());
+        assert!(parsed["warning"].is_string());
+    }
+
+    /// frameshift_use annotates its result with the activated persona's
+    /// capability manifest when one is declared.
+    #[test]
+    fn tool_call_use_annotates_capabilities() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_root = tmp.path().join("data");
+        let pack_dir = tmp.path().join("pack");
+        make_pack_dir_with_capabilities(&pack_dir, "usecaps", "0.1.0");
+
+        let project_root = tmp.path().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+
+        let client = make_client(&data_root);
+
+        client
+            .install(InstallRequest {
+                project_root: project_root.clone(),
+                spec: PersonaSpec {
+                    name: "usecaps".to_string(),
+                    version: "0.1.0".to_string(),
+                },
+                source: InstallSource::LocalPath(pack_dir),
+            })
+            .unwrap();
+
+        let args = serde_json::json!({
+            "project_root": project_root.to_str().unwrap(),
+            "persona": "usecaps"
+        });
+        let result = call_tool("frameshift_use", &args, &client);
+        assert!(
+            result.is_error.is_none(),
+            "unexpected error: {:?}",
+            result.content[0].text
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&result.content[0].text).unwrap();
+        assert_eq!(
+            parsed["capabilities"]["required_tools"],
+            serde_json::json!(["Read", "Bash"])
+        );
     }
 }
