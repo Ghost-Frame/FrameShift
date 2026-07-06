@@ -15,6 +15,7 @@ frameshift-capabilities = { path = "../frameshift-capabilities" }
 frameshift-client = { path = "../frameshift-client" }
 frameshift-growth = { path = "../frameshift-growth" }
 frameshift-orchestrator = { path = "../frameshift-orchestrator" }
+frameshift-embed-candle = { path = "../frameshift-embed-candle", optional = true }
 frameshift-pack = { path = "../frameshift-pack" }
 serde.workspace = true
 serde_json.workspace = true
@@ -26,3 +27,8 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[features]
+# Semantic selection via a local candle sentence-embedding model. Off by
+# default so the standard build stays free of the ML dependency stack.
+embeddings = ["dep:frameshift-embed-candle"]

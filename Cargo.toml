@@ -10,6 +10,7 @@ members = [
     "crates/frameshift-compose",
     "crates/frameshift-conformance",
     "crates/frameshift-daemon",
+    "crates/frameshift-embed-candle",
     "crates/frameshift-growth",
     "crates/frameshift-mcp",
     "crates/frameshift-memory",

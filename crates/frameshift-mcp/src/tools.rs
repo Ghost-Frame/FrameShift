@@ -4,11 +4,40 @@
 use frameshift_capabilities::{CapabilityFilter, Tool as CapabilityTool};
 use frameshift_client::{Client, InstallRequest, InstallSource, PersonaSpec};
 use frameshift_orchestrator::{
-    AuditLog, Mode, ModeState, PolicyWeights, Preferences, SelectionInputs,
+    AuditLog, Embedder, Mode, ModeState, PolicyWeights, Preferences, SelectionInputs,
 };
 use frameshift_pack::{CapabilityManifest, PackManifest};
 
 use crate::protocol::{ToolContent, ToolDef, ToolResult};
+
+/// Return the process-wide semantic embedder, loading the model once on first
+/// use. A failed load (offline, corrupt cache) is remembered as `None` so
+/// repeated `frameshift_select` calls do not retry the download.
+#[cfg(feature = "embeddings")]
+fn shared_embedder() -> Option<&'static dyn Embedder> {
+    use std::sync::OnceLock;
+    static EMBEDDER: OnceLock<Option<frameshift_embed_candle::CandleEmbedder>> = OnceLock::new();
+    EMBEDDER
+        .get_or_init(
+            || match frameshift_embed_candle::CandleEmbedder::from_hub() {
+                Ok(e) => Some(e),
+                Err(e) => {
+                    eprintln!(
+                        "warning: semantic embeddings unavailable ({e}); lexical ranking only"
+                    );
+                    None
+                }
+            },
+        )
+        .as_ref()
+        .map(|e| e as &dyn Embedder)
+}
+
+/// Without the `embeddings` feature there is never an embedder.
+#[cfg(not(feature = "embeddings"))]
+fn shared_embedder() -> Option<&'static dyn Embedder> {
+    None
+}
 
 /// Return the complete list of available MCP tools with their JSON Schema definitions.
 pub fn tool_definitions() -> Vec<ToolDef> {
@@ -576,7 +605,7 @@ fn call_select(arguments: &serde_json::Value, client: &Client) -> ToolResult {
         weights: PolicyWeights::default(),
     };
 
-    let ranked = match frameshift_orchestrator::select(&inputs) {
+    let ranked = match frameshift_orchestrator::select_with_embedder(&inputs, shared_embedder()) {
         Ok(r) => r,
         Err(e) => return err_result(format!("selection failed: {}", e)),
     };
