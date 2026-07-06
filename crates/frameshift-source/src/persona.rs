@@ -179,6 +179,10 @@ pub struct Persona {
     /// Short human-readable description of what this persona does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Topical tags that bias keyword-based persona selection and feed
+    /// registry search, mirroring the `tags` field in `pack.toml`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     /// SPDX license identifier for this persona pack.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub license: Option<String>,
@@ -263,6 +267,7 @@ impl Persona {
             name: name.into(),
             version: None,
             description: None,
+            tags: Vec::new(),
             license: None,
             author: None,
             extends: None,
@@ -319,6 +324,7 @@ mod tests {
             name: "cryptographic".to_string(),
             version: None,
             description: None,
+            tags: Vec::new(),
             license: None,
             author: None,
             extends: None,
@@ -368,6 +374,7 @@ mod tests {
             name: "enriched".to_string(),
             version: Some("1.2.3".to_string()),
             description: Some("A fully-enriched test persona.".to_string()),
+            tags: vec!["security".to_string(), "rust".to_string()],
             license: Some("MIT".to_string()),
             author: Some(Author {
                 handle: "testauthor".to_string(),

@@ -248,6 +248,7 @@ mod tests {
                 name: "test".to_string(),
                 version: None,
                 description: None,
+                tags: vec![],
                 license: None,
                 author: None,
                 extends: None,

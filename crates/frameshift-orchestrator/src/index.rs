@@ -118,6 +118,10 @@ impl PersonaProfile {
         if let Some(desc) = &src.persona.description {
             text_parts.push(desc.clone());
         }
+        // Topical tags bias keyword-based selection, mirroring the pack.toml path.
+        for tag in &src.persona.tags {
+            text_parts.push(tag.clone());
+        }
         text_parts.push(src.persona.voice.tone.clone());
         if let Some(vt) = &src.persona.voice.text {
             text_parts.push(vt.clone());
@@ -626,6 +630,7 @@ mod tests {
                 name: name.to_string(),
                 version: None,
                 description: Some(format!("{name} persona for testing")),
+                tags: vec![],
                 license: None,
                 author: None,
                 extends: None,
@@ -671,6 +676,22 @@ mod tests {
             .keywords
             .iter()
             .any(|k| k == "rust" || k == "expert"));
+    }
+
+    /// persona.toml tags land in the selection keyword corpus.
+    #[test]
+    fn profile_includes_tags_in_keywords() {
+        let mut src = minimal_source("helper", "neutral tone");
+        src.persona.tags = vec!["embedded".to_string(), "Firmware".to_string()];
+        let profile = PersonaProfile::from_source(&src);
+        assert!(
+            profile.keywords.iter().any(|k| k == "embedded"),
+            "tag should appear in keywords"
+        );
+        assert!(
+            profile.keywords.iter().any(|k| k == "firmware"),
+            "tags should be lowercased like the rest of the corpus"
+        );
     }
 
     /// PersonaIndex::build creates one profile per source.
