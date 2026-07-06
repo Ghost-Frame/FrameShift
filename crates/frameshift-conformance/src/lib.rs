@@ -11,6 +11,8 @@
 
 pub mod bundle;
 pub mod caller;
+#[cfg(feature = "cli-runner")]
+pub mod cli_runner;
 pub mod case;
 pub mod error;
 pub mod gate;
