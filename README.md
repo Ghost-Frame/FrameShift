@@ -64,103 +64,152 @@ frameshift feedback --auto-pick web-designer --chosen rust --intent debugging
 
 ## How it works
 
-Personas distribute as signed packs -- content-addressed tarballs with Ed25519 signatures and capability manifests. The CLI installs them into a central store outside your project tree. Your repo never gets persona files.
+Frameshift takes a typed persona definition, compiles it into the instruction file each agent expects, and distributes it as a signed, content-addressed pack that installs into a central store outside your project tree.
 
-All state lives in `$XDG_DATA_HOME/frameshift/`:
+### Packs
 
-```
-cache/<sha256>/                               # Content-addressed pack cache
-projects/<project-id>/
-  config.toml                                 # Declared dependencies
-  lock.toml                                   # Exact versions, hashes, author pubkeys
-  active                                      # Currently active persona name
-  personas/<name>/
-    source/                                   # Pack contents (AGENTS.md + pack.toml)
-    rendered/{claude,codex,gemini,generic}/    # Per-agent rendered output
-    growth.jsonl                              # Structured growth log (JSONL)
-  orchestrator/                               # Automate mode, preferences, audit log
-```
-
-Project ID is `sha256(realpath(project_root))`. Your project tree is never written to.
-
-## Persona source format
-
-A persona is a directory with two files:
-
-```
-personas/<name>/
-  AGENTS.md     # Persona body: identity, rules, frame, skills, growth integration
-  pack.toml     # Manifest: name, version, license, author, capabilities
-```
-
-Example `pack.toml`:
+A persona ships as a **pack**: a `pack.toml` manifest plus the persona's behavioral content. The manifest carries identity and contract metadata:
 
 ```toml
 schema_version = 1
 name = "cryptographic"
 version = "0.1.0"
 author_handle = "ghost-frame"
-author_pubkey = "ed25519:<hex>"
+author_pubkey = "1a2b3c..."  # 64 hex chars (Ed25519 verifying key)
 license = "Elastic-2.0"
+description = "Specification-anchored cryptographic implementation"
+tags = ["security", "rust"]
 
 [capability_manifest]
 required_tools = ["Read", "Edit", "Write", "Bash"]
 network_egress = false
-primary_intents = ["implementation", "security"]
-anti_keywords = ["frontend", "css", "react"]
+filesystem_scope = "project-only"
+memory_required = "none"
 ```
 
-`primary_intents` declares which task categories the persona handles best. `anti_keywords` lists tokens that should repel the selection engine away from this persona. Both fields are optional.
+`description` and `tags` feed registry search; `capability_manifest` declares the tools, network egress, filesystem scope, and memory requirement the persona expects (see Capabilities and Memory below). `extends` and `mixin` drive composition. `parent_hash` and `conformance_baseline` track version lineage.
 
-`AGENTS.md` is freeform markdown. Structure follows the behavioral-architecture pattern described in `personas/README.md`.
+### Content addressing and signatures
 
-A typed-source format (structured TOML with semantic diffs and patch operations) lives in the `frameshift-source` crate as the next-generation persona representation.
+Every pack has a **canonical hash**: a SHA-256 computed from its files by normalizing each relative path (NFC, forward slashes), sorting byte-lexicographically, and hashing `path \0 length \0 content \0` for each. Because it is derived from the directory's logical contents, the canonical hash is independent of how the pack is later archived or compressed -- two byte-identical pack directories always produce the same hash. This is the pack's identity and the exact value an author signs.
 
-## Growth
+Signing is Ed25519 over that 32-byte hash; the signature travels alongside the pack, never inside the tarball. On the wire the registry addresses the compressed `.tar.gz` by a second hash (the SHA-256 of the archive bytes), which the client checks on download before it extracts anything.
 
-Growth is local. Each persona accumulates structured learning entries as JSONL -- things learned, mistakes caught, patterns discovered. Entries carry session attribution, task context, and intent classification.
+### Trust: handle-bound keys, no central authority
+
+There is no central signing authority. An author **claims a handle** (e.g. `ghost-frame`) with a signed request, and the registry binds that handle to the key that signed it, first-claim-wins. Key rotation must be signed by the current key -- the old key authorizes its own replacement. At publish, the server checks that the live signer owns the handle and that the pack signature verifies against that registered key. On install from the registry, the client verifies the pack signature against the key in the **registry's record** for that version, not the key embedded in the manifest, so a tampered manifest cannot smuggle in a different key. Installing directly from a local path verifies a signature if one is present, and installs unsigned local packs as-is.
+
+### Install and the central store
+
+`frameshift install` resolves a pack (from the registry, or `--from-path`), verifies it, and materializes it into a central store -- your project tree is never written to. The project is keyed by `project-id = sha256(realpath(project_root))`, so the same directory always maps to the same state regardless of how you path to it.
+
+All state lives under `$XDG_DATA_HOME/frameshift/`:
+
+```
+cache/<canonical-hash>/                      Content-addressed pack cache (shared across projects)
+identity/ed25519-signing-key.bin             Your managed author signing key (mode 0600)
+projects/<project-id>/
+  config.toml                                Declared dependencies, telemetry opt-in, memory adapter
+  lock.toml                                  Exact versions, hashes, author pubkeys
+  active                                     Name of the currently active persona
+  automate.json  automate-prefs.json         Automate mode + learned selection biases
+  automate-audit.jsonl  automate-lock.json   Switch audit log + lock marker
+  selection-history.jsonl                    Local record of past selections
+  personas/<name>/
+    source/                                  The pack's own files
+    rendered/{claude,codex,gemini,generic}/  Per-agent rendered output
+    growth.md                                Append-only local growth log
+```
+
+The lockfile records each installed persona as name, version, author handle, author pubkey, and canonical hash. Re-running `install`/`sync` rebuilds the per-project `personas/` tree from the content-addressed cache to match the lockfile.
+
+### Rendering: one source, per-agent outputs
+
+A persona's typed source is four TOML files -- `persona.toml` (identity, voice, anchors), `rules.toml`, `skills.toml`, and `patterns.toml`. Rules carry a **layer**: L1 (non-negotiable invariants), L2 (contextual defaults, overridable with explicit justification), L3 (preferences).
+
+Rendering projects that source into Markdown, once per agent target, writing the file each agent expects into `rendered/<target>/`: `CLAUDE.md` for Claude, `AGENTS.md` for Codex and generic, `GEMINI.md` for Gemini. The targets differ in which sections they carry -- Claude and generic get the full document, Codex omits the Design Notes and Safety-Layer sections, Gemini omits Design Notes -- so the same source produces the idiom each agent reads best.
+
+### Composition: extends and mixins
+
+A pack can `extends` a single base persona and `mixin` a list of others. Composition merges in a fixed order -- base, then each mixin in turn, then the persona itself -- with later layers overriding earlier ones by rule or skill id (last write wins). One invariant is protected: a mixin can never override a base's **L1** rule, and a persona can override an inherited L1 rule only by explicitly opting in. A missing base or an illegal L1 override fails the install. Bases and mixins are resolved from the packs already installed in the same project.
+
+### Capabilities
+
+Each pack's `capability_manifest` declares the tools it expects, whether it needs network egress, its filesystem scope, and its memory requirement. Over MCP, Frameshift surfaces this contract as **advisory**: the `frameshift_capabilities` tool annotates a proposed tool list against the active persona's declared tools. It never blocks or hides the host agent's own tools -- the manifest names agent-side tools (Read, Bash, ...), a separate namespace from Frameshift's own MCP tools -- it only reports the contract.
+
+### Memory
+
+A persona can declare a memory requirement in its manifest, and it is enforced at activation: a persona with `memory_required = "hard"` refuses to activate unless the project declares a memory adapter (a `[memory]` table in the project's central `config.toml`), and a `"soft"` requirement activates with a warning. Frameshift defines a pluggable `MemoryAdapter` (store, search, recall, list, forget, health) with backends for HTTP APIs and local SQLite full-text search. Any knowledge system exposing those operations works; [Kleos](https://github.com/Ghost-Frame/Kleos) is the reference integration. The registry server can be configured with a backend via `MEMORY_BACKEND` and reports its status at `/v1/memory/health`.
+
+### Growth
+
+Each persona keeps an append-only local growth log at `personas/<name>/growth.md` -- things learned, mistakes caught, patterns discovered over a working session.
 
 ```bash
 frameshift grow append rust "orphan rules prevent implementing foreign traits on foreign types"
 ```
 
-Growth entries have two scopes. Project-scope entries stay with one project. Global-scope entries apply everywhere. The engine summarizes recent growth by deduplicating near-identical entries and picking the most recent per intent category.
+### Interfaces
 
-Legacy `growth.md` files migrate to JSONL with `migrate_growth_md`.
+The same selection engine backs every surface:
 
-## Memory
+- **CLI** -- `frameshift <command>` (see below).
+- **Stdio MCP server** -- a JSON-RPC server exposing tools (install, activate, list, select, use, automate, prefs, grow, capabilities) and prompts (`active_persona`, `select_persona`, `automate_status`) as slash commands in any MCP-capable agent.
+- **Watch daemon** -- an optional background service over a peer-authenticated Unix socket, offering install/activate/sync/gc operations to editor integrations.
+- **Registry / marketplace HTTP server** -- publish, search, download, and author/handle registration. The server and web frontend are under active development.
 
-Personas can declare a memory requirement in their pack manifest. The runtime satisfies it through a pluggable adapter trait with backends for HTTP APIs and local SQLite. Any knowledge system that exposes store/search/recall endpoints works -- [Kleos](https://github.com/Ghost-Frame/Kleos) is the reference integration.
+Automate mode itself is applied by the host integration: a session hook (or equivalent) reads the per-project automate flag, calls `frameshift select` for the current task, and activates the best-fit persona.
+
+### Semantic selection
+
+Selection blends language, lexical, intent, capability, and context signals. Built with the optional `embeddings` cargo feature, it adds a semantic channel: a local sentence-embedding model (all-MiniLM-L6-v2 on pure-Rust [candle](https://github.com/huggingface/candle), ~23 MB, downloaded on first use and cached) scores the task description against each persona's description and keywords by cosine similarity. The bonus is additive and capped -- it can lift a meaning-matching persona, never penalize one -- and everything degrades to the lexical channels when the feature is off or the model is unavailable. Default builds ship none of the ML stack.
 
 ## CLI
 
+Persona lifecycle:
+
 ```
-frameshift install <name@version> [--from-path <dir>]   Install a persona pack
-frameshift activate <name>                               Set active persona for this project
-frameshift use <name> --from <library>                   Install + activate + print rendered output
-frameshift select [--task TEXT] [--library DIR]           Rank personas by score/confidence/rationale
-           [--format table|json]
-frameshift automate on [--sensitivity 0.0-1.0]           Enable automate mode
-frameshift automate off                                  Disable automate mode
-frameshift automate status                               Print mode, sensitivity, active persona
-frameshift automate lock|unlock                          Pin/unpin current persona
-frameshift feedback --chosen <name> [--auto-pick <name>] Record a selection override
+frameshift install <name>[@<version>] [--from-path <dir>]  Install a pack (a bare name resolves the latest registry version)
+frameshift uninstall <persona>                             Remove a persona from this project (cache is kept for gc)
+frameshift activate <name>                                 Set the active persona for this project
+frameshift use <name> --from <library>                     Install + activate + print rendered output
+frameshift list                                            List installed personas and mark the active one
+frameshift sync                                            Reconcile the central store with the lockfile
+frameshift gc                                              Remove unreferenced cache entries
+frameshift migrate                                         Move legacy files into the central store
+```
+
+Selection and automate mode:
+
+```
+frameshift select [--task TEXT] [--library DIR] [--format table|json]   Rank personas by score/confidence/rationale
+frameshift automate on [--sensitivity 0.0-1.0]                          Enable automatic persona switching
+frameshift automate off | status | lock | unlock                        Disable / inspect / pin / unpin
+frameshift feedback --chosen <name> [--auto-pick <name>]                Record a selection override
            [--intent <intent>] [--reason <text>]
-frameshift grow append <persona> <text>                  Append to a persona's growth log
-frameshift prefs [show|reset]                            View or reset preference biases
-frameshift sync                                          Reconcile store with lockfile
-frameshift migrate                                       Move legacy files into central store
-frameshift gc                                            Remove unreferenced cache entries
-frameshift diff <a> <b>                                  Semantic diff between two personas
-frameshift render <persona>                              Render persona source to markdown
-frameshift verify <persona>                              Run conformance checks
-frameshift publish <persona>                             Publish a persona pack
-frameshift project-id                                    Print hashed project ID
+frameshift prefs [show|reset]                                           View or reset preference biases
+```
+
+Authoring and registry:
+
+```
+frameshift rule add <persona> --id <id> --layer <L1|L2|L3> --text <text>   Add a rule to a persona
+frameshift rule remove <persona> --id <id>                                 Remove a rule
+frameshift skill add <persona> --id <id> --text <when>                     Add a skill entry to a persona
+frameshift skill remove <persona> --id <id>                                Remove a skill entry
+frameshift grow append <persona> <text>                                    Append to a persona's growth log
+frameshift diff <a> <b>                                                    Semantic diff between two personas
+frameshift render <persona>                                                Render persona source to markdown
+frameshift verify <persona>                                                Run conformance checks
+frameshift register --server <url> --handle <handle> [--display-name <name>]   Claim an author handle
+frameshift publish <persona>                                               Publish a persona pack
+frameshift search [QUERY] [--tag <tag>] [--limit <n>]                      Search the registry
+frameshift project-id                                                      Print the hashed project ID
 ```
 
 ## What this repo contains
 
-- `crates/` -- Rust workspace: CLI, client engine, pack tooling, composition, conformance, catalog, memory, vault, object storage, HTTP server, MCP server, watch daemon, orchestrator, growth
+- `crates/` -- Rust workspace: CLI, client engine, pack tooling, composition, conformance, catalog, memory, vault, object storage, HTTP server, MCP server, watch daemon, orchestrator, embeddings, growth
 - `personas/` -- pack manifests for the persona library
 
 ## Building
@@ -168,6 +217,12 @@ frameshift project-id                                    Print hashed project ID
 ```bash
 cargo build
 cargo test
+```
+
+To include the semantic-selection channel (downloads a ~23 MB embedding model on first use):
+
+```bash
+cargo build -p frameshift-cli --features embeddings
 ```
 
 ### Running from source
