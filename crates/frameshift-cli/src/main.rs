@@ -251,9 +251,19 @@ fn run() -> Result<(), RunError> {
         // ------------------------------------------------------------------
         Command::Activate { persona } => {
             let client = make_client()?;
+            let project_root = current_dir()?;
             client
-                .activate(&current_dir()?, &persona)
+                .activate(&project_root, &persona)
                 .map_err(|e| RunError::General(e.to_string()))?;
+            // A soft memory requirement activates fine but deserves a heads-up.
+            if let Ok(status) = client.memory_requirement_status(&project_root, &persona) {
+                if status.soft_unmet() {
+                    eprintln!(
+                        "warning: {persona} works best with a memory adapter \
+                         (memory_required = \"soft\") but this project declares none"
+                    );
+                }
+            }
             println!("activated {persona}");
             Ok(())
         }

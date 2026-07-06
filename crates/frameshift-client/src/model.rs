@@ -14,6 +14,11 @@ pub struct ProjectConfig {
     /// sent when the user explicitly enables it (and an endpoint is configured).
     #[serde(default)]
     pub telemetry_opt_in: bool,
+    /// Optional memory-adapter declaration for this project. Personas whose
+    /// pack manifest sets `memory_required = "hard"` refuse to activate unless
+    /// this is present; `"soft"` personas surface a warning without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemoryConfig>,
 }
 
 impl Default for ProjectConfig {
@@ -22,8 +27,49 @@ impl Default for ProjectConfig {
             schema_version: SCHEMA_VERSION,
             project_id: None,
             telemetry_opt_in: false,
+            memory: None,
         }
     }
+}
+
+/// The memory-requirement posture of a persona within a project, combining
+/// the pack manifest's declared requirement with whether the project declares
+/// a memory adapter. Consumed by activation surfaces to refuse or warn.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryRequirementStatus {
+    /// Requirement declared by the persona's pack manifest.
+    pub requirement: frameshift_pack::MemoryRequirement,
+    /// Whether the project declares a `[memory]` adapter in config.toml.
+    pub memory_declared: bool,
+}
+
+impl MemoryRequirementStatus {
+    /// A hard requirement with no declared adapter: activation must refuse.
+    pub fn hard_unmet(&self) -> bool {
+        self.requirement == frameshift_pack::MemoryRequirement::Hard && !self.memory_declared
+    }
+
+    /// A soft requirement with no declared adapter: callers should warn.
+    pub fn soft_unmet(&self) -> bool {
+        self.requirement == frameshift_pack::MemoryRequirement::Soft && !self.memory_declared
+    }
+}
+
+/// A declared memory adapter for a project.
+///
+/// The sync client only records and validates the declaration; live
+/// connectivity checks belong to the async surfaces (daemon, server) that
+/// actually construct a `MemoryAdapter`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryConfig {
+    /// Adapter kind, e.g. `"http"` or `"sqlite"`.
+    pub adapter: String,
+    /// Endpoint URL for HTTP-backed adapters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// Database path for local file-backed adapters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

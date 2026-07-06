@@ -77,6 +77,17 @@ pub fn run_use(client: &Client, args: UseArgs) -> Result<(), CliError> {
             other => CliError::Orchestrator(other.to_string()),
         })?;
 
+    // A soft memory requirement activates fine but deserves a heads-up.
+    if let Ok(status) = client.memory_requirement_status(&project_root, &args.name) {
+        if status.soft_unmet() {
+            eprintln!(
+                "warning: {} works best with a memory adapter (memory_required = \"soft\") \
+                 but this project declares none",
+                args.name
+            );
+        }
+    }
+
     // Learn from the explicit choice: nudge future automatic selection toward
     // the persona the user activated. This writes the same `automate-prefs.json`
     // that `select` and the daemon read, so the bias actually closes the loop.

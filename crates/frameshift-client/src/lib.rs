@@ -12,7 +12,8 @@ mod selection;
 pub use error::ClientError;
 pub use model::{
     ClientOptions, GcReport, InstallReport, InstallRequest, InstallSource, LockedPersona, Lockfile,
-    PersonaSpec, ProjectConfig, ProjectPaths, SyncReport, SCHEMA_VERSION,
+    MemoryConfig, MemoryRequirementStatus, PersonaSpec, ProjectConfig, ProjectPaths, SyncReport,
+    SCHEMA_VERSION,
 };
 pub use publish::PublishOutcome;
 pub use registry::{RegistryPackSummary, RegistrySearchQuery, RegistrySearchResult};
@@ -203,9 +204,68 @@ impl Client {
             return Err(ClientError::PersonaNotInstalled(persona.to_string()));
         }
 
+        // Enforce the pack's declared memory contract: a hard requirement
+        // refuses to activate when the project declares no memory adapter.
+        // Soft requirements are surfaced as warnings by the CLI/MCP callers
+        // via `memory_requirement_status`.
+        let status = self.memory_requirement_status(project_root, persona)?;
+        if status.hard_unmet() {
+            return Err(ClientError::MemoryRequirementUnmet {
+                persona: persona.to_string(),
+                config_path: self.project_paths(project_root)?.config_path,
+            });
+        }
+
         let paths = self.project_paths(project_root)?;
         ensure_dir(&paths.project_state_dir)?;
         write_file(&paths.active_path, persona.as_bytes())
+    }
+
+    /// Report `persona`'s declared memory requirement against this project's
+    /// declared memory adapter.
+    ///
+    /// The requirement comes from `capability_manifest.memory_required` in the
+    /// persona's materialized `source/pack.toml`. A missing manifest file (e.g.
+    /// a bare local install) or an absent `capability_manifest` table reports
+    /// [`frameshift_pack::MemoryRequirement::None`]; an unreadable or invalid
+    /// manifest propagates its error.
+    pub fn memory_requirement_status(
+        &self,
+        project_root: &Path,
+        persona: &str,
+    ) -> Result<MemoryRequirementStatus, ClientError> {
+        let paths = self.project_paths(project_root)?;
+        let manifest_path = paths
+            .personas_dir
+            .join(persona)
+            .join("source")
+            .join("pack.toml");
+
+        let requirement = match fs::read_to_string(&manifest_path) {
+            Ok(raw) => toml::from_str::<frameshift_pack::PackManifest>(&raw)
+                .map_err(|source| ClientError::TomlDeserialize {
+                    path: manifest_path,
+                    source,
+                })?
+                .capability_manifest
+                .map(|cm| cm.memory_required)
+                .unwrap_or_default(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                frameshift_pack::MemoryRequirement::None
+            }
+            Err(source) => {
+                return Err(ClientError::Io {
+                    path: manifest_path,
+                    source,
+                })
+            }
+        };
+
+        let memory_declared = self.project_config(project_root)?.memory.is_some();
+        Ok(MemoryRequirementStatus {
+            requirement,
+            memory_declared,
+        })
     }
 
     /// Remove an installed persona from the project's lockfile and re-materialize

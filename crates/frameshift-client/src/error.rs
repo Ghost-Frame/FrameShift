@@ -154,6 +154,19 @@ pub enum ClientError {
     /// bare (version-less) install spec to.
     #[error("pack {0:?} exists in the registry but has no published version")]
     NoPublishedVersion(String),
+
+    /// The persona's pack manifest declares `memory_required = "hard"` but the
+    /// project declares no `[memory]` adapter in its config.toml.
+    #[error(
+        "persona {persona:?} requires a memory adapter (memory_required = \"hard\") but this \
+         project declares none; add a [memory] table to {config_path}"
+    )]
+    MemoryRequirementUnmet {
+        /// The persona that refused to activate.
+        persona: String,
+        /// The central project config.toml that would declare the adapter.
+        config_path: PathBuf,
+    },
 }
 
 /// Box the composition error so `ClientError` stays small while `?` on a bare
