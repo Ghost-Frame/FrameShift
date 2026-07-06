@@ -13,3 +13,17 @@ network_egress = false
 filesystem_scope = "project-only"
 memory_required = "none"
 memory_required_ops = []
+
+# Conformance baseline: a signed, tamper-evident claim about the persona's
+# behavior. `bundle_hash` is the sha256 of the canonical TOML for this persona's
+# private conformance bundle (personas-private/cryptographic/conformance/bundle.toml,
+# 6 regex cases covering audited-over-custom, constant-time comparison,
+# RustCrypto-not-OpenSSL, OsRng key generation, spec citation, secret wrapping).
+# The public catalog is manifest-only, so the bundle itself is not shipped here;
+# this claim travels with the pack and the regression gate rejects a version bump
+# whose bundle no longer hashes to this value. `score` is the asserted floor the
+# version claims on its own tests; it becomes a measured value once a real
+# (non-mock) conformance Runner lands.
+[conformance_baseline]
+score = 0.8
+bundle_hash = "990c06b85b1eb295ca8cbb21dc6541d8c4899c334880bd027efd1b588b30ce61"

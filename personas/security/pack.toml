@@ -13,3 +13,15 @@ network_egress = false
 filesystem_scope = "system"
 memory_required = "none"
 memory_required_ops = []
+
+# Signed, tamper-evident behavioral claim. bundle_hash is the sha256 of the
+# canonical TOML for this persona's private conformance bundle
+# (personas-private/security/conformance/bundle.toml, 5 regex cases:
+# noise-level classification, reject-undetectable, authorization-scope gate,
+# cred-not-hardcode, quietest-sufficient). The bundle is not shipped in the
+# manifest-only public catalog; this claim travels with the pack and the
+# regression gate rejects a version bump whose bundle no longer hashes to this.
+# score is the asserted floor, measured once a non-mock Runner lands.
+[conformance_baseline]
+score = 0.8
+bundle_hash = "cf38a913409a4b7bde0c437e59a71f33ba50be90561b8996c93b181fbd7b10ac"
