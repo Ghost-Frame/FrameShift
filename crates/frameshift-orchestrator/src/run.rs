@@ -30,7 +30,7 @@ use crate::error::OrchestratorError;
 use crate::feedback::Preferences;
 use crate::index::PersonaIndex;
 use crate::intent::Intent;
-use crate::policy::{rank, rank_with_embedder, PolicyWeights, Scored};
+use crate::policy::{rank_with_embedder, PolicyWeights, Scored};
 
 /// All inputs required to run a persona selection pass.
 pub struct SelectionInputs<'a> {
@@ -167,6 +167,18 @@ pub fn select_with_embedder(
 /// Returns an empty `SelectionOutput` (not an error) when both `catalog_root` is
 /// absent and `source_dirs` is empty.
 pub fn select_rich(inputs: &SelectionInputs<'_>) -> Result<SelectionOutput, OrchestratorError> {
+    select_rich_with_embedder(inputs, None)
+}
+
+/// Run a rich selection pass using an optional semantic `embedder`.
+///
+/// Identical to [`select_rich`] but threads `embedder` into the scorer so the
+/// semantic channel is active when one is supplied. Passing `None` reproduces
+/// [`select_rich`] exactly, so existing callers are unaffected.
+pub fn select_rich_with_embedder(
+    inputs: &SelectionInputs<'_>,
+    embedder: Option<&dyn Embedder>,
+) -> Result<SelectionOutput, OrchestratorError> {
     let index = if let Some(catalog_root) = &inputs.catalog_root {
         PersonaIndex::from_catalog(catalog_root)?
     } else {
@@ -186,7 +198,7 @@ pub fn select_rich(inputs: &SelectionInputs<'_>) -> Result<SelectionOutput, Orch
     };
 
     let ctx = sense(inputs.project_root, inputs.task_hint);
-    let ranked = rank(&ctx, &index, &inputs.weights, &inputs.prefs);
+    let ranked = rank_with_embedder(&ctx, &index, &inputs.weights, &inputs.prefs, embedder);
 
     let candidates = ranked
         .iter()

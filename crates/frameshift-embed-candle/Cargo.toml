@@ -1,0 +1,21 @@
+[package]
+name = "frameshift-embed-candle"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Candle-powered sentence embeddings (all-MiniLM-L6-v2) implementing the orchestrator's Embedder trait for semantic persona selection."
+
+[dependencies]
+frameshift-orchestrator = { path = "../frameshift-orchestrator" }
+# Pure-Rust inference stack: no native ONNX runtime to package per platform.
+candle-core = "0.11"
+candle-nn = "0.11"
+candle-transformers = "0.11"
+# HuggingFace tokenizer files (tokenizer.json) for the BERT wordpiece vocab.
+tokenizers = "0.23"
+# Model download-on-first-use with a local cache shared across projects.
+hf-hub = "0.5"
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

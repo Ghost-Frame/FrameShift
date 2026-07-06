@@ -7,9 +7,30 @@ use std::path::PathBuf;
 
 use clap::Args;
 use frameshift_client::Client;
-use frameshift_orchestrator::{PolicyWeights, Preferences, SelectionInputs};
+use frameshift_orchestrator::{Embedder, PolicyWeights, Preferences, SelectionInputs};
 
 use crate::util::CliError;
+
+/// Build the semantic embedder when the `embeddings` feature is enabled.
+///
+/// Model download or load failures degrade to `None` with a stderr warning,
+/// so selection falls back to the lexical channels instead of failing.
+#[cfg(feature = "embeddings")]
+fn make_embedder() -> Option<Box<dyn Embedder>> {
+    match frameshift_embed_candle::CandleEmbedder::from_hub() {
+        Ok(embedder) => Some(Box::new(embedder)),
+        Err(e) => {
+            eprintln!("warning: semantic embeddings unavailable ({e}); using lexical ranking only");
+            None
+        }
+    }
+}
+
+/// Without the `embeddings` feature there is never an embedder.
+#[cfg(not(feature = "embeddings"))]
+fn make_embedder() -> Option<Box<dyn Embedder>> {
+    None
+}
 
 /// Arguments for the `select` subcommand.
 #[derive(Debug, Args)]
@@ -72,17 +93,22 @@ pub fn run_select(client: &Client, args: SelectArgs) -> Result<(), CliError> {
         weights: PolicyWeights::default(),
     };
 
+    // Semantic channel: present only when built with the `embeddings` feature
+    // and the model loads; otherwise ranking is purely lexical/contextual.
+    let embedder = make_embedder();
+
     if args.format == "json" {
         // Emit the full SelectionOutput as structured JSON.
-        let output = frameshift_orchestrator::select_rich(&inputs)
-            .map_err(|e| CliError::Orchestrator(e.to_string()))?;
+        let output =
+            frameshift_orchestrator::select_rich_with_embedder(&inputs, embedder.as_deref())
+                .map_err(|e| CliError::Orchestrator(e.to_string()))?;
         let json = serde_json::to_string_pretty(&output)?;
         println!("{}", json);
         return Ok(());
     }
 
     // Default: table format using the ranked candidate list.
-    let ranked = frameshift_orchestrator::select(&inputs)
+    let ranked = frameshift_orchestrator::select_with_embedder(&inputs, embedder.as_deref())
         .map_err(|e| CliError::Orchestrator(e.to_string()))?;
 
     if ranked.is_empty() {

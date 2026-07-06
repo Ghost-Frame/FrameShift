@@ -11,11 +11,39 @@ use frameshift_client::Client;
 use frameshift_orchestrator::{
     audit::{now_timestamp, AuditLog, Transition},
     controller::{Decision, SwitchController, SwitchPolicy},
+    embed::Embedder,
     feedback::Preferences,
     mode::{Mode, ModeState},
     policy::PolicyWeights,
-    run::{select, SelectionInputs},
+    run::{select_with_embedder, SelectionInputs},
 };
+
+/// Return the process-wide semantic embedder, loading the model once on first
+/// use. A failed load (offline, corrupt cache) is remembered as `None` so the
+/// daemon does not retry the download every evaluation tick.
+#[cfg(feature = "embeddings")]
+fn shared_embedder() -> Option<&'static dyn Embedder> {
+    use std::sync::OnceLock;
+    static EMBEDDER: OnceLock<Option<frameshift_embed_candle::CandleEmbedder>> = OnceLock::new();
+    EMBEDDER
+        .get_or_init(
+            || match frameshift_embed_candle::CandleEmbedder::from_hub() {
+                Ok(e) => Some(e),
+                Err(e) => {
+                    tracing::warn!(error = %e, "semantic embeddings unavailable; lexical ranking only");
+                    None
+                }
+            },
+        )
+        .as_ref()
+        .map(|e| e as &dyn Embedder)
+}
+
+/// Without the `embeddings` feature there is never an embedder.
+#[cfg(not(feature = "embeddings"))]
+fn shared_embedder() -> Option<&'static dyn Embedder> {
+    None
+}
 
 /// Read the persona name recorded in the project's active marker, if any.
 ///
@@ -123,7 +151,7 @@ pub fn evaluate_and_apply(client: &Client, controller: &mut SwitchController, pr
         weights: PolicyWeights::default(),
     };
 
-    let ranked = match select(&inputs) {
+    let ranked = match select_with_embedder(&inputs, shared_embedder()) {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(error = %e, "orchestrator: selection failed");

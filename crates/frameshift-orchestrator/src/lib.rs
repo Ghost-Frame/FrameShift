@@ -36,8 +36,8 @@ pub use intent::{classify as classify_intent, Intent};
 pub use mode::{Mode, ModeState};
 pub use policy::{rank, rank_with_embedder, PolicyWeights, ScoreComponents, Scored};
 pub use run::{
-    select, select_rich, select_with_embedder, CandidateOutput, ContextSnapshot, SelectionInputs,
-    SelectionOutput,
+    select, select_rich, select_rich_with_embedder, select_with_embedder, CandidateOutput,
+    ContextSnapshot, SelectionInputs, SelectionOutput,
 };
 
 /// Facade that wires together the index, weights, policy, preferences, and controller.
