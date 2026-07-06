@@ -235,7 +235,12 @@ pub fn rank_with_embedder(
             } else {
                 ctx.task_tokens
                     .iter()
-                    .filter(|t| profile.anti_keywords.contains(t))
+                    .filter(|t| {
+                        profile
+                            .anti_keywords
+                            .iter()
+                            .any(|ak| ak.eq_ignore_ascii_case(t.as_str()))
+                    })
                     .count()
             };
             let lex_score = if anti_hit_count > 0 && !ctx.task_tokens.is_empty() {
@@ -679,8 +684,7 @@ mod tests {
         let baseline = rank(&ctx, &index, &weights, &Preferences::new());
 
         let emb = BagOfWordsEmbedder;
-        let ranked =
-            rank_with_embedder(&ctx, &index, &weights, &Preferences::new(), Some(&emb));
+        let ranked = rank_with_embedder(&ctx, &index, &weights, &Preferences::new(), Some(&emb));
 
         assert!(
             ranked[0].components.semantic > 0.0,

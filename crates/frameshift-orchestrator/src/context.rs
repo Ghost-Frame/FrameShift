@@ -173,16 +173,26 @@ fn walk(
             break;
         }
 
+        // Use the entry's own file type (this does not follow symlinks) so a
+        // planted symlink cannot redirect the walk outside the project tree.
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+
         let path = entry.path();
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
 
-        if path.is_dir() {
+        if file_type.is_dir() {
             if SKIP_DIRS.contains(&name_str.as_ref()) {
                 continue;
             }
             walk(&path, depth + 1, raw_counts, frameworks, file_count);
-        } else if path.is_file() {
+        } else if file_type.is_file() {
             *file_count += 1;
 
             // Check for framework marker files.

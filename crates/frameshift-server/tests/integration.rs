@@ -323,9 +323,10 @@ async fn download_pack_increments_download_counter() {
     let catalog = MockCatalog::new();
     {
         let mut state = catalog.state.write().unwrap();
-        state
-            .packs
-            .insert("counted-pack".to_string(), make_pack("counted-pack", author_key));
+        state.packs.insert(
+            "counted-pack".to_string(),
+            make_pack("counted-pack", author_key),
+        );
         state.versions.insert(
             ("counted-pack".to_string(), "1.0.0".to_string()),
             make_version("counted-pack", "1.0.0", hash, author_key),

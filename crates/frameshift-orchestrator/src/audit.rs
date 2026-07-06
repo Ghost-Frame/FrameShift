@@ -1,5 +1,7 @@
 //! Explainable audit log of persona transitions.
 
+use std::collections::VecDeque;
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use chrono::Utc;
@@ -34,25 +36,44 @@ pub struct AuditLog {
 }
 
 impl AuditLog {
+    /// Maximum number of audit entries retained in memory when loading. Entries
+    /// older than the most recent `MAX_AUDIT_ENTRIES` are dropped so a log grown
+    /// over a long-lived deployment cannot exhaust memory on load.
+    const MAX_AUDIT_ENTRIES: usize = 50_000;
+
     /// Load an audit log from a JSON-lines file.
     ///
-    /// Returns an empty `AuditLog` if the file does not exist. Each line must
-    /// be a valid JSON object matching `Transition`.
+    /// Returns an empty `AuditLog` if the file does not exist. Each non-empty
+    /// line must be a valid JSON object matching `Transition`. Only the most
+    /// recent `MAX_AUDIT_ENTRIES` are retained.
     pub fn load(path: &Path) -> Result<Self, OrchestratorError> {
+        Self::load_capped(path, Self::MAX_AUDIT_ENTRIES)
+    }
+
+    /// Load at most `max` most-recent entries, streaming the file line by line
+    /// so the full file contents are never held in memory at once.
+    fn load_capped(path: &Path, max: usize) -> Result<Self, OrchestratorError> {
         if !path.exists() {
             return Ok(AuditLog::default());
         }
-        let data = std::fs::read_to_string(path)?;
-        let mut entries = Vec::new();
-        for line in data.lines() {
+        let file = std::fs::File::open(path)?;
+        let reader = BufReader::new(file);
+        let mut entries: VecDeque<Transition> = VecDeque::new();
+        for line in reader.lines() {
+            let line = line?;
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
             }
             let t: Transition = serde_json::from_str(trimmed)?;
-            entries.push(t);
+            entries.push_back(t);
+            if max > 0 && entries.len() > max {
+                entries.pop_front();
+            }
         }
-        Ok(AuditLog { entries })
+        Ok(AuditLog {
+            entries: entries.into(),
+        })
     }
 
     /// Append a transition to both the in-memory log and the backing file.
@@ -180,5 +201,23 @@ mod tests {
         log.append(&path, make_transition(None, "only")).unwrap();
 
         assert_eq!(log.recent(100).len(), 1);
+    }
+
+    /// load_capped retains only the most recent `max` entries from the file.
+    #[test]
+    fn load_capped_keeps_most_recent() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("audit.jsonl");
+
+        let mut log = AuditLog::default();
+        for i in 0..5 {
+            log.append(&path, make_transition(None, &format!("p{i}")))
+                .unwrap();
+        }
+
+        let loaded = AuditLog::load_capped(&path, 3).unwrap();
+        assert_eq!(loaded.entries.len(), 3, "only the 3 most recent retained");
+        assert_eq!(loaded.entries.first().unwrap().to, "p2");
+        assert_eq!(loaded.entries.last().unwrap().to, "p4");
     }
 }
