@@ -27,7 +27,14 @@ pub(crate) fn classify_output(
     stderr: &str,
 ) -> Result<String, ConformanceError> {
     if !success {
-        let tail: String = stderr.chars().rev().take(400).collect::<String>().chars().rev().collect();
+        let tail: String = stderr
+            .chars()
+            .rev()
+            .take(400)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
         return Err(ConformanceError::Runner(format!(
             "agy exited with {code:?}: {tail}"
         )));
