@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+#
+# pre-push hook -- block a push that CI would reject.
+#
+# Runs the fast, no-compile gates (formatting + supply-chain audit) that have
+# historically slipped through to CI. These are cheap (no project build), so
+# they are safe to run on every push. Heavier gates (clippy, test) are NOT run
+# here to avoid rebuilding on every push; run `scripts/preflight.sh` for the
+# full local CI mirror before opening or updating a PR.
+#
+# Enable once per clone:
+#   git config core.hooksPath .githooks
+#
+# Bypass in an emergency (use sparingly, you own the CI result):
+#   git push --no-verify
+
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+preflight="$repo_root/scripts/preflight.sh"
+
+if [[ ! -x "$preflight" ]]; then
+    echo "pre-push: scripts/preflight.sh missing or not executable; skipping gate" >&2
+    exit 0
+fi
+
+echo "pre-push: running fast preflight (fmt + audit) ..."
+if ! "$preflight" --fast; then
+    echo "" >&2
+    echo "pre-push: BLOCKED -- fix the above before pushing (CI would fail)." >&2
+    echo "          run 'scripts/preflight.sh' for the full check, or" >&2
+    echo "          'git push --no-verify' to bypass (you own the CI result)." >&2
+    exit 1
+fi
+
+exit 0
