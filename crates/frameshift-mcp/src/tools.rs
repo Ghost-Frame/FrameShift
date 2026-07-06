@@ -439,8 +439,18 @@ fn call_activate(arguments: &serde_json::Value, client: &Client) -> ToolResult {
 
     match client.activate(&project_root, persona) {
         Ok(()) => {
-            let text = serde_json::json!({"activated": persona}).to_string();
-            ok_result(text)
+            // Annotate a soft memory requirement that the project cannot meet;
+            // hard requirements already failed activation inside the client.
+            let mut response = serde_json::json!({"activated": persona});
+            if let Ok(status) = client.memory_requirement_status(&project_root, persona) {
+                if status.soft_unmet() {
+                    response["memory_warning"] = serde_json::json!(format!(
+                        "{persona} works best with a memory adapter (memory_required = \
+                         \"soft\") but this project declares none"
+                    ));
+                }
+            }
+            ok_result(response.to_string())
         }
         Err(e) => err_result(format!("activate failed: {}", e)),
     }
