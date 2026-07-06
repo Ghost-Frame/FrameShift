@@ -54,11 +54,16 @@ impl SwitchPolicy {
     /// - z_threshold: 1.0 - sensitivity * 0.7 (range 1.0 to 0.3)
     /// - min_gap_fraction: 0.15 - sensitivity * 0.12 (range 0.15 to 0.03)
     /// - debounce_ticks: max(0, 3 - floor(sensitivity * 3)) (range 3 to 0)
+    /// - min_confidence: max(0, 0.5 - sensitivity) * 0.6 (range 0.3 to 0.0)
+    /// - switch_margin: max(0, 0.5 - sensitivity) * 0.3 (range 0.15 to 0.0)
     pub fn from_sensitivity(sensitivity: f32) -> Self {
         let s = sensitivity.clamp(0.0, 1.0);
         SwitchPolicy {
-            min_confidence: 0.0,
-            switch_margin: 0.0,
+            // Below the midpoint (the conservative end) impose a confidence floor
+            // and a score margin the challenger must clear; at and above 0.5 both
+            // are 0.0, leaving switching to the distribution/debounce heuristics.
+            min_confidence: (0.5 - s).max(0.0) * 0.6,
+            switch_margin: (0.5 - s).max(0.0) * 0.3,
             debounce_ticks: (3.0 - (s * 3.0).floor()).max(0.0) as u32,
             z_threshold: 1.0 - s * 0.7,
             min_gap_fraction: 0.15 - s * 0.12,
@@ -178,6 +183,47 @@ impl SwitchController {
         &self.state
     }
 
+    /// Return the name of the persona the controller currently tracks as active.
+    ///
+    /// Returns `Some` when the controller is `Active` or `Locked` on a named
+    /// persona, and `None` when `Off`, `Armed`, or `Locked` with no name. The
+    /// daemon uses this as its "last auto-pick" to detect when the on-disk
+    /// active marker has been changed out from under it (a manual override).
+    pub fn active_persona(&self) -> Option<&str> {
+        match &self.state {
+            AutomateState::Active { persona, .. } | AutomateState::Locked { persona } => {
+                if persona.is_empty() {
+                    None
+                } else {
+                    Some(persona.as_str())
+                }
+            }
+            AutomateState::Off | AutomateState::Armed => None,
+        }
+    }
+
+    /// Adopt an externally-applied persona as the new active baseline.
+    ///
+    /// Used when something outside the controller (a user manual switch) has
+    /// already changed the active persona. The controller records `persona` as
+    /// `Active` so subsequent `decide` calls apply hysteresis from the user's
+    /// choice rather than the controller's stale auto-pick, and so the same
+    /// override is not detected and re-learned on every tick. Debounce and
+    /// challenger tracking are reset. A user-asserted choice is treated as
+    /// maximally confident; the stored confidence is informational only and is
+    /// not read by `decide`. Locked state is left untouched.
+    pub fn adopt_active(&mut self, persona: &str) {
+        if matches!(self.state, AutomateState::Locked { .. }) {
+            return;
+        }
+        self.state = AutomateState::Active {
+            persona: persona.to_string(),
+            confidence: 1.0,
+        };
+        self.debounce_count = 0;
+        self.challenger = None;
+    }
+
     /// Evaluate a fresh ranking and decide whether to switch personas.
     ///
     /// Logic:
@@ -204,7 +250,10 @@ impl SwitchController {
 
         match &self.state.clone() {
             AutomateState::Off | AutomateState::Armed => {
-                // Armed/Off: accept top candidate immediately without threshold gating.
+                // Do not activate a candidate below the confidence floor.
+                if top.confidence < self.policy.min_confidence {
+                    return Decision::Hold;
+                }
                 self.state = AutomateState::Active {
                     persona: top.persona.clone(),
                     confidence: top.confidence,
@@ -223,6 +272,27 @@ impl SwitchController {
             } => {
                 if top.persona == *current {
                     // Same persona still at top -- reset challenger tracking, hold.
+                    self.debounce_count = 0;
+                    self.challenger = None;
+                    return Decision::Hold;
+                }
+
+                // Confidence floor: never switch to a challenger we are not
+                // confident in.
+                if top.confidence < self.policy.min_confidence {
+                    self.debounce_count = 0;
+                    self.challenger = None;
+                    return Decision::Hold;
+                }
+
+                // Margin floor: the challenger must beat the current active persona
+                // by at least switch_margin before any switch is considered.
+                let current_score = ranked
+                    .iter()
+                    .find(|s| s.persona == *current)
+                    .map(|s| s.score)
+                    .unwrap_or(0.0);
+                if top.score - current_score < self.policy.switch_margin {
                     self.debounce_count = 0;
                     self.challenger = None;
                     return Decision::Hold;
@@ -317,6 +387,8 @@ mod tests {
                 lexical: 0.0,
                 intent: 0.0,
                 capability: 0.0,
+                context: 0.0,
+                semantic: 0.0,
             },
         }
     }
@@ -520,5 +592,50 @@ mod tests {
         let policy = SwitchPolicy::from_sensitivity(0.5);
         assert!((policy.z_threshold - 0.65).abs() < 0.01);
         assert_eq!(policy.debounce_ticks, 2);
+        // At and above the midpoint the confidence/margin floors are disabled,
+        // so default behavior is governed by the distribution heuristics only.
+        assert_eq!(policy.min_confidence, 0.0);
+        assert_eq!(policy.switch_margin, 0.0);
+    }
+
+    /// A top candidate below min_confidence does not activate.
+    #[test]
+    fn min_confidence_blocks_low_confidence_activation() {
+        let policy = SwitchPolicy {
+            min_confidence: 0.5,
+            switch_margin: 0.0,
+            debounce_ticks: 0,
+            z_threshold: 0.65,
+            min_gap_fraction: 0.09,
+        };
+        let mut ctrl = SwitchController::new(policy);
+        ctrl.arm();
+        // Top candidate confidence 0.3 is below the 0.5 floor.
+        let ranked = vec![scored("alpha", 0.9, 0.3)];
+        let d = ctrl.decide(&ranked);
+        assert_eq!(d, Decision::Hold, "low-confidence top must not activate");
+        assert_eq!(*ctrl.state(), AutomateState::Armed, "state stays Armed");
+    }
+
+    /// A challenger that does not beat the active persona by switch_margin holds.
+    #[test]
+    fn switch_margin_blocks_marginal_challenger() {
+        let policy = SwitchPolicy {
+            min_confidence: 0.0,
+            switch_margin: 0.3,
+            debounce_ticks: 0,
+            z_threshold: 0.0,
+            min_gap_fraction: 0.0,
+        };
+        let mut ctrl = SwitchController::new(policy);
+        ctrl.arm();
+        // Activate alpha.
+        let ranked_a = vec![scored("alpha", 0.60, 0.9), scored("beta", 0.10, 0.2)];
+        ctrl.decide(&ranked_a);
+        // Beta edges ahead by only 0.05, below the 0.3 switch_margin. Without the
+        // margin floor the lenient z/gap/debounce settings would switch here.
+        let ranked_b = vec![scored("beta", 0.65, 0.9), scored("alpha", 0.60, 0.5)];
+        let d = ctrl.decide(&ranked_b);
+        assert_eq!(d, Decision::Hold, "margin below switch_margin must hold");
     }
 }

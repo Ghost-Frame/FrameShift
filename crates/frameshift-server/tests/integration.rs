@@ -308,6 +308,55 @@ async fn download_pack_502_when_blob_missing_from_objects() {
     assert_eq!(body["error"], "upstream backend mismatch");
 }
 
+/// `GET /v1/packs/{name}/versions/{version}/pack` calls `increment_download_counter`
+/// on a successful 200 response.
+///
+/// Regression test: before the fix, `download_pack_bytes` only called
+/// `record_download` (trending) and never `increment_download_counter`, so
+/// `total_downloads` on every pack was permanently 0.
+#[tokio::test]
+async fn download_pack_increments_download_counter() {
+    let blob = b"counted".to_vec();
+    let hash = ObjectHash::of(&blob);
+    let author_key = Ed25519PublicKey([5u8; 32]);
+
+    let catalog = MockCatalog::new();
+    {
+        let mut state = catalog.state.write().unwrap();
+        state.packs.insert(
+            "counted-pack".to_string(),
+            make_pack("counted-pack", author_key),
+        );
+        state.versions.insert(
+            ("counted-pack".to_string(), "1.0.0".to_string()),
+            make_version("counted-pack", "1.0.0", hash, author_key),
+        );
+    }
+    // Clone before moving into make_state -- both sides share the same
+    // Arc<RwLock<MockState>>, so writes through AppState are visible here.
+    let catalog_observer = catalog.clone();
+
+    let objects = MockPackStore::new();
+    objects.insert(hash, blob.clone());
+
+    let state = make_state(catalog, objects);
+    let resp = oneshot_get(state, "/v1/packs/counted-pack/versions/1.0.0/pack").await;
+    assert_eq!(resp.status(), StatusCode::OK, "download should succeed");
+
+    let increments = catalog_observer
+        .state
+        .read()
+        .unwrap()
+        .download_counter_increments
+        .get(&("counted-pack".to_string(), "1.0.0".to_string()))
+        .copied()
+        .unwrap_or(0);
+    assert_eq!(
+        increments, 1,
+        "increment_download_counter must be called exactly once per successful download"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // /v1/authors
 // ---------------------------------------------------------------------------

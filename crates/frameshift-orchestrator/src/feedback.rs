@@ -188,12 +188,23 @@ impl Preferences {
     }
 
     /// Persist preferences to a JSON file, creating parent directories as needed.
+    ///
+    /// The write is atomic: data is serialized to a uniquely-named temp file in
+    /// the same directory and then renamed over the target, so a crash or a
+    /// concurrent writer never leaves a half-written file that `load` would fail
+    /// to parse.
     pub fn save(&self, path: &Path) -> Result<(), OrchestratorError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let data = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, data)?;
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("preferences.json");
+        let tmp_path = path.with_file_name(format!(".{file_name}.tmp.{}", std::process::id()));
+        std::fs::write(&tmp_path, data.as_bytes())?;
+        std::fs::rename(&tmp_path, path)?;
         Ok(())
     }
 }
@@ -260,6 +271,28 @@ mod tests {
         let loaded = Preferences::load(&path).unwrap();
         assert!((loaded.bias_for("b") - prefs.bias_for("b")).abs() < f32::EPSILON);
         assert!((loaded.bias_for("a") - prefs.bias_for("a")).abs() < f32::EPSILON);
+    }
+
+    /// Saving writes atomically and leaves no temporary file behind.
+    #[test]
+    fn save_leaves_no_temp_file() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("prefs.json");
+
+        let mut prefs = Preferences::new();
+        prefs.record_override(Some("a"), "b");
+        prefs.save(&path).unwrap();
+
+        assert!(path.exists());
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        // No temp file should remain after a successful save.
+        assert!(leftovers.is_empty());
+        // And the saved file loads cleanly.
+        Preferences::load(&path).unwrap();
     }
 
     /// record_override_with_intent records a per-intent bias for the chosen persona.

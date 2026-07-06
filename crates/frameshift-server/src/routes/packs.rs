@@ -911,10 +911,24 @@ pub async fn download_pack_bytes(
     // Count successful direct-download responses.
     state.metrics.pack_downloads_total.inc();
 
-    // Record the download for trending ranking. Best-effort: a failure here must
-    // not fail the download the client already received.
+    // Record the download event for trending ranking -- feeds the 7-day velocity
+    // used by SortMode::Trending. Best-effort: a failure here must not fail the
+    // download the client already received.
     if let Err(e) = state.catalog.record_download(&name, &version).await {
         tracing::warn!(pack = %name, version = %version, error = %e, "record_download failed");
+    }
+
+    // Increment the cumulative download counter -- feeds `total_downloads` on
+    // the pack record shown on the marketplace catalog page. Best-effort: same
+    // policy as record_download above; warn and continue on failure. NotFound
+    // is unreachable here (the version record was fetched above), but the
+    // best-effort pattern handles it safely regardless.
+    if let Err(e) = state
+        .catalog
+        .increment_download_counter(&name, &version)
+        .await
+    {
+        tracing::warn!(pack = %name, version = %version, error = %e, "increment_download_counter failed");
     }
 
     Ok(response)

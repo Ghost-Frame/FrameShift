@@ -17,6 +17,20 @@ use frameshift_orchestrator::{
     run::{select, SelectionInputs},
 };
 
+/// Read the persona name recorded in the project's active marker, if any.
+///
+/// Returns `None` when the marker is absent, unreadable, or empty after
+/// trimming. Shared by the manual-override check and the audit `from` capture.
+fn read_active_persona(client: &Client, project_root: &Path) -> Option<String> {
+    match client.project_paths(project_root) {
+        Ok(paths) if paths.active_path.exists() => std::fs::read_to_string(&paths.active_path)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        _ => None,
+    }
+}
+
 /// Evaluate the current project context and apply a persona switch if warranted.
 ///
 /// Steps:
@@ -66,6 +80,31 @@ pub fn evaluate_and_apply(client: &Client, controller: &mut SwitchController, pr
         return;
     }
 
+    // Load learned preferences (shared with the CLI and the selection pass).
+    let mut prefs = Preferences::load(&prefs_path).unwrap_or_default();
+
+    // Manual-override learning (A1): if the persona on disk differs from the
+    // auto-pick the controller last applied, the user switched by hand. Reward
+    // their choice, decay the rejected auto-pick, persist the preference, and
+    // re-baseline the controller so the same override is not re-learned on every
+    // subsequent tick. The updated bias also feeds this tick's selection.
+    let auto_pick = controller.active_persona().map(str::to_string);
+    let active_now = read_active_persona(client, project_root);
+    if let (Some(auto), Some(chosen)) = (auto_pick.as_deref(), active_now.as_deref()) {
+        if auto != chosen {
+            prefs.record_override(Some(auto), chosen);
+            if let Err(e) = prefs.save(&prefs_path) {
+                tracing::warn!(error = %e, "orchestrator: failed to persist override preference");
+            }
+            controller.adopt_active(chosen);
+            tracing::info!(
+                from = %auto,
+                to = %chosen,
+                "orchestrator: learned manual persona override"
+            );
+        }
+    }
+
     // Step 3: collect persona source dirs and run selection.
     let source_dirs = match client.installed_persona_source_dirs(project_root) {
         Ok(dirs) => dirs,
@@ -74,8 +113,6 @@ pub fn evaluate_and_apply(client: &Client, controller: &mut SwitchController, pr
             return;
         }
     };
-
-    let prefs = Preferences::load(&prefs_path).unwrap_or_default();
 
     let inputs = SelectionInputs {
         project_root,
@@ -105,13 +142,7 @@ pub fn evaluate_and_apply(client: &Client, controller: &mut SwitchController, pr
     } = decision
     {
         // Read the currently active persona before overwriting the marker.
-        let from = match client.project_paths(project_root) {
-            Ok(paths) if paths.active_path.exists() => std::fs::read_to_string(&paths.active_path)
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty()),
-            _ => None,
-        };
+        let from = read_active_persona(client, project_root);
 
         tracing::info!(
             persona = %to,
@@ -381,5 +412,60 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A manual switch away from the daemon's auto-pick is learned: the chosen
+    /// persona is rewarded and the rejected auto-pick is decayed in the shared
+    /// preferences file, and the controller re-baselines to the manual choice.
+    /// Prior to A1 the daemon applied its own switches but never learned when
+    /// the user overrode them by hand.
+    #[test]
+    fn evaluate_learns_from_manual_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+
+        let data_root = tmp.path().join("data");
+        let client = test_client(&data_root);
+
+        // Enable automate mode (no lock) so evaluation proceeds.
+        let state_dir = client.orchestrator_state_dir(&project_root).unwrap();
+        fs::create_dir_all(&state_dir).unwrap();
+        let mode = ModeState {
+            mode: Mode::On,
+            sensitivity: 0.5,
+        };
+        mode.save(&state_dir.join("automate.json")).unwrap();
+
+        // Seed the controller's auto-pick deterministically, as if the daemon
+        // had activated "auto-pick" on a prior tick.
+        let mut controller = SwitchController::new(SwitchPolicy::default());
+        controller.adopt_active("auto-pick");
+
+        // Simulate the user manually switching to a different persona by writing
+        // the on-disk active marker directly.
+        let paths = client.project_paths(&project_root).unwrap();
+        if let Some(parent) = paths.active_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&paths.active_path, "manual-choice\n").unwrap();
+
+        // Tick: the daemon must detect the divergence and learn from it.
+        evaluate_and_apply(&client, &mut controller, &project_root);
+
+        let prefs_path = state_dir.join("automate-prefs.json");
+        let prefs = Preferences::load(&prefs_path).expect("preferences should load");
+        assert!(
+            prefs.bias_for("manual-choice") > 0.0,
+            "the user's manual choice must be rewarded"
+        );
+        assert!(
+            prefs.bias_for("auto-pick") < 0.0,
+            "the rejected auto-pick must be decayed"
+        );
+
+        // The controller re-baselines to the manual choice so the same override
+        // is not re-learned on the next tick.
+        assert_eq!(controller.active_persona(), Some("manual-choice"));
     }
 }

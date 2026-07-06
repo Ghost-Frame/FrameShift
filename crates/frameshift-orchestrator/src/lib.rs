@@ -15,6 +15,7 @@
 pub mod audit;
 pub mod context;
 pub mod controller;
+pub mod embed;
 pub mod error;
 pub mod feedback;
 pub mod index;
@@ -27,14 +28,16 @@ pub mod run;
 pub use audit::{now_timestamp, AuditLog, Transition};
 pub use context::{sense, ContextSignal};
 pub use controller::{AutomateState, Decision, SwitchController, SwitchPolicy};
+pub use embed::{cosine_similarity, semantic_similarity, Embedder};
 pub use error::OrchestratorError;
 pub use feedback::Preferences;
 pub use index::{PersonaIndex, PersonaProfile};
 pub use intent::{classify as classify_intent, Intent};
 pub use mode::{Mode, ModeState};
-pub use policy::{rank, PolicyWeights, ScoreComponents, Scored};
+pub use policy::{rank, rank_with_embedder, PolicyWeights, ScoreComponents, Scored};
 pub use run::{
-    select, select_rich, CandidateOutput, ContextSnapshot, SelectionInputs, SelectionOutput,
+    select, select_rich, select_with_embedder, CandidateOutput, ContextSnapshot, SelectionInputs,
+    SelectionOutput,
 };
 
 /// Facade that wires together the index, weights, policy, preferences, and controller.
@@ -136,6 +139,7 @@ mod tests {
             },
             frameworks: vec![],
             task_tokens: vec![],
+            context_tokens: vec![],
             inferred_intent: None,
         };
         // With only one persona and confidence depends on scoring; just verify no panic.

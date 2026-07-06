@@ -25,11 +25,12 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::context::sense;
+use crate::embed::Embedder;
 use crate::error::OrchestratorError;
 use crate::feedback::Preferences;
 use crate::index::PersonaIndex;
 use crate::intent::Intent;
-use crate::policy::{rank, PolicyWeights, Scored};
+use crate::policy::{rank, rank_with_embedder, PolicyWeights, Scored};
 
 /// All inputs required to run a persona selection pass.
 pub struct SelectionInputs<'a> {
@@ -127,6 +128,18 @@ pub struct ComponentsOutput {
 /// Returns an empty `Vec` (not an error) when both `catalog_root` is absent
 /// and `source_dirs` is empty.
 pub fn select(inputs: &SelectionInputs<'_>) -> Result<Vec<Scored>, OrchestratorError> {
+    select_with_embedder(inputs, None)
+}
+
+/// Run a persona selection pass using an optional semantic `embedder`.
+///
+/// Identical to [`select`] but threads `embedder` into the scorer so the
+/// semantic-similarity channel is active when an embedder is supplied. Passing
+/// `None` reproduces [`select`] exactly, so existing callers are unaffected.
+pub fn select_with_embedder(
+    inputs: &SelectionInputs<'_>,
+    embedder: Option<&dyn Embedder>,
+) -> Result<Vec<Scored>, OrchestratorError> {
     let index = if let Some(catalog_root) = &inputs.catalog_root {
         PersonaIndex::from_catalog(catalog_root)?
     } else {
@@ -141,7 +154,7 @@ pub fn select(inputs: &SelectionInputs<'_>) -> Result<Vec<Scored>, OrchestratorE
     }
 
     let ctx = sense(inputs.project_root, inputs.task_hint);
-    let ranked = rank(&ctx, &index, &inputs.weights, &inputs.prefs);
+    let ranked = rank_with_embedder(&ctx, &index, &inputs.weights, &inputs.prefs, embedder);
     Ok(ranked)
 }
 
