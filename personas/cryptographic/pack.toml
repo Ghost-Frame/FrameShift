@@ -21,9 +21,8 @@ memory_required_ops = []
 # RustCrypto-not-OpenSSL, OsRng key generation, spec citation, secret wrapping).
 # The public catalog is manifest-only, so the bundle itself is not shipped here;
 # this claim travels with the pack and the regression gate rejects a version bump
-# whose bundle no longer hashes to this value. `score` is the asserted floor the
-# version claims on its own tests; it becomes a measured value once a real
-# (non-mock) conformance Runner lands.
+# whose bundle no longer hashes to this value. `score` is the measured floor:
+# 1.0 across 2 runs (Gemini 3.1 Pro, 2026-07-07); every case passed.
 [conformance_baseline]
-score = 0.8
+score = 1.0
 bundle_hash = "990c06b85b1eb295ca8cbb21dc6541d8c4899c334880bd027efd1b588b30ce61"
