@@ -21,7 +21,7 @@ memory_required_ops = []
 # classify-blast-radius, heredoc-truncates-use-scp). The bundle is not shipped
 # in the manifest-only public catalog; this claim travels with the pack and the
 # regression gate rejects a version bump whose bundle no longer hashes to this.
-# score is the asserted floor, measured once a non-mock Runner lands.
+# score is the measured floor: 1.0 across 2 runs (Gemini 3.1 Pro, 2026-07-07), all cases pass.
 [conformance_baseline]
-score = 0.8
+score = 1.0
 bundle_hash = "a837149d20ae446ec770617ac5fea4a7f8db5e9b4bd29d4d28499c46f875051a"

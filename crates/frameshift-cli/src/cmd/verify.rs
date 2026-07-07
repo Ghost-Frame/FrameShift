@@ -1,10 +1,11 @@
 //! Implementation of the `frameshift verify` subcommand.
 //!
 //! Loads a conformance bundle from a persona's source directory (or a
-//! directly-specified bundle path), runs each test case through a
-//! [`MockRunner`] with a canned response, scores the results, and prints
-//! a summary table.  Returns an error if the overall score falls below the
-//! configured threshold.
+//! directly-specified bundle path), runs each test case through the runner
+//! selected by `--runner` (`MockRunner` with a canned response by default,
+//! or the `agy`-backed `CliRunner` when `--runner cli` is passed), scores
+//! the results, and prints a summary table.  Returns an error if the
+//! overall score falls below the configured threshold.
 
 use std::path::PathBuf;
 
@@ -15,6 +16,15 @@ use frameshift_conformance::{
 };
 
 use crate::util::{persona_source_dir, CliError};
+
+/// Which runner `verify` drives.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum RunnerKind {
+    /// Canned-response runner (default; offline, used by CI).
+    Mock,
+    /// Subscription-backed `agy` Gemini runner (needs a logged-in `agy`).
+    Cli,
+}
 
 /// Arguments for the `verify` subcommand.
 ///
@@ -36,13 +46,22 @@ pub struct VerifyArgs {
     /// Minimum passing score (0.0 to 1.0).
     #[arg(long, default_value = "0.5")]
     pub threshold: f32,
+
+    /// Runner backend: `mock` (default) or `cli` (agy/Gemini).
+    #[arg(long, value_enum, default_value = "mock")]
+    pub runner: RunnerKind,
+
+    /// Model name for the cli runner.
+    #[arg(long, default_value = "Gemini 3.1 Pro (High)")]
+    pub model: String,
 }
 
 /// Execute the `verify` subcommand.
 ///
 /// Resolves the bundle directory from `--persona` or `--bundle`, loads the
-/// bundle, runs each test case through a [`MockRunner`], prints a results
-/// table, and returns an error if the overall score is below the threshold.
+/// bundle, runs each test case through the runner selected by `--runner`,
+/// prints a results table, and returns an error if the overall score is
+/// below the threshold.
 pub fn run_verify(args: VerifyArgs) -> Result<(), CliError> {
     // Validate that exactly one of --persona or --bundle is specified.
     let bundle_dir = match (&args.persona, &args.bundle) {
@@ -57,7 +76,8 @@ pub fn run_verify(args: VerifyArgs) -> Result<(), CliError> {
             ));
         }
         (Some(name), None) => {
-            // Resolve the persona's conformance bundle subdirectory.
+            // Resolve the persona's source dir; the bundle is its `conformance`
+            // subdir and (for the cli runner) the persona text lives beside it.
             let client = Client::with_default_data_root()?;
             let source_dir = persona_source_dir(&client, name)?;
             source_dir.join("conformance")
@@ -68,8 +88,31 @@ pub fn run_verify(args: VerifyArgs) -> Result<(), CliError> {
     // Load the bundle from the directory.
     let bundle = load_from_dir(&bundle_dir).map_err(|e| CliError::Conformance(e.to_string()))?;
 
-    // Build the mock runner once and reuse it for every test case.
-    let runner = MockRunner::new(args.canned_response.clone());
+    // Build the chosen runner once and reuse it for every test case.
+    let runner: Box<dyn Runner> = match args.runner {
+        RunnerKind::Mock => Box::new(MockRunner::new(args.canned_response.clone())),
+        RunnerKind::Cli => {
+            let name = args
+                .persona
+                .as_deref()
+                .ok_or_else(|| CliError::Growth("--runner cli requires --persona".to_string()))?;
+            let client = Client::with_default_data_root()?;
+            let source_dir = persona_source_dir(&client, name)?;
+            let gemini = source_dir.join("GEMINI.md");
+            let persona_path = if gemini.exists() {
+                gemini
+            } else {
+                source_dir.join("AGENTS.md")
+            };
+            let persona_text = std::fs::read_to_string(&persona_path).map_err(|e| {
+                CliError::Conformance(format!("read persona {persona_path:?}: {e}"))
+            })?;
+            Box::new(
+                frameshift_conformance::CliRunner::new(&persona_text, args.model.clone())
+                    .map_err(|e| CliError::Conformance(e.to_string()))?,
+            )
+        }
+    };
 
     // Run each test case, collecting (TestCase, response) pairs.
     let rt = tokio::runtime::Runtime::new()
@@ -159,6 +202,8 @@ value = "{expected_value}"
             bundle: None,
             canned_response: String::new(),
             threshold: 0.5,
+            runner: RunnerKind::Mock,
+            model: "Gemini 3.1 Pro (High)".to_string(),
         };
         let result = run_verify(args);
         assert!(result.is_err(), "expected error when no args provided");
@@ -173,6 +218,8 @@ value = "{expected_value}"
             bundle: Some(tmp.path().to_path_buf()),
             canned_response: String::new(),
             threshold: 0.5,
+            runner: RunnerKind::Mock,
+            model: "Gemini 3.1 Pro (High)".to_string(),
         };
         let result = run_verify(args);
         assert!(result.is_err(), "expected error when both args provided");
@@ -189,6 +236,8 @@ value = "{expected_value}"
             bundle: Some(tmp.path().to_path_buf()),
             canned_response: "hello world".to_string(),
             threshold: 0.5,
+            runner: RunnerKind::Mock,
+            model: "Gemini 3.1 Pro (High)".to_string(),
         };
         let result = run_verify(args);
         assert!(
@@ -208,6 +257,8 @@ value = "{expected_value}"
             bundle: Some(tmp.path().to_path_buf()),
             canned_response: "goodbye".to_string(),
             threshold: 0.5,
+            runner: RunnerKind::Mock,
+            model: "Gemini 3.1 Pro (High)".to_string(),
         };
         let result = run_verify(args);
         // Score 0.0 < 0.5 threshold, so expect Err.
@@ -225,6 +276,8 @@ value = "{expected_value}"
             bundle: Some(tmp.path().to_path_buf()),
             canned_response: "hello world".to_string(),
             threshold: 0.5,
+            runner: RunnerKind::Mock,
+            model: "Gemini 3.1 Pro (High)".to_string(),
         };
         assert!(
             run_verify(args).is_ok(),
@@ -243,10 +296,35 @@ value = "{expected_value}"
             bundle: Some(tmp.path().to_path_buf()),
             canned_response: "goodbye".to_string(),
             threshold: 0.5,
+            runner: RunnerKind::Mock,
+            model: "Gemini 3.1 Pro (High)".to_string(),
         };
         assert!(
             run_verify(args).is_err(),
             "score 0.0 should fail threshold 0.5"
+        );
+    }
+
+    /// `--runner cli` without `--persona` must fail with the specific guard
+    /// error. A valid bundle is written first so execution reaches the
+    /// runner-selection arm where the guard lives (an empty bundle dir would
+    /// fail earlier in `load_from_dir` and never exercise the guard).
+    #[test]
+    fn verify_cli_runner_requires_persona() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_bundle(tmp.path(), "hello");
+        let args = VerifyArgs {
+            persona: None,
+            bundle: Some(tmp.path().to_path_buf()),
+            canned_response: String::new(),
+            threshold: 0.5,
+            runner: RunnerKind::Cli,
+            model: "Gemini 3.1 Pro (High)".to_string(),
+        };
+        let result = run_verify(args);
+        assert!(
+            matches!(result, Err(CliError::Growth(ref m)) if m.contains("requires --persona")),
+            "expected Growth error about --persona, got {result:?}"
         );
     }
 }
