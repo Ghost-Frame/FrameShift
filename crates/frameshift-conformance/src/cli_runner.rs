@@ -58,33 +58,32 @@ pub(crate) fn classify_output(
     Ok(trimmed.to_string())
 }
 
-/// Write `contents` to `path` as a plain file, first removing any symlink at
-/// `path`. `cp -a` preserves symlinks, and a bare `fs::write` would follow one
-/// and clobber a file outside the sandbox; removing it first prevents that.
-fn write_plain(path: &Path, contents: &[u8]) -> Result<(), ConformanceError> {
-    if let Ok(meta) = path.symlink_metadata() {
-        if meta.file_type().is_symlink() {
-            std::fs::remove_file(path)
-                .map_err(|e| ConformanceError::Runner(format!("unlink {path:?}: {e}")))?;
-        }
-    }
-    std::fs::write(path, contents)
-        .map_err(|e| ConformanceError::Runner(format!("write {path:?}: {e}")))
-}
+/// Files copied from the source `.gemini` into the isolated HOME: an allowlist
+/// of the credential and state files `agy` needs to authenticate and run
+/// headlessly. Everything else in the source directory -- the global
+/// `GEMINI.md`, hook registrations in `settings.json`, MCP config, extensions,
+/// skills, and session history -- is deliberately NOT copied, so no ambient
+/// context can contaminate a conformance run.
+const GEMINI_AUTH_FILES: &[&str] = &[
+    "oauth_creds.json",
+    "google_accounts.json",
+    "installation_id",
+    "projects.json",
+    "state.json",
+    "trustedFolders.json",
+];
 
-/// Build an isolated HOME whose `.gemini` mirrors `gemini_src` (auth intact)
-/// but whose global context is exactly `persona`.
+/// Build an isolated HOME whose `.gemini` contains only the allowlisted auth
+/// files plus the persona-under-test as the sole global `GEMINI.md`.
 ///
-/// Copies `gemini_src` with `cp -a` into `<home>/.gemini` (preserving symlinks
-/// and the `0600` creds mode), truncates the global appendix, removes the
-/// `hooks` symlink, and writes `persona` as `.gemini/GEMINI.md`. The returned
-/// `TempDir` owns the directory and deletes it on drop.
+/// Auth files are copied with `std::fs::copy` (kernel-level; their contents are
+/// never read into this process) which preserves their permission bits, so a
+/// `0600` credential stays `0600`. The returned `TempDir` owns the directory
+/// (created `0700` on Unix) and deletes it on drop.
 pub(crate) fn prepare_isolated_home(
     gemini_src: &Path,
     persona: &str,
 ) -> Result<TempDir, ConformanceError> {
-    // Isolated HOME with 0700 perms so the copied credential files are not
-    // exposed in a world-readable directory.
     #[cfg(unix)]
     let home = {
         use std::os::unix::fs::PermissionsExt;
@@ -96,37 +95,23 @@ pub(crate) fn prepare_isolated_home(
     #[cfg(not(unix))]
     let home =
         tempfile::tempdir().map_err(|e| ConformanceError::Runner(format!("tempdir: {e}")))?;
+
     let dst = home.path().join(".gemini");
+    std::fs::create_dir(&dst)
+        .map_err(|e| ConformanceError::Runner(format!("create .gemini: {e}")))?;
 
-    // Recursive, permission- and symlink-preserving copy. `cp -a src dst`
-    // creates dst as a copy of src when dst does not exist.
-    let status = std::process::Command::new("cp")
-        .arg("-a")
-        .arg(gemini_src)
-        .arg(&dst)
-        .status()
-        .map_err(|e| ConformanceError::Runner(format!("cp spawn: {e}")))?;
-    if !status.success() {
-        return Err(ConformanceError::Runner(format!(
-            "cp -a failed with {status:?}"
-        )));
+    // Copy only the allowlisted auth/state files that exist in the source.
+    for name in GEMINI_AUTH_FILES {
+        let src_file = gemini_src.join(name);
+        if src_file.exists() {
+            std::fs::copy(&src_file, dst.join(name))
+                .map_err(|e| ConformanceError::Runner(format!("copy {name}: {e}")))?;
+        }
     }
 
-    // Global context becomes exactly the persona under test (symlink-safe).
-    write_plain(&dst.join("GEMINI.md"), persona.as_bytes())?;
-
-    // Neutralize the global appendix if present (symlink-safe).
-    let appendix = dst.join("GEMINI-appendix.md");
-    if appendix.symlink_metadata().is_ok() {
-        write_plain(&appendix, b"")?;
-    }
-
-    // Remove the hooks symlink so hook-injected context cannot leak in.
-    let hooks = dst.join("hooks");
-    if hooks.symlink_metadata().is_ok() {
-        std::fs::remove_file(&hooks)
-            .map_err(|e| ConformanceError::Runner(format!("remove hooks: {e}")))?;
-    }
+    // The persona under test becomes the ONLY global context.
+    std::fs::write(dst.join("GEMINI.md"), persona)
+        .map_err(|e| ConformanceError::Runner(format!("write GEMINI.md: {e}")))?;
 
     Ok(home)
 }
@@ -155,6 +140,8 @@ impl CliRunner {
     /// Build a runner for `persona`, copying auth from the real `~/.gemini`.
     ///
     /// Errors if `$HOME` is unset or the isolated HOME cannot be prepared.
+    /// Blocks the calling thread while copying auth files; do not call from an
+    /// async task without `tokio::task::spawn_blocking`.
     pub fn new(persona: &str, model: impl Into<String>) -> Result<Self, ConformanceError> {
         let home = std::env::var("HOME")
             .map_err(|_| ConformanceError::Runner("HOME is not set".to_string()))?;
@@ -163,6 +150,8 @@ impl CliRunner {
     }
 
     /// Test seam: build a runner with an explicit program and source gemini dir.
+    /// Blocks the calling thread while copying auth files; do not call from an
+    /// async task without `tokio::task::spawn_blocking`.
     pub fn with_program_and_gemini_dir(
         persona: &str,
         model: impl Into<String>,
@@ -213,10 +202,12 @@ impl Runner for CliRunner {
     }
 }
 
+/// Unit and integration tests for the `cli-runner` module.
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// `assemble_args` places `-p <prompt>` before `--model <model>` in that order.
     #[test]
     fn assemble_args_orders_flags() {
         let args = assemble_args("Gemini 3.1 Pro (High)", "hello?");
@@ -226,18 +217,21 @@ mod tests {
         );
     }
 
+    /// A successful exit with non-empty stdout returns the trimmed output.
     #[test]
     fn classify_output_trims_success() {
         let r = classify_output(true, Some(0), "  Axum 0.8\n", "").expect("ok");
         assert_eq!(r, "Axum 0.8");
     }
 
+    /// A successful exit with whitespace-only stdout is treated as a failure.
     #[test]
     fn classify_output_rejects_empty() {
         let e = classify_output(true, Some(0), "   \n", "");
         assert!(matches!(e, Err(ConformanceError::Runner(_))));
     }
 
+    /// A non-zero exit is a failure whose error message includes the stderr tail.
     #[test]
     fn classify_output_rejects_nonzero() {
         let e = classify_output(false, Some(1), "", "boom");
@@ -247,80 +241,65 @@ mod tests {
         }
     }
 
+    /// Only the allowlisted auth files are copied; the persona is the sole
+    /// global context; ambient-context channels (settings.json hooks,
+    /// extensions, hooks symlink) are excluded.
     #[test]
-    fn isolated_home_bakes_persona_and_neutralizes_context() {
+    #[cfg(unix)]
+    fn isolated_home_allowlists_auth_and_excludes_context() {
         use std::fs;
-        // Build a fake ~/.gemini fixture: GIR global context + appendix + a hooks
-        // symlink target + a stand-in creds file.
         let src = tempfile::tempdir().expect("src");
-        fs::write(src.path().join("GEMINI.md"), "GIR TACOS").expect("w1");
-        fs::write(src.path().join("GEMINI-appendix.md"), "more gir").expect("w2");
-        fs::write(src.path().join("oauth_creds.json"), "{\"t\":1}").expect("w3");
-        let target = src.path().join("hooks-target");
-        fs::create_dir(&target).expect("mkdir");
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&target, src.path().join("hooks")).expect("symlink");
+        fs::write(src.path().join("oauth_creds.json"), "{\"t\":1}").expect("creds");
+        fs::write(src.path().join("installation_id"), "id123").expect("id");
+        fs::write(src.path().join("GEMINI.md"), "GIR TACOS").expect("gir");
+        fs::write(src.path().join("settings.json"), "{\"hooks\":{}}").expect("settings");
+        fs::create_dir(src.path().join("extensions")).expect("ext");
+        std::os::unix::fs::symlink(src.path().join("nonexistent"), src.path().join("hooks"))
+            .expect("hooks symlink");
 
         let home = prepare_isolated_home(src.path(), "PERSONA UNDER TEST").expect("prepare");
         let dst = home.path().join(".gemini");
 
         assert_eq!(
-            fs::read_to_string(dst.join("GEMINI.md")).expect("read gemini"),
+            fs::read_to_string(dst.join("oauth_creds.json")).expect("creds"),
+            "{\"t\":1}"
+        );
+        assert_eq!(
+            fs::read_to_string(dst.join("installation_id")).expect("id"),
+            "id123"
+        );
+        assert_eq!(
+            fs::read_to_string(dst.join("GEMINI.md")).expect("gemini"),
             "PERSONA UNDER TEST"
         );
-        assert_eq!(
-            fs::read_to_string(dst.join("GEMINI-appendix.md")).expect("read appendix"),
-            ""
+        assert!(
+            !dst.join("settings.json").exists(),
+            "settings.json (carries hooks) must not be copied"
         );
-        assert!(!dst.join("hooks").exists(), "hooks must be removed");
-        assert!(dst.join("oauth_creds.json").exists(), "creds must survive");
+        assert!(
+            !dst.join("extensions").exists(),
+            "extensions must not be copied"
+        );
+        assert!(!dst.join("hooks").exists(), "hooks must not be copied");
     }
 
-    /// A symlinked source GEMINI.md must not be written through: the external
-    /// target stays intact and the isolated copy is a plain file.
+    /// A source with no `GEMINI.md` (fresh gemini-cli install) still yields a
+    /// persona-only global context.
     #[test]
     #[cfg(unix)]
-    fn isolated_home_does_not_write_through_symlinked_gemini_md() {
-        use std::fs;
-        let ext = tempfile::tempdir().expect("ext");
-        let real = ext.path().join("real_gemini.md");
-        fs::write(&real, "EXTERNAL CONTENT").expect("write real");
-
-        let src = tempfile::tempdir().expect("src");
-        std::os::unix::fs::symlink(&real, src.path().join("GEMINI.md")).expect("symlink");
-
-        let home = prepare_isolated_home(src.path(), "PERSONA").expect("prepare");
-        let dst_gemini = home.path().join(".gemini").join("GEMINI.md");
-
-        assert_eq!(
-            fs::read_to_string(&dst_gemini).expect("read dst"),
-            "PERSONA"
-        );
-        assert!(!dst_gemini
-            .symlink_metadata()
-            .expect("meta")
-            .file_type()
-            .is_symlink());
-        assert_eq!(
-            fs::read_to_string(&real).expect("read real"),
-            "EXTERNAL CONTENT"
-        );
-    }
-
-    /// A dangling `hooks` symlink is removed without error.
-    #[test]
-    #[cfg(unix)]
-    fn isolated_home_handles_dangling_hooks_symlink() {
+    fn isolated_home_writes_persona_when_source_has_none() {
         use std::fs;
         let src = tempfile::tempdir().expect("src");
-        fs::write(src.path().join("GEMINI.md"), "g").expect("w");
-        std::os::unix::fs::symlink(src.path().join("nonexistent"), src.path().join("hooks"))
-            .expect("symlink");
-
+        fs::write(src.path().join("oauth_creds.json"), "{}").expect("creds");
         let home = prepare_isolated_home(src.path(), "P").expect("prepare");
-        assert!(!home.path().join(".gemini").join("hooks").exists());
+        assert_eq!(
+            fs::read_to_string(home.path().join(".gemini").join("GEMINI.md")).expect("gemini"),
+            "P"
+        );
     }
 
+    /// `CliRunner::run` spawns the configured stub program and returns its
+    /// trimmed stdout.
     #[tokio::test]
     async fn cli_runner_invokes_program_and_returns_stdout() {
         use std::fs;
