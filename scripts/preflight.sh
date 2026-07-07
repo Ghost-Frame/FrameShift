@@ -20,9 +20,10 @@ cd "$(git rev-parse --show-toplevel)"
 # The advisories CI ignores. Keep this in sync with the `ignore:` field in
 # .github/workflows/ci.yml (see that file for the full justification of each):
 #   RUSTSEC-2024-0370  proc-macro-error unmaintained (build-time only, age -> i18n-embed-fl)
+#   RUSTSEC-2024-0436  proc-macro-error unmaintained (same crate/path as -0370, second advisory id)
 #   RUSTSEC-2026-0194  quick-xml < 0.41 quadratic duplicate-attribute check (object_store -> R2, trusted XML)
 #   RUSTSEC-2026-0195  quick-xml < 0.41 unbounded namespace allocation (same path)
-AUDIT_IGNORE=(RUSTSEC-2024-0370 RUSTSEC-2026-0194 RUSTSEC-2026-0195)
+AUDIT_IGNORE=(RUSTSEC-2024-0370 RUSTSEC-2024-0436 RUSTSEC-2026-0194 RUSTSEC-2026-0195)
 
 fast_only=0
 if [[ "${1:-}" == "--fast" ]]; then

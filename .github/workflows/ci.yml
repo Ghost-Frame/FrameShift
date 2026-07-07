@@ -93,6 +93,10 @@ jobs:
   #   to the 0.11 BETA, unacceptable for the crate backing local vault
   #   encryption. Re-evaluate when age ships a stable 0.11.
   #
+  # - RUSTSEC-2024-0436 (proc-macro-error, unmaintained): a second advisory id
+  #   filed against the same build-time-only proc-macro-error crate as -0370,
+  #   same transitive path and same rationale. Drops together with -0370.
+  #
   # - RUSTSEC-2026-0194 + RUSTSEC-2026-0195 (quick-xml < 0.41, DoS: quadratic
   #   duplicate-attribute check and unbounded namespace-declaration allocation):
   #   pulled ONLY by object_store 0.13 -> frameshift-objects-r2 (R2 storage, aws
@@ -112,7 +116,7 @@ jobs:
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          ignore: RUSTSEC-2024-0370,RUSTSEC-2026-0194,RUSTSEC-2026-0195
+          ignore: RUSTSEC-2024-0370,RUSTSEC-2024-0436,RUSTSEC-2026-0194,RUSTSEC-2026-0195
 
 # Later tier (intentionally not yet wired, tracked in the roadmap):
 #   - cargo-deny (needs a deny.toml: license allowlist, ban list, advisory policy)
