@@ -14,6 +14,9 @@ path = "src/main.rs"
 frameshift-client = { path = "../frameshift-client" }
 frameshift-source = { path = "../frameshift-source" }
 frameshift-growth = { path = "../frameshift-growth" }
+# cli-runner is enabled intentionally: the shipped `frameshift` binary supports
+# `verify --runner cli`. The feature stays off in the conformance crate's own
+# default set; `mock` remains the default runner and the mock/CI path is unchanged.
 frameshift-conformance = { path = "../frameshift-conformance", features = ["cli-runner"] }
 frameshift-orchestrator = { path = "../frameshift-orchestrator" }
 frameshift-embed-candle = { path = "../frameshift-embed-candle", optional = true }
