@@ -1,10 +1,11 @@
 //! Implementation of the `frameshift verify` subcommand.
 //!
 //! Loads a conformance bundle from a persona's source directory (or a
-//! directly-specified bundle path), runs each test case through a
-//! [`MockRunner`] with a canned response, scores the results, and prints
-//! a summary table.  Returns an error if the overall score falls below the
-//! configured threshold.
+//! directly-specified bundle path), runs each test case through the runner
+//! selected by `--runner` (`MockRunner` with a canned response by default,
+//! or the `agy`-backed `CliRunner` when `--runner cli` is passed), scores
+//! the results, and prints a summary table.  Returns an error if the
+//! overall score falls below the configured threshold.
 
 use std::path::PathBuf;
 
@@ -58,8 +59,9 @@ pub struct VerifyArgs {
 /// Execute the `verify` subcommand.
 ///
 /// Resolves the bundle directory from `--persona` or `--bundle`, loads the
-/// bundle, runs each test case through a [`MockRunner`], prints a results
-/// table, and returns an error if the overall score is below the threshold.
+/// bundle, runs each test case through the runner selected by `--runner`,
+/// prints a results table, and returns an error if the overall score is
+/// below the threshold.
 pub fn run_verify(args: VerifyArgs) -> Result<(), CliError> {
     // Validate that exactly one of --persona or --bundle is specified.
     let bundle_dir = match (&args.persona, &args.bundle) {
@@ -303,10 +305,14 @@ value = "{expected_value}"
         );
     }
 
-    /// `--runner cli` without `--persona` must error (no source dir to load).
+    /// `--runner cli` without `--persona` must fail with the specific guard
+    /// error. A valid bundle is written first so execution reaches the
+    /// runner-selection arm where the guard lives (an empty bundle dir would
+    /// fail earlier in `load_from_dir` and never exercise the guard).
     #[test]
     fn verify_cli_runner_requires_persona() {
         let tmp = tempfile::tempdir().expect("tempdir");
+        write_bundle(tmp.path(), "hello");
         let args = VerifyArgs {
             persona: None,
             bundle: Some(tmp.path().to_path_buf()),
@@ -316,6 +322,9 @@ value = "{expected_value}"
             model: "Gemini 3.1 Pro (High)".to_string(),
         };
         let result = run_verify(args);
-        assert!(result.is_err(), "cli runner without --persona must error");
+        assert!(
+            matches!(result, Err(CliError::Growth(ref m)) if m.contains("requires --persona")),
+            "expected Growth error about --persona, got {result:?}"
+        );
     }
 }
