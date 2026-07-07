@@ -2,7 +2,11 @@
 //! an isolated workspace. Behind the `cli-runner` feature.
 
 use crate::error::ConformanceError;
+use crate::runner::Runner;
+use async_trait::async_trait;
 use std::path::Path;
+use std::path::PathBuf;
+use std::time::Duration;
 use tempfile::TempDir;
 
 /// Build the `agy` argument vector for a single headless call.
@@ -123,6 +127,77 @@ pub(crate) fn prepare_isolated_home(
     Ok(home)
 }
 
+/// Default per-call ceiling for an `agy` invocation.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Conformance runner that drives the `agy` Gemini CLI with the persona applied
+/// as the isolated HOME's global context. Persona-scoped: build one per persona
+/// and reuse it across that bundle's test cases.
+pub struct CliRunner {
+    /// Isolated HOME whose `.gemini/GEMINI.md` is the persona under test.
+    iso_home: TempDir,
+    /// Model name passed to `agy --model`.
+    model: String,
+    /// Program to invoke (`agy` in production; a stub in tests).
+    program: String,
+    /// Per-call timeout.
+    timeout: Duration,
+}
+
+impl CliRunner {
+    /// Build a runner for `persona`, copying auth from the real `~/.gemini`.
+    ///
+    /// Errors if `$HOME` is unset or the isolated HOME cannot be prepared.
+    pub fn new(persona: &str, model: impl Into<String>) -> Result<Self, ConformanceError> {
+        let home = std::env::var("HOME")
+            .map_err(|_| ConformanceError::Runner("HOME is not set".to_string()))?;
+        let gemini_dir = PathBuf::from(home).join(".gemini");
+        Self::with_program_and_gemini_dir(persona, model, "agy".to_string(), gemini_dir)
+    }
+
+    /// Test seam: build a runner with an explicit program and source gemini dir.
+    pub fn with_program_and_gemini_dir(
+        persona: &str,
+        model: impl Into<String>,
+        program: String,
+        gemini_dir: PathBuf,
+    ) -> Result<Self, ConformanceError> {
+        let iso_home = prepare_isolated_home(&gemini_dir, persona)?;
+        Ok(Self {
+            iso_home,
+            model: model.into(),
+            program,
+            timeout: DEFAULT_TIMEOUT,
+        })
+    }
+}
+
+#[async_trait]
+impl Runner for CliRunner {
+    async fn run(&self, prompt: &str) -> Result<String, ConformanceError> {
+        let args = assemble_args(&self.model, prompt);
+        let fut = tokio::process::Command::new(&self.program)
+            .args(&args)
+            .current_dir(self.iso_home.path())
+            .env("HOME", self.iso_home.path())
+            .output();
+
+        let output = tokio::time::timeout(self.timeout, fut)
+            .await
+            .map_err(|_| ConformanceError::Runner("agy timed out".to_string()))?
+            .map_err(|e| ConformanceError::Runner(format!("agy spawn: {e}")))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        classify_output(
+            output.status.success(),
+            output.status.code(),
+            &stdout,
+            &stderr,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,5 +304,53 @@ mod tests {
 
         let home = prepare_isolated_home(src.path(), "P").expect("prepare");
         assert!(!home.path().join(".gemini").join("hooks").exists());
+    }
+
+    #[tokio::test]
+    async fn cli_runner_invokes_program_and_returns_stdout() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        // Fake ~/.gemini so prepare_isolated_home succeeds.
+        let gem = tempfile::tempdir().expect("gem");
+        fs::write(gem.path().join("GEMINI.md"), "x").expect("w");
+
+        // Stub "agy": a script that ignores its args and prints a canned line.
+        let bindir = tempfile::tempdir().expect("bin");
+        let stub = bindir.path().join("agy-stub");
+        fs::write(&stub, "#!/bin/sh\necho 'Axum 0.8 is the answer'\n").expect("stub");
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let runner = CliRunner::with_program_and_gemini_dir(
+            "PERSONA",
+            "Gemini 3.1 Pro (High)",
+            stub.to_string_lossy().to_string(),
+            gem.path().to_path_buf(),
+        )
+        .expect("build runner");
+
+        let out = runner.run("which web framework?").await.expect("run");
+        assert!(out.contains("Axum 0.8"), "got: {out}");
+    }
+
+    /// Real end-to-end check against `agy`. Run manually:
+    /// `cargo test -p frameshift-conformance --features cli-runner real_agy -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn real_agy_rust_persona_scores_axum() {
+        let persona = std::fs::read_to_string(format!(
+            "{}/.local/share/frameshift/personas-private/rust/AGENTS.md",
+            std::env::var("HOME").unwrap()
+        ))
+        .expect("read rust persona");
+        let runner = CliRunner::new(&persona, "Gemini 3.1 Pro (High)").expect("runner");
+        let out = runner
+            .run("Which web framework should I build this HTTP service on?")
+            .await
+            .expect("run");
+        println!("RESPONSE:\n{out}");
+        let re = regex::Regex::new("(?i)axum").unwrap();
+        assert!(re.is_match(&out), "expected axum in response, got: {out}");
+        assert!(!out.to_lowercase().contains("taco"), "GIR bleed detected");
     }
 }

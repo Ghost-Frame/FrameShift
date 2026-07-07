@@ -14,6 +14,8 @@ pub mod caller;
 pub mod case;
 #[cfg(feature = "cli-runner")]
 pub mod cli_runner;
+#[cfg(feature = "cli-runner")]
+pub use cli_runner::CliRunner;
 pub mod error;
 pub mod gate;
 pub mod runner;
