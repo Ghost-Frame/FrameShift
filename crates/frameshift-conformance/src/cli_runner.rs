@@ -50,6 +50,20 @@ pub(crate) fn classify_output(
     Ok(trimmed.to_string())
 }
 
+/// Write `contents` to `path` as a plain file, first removing any symlink at
+/// `path`. `cp -a` preserves symlinks, and a bare `fs::write` would follow one
+/// and clobber a file outside the sandbox; removing it first prevents that.
+fn write_plain(path: &Path, contents: &[u8]) -> Result<(), ConformanceError> {
+    if let Ok(meta) = path.symlink_metadata() {
+        if meta.file_type().is_symlink() {
+            std::fs::remove_file(path)
+                .map_err(|e| ConformanceError::Runner(format!("unlink {path:?}: {e}")))?;
+        }
+    }
+    std::fs::write(path, contents)
+        .map_err(|e| ConformanceError::Runner(format!("write {path:?}: {e}")))
+}
+
 /// Build an isolated HOME whose `.gemini` mirrors `gemini_src` (auth intact)
 /// but whose global context is exactly `persona`.
 ///
@@ -61,6 +75,17 @@ pub(crate) fn prepare_isolated_home(
     gemini_src: &Path,
     persona: &str,
 ) -> Result<TempDir, ConformanceError> {
+    // Isolated HOME with 0700 perms so the copied credential files are not
+    // exposed in a world-readable directory.
+    #[cfg(unix)]
+    let home = {
+        use std::os::unix::fs::PermissionsExt;
+        tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .map_err(|e| ConformanceError::Runner(format!("tempdir: {e}")))?
+    };
+    #[cfg(not(unix))]
     let home =
         tempfile::tempdir().map_err(|e| ConformanceError::Runner(format!("tempdir: {e}")))?;
     let dst = home.path().join(".gemini");
@@ -79,15 +104,13 @@ pub(crate) fn prepare_isolated_home(
         )));
     }
 
-    // Global context becomes exactly the persona under test.
-    std::fs::write(dst.join("GEMINI.md"), persona)
-        .map_err(|e| ConformanceError::Runner(format!("write GEMINI.md: {e}")))?;
+    // Global context becomes exactly the persona under test (symlink-safe).
+    write_plain(&dst.join("GEMINI.md"), persona.as_bytes())?;
 
-    // Neutralize the appendix if present.
+    // Neutralize the global appendix if present (symlink-safe).
     let appendix = dst.join("GEMINI-appendix.md");
-    if appendix.exists() {
-        std::fs::write(&appendix, b"")
-            .map_err(|e| ConformanceError::Runner(format!("blank appendix: {e}")))?;
+    if appendix.symlink_metadata().is_ok() {
+        write_plain(&appendix, b"")?;
     }
 
     // Remove the hooks symlink so hook-injected context cannot leak in.
@@ -161,5 +184,50 @@ mod tests {
         );
         assert!(!dst.join("hooks").exists(), "hooks must be removed");
         assert!(dst.join("oauth_creds.json").exists(), "creds must survive");
+    }
+
+    /// A symlinked source GEMINI.md must not be written through: the external
+    /// target stays intact and the isolated copy is a plain file.
+    #[test]
+    #[cfg(unix)]
+    fn isolated_home_does_not_write_through_symlinked_gemini_md() {
+        use std::fs;
+        let ext = tempfile::tempdir().expect("ext");
+        let real = ext.path().join("real_gemini.md");
+        fs::write(&real, "EXTERNAL CONTENT").expect("write real");
+
+        let src = tempfile::tempdir().expect("src");
+        std::os::unix::fs::symlink(&real, src.path().join("GEMINI.md")).expect("symlink");
+
+        let home = prepare_isolated_home(src.path(), "PERSONA").expect("prepare");
+        let dst_gemini = home.path().join(".gemini").join("GEMINI.md");
+
+        assert_eq!(
+            fs::read_to_string(&dst_gemini).expect("read dst"),
+            "PERSONA"
+        );
+        assert!(!dst_gemini
+            .symlink_metadata()
+            .expect("meta")
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            fs::read_to_string(&real).expect("read real"),
+            "EXTERNAL CONTENT"
+        );
+    }
+
+    /// A dangling `hooks` symlink is removed without error.
+    #[test]
+    #[cfg(unix)]
+    fn isolated_home_handles_dangling_hooks_symlink() {
+        use std::fs;
+        let src = tempfile::tempdir().expect("src");
+        fs::write(src.path().join("GEMINI.md"), "g").expect("w");
+        std::os::unix::fs::symlink(src.path().join("nonexistent"), src.path().join("hooks"))
+            .expect("symlink");
+
+        let home = prepare_isolated_home(src.path(), "P").expect("prepare");
+        assert!(!home.path().join(".gemini").join("hooks").exists());
     }
 }
