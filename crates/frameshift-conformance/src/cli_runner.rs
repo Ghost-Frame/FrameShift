@@ -26,6 +26,10 @@ pub(crate) fn assemble_args(model: &str, prompt: &str) -> Vec<String> {
 ///
 /// Non-zero exit or empty (whitespace-only) stdout are failures. On success the
 /// trimmed stdout is returned.
+///
+/// On failure the returned error may include a trailing slice of the process
+/// stderr for diagnostics; treat `ConformanceError::Runner` as potentially
+/// sensitive at call sites that log it.
 pub(crate) fn classify_output(
     success: bool,
     code: Option<i32>,
@@ -133,6 +137,8 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(180);
 /// Conformance runner that drives the `agy` Gemini CLI with the persona applied
 /// as the isolated HOME's global context. Persona-scoped: build one per persona
 /// and reuse it across that bundle's test cases.
+/// Not safe for concurrent `run` calls on one instance: they share a single
+/// isolated HOME, so drive a given runner sequentially.
 pub struct CliRunner {
     /// Isolated HOME whose `.gemini/GEMINI.md` is the persona under test.
     iso_home: TempDir,
@@ -144,6 +150,7 @@ pub struct CliRunner {
     timeout: Duration,
 }
 
+/// Construction helpers for [`CliRunner`].
 impl CliRunner {
     /// Build a runner for `persona`, copying auth from the real `~/.gemini`.
     ///
@@ -173,13 +180,21 @@ impl CliRunner {
 }
 
 #[async_trait]
+/// Runs each conformance prompt through `agy` with the persona applied as the
+/// isolated HOME's global context.
 impl Runner for CliRunner {
+    /// Invoke `agy` once for `prompt` and return its trimmed stdout.
+    ///
+    /// Fails with [`ConformanceError::Runner`] on timeout, spawn/IO error,
+    /// non-zero exit status, or empty output.
     async fn run(&self, prompt: &str) -> Result<String, ConformanceError> {
         let args = assemble_args(&self.model, prompt);
         let fut = tokio::process::Command::new(&self.program)
             .args(&args)
             .current_dir(self.iso_home.path())
             .env("HOME", self.iso_home.path())
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
             .output();
 
         let output = tokio::time::timeout(self.timeout, fut)
