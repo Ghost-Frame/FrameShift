@@ -14,7 +14,7 @@ path = "src/main.rs"
 frameshift-client = { path = "../frameshift-client" }
 frameshift-source = { path = "../frameshift-source" }
 frameshift-growth = { path = "../frameshift-growth" }
-frameshift-conformance = { path = "../frameshift-conformance" }
+frameshift-conformance = { path = "../frameshift-conformance", features = ["cli-runner"] }
 frameshift-orchestrator = { path = "../frameshift-orchestrator" }
 frameshift-embed-candle = { path = "../frameshift-embed-candle", optional = true }
 clap = { workspace = true }
