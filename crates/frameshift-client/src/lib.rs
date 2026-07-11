@@ -64,6 +64,7 @@ pub struct Client {
     config_root: Option<PathBuf>,
 }
 
+/// Inherent methods implementing the Frameshift client's public API surface.
 impl Client {
     /// Construct a `Client` from the given options.
     pub fn new(options: ClientOptions) -> Self {
@@ -81,6 +82,7 @@ impl Client {
         }))
     }
 
+    /// Return the root of the managed Frameshift data directory.
     pub fn data_root(&self) -> &Path {
         &self.data_root
     }
@@ -146,6 +148,13 @@ impl Client {
         registry::resolve_latest_version(name)
     }
 
+    /// Resolve the project id for `project_root`.
+    ///
+    /// If the `FRAMESHIFT_PROJECT_ID` env var is set to a non-empty value, it
+    /// is validated via [`validate_explicit_project_id`] and returned
+    /// directly, overriding the default derivation. Otherwise the id is
+    /// derived by hashing the canonicalized project root path via
+    /// [`hashed_project_id`].
     pub fn project_id(&self, project_root: &Path) -> Result<String, ClientError> {
         if let Ok(explicit) = std::env::var(PROJECT_ID_ENV) {
             if !explicit.is_empty() {
@@ -157,6 +166,13 @@ impl Client {
         hashed_project_id(project_root)
     }
 
+    /// Compute the central-store paths for `project_root`.
+    ///
+    /// Derives the project id, then builds `config_path`/`lock_path`/
+    /// `cache_dir`/`active_path`/`personas_dir` under the data root. As a
+    /// side effect, runs [`migrate_legacy_project_files`] to migrate any
+    /// pre-WS-1 `frameshift.toml`/`frameshift.lock` found at the project root
+    /// into the central store.
     pub fn project_paths(&self, project_root: &Path) -> Result<ProjectPaths, ClientError> {
         let project_id = self.project_id(project_root)?;
         let cache_dir = self.data_root.join("cache");
@@ -178,6 +194,19 @@ impl Client {
         Ok(paths)
     }
 
+    /// Install a persona into `request.project_root` from either a local pack
+    /// directory or the HTTP registry.
+    ///
+    /// Verifies the pack's manifest matches the requested spec and its
+    /// Ed25519 signature (when present) for a local install, or fetches,
+    /// extracts, and verifies via the registry. Compares the incoming pack's
+    /// conformance baseline against any previously-installed version of the
+    /// same persona before overwriting it; an integrity-verification failure
+    /// hard-blocks the install unless
+    /// `FRAMESHIFT_ALLOW_CONFORMANCE_INTEGRITY_FAILURE=1` is set (a mere
+    /// score regression only warns). On success, upserts the lockfile and
+    /// re-materializes project state, returning the resulting
+    /// [`InstallReport`].
     pub fn install(&self, request: InstallRequest) -> Result<InstallReport, ClientError> {
         ensure_exists(&request.project_root)?;
 
@@ -198,17 +227,32 @@ impl Client {
             }
         };
 
-        // Best-effort, warn-only comparison of shipped conformance baselines
-        // against any version of this persona already installed for the
-        // project. Must be evaluated before `finish_install` overwrites the
-        // previously-installed persona directory. Never fails the install --
-        // see `evaluate_conformance_upgrade`.
+        // Comparison of shipped conformance baselines against any version of
+        // this persona already installed for the project. Must be evaluated
+        // before `finish_install` overwrites the previously-installed persona
+        // directory. Regression/MissingBaseline/InvalidScore are warn-only;
+        // IntegrityFailure hard-blocks the install (overridable via
+        // `FRAMESHIFT_ALLOW_CONFORMANCE_INTEGRITY_FAILURE=1`) -- see
+        // `enforce_conformance_integrity`.
         let conformance_upgrade = evaluate_conformance_upgrade(&paths, &locked);
+        enforce_conformance_integrity(
+            &locked.name,
+            conformance_upgrade.as_ref(),
+            integrity_override_enabled(),
+        )?;
 
         // Shared tail: upsert into lockfile and materialize project state.
         finish_install(self, &paths, locked, conformance_upgrade)
     }
 
+    /// Mark `persona` as the active persona for `project_root`.
+    ///
+    /// First re-syncs the project (see [`Client::sync`]), then errors with
+    /// [`ClientError::PersonaNotInstalled`] if `persona` is not among the
+    /// synced personas. Refuses to activate (returns
+    /// [`ClientError::MemoryRequirementUnmet`]) when the persona's memory
+    /// contract is hard-required but the project declares no memory adapter.
+    /// On success, writes `persona` into the project's `active` marker file.
     pub fn activate(&self, project_root: &Path, persona: &str) -> Result<(), ClientError> {
         let report = self.sync(project_root)?;
         if !report.personas.iter().any(|installed| installed == persona) {
@@ -420,6 +464,12 @@ impl Client {
         }
     }
 
+    /// Re-materialize project state from the project's lockfile.
+    ///
+    /// Reads `projects/<id>/lock.toml`; if it does not exist yet, returns an
+    /// empty [`SyncReport`] without touching disk further. Otherwise calls
+    /// [`Client::materialize_project_state`] to rebuild `personas/` from the
+    /// cache and returns the list of locked persona names.
     pub fn sync(&self, project_root: &Path) -> Result<SyncReport, ClientError> {
         let paths = self.project_paths(project_root)?;
         let Some((raw_lock, lockfile)) = load_lockfile_with_raw(&paths.lock_path)? else {
@@ -440,6 +490,11 @@ impl Client {
         })
     }
 
+    /// Remove cache entries not referenced by any project's lockfile.
+    ///
+    /// Scans every `projects/<id>/lock.toml` to build the set of referenced
+    /// pack hashes, then deletes any `cache/<hash>` directory not in that
+    /// set. Returns a [`GcReport`] listing the hashes that were removed.
     pub fn gc(&self) -> Result<GcReport, ClientError> {
         let mut referenced_hashes = BTreeSet::new();
         let projects_root = self.data_root.join("projects");
@@ -591,6 +646,16 @@ impl Client {
         Ok(paths.project_state_dir)
     }
 
+    /// Rebuild `personas_dir` on disk to exactly match `lockfile`.
+    ///
+    /// Validates every persona name (guarding against path traversal), writes
+    /// `raw_lock` to `lock_path`, removes any `personas/<name>` directory not
+    /// present in `lockfile`, and for each locked persona re-copies its
+    /// source from the content-addressed cache and re-renders its output via
+    /// `materialize_persona_rendered_outputs`. Returns
+    /// [`ClientError::MissingCacheEntry`] if a locked persona's hash is not
+    /// present in the cache. Also clears the `active` marker file if it
+    /// points at a persona no longer present in `lockfile`.
     fn materialize_project_state(
         &self,
         paths: &ProjectPaths,
@@ -777,6 +842,11 @@ impl Client {
     }
 }
 
+/// Resolve the default Frameshift data root.
+///
+/// Uses `XDG_DATA_HOME/frameshift` when `XDG_DATA_HOME` is set and
+/// non-empty, otherwise falls back to `$HOME/.local/share/frameshift`.
+/// Errors when neither is available.
 fn default_data_root() -> Result<PathBuf, ClientError> {
     if let Ok(xdg_data_home) = std::env::var("XDG_DATA_HOME") {
         if !xdg_data_home.is_empty() {
@@ -815,6 +885,10 @@ fn default_config_root() -> Result<PathBuf, ClientError> {
     Ok(home.join(".config"))
 }
 
+/// Validate an explicit project id supplied via `FRAMESHIFT_PROJECT_ID`.
+///
+/// Rejects an empty string, `.`, `..`, and any id containing `/` or `\`,
+/// since the id is joined as a single path component under the data root.
 fn validate_explicit_project_id(project_id: &str) -> Result<(), ClientError> {
     if project_id.is_empty() || project_id == "." || project_id == ".." || project_id.contains('/')
     {
@@ -945,6 +1019,10 @@ fn migrate_legacy_project_files(project_root: &Path, paths: &ProjectPaths) {
     }
 }
 
+/// Derive a project id by SHA-256 hashing the canonicalized project root path.
+///
+/// Fails if the path cannot be canonicalized (e.g. it does not exist) or if
+/// the canonicalized path is not valid UTF-8.
 fn hashed_project_id(project_root: &Path) -> Result<String, ClientError> {
     let canonical_root = fs::canonicalize(project_root).map_err(|source| ClientError::Io {
         path: project_root.to_path_buf(),
@@ -971,6 +1049,13 @@ pub(crate) fn validate_pack_request(pack: &Pack, spec: &PersonaSpec) -> Result<(
     Ok(())
 }
 
+/// Verify `pack`'s Ed25519 signature against its declared author pubkey, if
+/// the pack carries a signature at all.
+///
+/// A pack with no signature is accepted unchanged (local installs are not
+/// required to be signed). Returns [`ClientError::InvalidAuthorPublicKey`]
+/// if the pubkey cannot be decoded, or [`ClientError::SignatureVerification`]
+/// if the signature does not verify.
 fn verify_pack_signature_if_present(pack: &Pack) -> Result<(), ClientError> {
     if !pack.has_signature() {
         return Ok(());
@@ -983,6 +1068,11 @@ fn verify_pack_signature_if_present(pack: &Pack) -> Result<(), ClientError> {
         .map_err(|_| ClientError::SignatureVerification)
 }
 
+/// Decode a 32-byte Ed25519 public key from `encoded`, trying hex, then
+/// base64 URL-safe (no padding), then base64 standard (no padding) in turn.
+///
+/// Returns [`ClientError::InvalidAuthorPublicKey`] if none of the encodings
+/// produce exactly 32 bytes.
 fn parse_verifying_key_bytes(encoded: &str) -> Result<[u8; 32], ClientError> {
     if let Ok(bytes) = hex::decode(encoded) {
         if let Ok(array) = <[u8; 32]>::try_from(bytes.as_slice()) {
@@ -1017,6 +1107,10 @@ pub(crate) fn locked_persona_from_pack(pack: &Pack) -> LockedPersona {
     }
 }
 
+/// Insert or replace `persona` in `lockfile.personas` by name.
+///
+/// If a persona with the same name is already present, it is replaced in
+/// place; otherwise `persona` is appended and the list is re-sorted by name.
 fn upsert_locked_persona(lockfile: &mut Lockfile, persona: LockedPersona) {
     if let Some(existing) = lockfile
         .personas
@@ -1033,10 +1127,19 @@ fn upsert_locked_persona(lockfile: &mut Lockfile, persona: LockedPersona) {
         .sort_by(|left, right| left.name.cmp(&right.name));
 }
 
+/// Load and parse the lockfile at `path`, discarding the raw TOML text.
+///
+/// Returns `Ok(None)` when the file does not exist. See
+/// [`load_lockfile_with_raw`].
 fn load_lockfile(path: &Path) -> Result<Option<Lockfile>, ClientError> {
     load_lockfile_with_raw(path).map(|maybe| maybe.map(|(_, lockfile)| lockfile))
 }
 
+/// Read and parse the lockfile at `path`, returning both the raw TOML text
+/// and the parsed [`Lockfile`].
+///
+/// Returns `Ok(None)` when `path` does not exist. Returns
+/// [`ClientError::TomlDeserialize`] if the file exists but fails to parse.
 fn load_lockfile_with_raw(path: &Path) -> Result<Option<(String, Lockfile)>, ClientError> {
     if !path.exists() {
         return Ok(None);
@@ -1131,6 +1234,12 @@ fn compose_rendered_content(
     composed
 }
 
+/// Locate the markdown file to render for a pack directory.
+///
+/// Tries `RENDER_CANDIDATES` in priority order (`AGENTS.md`, `CLAUDE.md`,
+/// `GEMINI.md`, `README.md`), then falls back to the first `.md` file found
+/// in `pack_dir` (sorted). Returns [`ClientError::MissingRenderSource`] if
+/// no candidate exists.
 fn find_render_source(pack_dir: &Path) -> Result<PathBuf, ClientError> {
     for candidate in RENDER_CANDIDATES {
         let path = pack_dir.join(candidate);
@@ -1149,6 +1258,7 @@ fn find_render_source(pack_dir: &Path) -> Result<PathBuf, ClientError> {
     Err(ClientError::MissingRenderSource(pack_dir.to_path_buf()))
 }
 
+/// Return an error unless `path` exists on disk.
 fn ensure_exists(path: &Path) -> Result<(), ClientError> {
     if path.exists() {
         return Ok(());
@@ -1160,6 +1270,8 @@ fn ensure_exists(path: &Path) -> Result<(), ClientError> {
     })
 }
 
+/// Create `path` and any missing parent directories, wrapping failures as
+/// [`ClientError::Io`].
 fn ensure_dir(path: &Path) -> Result<(), ClientError> {
     fs::create_dir_all(path).map_err(|source| ClientError::Io {
         path: path.to_path_buf(),
@@ -1167,6 +1279,7 @@ fn ensure_dir(path: &Path) -> Result<(), ClientError> {
     })
 }
 
+/// Create an empty file at `path` if one does not already exist.
 fn touch_empty(path: &Path) -> Result<(), ClientError> {
     if path.exists() {
         return Ok(());
@@ -1174,6 +1287,7 @@ fn touch_empty(path: &Path) -> Result<(), ClientError> {
     write_file(path, b"")
 }
 
+/// Write `bytes` to `path`, creating any missing parent directories first.
 fn write_file(path: &Path, bytes: &[u8]) -> Result<(), ClientError> {
     if let Some(parent) = path.parent() {
         ensure_dir(parent)?;
@@ -1184,6 +1298,8 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<(), ClientError> {
     })
 }
 
+/// Read the entire contents of `path` as a UTF-8 string, wrapping failures
+/// as [`ClientError::Io`].
 fn read_to_string(path: &Path) -> Result<String, ClientError> {
     fs::read_to_string(path).map_err(|source| ClientError::Io {
         path: path.to_path_buf(),
@@ -1191,6 +1307,8 @@ fn read_to_string(path: &Path) -> Result<String, ClientError> {
     })
 }
 
+/// Recursively remove the directory at `path`, wrapping failures as
+/// [`ClientError::Io`].
 fn remove_dir_all(path: &Path) -> Result<(), ClientError> {
     fs::remove_dir_all(path).map_err(|source| ClientError::Io {
         path: path.to_path_buf(),
@@ -1198,6 +1316,7 @@ fn remove_dir_all(path: &Path) -> Result<(), ClientError> {
     })
 }
 
+/// Remove the file at `path`, treating a missing file as success.
 fn remove_file_if_exists(path: &Path) -> Result<(), ClientError> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -1209,6 +1328,10 @@ fn remove_file_if_exists(path: &Path) -> Result<(), ClientError> {
     }
 }
 
+/// Recursively copy every file and subdirectory from `source` into
+/// `destination`, creating directories as needed.
+///
+/// Skips entries that are neither files nor directories (e.g. symlinks).
 fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<(), ClientError> {
     ensure_dir(destination)?;
     for entry in read_dir_sorted(source)? {
@@ -1232,6 +1355,8 @@ fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<(), ClientErr
     Ok(())
 }
 
+/// Read the entries of `path` and return them sorted by file name, for
+/// deterministic iteration order.
 fn read_dir_sorted(path: &Path) -> Result<Vec<fs::DirEntry>, ClientError> {
     let mut entries = fs::read_dir(path)
         .map_err(|source| ClientError::Io {
@@ -1287,9 +1412,9 @@ fn install_from_registry(
     registry::fetch_and_install(spec, paths)
 }
 
-/// Best-effort, non-blocking comparison of `locked`'s shipped conformance
-/// baseline against the baseline of any version of the same persona already
-/// installed for this project.
+/// Comparison of `locked`'s shipped conformance baseline against the
+/// baseline of any version of the same persona already installed for this
+/// project.
 ///
 /// Returns `None` when there is no previously-installed version of
 /// `locked.name` (a fresh install, not an upgrade) -- this is the only
@@ -1297,9 +1422,13 @@ fn install_from_registry(
 /// comparison applies at all. When there is a previous version, delegates
 /// to `frameshift_conformance::RegressionGate::evaluate_cross_version` and
 /// logs the result via `tracing`: `Regression`/`IntegrityFailure`/
-/// `InvalidScore` at `warn!` (all warn-only -- installation is never
-/// blocked), `MissingBaseline` at `debug!` (an expected, non-fatal outcome
-/// for packs that ship no baseline).
+/// `InvalidScore` at `warn!`, `MissingBaseline` at `debug!` (an expected,
+/// non-fatal outcome for packs that ship no baseline).
+///
+/// This function only observes and logs; enforcement is the caller's job.
+/// `Regression`/`MissingBaseline`/`InvalidScore` are warn-only, while
+/// `IntegrityFailure` hard-blocks the install via
+/// [`enforce_conformance_integrity`].
 ///
 /// Must be called *before* `finish_install`/`materialize_project_state`
 /// overwrites the previously-installed persona directory, since this reads
@@ -1352,8 +1481,7 @@ fn evaluate_conformance_upgrade(
                 version = %locked.version,
                 declared_hash,
                 actual_hash = ?actual_hash,
-                "incoming pack's conformance baseline failed integrity verification \
-                 (warn-only, install not blocked)"
+                "incoming pack's conformance baseline failed integrity verification"
             );
         }
         frameshift_conformance::CrossVersionDecision::MissingBaseline {
@@ -1380,6 +1508,57 @@ fn evaluate_conformance_upgrade(
     Some(decision)
 }
 
+/// Environment variable that lets an operator explicitly bypass the
+/// conformance-integrity hard block on install. Only the exact value `"1"`
+/// counts as set.
+const ALLOW_INTEGRITY_FAILURE_ENV: &str = "FRAMESHIFT_ALLOW_CONFORMANCE_INTEGRITY_FAILURE";
+
+/// Whether the operator has explicitly opted to install packs whose shipped
+/// conformance baseline fails integrity verification.
+fn integrity_override_enabled() -> bool {
+    std::env::var(ALLOW_INTEGRITY_FAILURE_ENV).is_ok_and(|v| v == "1")
+}
+
+/// Hard gate on the cross-version conformance decision: refuse an
+/// install-over-existing whose shipped baseline fails integrity verification.
+///
+/// A baseline whose declared bundle hash does not match the bundle the pack
+/// actually ships means the pack's conformance evidence cannot be trusted --
+/// unlike a mere score regression, this indicates tampering or a broken
+/// publish pipeline, so it blocks the install. `override_enabled` (from
+/// [`integrity_override_enabled`]) downgrades the block to a `warn!` so an
+/// operator can consciously proceed. Every other decision variant (and a
+/// fresh install's `None`) passes through untouched.
+fn enforce_conformance_integrity(
+    persona: &str,
+    decision: Option<&frameshift_conformance::CrossVersionDecision>,
+    override_enabled: bool,
+) -> Result<(), ClientError> {
+    let Some(frameshift_conformance::CrossVersionDecision::IntegrityFailure {
+        declared_hash,
+        actual_hash,
+    }) = decision
+    else {
+        return Ok(());
+    };
+    let actual = actual_hash.clone().unwrap_or_else(|| "missing".to_string());
+    if override_enabled {
+        warn!(
+            persona,
+            declared_hash,
+            actual_hash = %actual,
+            "conformance-integrity failure overridden by {ALLOW_INTEGRITY_FAILURE_ENV}=1; \
+             installing anyway"
+        );
+        return Ok(());
+    }
+    Err(ClientError::ConformanceIntegrityFailure {
+        persona: persona.to_string(),
+        declared_hash: declared_hash.clone(),
+        actual_hash: actual,
+    })
+}
+
 /// Read and parse `manifest_path` as a [`frameshift_pack::PackManifest`],
 /// returning its `conformance_baseline` if present.
 ///
@@ -1394,9 +1573,46 @@ fn read_pack_conformance_baseline(
     manifest.conformance_baseline
 }
 
+/// Unit tests for install/activate/sync/gc, lockfile handling, persona-name
+/// validation, conformance-upgrade evaluation, and rendered-output
+/// composition.
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// enforce_conformance_integrity blocks IntegrityFailure, honors the
+    /// operator override, and passes every other decision (and fresh
+    /// installs) through untouched.
+    #[test]
+    fn conformance_integrity_gate_blocks_and_overrides() {
+        use frameshift_conformance::CrossVersionDecision as D;
+        let failure = D::IntegrityFailure {
+            declared_hash: "aa".into(),
+            actual_hash: Some("bb".into()),
+        };
+        let err = enforce_conformance_integrity("rust", Some(&failure), false).unwrap_err();
+        assert!(matches!(
+            err,
+            ClientError::ConformanceIntegrityFailure { .. }
+        ));
+        assert!(enforce_conformance_integrity("rust", Some(&failure), true).is_ok());
+        let regression = D::Regression { delta: 0.5 };
+        assert!(enforce_conformance_integrity("rust", Some(&regression), false).is_ok());
+        assert!(enforce_conformance_integrity("rust", Some(&D::Pass), false).is_ok());
+        assert!(enforce_conformance_integrity("rust", None, false).is_ok());
+    }
+
+    /// A pack that ships no conformance bundle renders its actual hash as
+    /// "missing" in the blocking error.
+    #[test]
+    fn conformance_integrity_error_renders_missing_actual_hash() {
+        let failure = frameshift_conformance::CrossVersionDecision::IntegrityFailure {
+            declared_hash: "aa".into(),
+            actual_hash: None,
+        };
+        let err = enforce_conformance_integrity("rust", Some(&failure), false).unwrap_err();
+        assert!(err.to_string().contains("actual missing"));
+    }
 
     /// validate_persona_name accepts clean slugs and rejects traversal/separators.
     #[test]
@@ -1639,6 +1855,7 @@ mod tests {
         );
     }
 
+    /// PersonaSpec parsing rejects strings missing a name or version.
     #[test]
     fn rejects_invalid_persona_specs() {
         assert!("cryptographic".parse::<PersonaSpec>().is_err());
@@ -1646,6 +1863,8 @@ mod tests {
         assert!("cryptographic@".parse::<PersonaSpec>().is_err());
     }
 
+    /// validate_explicit_project_id rejects path separators and accepts a
+    /// plain id.
     #[test]
     fn explicit_project_id_rejects_path_separators() {
         assert!(validate_explicit_project_id("team/alpha").is_err());
@@ -1653,6 +1872,8 @@ mod tests {
         assert!(validate_explicit_project_id("valid-id").is_ok());
     }
 
+    /// Rendered output composes the infrastructure overlay before the
+    /// persona content when `config_root` provides one.
     #[test]
     fn rendered_output_includes_infra_overlay() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1730,6 +1951,8 @@ mod tests {
         );
     }
 
+    /// Rendered output contains only the persona content when no
+    /// infrastructure overlay is configured.
     #[test]
     fn rendered_output_works_without_infra_overlay() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1955,9 +2178,11 @@ mod tests {
     }
 
     /// An incoming pack that declares a baseline but ships no
-    /// `conformance/bundle.toml` to verify it against reports
-    /// `IntegrityFailure` with `actual_hash: None`, never `Pass` or
-    /// `Regression` -- and the install still succeeds (warn-only).
+    /// `conformance/bundle.toml` to verify it against is an integrity
+    /// failure, and integrity failures hard-block the install: the second
+    /// install must fail with `ClientError::ConformanceIntegrityFailure`
+    /// (rendering the unshipped bundle's hash as "missing") and must leave
+    /// the previously-installed version untouched.
     #[test]
     fn upgrade_with_unshipped_bundle_reports_integrity_failure() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1985,26 +2210,34 @@ mod tests {
         // conformance/bundle.toml is written to back it up.
         let new_pack_dir = tmp.path().join("new-pack");
         write_pack_with_baseline(&new_pack_dir, "conform-noverify", "2.0.0", 0.9, false);
-        let report = client
+        let err = client
             .install(InstallRequest {
-                project_root,
+                project_root: project_root.clone(),
                 spec: PersonaSpec {
                     name: "conform-noverify".to_string(),
                     version: "2.0.0".to_string(),
                 },
                 source: InstallSource::LocalPath(new_pack_dir),
             })
-            .unwrap();
+            .expect_err("integrity failure must hard-block the install");
 
-        match report.conformance_upgrade {
-            Some(frameshift_conformance::CrossVersionDecision::IntegrityFailure {
+        match &err {
+            ClientError::ConformanceIntegrityFailure {
+                persona,
                 actual_hash,
                 ..
-            }) => {
-                assert_eq!(actual_hash, None);
+            } => {
+                assert_eq!(persona, "conform-noverify");
+                assert_eq!(actual_hash, "missing");
             }
-            other => panic!("expected Some(IntegrityFailure), got {other:?}"),
+            other => panic!("expected ConformanceIntegrityFailure, got {other:?}"),
         }
+
+        // The blocked upgrade must not have clobbered the installed version.
+        let lockfile_raw =
+            fs::read_to_string(client.project_paths(&project_root).unwrap().lock_path).unwrap();
+        assert!(lockfile_raw.contains("1.0.0"));
+        assert!(!lockfile_raw.contains("2.0.0"));
     }
 
     /// Upgrading a persona that has never shipped a baseline (old or new)

@@ -148,6 +148,7 @@ enum RunError {
     NotImplemented(String),
 }
 
+/// Human-readable rendering used when printing the error to stderr.
 impl std::fmt::Display for RunError {
     /// Format the run error for printing to stderr.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -157,6 +158,8 @@ impl std::fmt::Display for RunError {
     }
 }
 
+/// Bridge from the command layer's `CliError` into the process-level
+/// `RunError`.
 impl From<CliError> for RunError {
     /// Convert a `CliError` into a `RunError`, preserving the exit-code
     /// distinction for `NotImplemented` vs all other errors.
@@ -473,10 +476,12 @@ fn current_dir() -> Result<PathBuf, RunError> {
 ///
 /// Returning a message rather than printing directly keeps this testable
 /// without capturing stderr. This is purely informational: `Client::install`
-/// has already committed the install by the time the caller prints this, so
-/// nothing here can or should block anything -- see
-/// `evaluate_conformance_upgrade` in `frameshift-client/src/lib.rs` for the
-/// blocking-semantics rationale.
+/// has already committed the install by the time the caller prints this.
+/// An `IntegrityFailure` normally fails the install with
+/// `ClientError::ConformanceIntegrityFailure` before any report exists, so
+/// its arm here is only reached when the operator overrode the block with
+/// `FRAMESHIFT_ALLOW_CONFORMANCE_INTEGRITY_FAILURE=1` -- see
+/// `enforce_conformance_integrity` in `frameshift-client/src/lib.rs`.
 fn conformance_upgrade_warning(
     persona: &str,
     decision: &frameshift_client::CrossVersionDecision,
@@ -493,7 +498,8 @@ fn conformance_upgrade_warning(
             actual_hash,
         } => Some(format!(
             "{persona}'s shipped conformance baseline failed integrity verification \
-             (declared hash {declared_hash}, actual {actual_hash:?}); install not blocked"
+             (declared hash {declared_hash}, actual {actual_hash:?}); installed anyway \
+             because FRAMESHIFT_ALLOW_CONFORMANCE_INTEGRITY_FAILURE=1 is set"
         )),
         CrossVersionDecision::InvalidScore => Some(format!(
             "{persona}'s conformance baseline score is invalid; cannot evaluate this \
@@ -502,6 +508,7 @@ fn conformance_upgrade_warning(
     }
 }
 
+/// Unit tests for `conformance_upgrade_warning`'s per-variant messaging.
 #[cfg(test)]
 mod conformance_warning_tests {
     use super::*;
@@ -522,8 +529,10 @@ mod conformance_warning_tests {
         .is_none());
     }
 
-    /// Every non-clean variant produces a message naming the persona and
-    /// stating that the install was not blocked.
+    /// Every non-clean variant produces a message naming the persona.
+    /// Regression/InvalidScore state the install was not blocked;
+    /// IntegrityFailure (only printable under the operator override, since
+    /// it otherwise fails the install) names the override variable.
     #[test]
     fn message_for_every_non_clean_variant() {
         let regression =
@@ -541,7 +550,7 @@ mod conformance_warning_tests {
         )
         .unwrap();
         assert!(integrity.contains("rust"));
-        assert!(integrity.contains("not blocked"));
+        assert!(integrity.contains("FRAMESHIFT_ALLOW_CONFORMANCE_INTEGRITY_FAILURE"));
 
         let invalid =
             conformance_upgrade_warning("rust", &CrossVersionDecision::InvalidScore).unwrap();

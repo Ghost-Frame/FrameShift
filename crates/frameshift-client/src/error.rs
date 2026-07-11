@@ -1,5 +1,8 @@
 use std::path::PathBuf;
 
+/// Every failure the client library can surface to callers (CLI, daemon,
+/// MCP server, desktop app). Variants carry enough context to render an
+/// actionable message without any additional lookup.
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
     #[error("failed to read or write {path}: {source}")]
@@ -154,6 +157,26 @@ pub enum ClientError {
     /// bare (version-less) install spec to.
     #[error("pack {0:?} exists in the registry but has no published version")]
     NoPublishedVersion(String),
+
+    /// An install-over-existing was refused because the incoming pack's shipped
+    /// conformance baseline failed integrity verification: the bundle hash the
+    /// baseline declares does not match the hash of the conformance bundle the
+    /// pack actually ships, so its conformance evidence cannot be trusted.
+    #[error(
+        "refusing to install persona {persona:?}: its shipped conformance baseline failed \
+         integrity verification (declared bundle hash {declared_hash}, actual {actual_hash}); \
+         the pack's conformance evidence may have been tampered with. Set \
+         FRAMESHIFT_ALLOW_CONFORMANCE_INTEGRITY_FAILURE=1 to install anyway"
+    )]
+    ConformanceIntegrityFailure {
+        /// The persona whose upgrade was refused.
+        persona: String,
+        /// The bundle hash the shipped baseline declares.
+        declared_hash: String,
+        /// The hash of the conformance bundle the pack actually ships, or
+        /// `"missing"` when the pack ships no bundle at all.
+        actual_hash: String,
+    },
 
     /// The persona's pack manifest declares `memory_required = "hard"` but the
     /// project declares no `[memory]` adapter in its config.toml.
