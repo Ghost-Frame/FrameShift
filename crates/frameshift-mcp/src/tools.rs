@@ -2,7 +2,7 @@
 ///
 /// Each tool maps directly to a frameshift-client or frameshift-growth operation.
 use frameshift_capabilities::{CapabilityFilter, Tool as CapabilityTool};
-use frameshift_client::{Client, InstallRequest, InstallSource, PersonaSpec};
+use frameshift_client::{Client, InstallRequest, InstallSource, PersonaSpec, RegistrySearchQuery};
 use frameshift_orchestrator::{
     AuditLog, Embedder, Mode, ModeState, PolicyWeights, Preferences, SelectionInputs,
 };
@@ -177,6 +177,21 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                     "persona": {"type": "string"}
                 },
                 "required": ["project_root", "action"]
+            }),
+        },
+        ToolDef {
+            name: "frameshift_search".to_string(),
+            description: "Search the registry's pack catalog by free-text query and return matching packs with name, latest version, download count, tags, and description. Read-only; does not install anything. Use this to discover packs before calling frameshift_install.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of results to return (default 20, capped at 100)."
+                    }
+                },
+                "required": ["query"]
             }),
         },
     ]
@@ -389,6 +404,7 @@ pub fn call_tool(name: &str, arguments: &serde_json::Value, client: &Client) -> 
         "frameshift_automate" => call_automate(arguments, client),
         "frameshift_prefs" => call_prefs(arguments, client),
         "frameshift_capabilities" => call_capabilities(arguments, client),
+        "frameshift_search" => call_search(arguments, client),
         _ => err_result(format!("unknown tool: {}", name)),
     }
 }
@@ -910,6 +926,76 @@ fn call_prefs(arguments: &serde_json::Value, client: &Client) -> ToolResult {
     }
 }
 
+/// Default result-page size for `frameshift_search` when the caller omits
+/// `limit`. Matches the registry server's own default (see
+/// `frameshift_server::routes::packs`) so behavior is consistent whether the
+/// caller specifies a limit or not.
+const DEFAULT_SEARCH_LIMIT: u32 = 20;
+
+/// Upper bound on `frameshift_search`'s `limit` argument, enforced on the MCP
+/// side regardless of what the registry server itself would allow. Keeps a
+/// single tool call from flooding the calling agent's context with an
+/// unbounded result page.
+const MAX_SEARCH_LIMIT: u32 = 100;
+
+/// Resolve the `limit` argument for `frameshift_search` into a validated page
+/// size.
+///
+/// A missing, non-numeric, zero, or negative value falls back to
+/// [`DEFAULT_SEARCH_LIMIT`]; any positive value is clamped to
+/// `[1, MAX_SEARCH_LIMIT]`.
+fn parse_search_limit(arguments: &serde_json::Value) -> u32 {
+    arguments
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .filter(|&n| n > 0)
+        .map(|n| n.clamp(1, MAX_SEARCH_LIMIT as u64) as u32)
+        .unwrap_or(DEFAULT_SEARCH_LIMIT)
+}
+
+/// Handle the frameshift_search tool call.
+///
+/// Searches the registry's pack catalog (`GET /v1/packs`) via
+/// `client.search_registry`, mirroring the CLI's `frameshift search`
+/// subcommand (`frameshift_cli::cmd::search::run_search`). Returns
+/// `{ "results": [{name, latest_version, description, tags, total_downloads,
+/// score}, ...] }` so MCP-only agents can discover packs before calling
+/// `frameshift_install`.
+fn call_search(arguments: &serde_json::Value, client: &Client) -> ToolResult {
+    let query = match arguments.get("query").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => return err_result("missing required argument: query".to_string()),
+    };
+
+    let limit = parse_search_limit(arguments);
+
+    let search_query = RegistrySearchQuery {
+        query: Some(query.to_string()),
+        tag: None,
+        limit: Some(limit),
+    };
+
+    match client.search_registry(&search_query) {
+        Ok(results) => {
+            let entries: Vec<serde_json::Value> = results
+                .iter()
+                .map(|hit| {
+                    serde_json::json!({
+                        "name": hit.pack.name,
+                        "latest_version": hit.pack.latest_version,
+                        "description": hit.pack.description,
+                        "tags": hit.pack.tags,
+                        "total_downloads": hit.pack.total_downloads,
+                        "score": hit.score,
+                    })
+                })
+                .collect();
+            ok_result(serde_json::json!({ "results": entries }).to_string())
+        }
+        Err(e) => err_result(format!("search failed: {}", e)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -966,11 +1052,38 @@ mod tests {
     }
 
     /// Verify that tool_definitions returns the expected number of tools
-    /// (4 original + 4 automate/prefs additions + 1 capabilities).
+    /// (4 original + 4 automate/prefs additions + 1 capabilities + 1 search).
     #[test]
-    fn tool_definitions_returns_nine() {
+    fn tool_definitions_returns_ten() {
         let defs = tool_definitions();
-        assert_eq!(defs.len(), 9);
+        assert_eq!(defs.len(), 10);
+    }
+
+    /// frameshift_search is present in tool_definitions with `query` required
+    /// and `limit` present but optional in its input schema.
+    #[test]
+    fn tool_definitions_includes_search() {
+        let defs = tool_definitions();
+        let search = defs
+            .iter()
+            .find(|d| d.name == "frameshift_search")
+            .expect("tool_definitions must include frameshift_search");
+
+        let required = search.input_schema["required"]
+            .as_array()
+            .expect("input_schema.required must be an array");
+        assert!(
+            required.iter().any(|v| v == "query"),
+            "query must be a required argument"
+        );
+        assert!(
+            !required.iter().any(|v| v == "limit"),
+            "limit must not be required"
+        );
+        assert!(
+            search.input_schema["properties"]["limit"].is_object(),
+            "limit must be a declared property"
+        );
     }
 
     /// Verify that calling an unknown tool name returns an is_error result.
@@ -1481,6 +1594,55 @@ mod tests {
         assert_eq!(
             parsed["capabilities"]["required_tools"],
             serde_json::json!(["Read", "Bash"])
+        );
+    }
+
+    /// frameshift_search rejects a call with no `query` argument, without
+    /// ever reaching the network (call_search must validate before dispatch).
+    #[test]
+    fn tool_call_search_requires_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let client = make_client(tmp.path());
+
+        let result = call_tool("frameshift_search", &serde_json::json!({}), &client);
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content[0].text.contains("query"));
+    }
+
+    /// parse_search_limit falls back to DEFAULT_SEARCH_LIMIT when `limit` is
+    /// absent, non-numeric, zero, or negative.
+    #[test]
+    fn parse_search_limit_defaults_on_missing_or_invalid() {
+        assert_eq!(
+            parse_search_limit(&serde_json::json!({})),
+            DEFAULT_SEARCH_LIMIT
+        );
+        assert_eq!(
+            parse_search_limit(&serde_json::json!({"limit": "not a number"})),
+            DEFAULT_SEARCH_LIMIT
+        );
+        assert_eq!(
+            parse_search_limit(&serde_json::json!({"limit": 0})),
+            DEFAULT_SEARCH_LIMIT
+        );
+        assert_eq!(
+            parse_search_limit(&serde_json::json!({"limit": -5})),
+            DEFAULT_SEARCH_LIMIT
+        );
+    }
+
+    /// parse_search_limit passes through an in-range positive value and
+    /// clamps one above MAX_SEARCH_LIMIT down to the cap.
+    #[test]
+    fn parse_search_limit_clamps_to_range() {
+        assert_eq!(parse_search_limit(&serde_json::json!({"limit": 5})), 5);
+        assert_eq!(
+            parse_search_limit(&serde_json::json!({"limit": MAX_SEARCH_LIMIT})),
+            MAX_SEARCH_LIMIT
+        );
+        assert_eq!(
+            parse_search_limit(&serde_json::json!({"limit": MAX_SEARCH_LIMIT as u64 + 1000})),
+            MAX_SEARCH_LIMIT
         );
     }
 }
