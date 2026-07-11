@@ -49,6 +49,22 @@ pub enum GrowthError {
 }
 
 /// Append a growth entry with the current UTC timestamp.
+///
+/// This dual-writes to both formats: the legacy markdown `growth.md` (for
+/// human readability and backward compatibility) and the structured
+/// `growth.jsonl` (for the read surfaces in this crate -- `read_entries`,
+/// `recent_entries`, `summarize`). The markdown write happens first; if it
+/// succeeds but the subsequent JSONL write fails, this function returns the
+/// JSONL error even though the markdown entry was already persisted. Callers
+/// that need transactional all-or-nothing semantics across both files are not
+/// supported by this function -- the markdown file is treated as the
+/// source of truth for "did the append happen at all", and the JSONL file may
+/// legitimately lag behind it if a JSONL write fails.
+///
+/// Structured fields not derivable from these parameters (`auto_selected`,
+/// `task`, `intent`) are populated with their default/`None` forms; richer
+/// callers should call `append_jsonl` directly with a fully populated
+/// `GrowthEntry` instead of relying on this best-effort projection.
 pub fn append(
     data_root: &Path,
     project_id: &str,
@@ -56,7 +72,29 @@ pub fn append(
     entry_text: &str,
 ) -> Result<(), GrowthError> {
     let ts = format_utc_now();
-    append_with_timestamp(data_root, project_id, persona_name, entry_text, &ts)
+    append_with_timestamp(data_root, project_id, persona_name, entry_text, &ts)?;
+
+    let entry = GrowthEntry {
+        ts,
+        session: current_session_id(),
+        project_id: project_id.to_string(),
+        persona: persona_name.to_string(),
+        auto_selected: false,
+        task: None,
+        intent: None,
+        text: entry_text.to_string(),
+        scope: Scope::Project,
+    };
+    append_jsonl(data_root, project_id, persona_name, &entry)
+}
+
+/// Return a best-effort session identifier for structured growth entries.
+///
+/// Uses the current process ID, which is stable for the lifetime of the
+/// calling process (CLI invocation, daemon connection handler, etc.) and
+/// requires no additional state to thread through `append`'s call sites.
+fn current_session_id() -> String {
+    std::process::id().to_string()
 }
 
 /// Append a growth entry with a caller-supplied timestamp string.
@@ -100,7 +138,11 @@ pub fn append_with_timestamp(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|source| GrowthError::Io {
+                path: growth_path.clone(),
+                source,
+            })?;
     }
 
     writeln!(
@@ -522,6 +564,49 @@ mod tests {
         assert_eq!(mode, 0o600, "growth file must be owner-only readable");
     }
 
+    /// Appending to a pre-existing growth.md that was widened out-of-band
+    /// (e.g. by an umask change or manual chmod) must re-tighten the mode to
+    /// 0o600 rather than silently leaving it world-readable.
+    #[cfg(unix)]
+    #[test]
+    fn append_to_existing_file_retightens_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        append_with_timestamp(
+            tmp.path(),
+            "proj1",
+            "cryptographic",
+            "first entry",
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
+        let path = tmp
+            .path()
+            .join("projects/proj1/personas/cryptographic/growth.md");
+
+        // Simulate a widened pre-existing file (e.g. left over from an old
+        // umask) before the second append.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        append_with_timestamp(
+            tmp.path(),
+            "proj1",
+            "cryptographic",
+            "second entry",
+            "2026-01-02T00:00:00Z",
+        )
+        .unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "append to a pre-existing widened file must re-tighten to owner-only"
+        );
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("first entry"));
+        assert!(content.contains("second entry"));
+    }
+
     #[test]
     fn append_accumulates_entries() {
         let tmp = tempfile::tempdir().unwrap();
@@ -546,6 +631,29 @@ mod tests {
         assert!(content.contains("entry one"));
         assert!(content.contains("entry two"));
         assert!(content.find("entry one") < content.find("entry two"));
+    }
+
+    /// `append` (the legacy entry point) must dual-write: the markdown entry
+    /// lands in `growth.md` as before, and a best-effort `GrowthEntry` also
+    /// lands in `growth.jsonl` with unknown fields left as `None`/default.
+    #[test]
+    fn append_dual_writes_markdown_and_jsonl() {
+        let tmp = tempfile::tempdir().unwrap();
+        append(tmp.path(), "proj1", "rust", "learned something").unwrap();
+
+        let md_path = tmp.path().join("projects/proj1/personas/rust/growth.md");
+        assert!(md_path.exists());
+        let md_content = fs::read_to_string(&md_path).unwrap();
+        assert!(md_content.contains("learned something"));
+
+        let entries = read_entries(tmp.path(), "proj1", "rust", Scope::Project).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].text, "learned something");
+        assert_eq!(entries[0].scope, Scope::Project);
+        assert!(!entries[0].auto_selected);
+        assert!(entries[0].task.is_none());
+        assert!(entries[0].intent.is_none());
+        assert!(!entries[0].session.is_empty());
     }
 
     #[test]
