@@ -20,7 +20,7 @@
 //! # Disabling
 //!
 //! When `DOWNLOAD_SECRET` is empty in [`crate::config::ServerConfig`], the signer
-//! returns `503 Service Unavailable` and the verifier returns `404 Not Found`
+//! returns `400 Bad Request` and the verifier returns `403 Forbidden`
 //! (no special-case status; the route stays mounted but every request rejects).
 
 use axum::body::Body;
@@ -95,11 +95,11 @@ pub struct DownloadQuery {
 ///
 /// # Errors
 ///
-/// - `400 Bad Request` if `name` or `version` fails validation.
+/// - `400 Bad Request` if `name` or `version` fails validation, or if
+///   `DOWNLOAD_SECRET` is empty (downloads disabled).
 /// - `404 Not Found` if the pack version does not exist.
 /// - `500 Internal Server Error` if `DOWNLOAD_SECRET` is misconfigured (set but not
 ///   valid 32-byte hex).
-/// - `503 Service Unavailable` if `DOWNLOAD_SECRET` is empty (downloads disabled).
 pub async fn mint_download_url(
     State(state): State<AppState>,
     Path((name, version)): Path<(String, String)>,

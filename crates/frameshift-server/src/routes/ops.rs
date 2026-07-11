@@ -99,6 +99,20 @@ pub struct MemoryHealthSummary {
     pub detail: String,
 }
 
+/// Reduce a backend's rich health detail to a fixed public-safe string.
+///
+/// Adapters return operator-facing detail strings (filesystem paths, pool
+/// counts, raw driver errors) that must never cross the unauthenticated
+/// `/healthz` boundary. Callers should log the real detail via `tracing`
+/// before discarding it in favor of this sanitized value.
+fn sanitized_detail(healthy: bool) -> String {
+    if healthy {
+        "ok".to_string()
+    } else {
+        "degraded".to_string()
+    }
+}
+
 /// `GET /healthz`
 ///
 /// Returns the health status of all backends. Always responds with `200 OK`
@@ -131,16 +145,37 @@ pub struct MemoryHealthSummary {
 /// - `memory.health()` (only when configured) -- may return
 ///   `MemoryError` which is mapped to `healthy: false`.
 ///
+/// # Public boundary sanitization
+///
+/// This is an unauthenticated, internet-facing endpoint. Adapters
+/// (`frameshift-catalog-postgres`, `frameshift-objects-fs`, ...) return rich
+/// `detail` strings for operator-facing surfaces (structured logs, internal
+/// dashboards) that may embed filesystem paths, pool internals, or raw driver
+/// error text. None of that may reach this public response. Every `detail`
+/// field in the returned JSON is therefore reduced to the fixed string `"ok"`
+/// (healthy) or `"degraded"` (unhealthy); the adapter's real detail is logged
+/// server-side via `tracing` (`info` when healthy, `warn` when degraded) and
+/// never serialized.
+///
 /// # Errors
 ///
 /// This handler never returns an HTTP error. Backend failures are represented
 /// as `healthy: false` in the response body.
 pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
     let catalog_health = match state.catalog.health().await {
-        Ok(h) => CatalogHealthSummary {
-            healthy: h.healthy,
-            detail: h.detail,
-        },
+        Ok(h) => {
+            // The adapter's detail may embed internals (e.g. pool counts, raw
+            // driver errors); log it server-side but never expose it publicly.
+            if h.healthy {
+                tracing::info!(detail = %h.detail, "catalog health check ok");
+            } else {
+                tracing::warn!(detail = %h.detail, "catalog health check degraded");
+            }
+            CatalogHealthSummary {
+                healthy: h.healthy,
+                detail: sanitized_detail(h.healthy),
+            }
+        }
         Err(e) => {
             // Log the raw error internally; never expose it in the public response.
             tracing::warn!(error = %e, "catalog health check failed");
@@ -152,12 +187,21 @@ pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
     };
 
     let objects_health = match state.objects.health().await {
-        Ok(h) => ObjectsHealthSummary {
-            healthy: h.healthy,
-            total_objects: h.total_objects,
-            total_bytes: h.total_bytes,
-            detail: h.detail,
-        },
+        Ok(h) => {
+            // The adapter's detail may embed the object store's absolute
+            // filesystem root path; log it server-side, never expose it.
+            if h.healthy {
+                tracing::info!(detail = %h.detail, "object store health check ok");
+            } else {
+                tracing::warn!(detail = %h.detail, "object store health check degraded");
+            }
+            ObjectsHealthSummary {
+                healthy: h.healthy,
+                total_objects: h.total_objects,
+                total_bytes: h.total_bytes,
+                detail: sanitized_detail(h.healthy),
+            }
+        }
         Err(e) => {
             // Log the raw error internally; never expose it in the public response.
             tracing::warn!(error = %e, "object store health check failed");
@@ -175,10 +219,19 @@ pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
     // nothing else in the server consumes memory yet.
     let memory_health = match &state.memory {
         Some(adapter) => Some(match adapter.health().await {
-            Ok(h) => MemoryHealthSummary {
-                healthy: h.healthy,
-                detail: h.message,
-            },
+            Ok(h) => {
+                // The adapter's message may embed backend internals; log it
+                // server-side, never expose it in the public response.
+                if h.healthy {
+                    tracing::info!(detail = %h.message, "memory health check ok");
+                } else {
+                    tracing::warn!(detail = %h.message, "memory health check degraded");
+                }
+                MemoryHealthSummary {
+                    healthy: h.healthy,
+                    detail: sanitized_detail(h.healthy),
+                }
+            }
             Err(e) => {
                 // Log the raw error internally; never expose it in the public response.
                 tracing::warn!(error = %e, "memory health check failed");

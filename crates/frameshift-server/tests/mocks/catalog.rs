@@ -165,17 +165,26 @@ impl CatalogBackend for MockCatalog {
             })
     }
 
-    /// List authors (returns all stored authors, ignoring pagination).
+    /// List authors, paginated by `limit`/`offset` and ordered by
+    /// `created_at ASC` for a stable order matching the trait's documented
+    /// contract (mirrors the real Postgres backend's `ORDER BY created_at`).
     async fn list_authors(
         &self,
-        _limit: u32,
-        _offset: u32,
+        limit: u32,
+        offset: u32,
     ) -> Result<Vec<AuthorRecord>, CatalogError> {
         let state = self
             .state
             .read()
             .map_err(|e| CatalogError::BackendError(e.to_string().into()))?;
-        Ok(state.authors.values().cloned().collect())
+        let mut authors: Vec<AuthorRecord> = state.authors.values().cloned().collect();
+        authors.sort_by_key(|a| a.created_at);
+        let page = authors
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect();
+        Ok(page)
     }
 
     /// Register a pack version.

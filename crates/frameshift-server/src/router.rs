@@ -78,7 +78,7 @@ use crate::state::AppState;
 ///   /metrics    -- ops
 ///   /v1
 ///     /packs    -- pack read endpoints + POST publish (signed-request)
-///     /authors  -- author lookup + POST register / POST {handle}/rotate (signed-request)
+///     /authors  -- GET list (paginated) + lookup; POST register / rotate (signed-request)
 ///     /handles  -- handle lookup
 ///     /telemetry -- POST /selection opt-in selection telemetry sink
 ///     /memory   -- GET /health read-only memory backend health

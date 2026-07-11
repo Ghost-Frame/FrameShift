@@ -14,10 +14,13 @@
 //! - `GET /v1/packs/../etc/passwd` -> 400 path validation
 //! - `GET /v1/packs/{name}/versions/{version}/pack` -> 200 octet-stream
 //! - `GET /v1/packs/{name}/versions/{version}/pack` -> 502 when blob missing
+//! - `GET /v1/packs/{name}/versions` -> 200, default/clamped/offset pagination
 //! - `GET /v1/authors/{valid_base64url}` -> 200
 //! - `GET /v1/authors/not-base64!!!` -> 400
 //! - `GET /v1/authors/{valid_but_unknown}` -> 404
-//! - `GET /healthz` -> 200 with both backends healthy
+//! - `GET /v1/authors` -> 200, default/clamped/offset pagination
+//! - `GET /healthz` -> 200 with both backends healthy, `detail` sanitized to
+//!   `"ok"`/`"degraded"` (never the adapter's raw internal detail text)
 //! - `GET /mcp/anything` -> 501
 //! - All responses include `x-request-id` header
 //! - `AppError::Internal` does not leak source details in body
@@ -242,6 +245,109 @@ fn make_version(
     }
 }
 
+// ---------------------------------------------------------------------------
+// /v1/packs/{name}/versions (list, paginated)
+// ---------------------------------------------------------------------------
+
+/// Insert `count` distinct version records for `pack_name` into `catalog`,
+/// registering the parent pack record first. Returns nothing; callers only
+/// need the side effect.
+fn seed_pack_versions(
+    catalog: &MockCatalog,
+    pack_name: &str,
+    count: u32,
+    author: Ed25519PublicKey,
+) {
+    let mut state = catalog.state.write().unwrap();
+    state
+        .packs
+        .insert(pack_name.to_string(), make_pack(pack_name, author));
+    for i in 0..count {
+        let version = format!("0.{i}.0");
+        let hash = ObjectHash::of(format!("{pack_name}-{version}").as_bytes());
+        state.versions.insert(
+            (pack_name.to_string(), version.clone()),
+            make_version(pack_name, &version, hash, author),
+        );
+    }
+}
+
+/// `GET /v1/packs/{name}/versions` with no query params returns every
+/// version when the count is well under the default `limit=100`.
+#[tokio::test]
+async fn pack_versions_default_limit_returns_all_when_under_default() {
+    let author = Ed25519PublicKey([30u8; 32]);
+    let catalog = MockCatalog::new();
+    seed_pack_versions(&catalog, "many-versions", 3, author);
+
+    let state = make_state(catalog, MockPackStore::new());
+    let resp = oneshot_get(state, "/v1/packs/many-versions/versions").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let arr = body.as_array().expect("body must be a JSON array");
+    assert_eq!(arr.len(), 3);
+}
+
+/// `GET /v1/packs/{name}/versions?limit=2` caps the response to 2 records
+/// even though more versions exist -- the fix for the unbounded version
+/// history response.
+#[tokio::test]
+async fn pack_versions_limit_caps_response_size() {
+    let author = Ed25519PublicKey([31u8; 32]);
+    let catalog = MockCatalog::new();
+    seed_pack_versions(&catalog, "many-versions", 5, author);
+
+    let state = make_state(catalog, MockPackStore::new());
+    let resp = oneshot_get(state, "/v1/packs/many-versions/versions?limit=2").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let arr = body.as_array().expect("body must be a JSON array");
+    assert_eq!(arr.len(), 2);
+}
+
+/// `GET /v1/packs/{name}/versions?offset=2` skips the first 2 records (by
+/// whatever order the backend returns them in).
+#[tokio::test]
+async fn pack_versions_offset_skips_records() {
+    let author = Ed25519PublicKey([32u8; 32]);
+    let catalog = MockCatalog::new();
+    seed_pack_versions(&catalog, "many-versions", 3, author);
+
+    let state = make_state(catalog, MockPackStore::new());
+    let resp = oneshot_get(state, "/v1/packs/many-versions/versions?offset=2").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let arr = body.as_array().expect("body must be a JSON array");
+    assert_eq!(arr.len(), 1);
+}
+
+/// `GET /v1/packs/{name}/versions?limit=999999` is clamped to
+/// `max_search_limit` (100 in the test config) and the response includes a
+/// `Warning` header, mirroring `GET /v1/packs`'s clamping behavior.
+#[tokio::test]
+async fn pack_versions_limit_clamped_includes_warning_header() {
+    let author = Ed25519PublicKey([33u8; 32]);
+    let catalog = MockCatalog::new();
+    seed_pack_versions(&catalog, "many-versions", 3, author);
+
+    let state = make_state(catalog, MockPackStore::new());
+    let resp = oneshot_get(state, "/v1/packs/many-versions/versions?limit=999999").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        resp.headers().contains_key("warning"),
+        "response must contain a Warning header when limit is clamped"
+    );
+}
+
+/// `GET /v1/packs/{name}/versions` for an unknown pack still returns 404,
+/// unaffected by the new query parameters.
+#[tokio::test]
+async fn pack_versions_unknown_pack_returns_404() {
+    let state = make_state(MockCatalog::new(), MockPackStore::new());
+    let resp = oneshot_get(state, "/v1/packs/unknown/versions").await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
 /// `GET /v1/packs/{name}/versions/{version}/pack` returns 200 with the correct
 /// bytes and `Content-Type: application/octet-stream` when both catalog and
 /// object store have the artifact.
@@ -407,11 +513,109 @@ async fn get_author_404_when_unknown() {
 }
 
 // ---------------------------------------------------------------------------
+// /v1/authors (list, paginated)
+// ---------------------------------------------------------------------------
+
+/// Insert `count` distinct registered authors into `catalog`, with handles
+/// `"author-0"`, `"author-1"`, ... and pubkeys derived from `seed` so each
+/// call site can use a disjoint byte range.
+fn seed_authors(catalog: &MockCatalog, count: u8, seed: u8) {
+    let mut state = catalog.state.write().unwrap();
+    for i in 0..count {
+        let pubkey_bytes = [seed.wrapping_add(i); 32];
+        let key = Ed25519PublicKey(pubkey_bytes);
+        let handle = format!("author-{i}");
+        state
+            .authors
+            .insert(key.to_string(), make_author(pubkey_bytes, &handle));
+    }
+}
+
+/// `GET /v1/authors` with an empty catalog returns 200 with `{"authors":[]}`.
+#[tokio::test]
+async fn list_authors_empty_catalog_returns_200_empty_array() {
+    let state = make_state(MockCatalog::new(), MockPackStore::new());
+    let resp = oneshot_get(state, "/v1/authors").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["authors"], serde_json::json!([]));
+}
+
+/// `GET /v1/authors` with no query params returns every registered author
+/// when the count is well under the default `limit=100`.
+#[tokio::test]
+async fn list_authors_default_limit_returns_all_when_under_default() {
+    let catalog = MockCatalog::new();
+    seed_authors(&catalog, 3, 40);
+
+    let state = make_state(catalog, MockPackStore::new());
+    let resp = oneshot_get(state, "/v1/authors").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let arr = body["authors"]
+        .as_array()
+        .expect("authors must be an array");
+    assert_eq!(arr.len(), 3);
+}
+
+/// `GET /v1/authors?limit=2` caps the response to 2 records even though more
+/// authors are registered.
+#[tokio::test]
+async fn list_authors_limit_caps_response_size() {
+    let catalog = MockCatalog::new();
+    seed_authors(&catalog, 5, 60);
+
+    let state = make_state(catalog, MockPackStore::new());
+    let resp = oneshot_get(state, "/v1/authors?limit=2").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let arr = body["authors"]
+        .as_array()
+        .expect("authors must be an array");
+    assert_eq!(arr.len(), 2);
+}
+
+/// `GET /v1/authors?offset=2` skips the first 2 records in stable
+/// `created_at ASC` order.
+#[tokio::test]
+async fn list_authors_offset_skips_records() {
+    let catalog = MockCatalog::new();
+    seed_authors(&catalog, 3, 80);
+
+    let state = make_state(catalog, MockPackStore::new());
+    let resp = oneshot_get(state, "/v1/authors?offset=2").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let arr = body["authors"]
+        .as_array()
+        .expect("authors must be an array");
+    assert_eq!(arr.len(), 1);
+}
+
+/// `GET /v1/authors?limit=999999` is clamped to `max_search_limit` (100 in
+/// the test config) and the response includes a `Warning` header, mirroring
+/// `GET /v1/packs`'s and `GET /v1/packs/{name}/versions`'s clamping behavior.
+#[tokio::test]
+async fn list_authors_limit_clamped_includes_warning_header() {
+    let catalog = MockCatalog::new();
+    seed_authors(&catalog, 3, 100);
+
+    let state = make_state(catalog, MockPackStore::new());
+    let resp = oneshot_get(state, "/v1/authors?limit=999999").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        resp.headers().contains_key("warning"),
+        "response must contain a Warning header when limit is clamped"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // /healthz
 // ---------------------------------------------------------------------------
 
 /// `GET /healthz` returns 200 with `ok: true` when both mock backends report
-/// healthy.
+/// healthy, and the public `detail` fields are sanitized to the fixed string
+/// `"ok"` rather than the adapter's rich internal detail text.
 #[tokio::test]
 async fn healthz_returns_200_with_both_backends_healthy() {
     let state = make_state(MockCatalog::new(), MockPackStore::new());
@@ -421,6 +625,27 @@ async fn healthz_returns_200_with_both_backends_healthy() {
     assert_eq!(body["ok"], true);
     assert_eq!(body["catalog"]["healthy"], true);
     assert_eq!(body["objects"]["healthy"], true);
+    assert_eq!(body["catalog"]["detail"], "ok");
+    assert_eq!(body["objects"]["detail"], "ok");
+}
+
+/// `GET /healthz` never echoes an adapter's rich health detail (the mocks'
+/// own detail strings) into the public response body; only the sanitized
+/// `"ok"`/`"degraded"` values may appear.
+#[tokio::test]
+async fn healthz_does_not_leak_adapter_detail_text() {
+    let state = make_state(MockCatalog::new(), MockPackStore::new());
+    let resp = oneshot_get(state, "/healthz").await;
+    let body = body_json(resp).await;
+    let raw = serde_json::to_string(&body).expect("health body must serialize");
+    assert!(
+        !raw.contains("mock catalog is always healthy"),
+        "public /healthz body must not leak adapter detail text: {raw}"
+    );
+    assert!(
+        !raw.contains("mock object store is always healthy"),
+        "public /healthz body must not leak adapter detail text: {raw}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -453,7 +678,8 @@ async fn memory_health_configured_reports_adapter_status() {
 }
 
 /// `GET /healthz` includes a `memory` summary only when a backend is
-/// configured; its `healthy` flag reflects the adapter's reported status.
+/// configured; its `healthy` flag reflects the adapter's reported status, and
+/// its `detail` is sanitized to `"ok"`, not the adapter's raw message text.
 /// When no backend is configured, `memory` is absent/null and `ok` is
 /// unaffected.
 #[tokio::test]
@@ -464,6 +690,7 @@ async fn healthz_includes_memory_when_configured() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp).await;
     assert_eq!(body["memory"]["healthy"], true);
+    assert_eq!(body["memory"]["detail"], "ok");
     assert_eq!(body["ok"], true);
 
     // Default (unconfigured) state: memory is null and does not affect ok.
@@ -472,6 +699,26 @@ async fn healthz_includes_memory_when_configured() {
     let body = body_json(resp).await;
     assert!(body["memory"].is_null());
     assert_eq!(body["ok"], true);
+}
+
+/// `GET /healthz` reports `detail: "degraded"` for a configured memory
+/// backend that is unhealthy, and never leaks the adapter's raw message text
+/// into the public response body.
+#[tokio::test]
+async fn healthz_memory_degraded_sanitizes_detail() {
+    let mut state = make_state(MockCatalog::new(), MockPackStore::new());
+    state.memory = Some(Arc::new(MockMemoryAdapter { healthy: false }));
+    let resp = oneshot_get(state, "/healthz").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["memory"]["healthy"], false);
+    assert_eq!(body["memory"]["detail"], "degraded");
+    assert_eq!(body["ok"], false);
+    let raw = serde_json::to_string(&body).expect("health body must serialize");
+    assert!(
+        !raw.contains("mock memory adapter is unhealthy"),
+        "public /healthz body must not leak adapter detail text: {raw}"
+    );
 }
 
 // ---------------------------------------------------------------------------
