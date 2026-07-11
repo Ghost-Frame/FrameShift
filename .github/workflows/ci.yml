@@ -3,8 +3,8 @@
 # Gates every pull request (and pushes to the default branch) on formatting,
 # lints, the unit/integration test suite, the Docker-gated Postgres tests, and
 # a supply-chain advisory scan. Jobs run on the stable toolchain to match the
-# local development environment; the workspace declares rust-version 1.75 but is
-# built on current stable, so a dedicated 1.75 MSRV-verification job is deferred
+# local development environment; the workspace declares rust-version 1.86 but is
+# built on current stable, so a dedicated 1.86 MSRV-verification job is deferred
 # to the later tier rather than risking a spurious MSRV failure.
 name: CI
 
