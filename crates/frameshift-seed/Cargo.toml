@@ -30,3 +30,6 @@ unicode-normalization = { workspace = true }
 toml = { workspace = true }
 diesel = { workspace = true }
 diesel-async = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
