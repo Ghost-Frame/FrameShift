@@ -45,6 +45,7 @@ fn test_config() -> Arc<ServerConfig> {
         r2_secret_access_key: SecretString::new(String::new()),
         trust_forwarded_for: false,
         signed_request_max_skew: Duration::from_secs(300),
+        admin_pubkeys: Vec::new(),
         memory_backend: "none".to_string(),
         memory_http_endpoint: String::new(),
         memory_http_auth: "none".to_string(),

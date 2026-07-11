@@ -39,6 +39,7 @@ fn test_config() -> Arc<ServerConfig> {
         max_search_limit: 100,
         trust_forwarded_for: false,
         signed_request_max_skew: Duration::from_secs(300),
+        admin_pubkeys: Vec::new(),
         shutdown_grace: Duration::from_secs(1),
         cors_allowed_origins: String::new(),
         download_secret: SecretString::new(String::new()),

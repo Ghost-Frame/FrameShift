@@ -31,10 +31,14 @@
 //! | `R2_SECRET_ACCESS_KEY` | `""` | Secret access key (supplied via a secrets manager in production) |
 //! | `TRUST_FORWARDED_FOR` | `false` | Trust `X-Forwarded-For` for rate-limit key extraction; set `true` only behind a trusted proxy |
 //! | `SIGNED_REQUEST_MAX_SKEW_SECS` | `300` | Max allowed clock skew (seconds) between a signed write request's timestamp and server time; also bounds the replay-nonce retention window |
+//! | `FRAMESHIFT_ADMIN_PUBKEYS` | `""` | Comma-separated base64url-no-pad Ed25519 public keys allowed to call `/v1/admin/*` endpoints; empty disables all admin endpoints (404) |
 //!
 //! Env var names match the struct field names verbatim (figment maps
 //! `download_secret` <-> `DOWNLOAD_SECRET`); shorter aliases would require an
-//! explicit remap step which we don't have yet.
+//! explicit remap step which we don't have yet. `FRAMESHIFT_ADMIN_PUBKEYS` is
+//! the one deliberate exception: it carries the `FRAMESHIFT_` prefix so it
+//! cannot be confused with an unrelated `ADMIN_PUBKEYS` variable that some
+//! other tool in the deployment environment might already own.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -205,6 +209,19 @@ pub struct ServerConfig {
     /// Default: 300 seconds (5 minutes).
     pub signed_request_max_skew: Duration,
 
+    /// Base64url-no-pad Ed25519 public keys authorized to call the admin
+    /// endpoints (e.g. `POST /v1/admin/packs/{name}/{version}/tombstone`).
+    ///
+    /// Parsed from the comma-separated `FRAMESHIFT_ADMIN_PUBKEYS` env var.
+    /// Stored in the same base64url-no-pad string representation produced by
+    /// `Ed25519PublicKey`'s `Display` impl, so callers compare with a plain
+    /// string equality against
+    /// `verified_signer.pubkey.to_string()` (see
+    /// [`crate::auth::VerifiedSigner`]). Default: empty (admin endpoints
+    /// disabled; handlers return `404` rather than `403` so the route's
+    /// existence is not disclosed).
+    pub admin_pubkeys: Vec<String>,
+
     /// Memory backend selector: `"none"` (default), `"http"`, or `"sqlite"`.
     ///
     /// - `"none"` -- no memory adapter; personas that require memory will fail
@@ -306,6 +323,10 @@ impl std::fmt::Debug for ServerConfig {
             .field("r2_secret_access_key", &"[REDACTED]")
             .field("trust_forwarded_for", &self.trust_forwarded_for)
             .field("signed_request_max_skew", &self.signed_request_max_skew)
+            .field(
+                "admin_pubkeys",
+                &format!("[{} key(s)]", self.admin_pubkeys.len()),
+            )
             .field("memory_backend", &self.memory_backend)
             .field("memory_http_endpoint", &self.memory_http_endpoint)
             .field("memory_http_auth", &"[REDACTED]")
@@ -387,6 +408,11 @@ struct RawConfig {
     /// `SIGNED_REQUEST_MAX_SKEW_SECS`).
     signed_request_max_skew_secs: u64,
 
+    /// Comma-separated base64url-no-pad Ed25519 admin public keys (raw
+    /// string, split into `Vec<String>` on convert). Maps to
+    /// `FRAMESHIFT_ADMIN_PUBKEYS`.
+    admin_pubkeys: String,
+
     /// Memory backend selector.
     memory_backend: String,
     /// HTTP memory endpoint URL.
@@ -397,6 +423,21 @@ struct RawConfig {
     memory_http_timeout_secs: u64,
     /// SQLite memory database path.
     memory_sqlite_path: String,
+}
+
+/// Split a comma-separated raw string into a `Vec<String>`, trimming
+/// whitespace around each entry and skipping empty segments.
+///
+/// Mirrors the parsing convention already used by
+/// [`ServerConfig::cors_origins`], but eagerly collects into an owned
+/// `Vec<String>` instead of returning a lazy iterator, since
+/// `admin_pubkeys` is compared on every admin-route request.
+fn split_comma_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 impl RawConfig {
@@ -428,6 +469,7 @@ impl RawConfig {
             r2_secret_access_key: SecretString::new(self.r2_secret_access_key),
             trust_forwarded_for: self.trust_forwarded_for,
             signed_request_max_skew: Duration::from_secs(self.signed_request_max_skew_secs),
+            admin_pubkeys: split_comma_list(&self.admin_pubkeys),
             memory_backend: self.memory_backend,
             memory_http_endpoint: self.memory_http_endpoint,
             memory_http_auth: self.memory_http_auth,
@@ -465,6 +507,7 @@ fn default_raw_config() -> RawConfig {
         r2_secret_access_key: String::new(),
         trust_forwarded_for: false,
         signed_request_max_skew_secs: 300,
+        admin_pubkeys: String::new(),
         memory_backend: "none".to_string(),
         memory_http_endpoint: String::new(),
         memory_http_auth: "none".to_string(),
@@ -479,7 +522,11 @@ impl ServerConfig {
     ///
     /// Environment variables are read with no prefix (e.g. `BIND_ADDR` not
     /// `FRAMESHIFT_BIND_ADDR`). See the module-level documentation for the full
-    /// mapping.
+    /// mapping. `admin_pubkeys` is the sole exception: it is read from the
+    /// prefixed `FRAMESHIFT_ADMIN_PUBKEYS` var via a second, narrowly-scoped
+    /// `Env::prefixed(...).only(...)` merge layered on top of the unprefixed
+    /// provider, so every other field keeps the established no-prefix
+    /// convention.
     ///
     /// # Errors
     ///
@@ -491,6 +538,7 @@ impl ServerConfig {
     pub fn from_env() -> Result<Self, Box<figment::Error>> {
         let raw: RawConfig = Figment::from(Serialized::defaults(default_raw_config()))
             .merge(Env::raw())
+            .merge(Env::prefixed("FRAMESHIFT_").only(&["admin_pubkeys"]))
             .extract()
             .map_err(Box::new)?;
         Ok(raw.into_server_config())
@@ -531,6 +579,7 @@ mod tests {
             r2_secret_access_key: SecretString::new(String::new()),
             trust_forwarded_for: false,
             signed_request_max_skew: Duration::from_secs(300),
+            admin_pubkeys: Vec::new(),
             memory_backend: "none".to_string(),
             memory_http_endpoint: String::new(),
             memory_http_auth: "none".to_string(),
@@ -570,6 +619,7 @@ mod tests {
             r2_secret_access_key: SecretString::new(String::new()),
             trust_forwarded_for: false,
             signed_request_max_skew: Duration::from_secs(300),
+            admin_pubkeys: Vec::new(),
             memory_backend: "none".to_string(),
             memory_http_endpoint: String::new(),
             memory_http_auth: "none".to_string(),
@@ -605,6 +655,7 @@ mod tests {
             r2_secret_access_key: SecretString::new(String::new()),
             trust_forwarded_for: false,
             signed_request_max_skew: Duration::from_secs(300),
+            admin_pubkeys: Vec::new(),
             memory_backend: "none".to_string(),
             memory_http_endpoint: String::new(),
             memory_http_auth: "none".to_string(),
@@ -667,6 +718,7 @@ mod tests {
             r2_secret_access_key: SecretString::new(String::new()),
             trust_forwarded_for: false,
             signed_request_max_skew: Duration::from_secs(300),
+            admin_pubkeys: Vec::new(),
             memory_backend: "none".to_string(),
             memory_http_endpoint: String::new(),
             memory_http_auth: "none".to_string(),

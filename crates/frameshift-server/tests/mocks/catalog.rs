@@ -21,7 +21,7 @@ use frameshift_catalog::error::{CatalogError, HealthStatus};
 use frameshift_catalog::filters::{PackSearchFilters, PackSearchResult};
 use frameshift_catalog::identity::Ed25519PublicKey;
 use frameshift_catalog::records::{AuthorRecord, PackRecord, PackVersionRecord};
-use frameshift_catalog::status::TombstoneRecord;
+use frameshift_catalog::status::{PackStatus, TombstoneRecord};
 
 /// Shared mutable state for [`MockCatalog`].
 ///
@@ -293,14 +293,36 @@ impl CatalogBackend for MockCatalog {
         Ok(*count)
     }
 
-    /// Tombstone a pack version (no-op in mock).
+    /// Tombstone a pack version, mirroring the Postgres adapter's documented
+    /// choice (`crates/frameshift-catalog-postgres/src/backend.rs`):
+    /// re-tombstoning an already-tombstoned version is idempotent
+    /// (last-writer-wins on `reason`/`recorded_at`), never `Conflict`.
+    /// Returns `NotFound` when the `(name, version)` pair has no version
+    /// record, matching the trait's documented contract.
     async fn tombstone_pack(
         &self,
-        _name: &str,
-        _version: &str,
-        _record: TombstoneRecord,
+        name: &str,
+        version: &str,
+        record: TombstoneRecord,
     ) -> Result<(), CatalogError> {
-        Ok(())
+        let mut state = self
+            .state
+            .write()
+            .map_err(|e| CatalogError::BackendError(e.to_string().into()))?;
+        let key = (name.to_string(), version.to_string());
+        match state.versions.get_mut(&key) {
+            Some(v) => {
+                v.status = PackStatus::Tombstone {
+                    reason: record.reason,
+                    recorded_at: record.recorded_at,
+                };
+                Ok(())
+            }
+            None => Err(CatalogError::NotFound {
+                kind: "pack_version",
+                key: format!("{name}@{version}"),
+            }),
+        }
     }
 
     /// Get the public key for a handle.
