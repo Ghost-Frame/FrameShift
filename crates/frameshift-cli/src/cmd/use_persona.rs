@@ -100,6 +100,10 @@ pub fn run_use(client: &Client, args: UseArgs) -> Result<(), CliError> {
         }
     }
 
+    // Record this activation to the local selection-history audit log and
+    // (only if the project has opted in) send anonymous selection telemetry.
+    record_use_selection_and_telemetry(client, &project_root, &args.name);
+
     // Read and print the rendered persona for the claude target.
     let rendered = client.rendered_persona(&project_root, &args.name, "claude")?;
     println!("{}", rendered);
@@ -141,9 +145,36 @@ fn record_persona_use(prefs_path: &Path, persona: &str) -> Result<(), String> {
     prefs.save(prefs_path).map_err(|e| e.to_string())
 }
 
+/// Record `persona`'s explicit activation to the local selection-history
+/// audit log and, only if the project has opted in, send anonymous selection
+/// telemetry for it.
+///
+/// Mirrors the activation contract shared by every FrameShift client
+/// surface: a session id of `"<surface>:<pid>"`, `auto = false` since this
+/// is an explicit user choice (not an automatic pick), and no rationale.
+/// `Client::send_telemetry_for_persona`
+/// no-ops internally unless `ProjectConfig.telemetry_opt_in` is set, so a
+/// stock CLI invocation never phones home.
+///
+/// Both calls are best-effort: `run_use` has already committed the activation
+/// by the time this runs, so a history-log or telemetry failure must never
+/// fail the command. Failures are logged via `tracing::warn!` and swallowed.
+fn record_use_selection_and_telemetry(client: &Client, project_root: &Path, persona: &str) {
+    let session = format!("cli:{}", std::process::id());
+    let history_result =
+        client.record_selection_event(project_root, persona, &session, false, None);
+    if let Err(error) = history_result {
+        tracing::warn!(persona, %error, "record_selection_event failed");
+    }
+    if let Err(error) = client.send_telemetry_for_persona(project_root, persona, &session) {
+        tracing::warn!(persona, %error, "send_telemetry_for_persona failed");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use frameshift_client::ClientOptions;
     use tempfile::TempDir;
 
     /// Recording a use bumps the persona's bias and persists it to the shared
@@ -175,5 +206,32 @@ mod tests {
         let second = Preferences::load(&prefs_path).unwrap().bias_for("rust");
 
         assert!(second >= first, "bias should not decrease on repeated use");
+    }
+
+    /// record_use_selection_and_telemetry appends exactly one local
+    /// selection-history event for the activated persona (`auto = false`,
+    /// matching an explicit user choice), and never panics or errors even
+    /// though telemetry stays disabled -- the default `telemetry_opt_in =
+    /// false` makes `send_telemetry_for_persona` a silent no-op with no
+    /// network access attempted.
+    #[test]
+    fn record_use_selection_and_telemetry_writes_history_event() {
+        let tmp = TempDir::new().unwrap();
+        let client = Client::new(ClientOptions {
+            data_root: tmp.path().join("data"),
+            config_root: None,
+        });
+        let project_root = tmp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+
+        record_use_selection_and_telemetry(&client, &project_root, "rust");
+
+        let state_dir = client.orchestrator_state_dir(&project_root).unwrap();
+        let history_path = state_dir.join(frameshift_client::SELECTION_HISTORY_FILENAME);
+        let raw = std::fs::read_to_string(&history_path).unwrap();
+        let lines: Vec<&str> = raw.lines().collect();
+        assert_eq!(lines.len(), 1, "expected exactly one recorded event");
+        assert!(lines[0].contains("\"persona\":\"rust\""));
+        assert!(lines[0].contains("\"auto\":false"));
     }
 }

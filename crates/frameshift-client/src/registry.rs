@@ -36,7 +36,11 @@ use crate::model::{LockedPersona, PersonaSpec, ProjectPaths};
 pub const REGISTRY_URL_ENV: &str = "FRAMESHIFT_REGISTRY_URL";
 
 /// Default registry base URL used when [`REGISTRY_URL_ENV`] is not set.
-const DEFAULT_REGISTRY_URL: &str = "https://frameshift.syntheos.dev";
+///
+/// The public registry API lives on the `-api` subdomain; every FrameShift
+/// client surface points there. The bare `frameshift.syntheos.dev` host does
+/// not serve the API -- do not point this back at it.
+const DEFAULT_REGISTRY_URL: &str = "https://frameshift-api.syntheos.dev";
 
 /// Maximum number of decompressed bytes we will accept from a registry pack archive.
 ///

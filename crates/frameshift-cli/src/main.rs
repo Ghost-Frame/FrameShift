@@ -11,6 +11,7 @@ mod util;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use tracing_subscriber::EnvFilter;
 
 use frameshift_client::{Client, InstallRequest, InstallSource, PersonaSpec};
 
@@ -175,6 +176,15 @@ impl From<CliError> for RunError {
 /// - 1: general error (I/O, parse, patch conflict, etc.)
 /// - 2: feature not yet implemented (M2+ stubs)
 fn main() -> ExitCode {
+    // Initialize structured tracing output (mirrors frameshift-daemon/mcp/server).
+    // Silent by default (`RUST_LOG` unset -> only ERROR-level events surface);
+    // set `RUST_LOG=warn` to see best-effort warnings such as a failed
+    // telemetry send or selection-history write.
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .init();
+
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(RunError::NotImplemented(msg)) => {
@@ -243,6 +253,15 @@ fn run() -> Result<(), RunError> {
                 "installed {}@{} ({})",
                 report.persona.name, report.persona.version, report.persona.hash
             );
+            // Surface the additive, warn-only cross-version conformance
+            // comparison computed during install. `report.conformance_upgrade`
+            // is `None` for a fresh install; installation has already
+            // succeeded by this point regardless of what the decision says.
+            if let Some(decision) = &report.conformance_upgrade {
+                if let Some(message) = conformance_upgrade_warning(&report.persona.name, decision) {
+                    eprintln!("warning: {message}");
+                }
+            }
             Ok(())
         }
 
@@ -443,4 +462,90 @@ fn run() -> Result<(), RunError> {
 /// Maps the `io::Error` to a `RunError::General` so callers can use `?` in `run()`.
 fn current_dir() -> Result<PathBuf, RunError> {
     std::env::current_dir().map_err(|e| RunError::General(e.to_string()))
+}
+
+/// Build the human-readable warning message for a cross-version
+/// conformance-baseline comparison that is not clean, per
+/// `frameshift_conformance::CrossVersionDecision` (re-exported as
+/// `frameshift_client::CrossVersionDecision`). Returns `None` for `Pass` and
+/// `MissingBaseline`, which are expected, non-fatal outcomes with nothing to
+/// report.
+///
+/// Returning a message rather than printing directly keeps this testable
+/// without capturing stderr. This is purely informational: `Client::install`
+/// has already committed the install by the time the caller prints this, so
+/// nothing here can or should block anything -- see
+/// `evaluate_conformance_upgrade` in `frameshift-client/src/lib.rs` for the
+/// blocking-semantics rationale.
+fn conformance_upgrade_warning(
+    persona: &str,
+    decision: &frameshift_client::CrossVersionDecision,
+) -> Option<String> {
+    use frameshift_client::CrossVersionDecision;
+    match decision {
+        CrossVersionDecision::Pass | CrossVersionDecision::MissingBaseline { .. } => None,
+        CrossVersionDecision::Regression { delta } => Some(format!(
+            "{persona}'s conformance baseline dropped by {delta:.3} relative to the \
+             version it replaced (install not blocked)"
+        )),
+        CrossVersionDecision::IntegrityFailure {
+            declared_hash,
+            actual_hash,
+        } => Some(format!(
+            "{persona}'s shipped conformance baseline failed integrity verification \
+             (declared hash {declared_hash}, actual {actual_hash:?}); install not blocked"
+        )),
+        CrossVersionDecision::InvalidScore => Some(format!(
+            "{persona}'s conformance baseline score is invalid; cannot evaluate this \
+             upgrade (install not blocked)"
+        )),
+    }
+}
+
+#[cfg(test)]
+mod conformance_warning_tests {
+    use super::*;
+    use frameshift_client::CrossVersionDecision;
+
+    /// `Pass` and `MissingBaseline` are expected, non-fatal outcomes: no
+    /// message should be printed for either.
+    #[test]
+    fn no_message_for_clean_outcomes() {
+        assert!(conformance_upgrade_warning("rust", &CrossVersionDecision::Pass).is_none());
+        assert!(conformance_upgrade_warning(
+            "rust",
+            &CrossVersionDecision::MissingBaseline {
+                installed_present: true,
+                incoming_present: false,
+            }
+        )
+        .is_none());
+    }
+
+    /// Every non-clean variant produces a message naming the persona and
+    /// stating that the install was not blocked.
+    #[test]
+    fn message_for_every_non_clean_variant() {
+        let regression =
+            conformance_upgrade_warning("rust", &CrossVersionDecision::Regression { delta: 0.2 })
+                .unwrap();
+        assert!(regression.contains("rust"));
+        assert!(regression.contains("not blocked"));
+
+        let integrity = conformance_upgrade_warning(
+            "rust",
+            &CrossVersionDecision::IntegrityFailure {
+                declared_hash: "abc".to_string(),
+                actual_hash: Some("tampered".to_string()),
+            },
+        )
+        .unwrap();
+        assert!(integrity.contains("rust"));
+        assert!(integrity.contains("not blocked"));
+
+        let invalid =
+            conformance_upgrade_warning("rust", &CrossVersionDecision::InvalidScore).unwrap();
+        assert!(invalid.contains("rust"));
+        assert!(invalid.contains("not blocked"));
+    }
 }

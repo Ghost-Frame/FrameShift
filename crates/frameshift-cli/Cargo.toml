@@ -24,6 +24,10 @@ clap = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+# Structured logging for best-effort paths (e.g. telemetry/selection-history
+# recording) that must warn on failure without failing the command.
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [features]
 # Semantic selection via a local candle sentence-embedding model. Off by

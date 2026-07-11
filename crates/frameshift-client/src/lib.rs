@@ -10,6 +10,10 @@ mod registry;
 mod selection;
 
 pub use error::ClientError;
+/// Re-exported so callers of [`InstallReport::conformance_upgrade`] can match
+/// on the decision variants without adding their own `frameshift-conformance`
+/// dependency just to name the type.
+pub use frameshift_conformance::CrossVersionDecision;
 pub use model::{
     ClientOptions, GcReport, InstallReport, InstallRequest, InstallSource, LockedPersona, Lockfile,
     MemoryConfig, MemoryRequirementStatus, PersonaSpec, ProjectConfig, ProjectPaths, SyncReport,
@@ -194,8 +198,15 @@ impl Client {
             }
         };
 
+        // Best-effort, warn-only comparison of shipped conformance baselines
+        // against any version of this persona already installed for the
+        // project. Must be evaluated before `finish_install` overwrites the
+        // previously-installed persona directory. Never fails the install --
+        // see `evaluate_conformance_upgrade`.
+        let conformance_upgrade = evaluate_conformance_upgrade(&paths, &locked);
+
         // Shared tail: upsert into lockfile and materialize project state.
-        finish_install(self, &paths, locked)
+        finish_install(self, &paths, locked, conformance_upgrade)
     }
 
     pub fn activate(&self, project_root: &Path, persona: &str) -> Result<(), ClientError> {
@@ -316,8 +327,10 @@ impl Client {
     }
 
     /// Append a persona-selection event to the project's local selection history
-    /// (`projects/<id>/selection-history.jsonl`). Local-only state that the
-    /// intelligent-selection feature learns from; it is never sent anywhere.
+    /// (`projects/<id>/selection-history.jsonl`). Local-only, write-only audit
+    /// log: it is never sent anywhere and nothing in this codebase reads it back.
+    /// The intelligent-selection feature learns from a separate mechanism, the
+    /// `Preferences` store in `automate-prefs.json` (see `frameshift_orchestrator`).
     /// `auto` distinguishes automatic selections from explicit user choices, and
     /// `reason` is an optional rationale.
     pub fn record_selection_event(
@@ -1238,11 +1251,16 @@ fn read_dir_sorted(path: &Path) -> Result<Vec<fs::DirEntry>, ClientError> {
 /// the lockfile, and materialize project state. Both the LocalPath and Registry
 /// arms call this after producing their locked persona.
 ///
+/// `conformance_upgrade` is threaded straight through into the returned
+/// [`InstallReport`]; it was already computed by the caller (before this
+/// function overwrites any previously-installed persona directory).
+///
 /// Returns an [`InstallReport`] on success.
 fn finish_install(
     client: &Client,
     paths: &ProjectPaths,
     locked: LockedPersona,
+    conformance_upgrade: Option<frameshift_conformance::CrossVersionDecision>,
 ) -> Result<InstallReport, ClientError> {
     let mut lockfile = load_lockfile(&paths.lock_path)?.unwrap_or_default();
     upsert_locked_persona(&mut lockfile, locked.clone());
@@ -1253,6 +1271,7 @@ fn finish_install(
         project_id: paths.project_id.clone(),
         cache_path: paths.cache_dir.join(&locked.hash),
         persona: locked,
+        conformance_upgrade,
     })
 }
 
@@ -1266,6 +1285,113 @@ fn install_from_registry(
     paths: &ProjectPaths,
 ) -> Result<LockedPersona, ClientError> {
     registry::fetch_and_install(spec, paths)
+}
+
+/// Best-effort, non-blocking comparison of `locked`'s shipped conformance
+/// baseline against the baseline of any version of the same persona already
+/// installed for this project.
+///
+/// Returns `None` when there is no previously-installed version of
+/// `locked.name` (a fresh install, not an upgrade) -- this is the only
+/// signal `Client::install` needs to decide whether a cross-version
+/// comparison applies at all. When there is a previous version, delegates
+/// to `frameshift_conformance::RegressionGate::evaluate_cross_version` and
+/// logs the result via `tracing`: `Regression`/`IntegrityFailure`/
+/// `InvalidScore` at `warn!` (all warn-only -- installation is never
+/// blocked), `MissingBaseline` at `debug!` (an expected, non-fatal outcome
+/// for packs that ship no baseline).
+///
+/// Must be called *before* `finish_install`/`materialize_project_state`
+/// overwrites the previously-installed persona directory, since this reads
+/// the old `pack.toml` from exactly that location.
+fn evaluate_conformance_upgrade(
+    paths: &ProjectPaths,
+    locked: &LockedPersona,
+) -> Option<frameshift_conformance::CrossVersionDecision> {
+    let installed_manifest_path = paths
+        .personas_dir
+        .join(&locked.name)
+        .join("source")
+        .join("pack.toml");
+    if !installed_manifest_path.is_file() {
+        // Fresh install: no previous version of this persona to compare against.
+        return None;
+    }
+
+    let installed_baseline = read_pack_conformance_baseline(&installed_manifest_path);
+
+    let new_pack_dir = paths.cache_dir.join(&locked.hash);
+    let incoming_baseline = read_pack_conformance_baseline(&new_pack_dir.join("pack.toml"));
+    let incoming_actual_bundle_hash =
+        frameshift_conformance::load_from_dir(&new_pack_dir.join("conformance"))
+            .ok()
+            .and_then(|bundle| frameshift_conformance::bundle_hash(&bundle).ok());
+
+    let decision = frameshift_conformance::RegressionGate::evaluate_cross_version(
+        installed_baseline.as_ref(),
+        incoming_baseline.as_ref(),
+        incoming_actual_bundle_hash.as_deref(),
+    );
+
+    match &decision {
+        frameshift_conformance::CrossVersionDecision::Pass => {}
+        frameshift_conformance::CrossVersionDecision::Regression { delta } => {
+            warn!(
+                persona = %locked.name,
+                version = %locked.version,
+                delta,
+                "conformance regression detected on upgrade (warn-only, install not blocked)"
+            );
+        }
+        frameshift_conformance::CrossVersionDecision::IntegrityFailure {
+            declared_hash,
+            actual_hash,
+        } => {
+            warn!(
+                persona = %locked.name,
+                version = %locked.version,
+                declared_hash,
+                actual_hash = ?actual_hash,
+                "incoming pack's conformance baseline failed integrity verification \
+                 (warn-only, install not blocked)"
+            );
+        }
+        frameshift_conformance::CrossVersionDecision::MissingBaseline {
+            installed_present,
+            incoming_present,
+        } => {
+            debug!(
+                persona = %locked.name,
+                installed_present,
+                incoming_present,
+                "no cross-version conformance-baseline comparison possible for this upgrade"
+            );
+        }
+        frameshift_conformance::CrossVersionDecision::InvalidScore => {
+            warn!(
+                persona = %locked.name,
+                version = %locked.version,
+                "conformance baseline score is invalid; cannot evaluate upgrade \
+                 (warn-only, install not blocked)"
+            );
+        }
+    }
+
+    Some(decision)
+}
+
+/// Read and parse `manifest_path` as a [`frameshift_pack::PackManifest`],
+/// returning its `conformance_baseline` if present.
+///
+/// Any I/O or parse failure yields `None` silently: this backs an advisory,
+/// best-effort check (`evaluate_conformance_upgrade`) that must never fail
+/// `Client::install`.
+fn read_pack_conformance_baseline(
+    manifest_path: &Path,
+) -> Option<frameshift_pack::ConformanceBaseline> {
+    let raw = fs::read_to_string(manifest_path).ok()?;
+    let manifest: frameshift_pack::PackManifest = toml::from_str(&raw).ok()?;
+    manifest.conformance_baseline
 }
 
 #[cfg(test)]
@@ -1650,6 +1776,273 @@ mod tests {
         assert!(
             !content.contains("Infrastructure"),
             "no infra overlay expected"
+        );
+    }
+
+    // ---- evaluate_conformance_upgrade / InstallReport.conformance_upgrade ----
+
+    /// Build a pack directory whose `pack.toml` declares `[conformance_baseline]`
+    /// with the given `score`. When `ship_matching_bundle` is true, also writes a
+    /// real `conformance/bundle.toml` and sets `bundle_hash` to that bundle's
+    /// actual computed hash (integrity passes); when false, no bundle is shipped
+    /// at all and `bundle_hash` is a valid-looking but unverifiable placeholder
+    /// (integrity fails via the "no bundle shipped" path).
+    fn write_pack_with_baseline(
+        pack_dir: &Path,
+        name: &str,
+        version: &str,
+        score: f32,
+        ship_matching_bundle: bool,
+    ) {
+        use frameshift_conformance::{
+            bundle_hash, ExpectedBehavior, ScorerKind, TestBundle, TestCase,
+        };
+
+        let bundle = TestBundle {
+            name: name.to_string(),
+            version: version.to_string(),
+            tests: vec![TestCase {
+                id: "case-1".to_string(),
+                prompt: "hello".to_string(),
+                expected: ExpectedBehavior::Contains {
+                    value: "hi".to_string(),
+                },
+                scorer: ScorerKind::Substring,
+            }],
+        };
+        let actual_hash = bundle_hash(&bundle).unwrap();
+
+        fs::create_dir_all(pack_dir).unwrap();
+        fs::write(
+            pack_dir.join("pack.toml"),
+            format!(
+                "schema_version = 1\nname = \"{name}\"\nauthor_handle = \"test\"\nauthor_pubkey = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\nversion = \"{version}\"\n\n[conformance_baseline]\nscore = {score}\nbundle_hash = \"{actual_hash}\"\n"
+            ),
+        )
+        .unwrap();
+        fs::write(pack_dir.join("AGENTS.md"), format!("# {name}\n\nTest.\n")).unwrap();
+
+        if ship_matching_bundle {
+            let conformance_dir = pack_dir.join("conformance");
+            fs::create_dir_all(&conformance_dir).unwrap();
+            fs::write(
+                conformance_dir.join("bundle.toml"),
+                toml::to_string(&bundle).unwrap(),
+            )
+            .unwrap();
+        }
+    }
+
+    /// A fresh install (no persona of this name previously installed for the
+    /// project) reports no conformance-upgrade comparison at all, even though
+    /// the pack ships a baseline -- there is nothing to compare against yet.
+    #[test]
+    fn fresh_install_has_no_conformance_upgrade_report() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pack_dir = tmp.path().join("pack");
+        write_pack_with_baseline(&pack_dir, "conform-fresh", "1.0.0", 0.9, true);
+
+        let project_root = tmp.path().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let client = Client::new(ClientOptions {
+            data_root: tmp.path().join("data"),
+            config_root: None,
+        });
+
+        let report = client
+            .install(InstallRequest {
+                project_root,
+                spec: PersonaSpec {
+                    name: "conform-fresh".to_string(),
+                    version: "1.0.0".to_string(),
+                },
+                source: InstallSource::LocalPath(pack_dir),
+            })
+            .unwrap();
+
+        assert_eq!(report.conformance_upgrade, None);
+    }
+
+    /// Installing a lower-scoring version over an already-installed,
+    /// integrity-verified version reports `Regression` with the correct delta.
+    #[test]
+    fn upgrade_with_lower_score_reports_regression() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let client = Client::new(ClientOptions {
+            data_root: tmp.path().join("data"),
+            config_root: None,
+        });
+
+        let old_pack_dir = tmp.path().join("old-pack");
+        write_pack_with_baseline(&old_pack_dir, "conform-regress", "1.0.0", 0.9, true);
+        client
+            .install(InstallRequest {
+                project_root: project_root.clone(),
+                spec: PersonaSpec {
+                    name: "conform-regress".to_string(),
+                    version: "1.0.0".to_string(),
+                },
+                source: InstallSource::LocalPath(old_pack_dir),
+            })
+            .unwrap();
+
+        let new_pack_dir = tmp.path().join("new-pack");
+        write_pack_with_baseline(&new_pack_dir, "conform-regress", "2.0.0", 0.5, true);
+        let report = client
+            .install(InstallRequest {
+                project_root,
+                spec: PersonaSpec {
+                    name: "conform-regress".to_string(),
+                    version: "2.0.0".to_string(),
+                },
+                source: InstallSource::LocalPath(new_pack_dir),
+            })
+            .unwrap();
+
+        match report.conformance_upgrade {
+            Some(frameshift_conformance::CrossVersionDecision::Regression { delta }) => {
+                assert!((delta - 0.4).abs() < 1e-6, "delta was {delta}");
+            }
+            other => panic!("expected Some(Regression), got {other:?}"),
+        }
+    }
+
+    /// Installing a higher-scoring, integrity-verified version over an
+    /// already-installed version reports `Pass` -- and, crucially, never
+    /// blocks or fails the install itself.
+    #[test]
+    fn upgrade_with_higher_score_reports_pass() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let client = Client::new(ClientOptions {
+            data_root: tmp.path().join("data"),
+            config_root: None,
+        });
+
+        let old_pack_dir = tmp.path().join("old-pack");
+        write_pack_with_baseline(&old_pack_dir, "conform-pass", "1.0.0", 0.5, true);
+        client
+            .install(InstallRequest {
+                project_root: project_root.clone(),
+                spec: PersonaSpec {
+                    name: "conform-pass".to_string(),
+                    version: "1.0.0".to_string(),
+                },
+                source: InstallSource::LocalPath(old_pack_dir),
+            })
+            .unwrap();
+
+        let new_pack_dir = tmp.path().join("new-pack");
+        write_pack_with_baseline(&new_pack_dir, "conform-pass", "2.0.0", 0.9, true);
+        let report = client
+            .install(InstallRequest {
+                project_root,
+                spec: PersonaSpec {
+                    name: "conform-pass".to_string(),
+                    version: "2.0.0".to_string(),
+                },
+                source: InstallSource::LocalPath(new_pack_dir),
+            })
+            .unwrap();
+
+        assert_eq!(
+            report.conformance_upgrade,
+            Some(frameshift_conformance::CrossVersionDecision::Pass)
+        );
+    }
+
+    /// An incoming pack that declares a baseline but ships no
+    /// `conformance/bundle.toml` to verify it against reports
+    /// `IntegrityFailure` with `actual_hash: None`, never `Pass` or
+    /// `Regression` -- and the install still succeeds (warn-only).
+    #[test]
+    fn upgrade_with_unshipped_bundle_reports_integrity_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let client = Client::new(ClientOptions {
+            data_root: tmp.path().join("data"),
+            config_root: None,
+        });
+
+        let old_pack_dir = tmp.path().join("old-pack");
+        write_pack_with_baseline(&old_pack_dir, "conform-noverify", "1.0.0", 0.5, true);
+        client
+            .install(InstallRequest {
+                project_root: project_root.clone(),
+                spec: PersonaSpec {
+                    name: "conform-noverify".to_string(),
+                    version: "1.0.0".to_string(),
+                },
+                source: InstallSource::LocalPath(old_pack_dir),
+            })
+            .unwrap();
+
+        // ship_matching_bundle = false: pack.toml claims a baseline but no
+        // conformance/bundle.toml is written to back it up.
+        let new_pack_dir = tmp.path().join("new-pack");
+        write_pack_with_baseline(&new_pack_dir, "conform-noverify", "2.0.0", 0.9, false);
+        let report = client
+            .install(InstallRequest {
+                project_root,
+                spec: PersonaSpec {
+                    name: "conform-noverify".to_string(),
+                    version: "2.0.0".to_string(),
+                },
+                source: InstallSource::LocalPath(new_pack_dir),
+            })
+            .unwrap();
+
+        match report.conformance_upgrade {
+            Some(frameshift_conformance::CrossVersionDecision::IntegrityFailure {
+                actual_hash,
+                ..
+            }) => {
+                assert_eq!(actual_hash, None);
+            }
+            other => panic!("expected Some(IntegrityFailure), got {other:?}"),
+        }
+    }
+
+    /// Upgrading a persona that has never shipped a baseline (old or new)
+    /// reports `MissingBaseline`, and the install still succeeds.
+    #[test]
+    fn upgrade_without_any_baseline_reports_missing_baseline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (client, project_root) = install_test_persona(&tmp, "conform-nobaseline");
+
+        // install_test_persona's pack has no [conformance_baseline] section.
+        let new_pack_dir = tmp.path().join("new-pack-nobaseline");
+        fs::create_dir_all(&new_pack_dir).unwrap();
+        fs::write(
+            new_pack_dir.join("pack.toml"),
+            "schema_version = 1\nname = \"conform-nobaseline\"\nauthor_handle = \"test\"\nauthor_pubkey = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\nversion = \"0.2.0\"\n",
+        )
+        .unwrap();
+        fs::write(new_pack_dir.join("AGENTS.md"), "# conform-nobaseline v2\n").unwrap();
+
+        let report = client
+            .install(InstallRequest {
+                project_root,
+                spec: PersonaSpec {
+                    name: "conform-nobaseline".to_string(),
+                    version: "0.2.0".to_string(),
+                },
+                source: InstallSource::LocalPath(new_pack_dir),
+            })
+            .unwrap();
+
+        assert_eq!(
+            report.conformance_upgrade,
+            Some(
+                frameshift_conformance::CrossVersionDecision::MissingBaseline {
+                    installed_present: false,
+                    incoming_present: false,
+                }
+            )
         );
     }
 }

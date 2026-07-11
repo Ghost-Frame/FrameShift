@@ -12,6 +12,10 @@ frameshift-pack = { path = "../frameshift-pack" }
 frameshift-compose = { path = "../frameshift-compose" }
 # Typed persona source loading and deterministic markdown rendering.
 frameshift-source = { path = "../frameshift-source" }
+# Cross-version conformance-baseline comparison for the install-over-existing
+# path (RegressionGate::evaluate_cross_version); default features only, no
+# cli-runner (no `agy`/tokio-process dependency needed here).
+frameshift-conformance = { path = "../frameshift-conformance" }
 base64.workspace = true
 ed25519-dalek.workspace = true
 hex.workspace = true
