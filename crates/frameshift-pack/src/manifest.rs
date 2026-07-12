@@ -50,8 +50,11 @@ pub struct PackManifest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mixin: Vec<String>,
     /// Conformance baseline: minimum score the pack version asserts on its own test bundle.
-    /// The runtime conformance runner (M4) gates upgrades on this; if a newer version
-    /// scores below baseline on the OLD bundle, the upgrade is blocked.
+    /// The client's install-time cross-version gate compares baselines between the
+    /// installed and incoming versions: a score drop or missing baseline is warn-only,
+    /// while a baseline whose `bundle_hash` does not match the bundle the pack actually
+    /// ships blocks the install (operator-overridable). See
+    /// `frameshift_conformance::RegressionGate::evaluate_cross_version`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conformance_baseline: Option<ConformanceBaseline>,
     /// One-line human-readable summary of what the persona is for. Consumed by the

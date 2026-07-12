@@ -16,7 +16,7 @@ memory_required_ops = []
 
 # Conformance baseline: a signed, tamper-evident claim about the persona's
 # behavior. `bundle_hash` is the sha256 of the canonical TOML for this persona's
-# private conformance bundle (personas-private/cryptographic/conformance/bundle.toml,
+# private conformance bundle (not shipped;
 # 6 regex cases covering audited-over-custom, constant-time comparison,
 # RustCrypto-not-OpenSSL, OsRng key generation, spec citation, secret wrapping).
 # The public catalog is manifest-only, so the bundle itself is not shipped here;
