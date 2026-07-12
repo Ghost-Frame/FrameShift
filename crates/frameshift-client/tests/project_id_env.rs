@@ -17,6 +17,7 @@ fn project_id_env_override_is_used_verbatim() {
     let client = Client::new(ClientOptions {
         data_root,
         config_root: None,
+        vault: None,
     });
     let result = client.project_id(&project_root);
     std::env::remove_var("FRAMESHIFT_PROJECT_ID");

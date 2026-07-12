@@ -68,6 +68,7 @@ fn hard_requirement_without_adapter_blocks_activation() {
     let client = Client::new(ClientOptions {
         data_root: data_root.clone(),
         config_root: None,
+        vault: None,
     });
     install(&client, &project_root, &pack_root, "archivist");
 
@@ -101,6 +102,7 @@ fn hard_requirement_with_adapter_activates() {
     let client = Client::new(ClientOptions {
         data_root: data_root.clone(),
         config_root: None,
+        vault: None,
     });
     install(&client, &project_root, &pack_root, "archivist");
     declare_memory(&client, &data_root, &project_root);
@@ -123,6 +125,7 @@ fn soft_requirement_activates_and_reports_unmet() {
     let client = Client::new(ClientOptions {
         data_root,
         config_root: None,
+        vault: None,
     });
     install(&client, &project_root, &pack_root, "coach");
 
@@ -161,6 +164,7 @@ version = "0.1.0"
     let client = Client::new(ClientOptions {
         data_root,
         config_root: None,
+        vault: None,
     });
     install(&client, &project_root, &pack_root, "plain");
 

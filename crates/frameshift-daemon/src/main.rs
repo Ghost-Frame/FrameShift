@@ -39,10 +39,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    // Build the shared client using XDG-derived paths.
+    // Build the shared client using XDG-derived paths. The vault provider is
+    // env-only: the daemon runs unattended with no interactive terminal, so
+    // a passphrase prompt would simply hang the process. Operators who need
+    // vault-backed template tokens available to the daemon must export
+    // FRAMESHIFT_VAULT_PASSPHRASE in its environment.
     let client = Arc::new(
-        frameshift_client::Client::with_default_data_root()
-            .expect("failed to initialize frameshift client"),
+        frameshift_client::Client::with_default_data_root_and_vault(Some(
+            frameshift_client::env_only_vault_provider(),
+        ))
+        .expect("failed to initialize frameshift client"),
     );
 
     // Determine the socket directory from XDG_RUNTIME_DIR (fallback: /tmp).

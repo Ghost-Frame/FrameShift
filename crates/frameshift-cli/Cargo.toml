@@ -20,7 +20,13 @@ frameshift-growth = { path = "../frameshift-growth" }
 frameshift-conformance = { path = "../frameshift-conformance", features = ["cli-runner"] }
 frameshift-orchestrator = { path = "../frameshift-orchestrator" }
 frameshift-embed-candle = { path = "../frameshift-embed-candle", optional = true }
+# `frameshift vault` subcommand: vault schema/error/backend-trait types and the
+# age-encrypted local backend (init/set/get/rm/list operate on these directly).
+frameshift-vault = { path = "../frameshift-vault" }
+frameshift-vault-local = { path = "../frameshift-vault-local" }
 clap = { workspace = true }
+# Wraps the vault passphrase/value input so it is never accidentally logged.
+secrecy = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
@@ -28,6 +34,9 @@ tokio = { workspace = true }
 # recording) that must warn on failure without failing the command.
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# Hidden-input prompts for `frameshift vault` passphrases/values and the
+# render-time interactive vault provider (only used when stdin is a TTY).
+rpassword = { workspace = true }
 
 [features]
 # Semantic selection via a local candle sentence-embedding model. Off by

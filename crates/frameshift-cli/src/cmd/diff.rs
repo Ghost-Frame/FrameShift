@@ -174,6 +174,7 @@ mod tests {
         let client = Client::new(ClientOptions {
             data_root,
             config_root: None,
+            vault: None,
         });
         let args = DiffArgs {
             persona_a: "pa".to_string(),

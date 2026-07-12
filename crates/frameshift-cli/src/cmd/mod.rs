@@ -4,6 +4,7 @@
 //! `Subcommand` enum in `main.rs` dispatches to the appropriate module.
 
 pub mod automate;
+pub mod config;
 pub mod diff;
 pub mod feedback;
 pub mod grow;
@@ -17,4 +18,5 @@ pub mod search;
 pub mod select;
 pub mod skill;
 pub mod use_persona;
+pub mod vault;
 pub mod verify;

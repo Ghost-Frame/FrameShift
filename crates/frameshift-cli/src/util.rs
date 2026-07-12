@@ -95,6 +95,32 @@ pub enum CliError {
     /// Publish/register flow error (missing argument, registry rejection hint).
     #[error("{0}")]
     Publish(String),
+
+    /// `frameshift config` error: unknown key or a value that fails to parse
+    /// for the requested key's type.
+    #[error("{0}")]
+    Config(String),
+
+    /// `frameshift vault` error: a `frameshift-vault`/`frameshift-vault-local`
+    /// failure (open/save/validate), or a CLI-level vault condition (e.g.
+    /// `init` refusing to overwrite an existing vault) that has no direct
+    /// `VaultError` variant of its own.
+    #[error("vault error: {0}")]
+    Vault(String),
+}
+
+/// Stringifies a [`frameshift_vault::VaultError`] into [`CliError::Vault`]
+/// rather than deriving `#[from]` directly on the variant, so `CliError`
+/// does not need to name `frameshift_vault::VaultError` in its own type
+/// (mirrors `impl From<ComposeError> for ClientError` in
+/// `frameshift-client/src/error.rs`, which boxes for a different reason but
+/// follows the same "manual `From`, not `#[from]`" shape).
+impl From<frameshift_vault::VaultError> for CliError {
+    /// Convert a `VaultError` into `CliError::Vault` by rendering its
+    /// `Display` message.
+    fn from(e: frameshift_vault::VaultError) -> Self {
+        CliError::Vault(e.to_string())
+    }
 }
 
 /// Validate that a registry server URL uses an `http`/`https` scheme.
@@ -378,6 +404,7 @@ mod tests {
         let client = Client::new(ClientOptions {
             data_root: data_root.clone(),
             config_root: None,
+            vault: None,
         });
 
         // Load path: persona_source_dir must reject the symlink.

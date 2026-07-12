@@ -123,6 +123,7 @@ mod tests {
         let client = Client::new(ClientOptions {
             data_root: tmp.path().join("data"),
             config_root: None,
+            vault: None,
         });
         let persona_dir = client
             .data_root()
@@ -185,6 +186,7 @@ mod tests {
         let client = Client::new(ClientOptions {
             data_root: tmp.path().join("data"),
             config_root: None,
+            vault: None,
         });
 
         let migrated =

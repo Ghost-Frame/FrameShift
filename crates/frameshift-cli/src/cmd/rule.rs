@@ -177,6 +177,7 @@ mod tests {
         let client = Client::new(ClientOptions {
             data_root,
             config_root: None,
+            vault: None,
         });
         let args = RuleAddArgs {
             persona: "test-persona".to_string(),
@@ -226,6 +227,7 @@ mod tests {
         let client = Client::new(ClientOptions {
             data_root,
             config_root: None,
+            vault: None,
         });
         let args = RuleRemoveArgs {
             persona: "p2".to_string(),
@@ -269,6 +271,7 @@ mod tests {
         let client = Client::new(ClientOptions {
             data_root,
             config_root: None,
+            vault: None,
         });
         let args = RuleAddArgs {
             persona: "dup".to_string(),

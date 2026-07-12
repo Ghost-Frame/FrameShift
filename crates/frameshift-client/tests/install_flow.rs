@@ -33,6 +33,7 @@ version = "0.3.1"
     let client = Client::new(ClientOptions {
         data_root: data_root.clone(),
         config_root: None,
+        vault: None,
     });
 
     let report = client
@@ -121,6 +122,7 @@ fn migrates_legacy_project_files() {
     let client = Client::new(ClientOptions {
         data_root: data_root.clone(),
         config_root: None,
+        vault: None,
     });
 
     // project_paths() triggers the migration shim.
@@ -169,6 +171,7 @@ version = "0.3.1"
     let client = Client::new(ClientOptions {
         data_root: data_root.clone(),
         config_root: None,
+        vault: None,
     });
     let report = client
         .install(InstallRequest {

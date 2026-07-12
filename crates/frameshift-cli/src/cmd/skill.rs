@@ -119,6 +119,7 @@ mod tests {
         let client = Client::new(ClientOptions {
             data_root,
             config_root: None,
+            vault: None,
         });
         let args = SkillAddArgs {
             persona: "sp1".to_string(),
@@ -166,6 +167,7 @@ mod tests {
         let client = Client::new(ClientOptions {
             data_root,
             config_root: None,
+            vault: None,
         });
         let args = SkillRemoveArgs {
             persona: "sp2".to_string(),
@@ -207,6 +209,7 @@ mod tests {
         let client = Client::new(ClientOptions {
             data_root,
             config_root: None,
+            vault: None,
         });
         let args = SkillAddArgs {
             persona: "dup-skill".to_string(),

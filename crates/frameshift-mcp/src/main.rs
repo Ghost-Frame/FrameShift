@@ -16,7 +16,14 @@ async fn main() {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    let client = match Client::with_default_data_root() {
+    // Env-only vault provider: stdin/stdout here *are* the JSON-RPC protocol
+    // channel, so there is never an interactive terminal to prompt on, and a
+    // blocking stdin read would corrupt the protocol stream. Callers that
+    // need vault-backed template tokens available to this server must export
+    // FRAMESHIFT_VAULT_PASSPHRASE in its environment.
+    let client = match Client::with_default_data_root_and_vault(Some(
+        frameshift_client::env_only_vault_provider(),
+    )) {
         Ok(c) => c,
         Err(e) => {
             // stdout is the protocol channel and no request id exists yet, so the
@@ -237,6 +244,7 @@ mod tests {
         Client::new(ClientOptions {
             data_root: data_root.to_path_buf(),
             config_root: None,
+            vault: None,
         })
     }
 

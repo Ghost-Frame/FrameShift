@@ -220,6 +220,7 @@ mod tests {
         let client = Client::new(ClientOptions {
             data_root: tmp.path().join("data"),
             config_root: None,
+            vault: None,
         });
         let project_root = tmp.path().join("project");
         std::fs::create_dir_all(&project_root).unwrap();

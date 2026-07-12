@@ -16,6 +16,7 @@ use tracing_subscriber::EnvFilter;
 use frameshift_client::{Client, InstallRequest, InstallSource, PersonaSpec};
 
 use cmd::automate::AutomateArgs;
+use cmd::config::ConfigArgs;
 use cmd::diff::DiffArgs;
 use cmd::feedback::FeedbackArgs;
 use cmd::grow::GrowArgs;
@@ -29,6 +30,7 @@ use cmd::search::SearchArgs;
 use cmd::select::SelectArgs;
 use cmd::skill::{SkillArgs, SkillCommand};
 use cmd::use_persona::UseArgs;
+use cmd::vault::VaultArgs;
 use cmd::verify::VerifyArgs;
 use util::CliError;
 
@@ -134,6 +136,15 @@ enum Command {
 
     /// Record a persona selection override for preference learning.
     Feedback(FeedbackArgs),
+
+    /// Get or set a key in the current project's central config.toml.
+    Config(ConfigArgs),
+
+    // ------------------------------------------------------------------
+    // Vault: {{token}} values for templated packs
+    // ------------------------------------------------------------------
+    /// Manage this project's vault of `{{token}}` values for templated packs.
+    Vault(VaultArgs),
 }
 
 /// Typed run-level error that carries an exit code alongside a message.
@@ -201,12 +212,38 @@ fn main() -> ExitCode {
     }
 }
 
-/// Build a `Client` using the default central data root.
+/// Build a `Client` using the default central data root, with the CLI's
+/// vault provider attached (see [`cli_open_vault`]).
+///
+/// The provider is attached unconditionally: it costs nothing for the many
+/// subcommands that never render a templated pack, since
+/// `frameshift_client::VaultProvider::open_vault` is only invoked when a
+/// pack actually ships `pack.template.toml`.
 ///
 /// Fails with a `RunError::General` if the data root cannot be determined
 /// (e.g., `$HOME` is not set).
 fn make_client() -> Result<Client, RunError> {
-    Client::with_default_data_root().map_err(|e| RunError::General(e.to_string()))
+    Client::with_default_data_root_and_vault(Some(cli_vault_provider()))
+        .map_err(|e| RunError::General(e.to_string()))
+}
+
+/// Build the CLI's [`frameshift_client::VaultProvider`]: passphrase from
+/// `FRAMESHIFT_VAULT_PASSPHRASE`, or (only when stdin is an interactive
+/// terminal) a hidden `rpassword` prompt. See [`cmd::vault::resolve_passphrase`],
+/// which this delegates to so the `frameshift vault` subcommands and this
+/// render-time provider resolve the passphrase identically.
+fn cli_vault_provider() -> std::sync::Arc<dyn frameshift_client::VaultProvider> {
+    std::sync::Arc::new(cli_open_vault)
+}
+
+/// Open the vault at `vault_path` using the CLI's passphrase-resolution
+/// policy. Matches the `frameshift_client::VaultProvider` signature so it
+/// can be used directly via the blanket `Fn` impl.
+fn cli_open_vault(
+    vault_path: &std::path::Path,
+) -> Result<frameshift_client::VaultData, frameshift_client::VaultError> {
+    let passphrase = cmd::vault::resolve_passphrase()?;
+    frameshift_client::open_vault_with_passphrase(vault_path, passphrase)
 }
 
 /// Execute the parsed subcommand.
@@ -456,6 +493,16 @@ fn run() -> Result<(), RunError> {
         Command::Feedback(args) => {
             let client = make_client()?;
             cmd::feedback::run_feedback(&client, args).map_err(RunError::from)
+        }
+
+        Command::Config(args) => {
+            let client = make_client()?;
+            cmd::config::run_config(&client, args).map_err(RunError::from)
+        }
+
+        Command::Vault(args) => {
+            let client = make_client()?;
+            cmd::vault::run_vault(&client, args).map_err(RunError::from)
         }
     }
 }

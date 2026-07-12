@@ -14,6 +14,11 @@ pub use error::ClientError;
 /// on the decision variants without adding their own `frameshift-conformance`
 /// dependency just to name the type.
 pub use frameshift_conformance::CrossVersionDecision;
+/// Re-exported vault schema/error types so callers implementing
+/// [`VaultProvider`] (the CLI, daemon, MCP server) do not need their own
+/// direct `frameshift-vault` dependency just to name `VaultData`/`VaultError`
+/// in a provider function's signature.
+pub use frameshift_vault::{VaultData, VaultError};
 pub use model::{
     ClientOptions, GcReport, InstallReport, InstallRequest, InstallSource, LockedPersona, Lockfile,
     MemoryConfig, MemoryRequirementStatus, PersonaSpec, ProjectConfig, ProjectPaths, SyncReport,
@@ -28,10 +33,14 @@ pub use selection::{
 use base64::{engine::general_purpose, Engine as _};
 use ed25519_dalek::VerifyingKey;
 use frameshift_pack::Pack;
+use frameshift_vault::VaultBackend as _;
+use frameshift_vault_local::{LocalAgeBackend, Recipients};
+use secrecy::SecretString;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 /// Legacy filename written to the project root by pre-WS-1 versions.
@@ -43,9 +52,19 @@ const LEGACY_LOCK_FILENAME: &str = "frameshift.lock";
 const CENTRAL_CONFIG_FILENAME: &str = "config.toml";
 /// Canonical lock filename inside the central store: `projects/<id>/lock.toml`.
 const CENTRAL_LOCK_FILENAME: &str = "lock.toml";
+/// Canonical vault filename inside the central store: `projects/<id>/vault.age`.
+const CENTRAL_VAULT_FILENAME: &str = "vault.age";
 const ACTIVE_FILENAME: &str = "active";
 /// Env var to override the auto-derived path-hash project_id.
 const PROJECT_ID_ENV: &str = "FRAMESHIFT_PROJECT_ID";
+/// Env var consulted by [`env_only_vault_provider`] and (as a first choice,
+/// before any interactive fallback) by the `frameshift` CLI's own provider.
+pub const VAULT_PASSPHRASE_ENV: &str = "FRAMESHIFT_VAULT_PASSPHRASE";
+/// Filename of a templated pack's companion token/section manifest. Its
+/// presence in a pack's cache directory is the sole gate for token
+/// substitution: packs that do not ship this file render exactly as they
+/// did before this feature existed, with no vault lookup performed at all.
+const PACK_TEMPLATE_MANIFEST_FILENAME: &str = "pack.template.toml";
 
 const RENDER_TARGETS: [(&str, &str); 4] = [
     ("claude", "CLAUDE.md"),
@@ -62,6 +81,107 @@ pub struct Client {
     data_root: PathBuf,
     /// Root of the XDG config directory (for infrastructure overlay).
     config_root: Option<PathBuf>,
+    /// Optional vault-data provider used to substitute `{{token}}`
+    /// placeholders when materializing a templated pack's render output.
+    /// See [`VaultProvider`]'s never-prompts contract.
+    vault: Option<Arc<dyn VaultProvider>>,
+}
+
+// ── Vault provider ──────────────────────────────────────────────────────────
+
+/// Supplies decrypted vault data for `{{token}}` substitution during
+/// template rendering.
+///
+/// # Never-prompts contract
+///
+/// Implementations of this trait MUST NOT read from stdin or otherwise block
+/// on interactive input. The client library itself never prompts for a
+/// vault passphrase; any interactive prompting must happen in the caller
+/// (e.g. the `frameshift` CLI's own provider) *before* the passphrase is
+/// captured into the closure/impl passed here, so that `open_vault` itself
+/// is always a non-interactive operation from this crate's point of view.
+pub trait VaultProvider: Send + Sync {
+    /// Open and decrypt the vault at `vault_path`, returning its contents.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`VaultError`] the underlying backend produces --
+    /// typically [`VaultError::Io`] for a missing file, [`VaultError::Crypto`]
+    /// for a wrong passphrase, or [`VaultError::BackendUnavailable`] when no
+    /// passphrase could be resolved (e.g. non-interactive with no env var set).
+    fn open_vault(&self, vault_path: &Path) -> Result<VaultData, VaultError>;
+}
+
+/// Blanket impl so any `Fn(&Path) -> Result<VaultData, VaultError> + Send +
+/// Sync` (a plain function item or a non-capturing closure) can be used
+/// directly as a [`VaultProvider`] without a dedicated wrapper type.
+impl<F> VaultProvider for F
+where
+    F: Fn(&Path) -> Result<VaultData, VaultError> + Send + Sync,
+{
+    /// Delegates to the wrapped callable.
+    fn open_vault(&self, vault_path: &Path) -> Result<VaultData, VaultError> {
+        self(vault_path)
+    }
+}
+
+/// Open the age-encrypted vault at `vault_path` using a passphrase recipient,
+/// then run [`frameshift_vault::validate`] on the decrypted contents.
+///
+/// This is the one place `Client` (and its callers) talk to
+/// `frameshift-vault-local::LocalAgeBackend`; every ready-made provider below
+/// and the `frameshift` CLI's own interactive provider funnel through here so
+/// the backend choice and the post-open validation pass stay in one spot.
+///
+/// # Errors
+///
+/// Returns whatever [`VaultError`] `LocalAgeBackend::open` or
+/// [`frameshift_vault::validate`] produces.
+pub fn open_vault_with_passphrase(
+    vault_path: &Path,
+    passphrase: SecretString,
+) -> Result<VaultData, VaultError> {
+    let backend =
+        LocalAgeBackend::new(vault_path.to_path_buf(), Recipients::Passphrase(passphrase));
+    let data = backend.open()?;
+    frameshift_vault::validate(&data)?;
+    Ok(data)
+}
+
+/// Resolve the vault passphrase strictly from [`VAULT_PASSPHRASE_ENV`],
+/// never touching stdin.
+///
+/// # Errors
+///
+/// Returns [`VaultError::BackendUnavailable`] when the env var is unset or
+/// empty.
+fn env_vault_passphrase() -> Result<SecretString, VaultError> {
+    match std::env::var(VAULT_PASSPHRASE_ENV) {
+        Ok(value) if !value.is_empty() => Ok(SecretString::new(value)),
+        _ => Err(VaultError::BackendUnavailable(format!(
+            "vault passphrase not available: set {VAULT_PASSPHRASE_ENV}"
+        ))),
+    }
+}
+
+/// [`VaultProvider`] implementation used by [`env_only_vault_provider`].
+/// A plain function item (captures nothing), so it satisfies the blanket
+/// `VaultProvider` impl directly.
+fn env_only_open_vault(vault_path: &Path) -> Result<VaultData, VaultError> {
+    open_vault_with_passphrase(vault_path, env_vault_passphrase()?)
+}
+
+/// Build a [`VaultProvider`] that resolves the passphrase strictly from
+/// [`VAULT_PASSPHRASE_ENV`] and never touches stdin.
+///
+/// Intended for daemon/background-service callers (`frameshift-daemon`,
+/// `frameshift-mcp`) where there is no interactive terminal attached and a
+/// blocking stdin read would hang the service (or, for the MCP server,
+/// corrupt the stdin/stdout JSON-RPC protocol stream). When the env var is
+/// unset, the returned provider fails with [`VaultError::BackendUnavailable`]
+/// rather than blocking or falling back to an unauthenticated vault open.
+pub fn env_only_vault_provider() -> Arc<dyn VaultProvider> {
+    Arc::new(env_only_open_vault)
 }
 
 /// Inherent methods implementing the Frameshift client's public API surface.
@@ -71,14 +191,31 @@ impl Client {
         Self {
             data_root: options.data_root,
             config_root: options.config_root,
+            vault: options.vault,
         }
     }
 
-    /// Construct a `Client` using the XDG data and config roots resolved from environment variables.
+    /// Construct a `Client` using the XDG data and config roots resolved from
+    /// environment variables, with no vault provider configured. Templated
+    /// packs (those shipping `pack.template.toml`) will fail to render with
+    /// [`ClientError::MissingRequiredTokens`] under a `Client` built this
+    /// way; callers that need vault-backed token substitution should use
+    /// [`Client::with_default_data_root_and_vault`] instead.
     pub fn with_default_data_root() -> Result<Self, ClientError> {
+        Self::with_default_data_root_and_vault(None)
+    }
+
+    /// Construct a `Client` using the XDG data and config roots resolved from
+    /// environment variables, attaching `vault` as the render-time
+    /// [`VaultProvider`]. Pass `None` for callers that never render templated
+    /// packs (equivalent to [`Client::with_default_data_root`]).
+    pub fn with_default_data_root_and_vault(
+        vault: Option<Arc<dyn VaultProvider>>,
+    ) -> Result<Self, ClientError> {
         Ok(Self::new(ClientOptions {
             data_root: default_data_root()?,
             config_root: Some(default_config_root()?),
+            vault,
         }))
     }
 
@@ -184,6 +321,7 @@ impl Client {
             project_id,
             config_path: project_state_dir.join(CENTRAL_CONFIG_FILENAME),
             lock_path: project_state_dir.join(CENTRAL_LOCK_FILENAME),
+            vault_path: project_state_dir.join(CENTRAL_VAULT_FILENAME),
             cache_dir,
             active_path: project_state_dir.join(ACTIVE_FILENAME),
             personas_dir,
@@ -368,6 +506,24 @@ impl Client {
                 source,
             }),
         }
+    }
+
+    /// Write `config` to the central project config (`projects/<id>/config.toml`),
+    /// creating the containing directory if it does not exist yet.
+    ///
+    /// This is the write-side counterpart to [`Client::project_config`]. Used by
+    /// the `frameshift config set` CLI subcommand and any other caller that
+    /// needs to persist a `ProjectConfig` change (e.g. toggling
+    /// `telemetry_opt_in`) rather than only reading it.
+    pub fn save_project_config(
+        &self,
+        project_root: &Path,
+        config: &ProjectConfig,
+    ) -> Result<(), ClientError> {
+        let paths = self.project_paths(project_root)?;
+        ensure_dir(&paths.project_state_dir)?;
+        let raw = toml::to_string_pretty(config)?;
+        write_file(&paths.config_path, raw.as_bytes())
     }
 
     /// Append a persona-selection event to the project's local selection history
@@ -718,6 +874,7 @@ impl Client {
                 &paths.cache_dir,
                 &cache_path,
                 &rendered_root,
+                &paths.vault_path,
                 &persona.name,
                 lockfile,
             )?;
@@ -756,11 +913,20 @@ impl Client {
     /// - `extends`/`mixin` declared but no `persona.toml`: warns and falls
     ///   back to the markdown-only render path, since there is no typed
     ///   source for the composer to operate on.
+    ///
+    /// Independently of which of the three paths above is taken: if the pack
+    /// at `cache_path` ships a `pack.template.toml` manifest, every render
+    /// target's markdown is additionally passed through `{{token}}`
+    /// substitution (see [`load_template_context`] / [`substitute_tokens`])
+    /// before being written. The vault is opened at most once per call
+    /// (not once per render target). Packs that ship no such manifest render
+    /// byte-identically to how they did before this feature existed.
     fn materialize_persona_rendered_outputs(
         &self,
         cache_dir: &Path,
         cache_path: &Path,
         rendered_root: &Path,
+        vault_path: &Path,
         persona_name: &str,
         lockfile: &Lockfile,
     ) -> Result<(), ClientError> {
@@ -778,6 +944,12 @@ impl Client {
 
         let has_composition = manifest.extends.is_some() || !manifest.mixin.is_empty();
         let has_typed_source = cache_path.join("persona.toml").is_file();
+
+        // Loaded once regardless of which render branch runs below, so a
+        // templated pack opens its vault a single time per materialize call
+        // rather than once per render target.
+        let template_ctx =
+            load_template_context(cache_path, vault_path, self.vault.as_ref(), persona_name)?;
 
         if has_composition && has_typed_source {
             let root = frameshift_source::PersonaSource::load_from_dir(cache_path)
@@ -818,9 +990,13 @@ impl Client {
                 let markdown = frameshift_source::render_to_markdown(&src, target);
                 let composed_content =
                     compose_rendered_content(persona_name, &markdown, self.config_root.as_deref());
+                let context =
+                    format!("rendered markdown for persona {persona_name:?} (target {target_dir})");
+                let final_content =
+                    substitute_tokens(&composed_content, &context, template_ctx.as_ref())?;
                 let dir = rendered_root.join(target_dir);
                 ensure_dir(&dir)?;
-                write_file(&dir.join(filename), composed_content.as_bytes())?;
+                write_file(&dir.join(filename), final_content.as_bytes())?;
             }
 
             return Ok(());
@@ -838,6 +1014,7 @@ impl Client {
             rendered_root,
             persona_name,
             self.config_root.as_deref(),
+            template_ctx.as_ref(),
         )
     }
 }
@@ -1191,6 +1368,7 @@ fn materialize_rendered_outputs(
     rendered_root: &Path,
     persona_name: &str,
     config_root: Option<&Path>,
+    template_ctx: Option<&(frameshift_template::TemplateManifest, VaultData)>,
 ) -> Result<(), ClientError> {
     let render_source = find_render_source(cache_path)?;
     let persona_content = fs::read_to_string(&render_source).map_err(|source| ClientError::Io {
@@ -1199,14 +1377,153 @@ fn materialize_rendered_outputs(
     })?;
 
     let composed = compose_rendered_content(persona_name, &persona_content, config_root);
+    let final_content = substitute_tokens(
+        &composed,
+        &format!("rendered markdown for persona {persona_name:?}"),
+        template_ctx,
+    )?;
 
     for (target_dir, filename) in RENDER_TARGETS {
         let dir = rendered_root.join(target_dir);
         ensure_dir(&dir)?;
-        write_file(&dir.join(filename), composed.as_bytes())?;
+        write_file(&dir.join(filename), final_content.as_bytes())?;
     }
 
     Ok(())
+}
+
+/// Load the token-substitution context for a templated pack, or `None` when
+/// the pack at `cache_path` does not ship
+/// [`PACK_TEMPLATE_MANIFEST_FILENAME`] -- the byte-identical-rendering fast
+/// path used by every pack today, and asserted by
+/// `pack_without_manifest_renders_byte_identically_regardless_of_vault` in
+/// this module's tests.
+///
+/// When the manifest *is* present, this opens the project vault via
+/// `vault_provider` and checks that every `required = true` token declared
+/// in the manifest has a value, failing before any render output is written
+/// with [`ClientError::MissingRequiredTokens`] naming every missing token,
+/// not just the first.
+///
+/// # Errors
+///
+/// - [`ClientError::Io`]: the manifest file exists but could not be read.
+/// - [`ClientError::Template`]: the manifest could not be parsed as TOML.
+/// - [`ClientError::MissingRequiredTokens`]: no vault provider was
+///   configured, the vault file does not exist yet, or the vault exists but
+///   is missing one or more required token values.
+/// - [`ClientError::VaultOpen`]: the vault provider returned some other
+///   failure while opening the vault (e.g. a wrong passphrase).
+fn load_template_context(
+    cache_path: &Path,
+    vault_path: &Path,
+    vault_provider: Option<&Arc<dyn VaultProvider>>,
+    persona_name: &str,
+) -> Result<Option<(frameshift_template::TemplateManifest, VaultData)>, ClientError> {
+    let manifest_path = cache_path.join(PACK_TEMPLATE_MANIFEST_FILENAME);
+    if !manifest_path.is_file() {
+        return Ok(None);
+    }
+
+    let manifest_raw = fs::read_to_string(&manifest_path).map_err(|source| ClientError::Io {
+        path: manifest_path.clone(),
+        source,
+    })?;
+    let manifest =
+        frameshift_template::TemplateManifest::from_toml(&manifest_raw).map_err(|source| {
+            ClientError::Template {
+                context: format!("manifest {}", manifest_path.display()),
+                source: Box::new(source),
+            }
+        })?;
+
+    // Local helper: every `required = true` token name, in sorted order.
+    let required_tokens = |manifest: &frameshift_template::TemplateManifest| -> Vec<String> {
+        manifest
+            .tokens
+            .iter()
+            .filter(|(_, decl)| decl.required)
+            .map(|(name, _)| name.clone())
+            .collect()
+    };
+
+    let Some(provider) = vault_provider else {
+        return Err(ClientError::MissingRequiredTokens {
+            persona: persona_name.to_owned(),
+            vault_path: vault_path.to_path_buf(),
+            tokens: required_tokens(&manifest),
+        });
+    };
+
+    let vault = match provider.open_vault(vault_path) {
+        Ok(vault) => vault,
+        Err(VaultError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ClientError::MissingRequiredTokens {
+                persona: persona_name.to_owned(),
+                vault_path: vault_path.to_path_buf(),
+                tokens: required_tokens(&manifest),
+            });
+        }
+        Err(source) => {
+            return Err(ClientError::VaultOpen {
+                vault_path: vault_path.to_path_buf(),
+                source: Box::new(source),
+            });
+        }
+    };
+
+    let missing: Vec<String> = manifest
+        .tokens
+        .iter()
+        .filter(|(name, decl)| decl.required && vault.get_variable(name).is_none())
+        .map(|(name, _)| name.clone())
+        .collect();
+    if !missing.is_empty() {
+        return Err(ClientError::MissingRequiredTokens {
+            persona: persona_name.to_owned(),
+            vault_path: vault_path.to_path_buf(),
+            tokens: missing,
+        });
+    }
+
+    Ok(Some((manifest, vault)))
+}
+
+/// Apply `{{token}}` substitution to `content` using an already-loaded
+/// template context, or return `content` unchanged (byte-identical, no
+/// alloc-and-compare needed since this is a plain clone) when `template_ctx`
+/// is `None`.
+///
+/// Optional (`required = false`) tokens absent from the vault are left as
+/// `{{name}}` in the output: `frameshift_template::TokenDecl` has no
+/// default-value field, so there is nothing to substitute, and this matches
+/// `frameshift_runtime::Runtime::render`'s existing behavior (missing tokens
+/// stay visible rather than becoming empty strings).
+///
+/// `context` is a human-readable description of what `content` is (used
+/// only in the [`ClientError::Template`] error message on a parse failure).
+///
+/// # Errors
+///
+/// Returns [`ClientError::Template`] if `content` cannot be parsed as a
+/// [`frameshift_template::Template`] (unclosed section, invalid token name,
+/// etc.).
+fn substitute_tokens(
+    content: &str,
+    context: &str,
+    template_ctx: Option<&(frameshift_template::TemplateManifest, VaultData)>,
+) -> Result<String, ClientError> {
+    let Some((_, vault)) = template_ctx else {
+        return Ok(content.to_owned());
+    };
+
+    let template =
+        frameshift_template::Template::parse(content).map_err(|source| ClientError::Template {
+            context: context.to_owned(),
+            source: Box::new(source),
+        })?;
+
+    Ok(template.render(vault.variables(), vault.overlays()))
 }
 
 /// Compose the final rendered content from infrastructure overlay + persona context header + persona content.
@@ -1651,6 +1968,7 @@ mod tests {
         let client = Client::new(ClientOptions {
             data_root: tmp.path().join("data"),
             config_root: None,
+            vault: None,
         });
 
         client
@@ -1749,6 +2067,7 @@ mod tests {
         let client = Client::new(ClientOptions {
             data_root: tmp.path().join("data"),
             config_root: None,
+            vault: None,
         });
         assert!(client.list_personas(&project_root).unwrap().is_empty());
     }
@@ -1788,6 +2107,7 @@ mod tests {
         let client = Client::new(ClientOptions {
             data_root: tmp.path().join("data"),
             config_root: None,
+            vault: None,
         });
         let dirs = client.installed_persona_source_dirs(&project_root).unwrap();
         assert!(dirs.is_empty());
@@ -1829,6 +2149,7 @@ mod tests {
         let client = Client::new(ClientOptions {
             data_root: tmp.path().join("data"),
             config_root: None,
+            vault: None,
         });
         let err = client
             .rendered_persona(&project_root, "ghost", "claude")
@@ -1909,6 +2230,7 @@ mod tests {
         let client = Client::new(ClientOptions {
             data_root: data_root.clone(),
             config_root: Some(config_root),
+            vault: None,
         });
         client
             .install(InstallRequest {
@@ -1973,6 +2295,7 @@ mod tests {
         let client = Client::new(ClientOptions {
             data_root: data_root.clone(),
             config_root: None,
+            vault: None,
         });
         client
             .install(InstallRequest {
@@ -2070,6 +2393,7 @@ mod tests {
         let client = Client::new(ClientOptions {
             data_root: tmp.path().join("data"),
             config_root: None,
+            vault: None,
         });
 
         let report = client
@@ -2096,6 +2420,7 @@ mod tests {
         let client = Client::new(ClientOptions {
             data_root: tmp.path().join("data"),
             config_root: None,
+            vault: None,
         });
 
         let old_pack_dir = tmp.path().join("old-pack");
@@ -2143,6 +2468,7 @@ mod tests {
         let client = Client::new(ClientOptions {
             data_root: tmp.path().join("data"),
             config_root: None,
+            vault: None,
         });
 
         let old_pack_dir = tmp.path().join("old-pack");
@@ -2191,6 +2517,7 @@ mod tests {
         let client = Client::new(ClientOptions {
             data_root: tmp.path().join("data"),
             config_root: None,
+            vault: None,
         });
 
         let old_pack_dir = tmp.path().join("old-pack");

@@ -250,6 +250,7 @@ fn test_client_and_project(temp: &tempfile::TempDir) -> (Client, std::path::Path
     let client = Client::new(ClientOptions {
         data_root,
         config_root: None,
+        vault: None,
     });
     (client, project_root)
 }
