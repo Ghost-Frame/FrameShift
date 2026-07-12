@@ -581,6 +581,18 @@ impl CatalogBackend for PostgresCatalog {
     /// are set, both `@>` clauses are ANDed (intersection of intersections),
     /// which Postgres resolves via the GIN index efficiently.
     ///
+    /// # Tombstone exclusion mechanism
+    ///
+    /// Every query issued by this method (the plain DSL branches below and
+    /// the raw-SQL helpers `search_raw` / `search_trending_raw`)
+    /// unconditionally adds `latest_version IS NOT NULL` to its `WHERE`
+    /// clause. `latest_version` is recomputed by `tombstone_pack` on every
+    /// call to be the newest remaining `Active` version, or `NULL` when the
+    /// pack has zero `Active` versions left. So a pack "falls out" of search
+    /// exactly when its last `Active` version is tombstoned -- there is no
+    /// separate per-version status check here, because `search_packs`
+    /// operates on the `packs` head table, not `pack_versions`.
+    ///
     /// NOTE: Large offsets degrade because Postgres must scan and skip rows.
     /// Keyset pagination is a tracked future improvement.
     #[instrument(skip(self, filters))]
@@ -619,6 +631,9 @@ impl CatalogBackend for PostgresCatalog {
                     .await?
                 }
                 SortMode::TopRated => packs::table
+                    // Dead packs (zero Active versions) have latest_version
+                    // cleared by tombstone_pack's head recompute; exclude them.
+                    .filter(packs::latest_version.is_not_null())
                     .select(PackRow::as_select())
                     .order((packs::total_downloads.desc(), packs::name.asc()))
                     .limit(limit_i)
@@ -627,6 +642,8 @@ impl CatalogBackend for PostgresCatalog {
                     .await
                     .map_err(|e| map_diesel_error(e, "pack", String::new()))?,
                 SortMode::Recent => packs::table
+                    // See the TopRated arm above for why this filter exists.
+                    .filter(packs::latest_version.is_not_null())
                     .select(PackRow::as_select())
                     .order((packs::created_at.desc(), packs::name.asc()))
                     .limit(limit_i)
@@ -736,19 +753,29 @@ impl CatalogBackend for PostgresCatalog {
         Ok(new_count.max(0) as u64)
     }
 
-    /// Mark a specific pack version as tombstoned.
+    /// Mark a specific pack version as tombstoned and recompute the pack head.
     ///
-    /// SQL shape:
-    /// ```sql
-    /// UPDATE pack_versions SET status = $1
-    ///   WHERE pack_name = $2 AND version = $3
-    /// ```
-    /// The `status` column is set to the JSON serialisation of
-    /// `PackStatus::Tombstone { reason, recorded_at }`. No rows are deleted.
+    /// Executed inside a single transaction:
+    /// 1. `UPDATE pack_versions SET status = $1 WHERE pack_name = $2 AND
+    ///    version = $3`. The `status` column is set to the JSON serialisation
+    ///    of `PackStatus::Tombstone { reason, recorded_at }`. No rows are
+    ///    deleted; content-addressed retrieval by hash still works afterwards.
+    /// 2. Every remaining version row for the pack is read back and its
+    ///    `status` is deserialised. The `Active` versions are compared with
+    ///    [`semver_gt`] (the SAME true-semver-precedence comparator
+    ///    `register_pack_version` uses for D8) to find the newest one.
+    /// 3. `packs.latest_version` is set to that newest `Active` version, or to
+    ///    `NULL` when no `Active` version remains -- this is what makes the
+    ///    pack "disappear" from `search_packs` (see its doc for the
+    ///    mechanism) while the version rows themselves stay queryable via
+    ///    `get_pack_version` / `list_pack_versions` with their tombstoned
+    ///    status visible.
     ///
     /// Re-tombstoning an already-tombstoned version is idempotent (last-writer
     /// wins). This differs from some adapters that return `Conflict` on
-    /// re-tombstone; the choice here favors operational simplicity.
+    /// re-tombstone; the choice here favors operational simplicity. The head
+    /// recompute step still runs on every call, which is a harmless no-op when
+    /// the newest `Active` version has not changed.
     #[instrument(skip(self, name, version, record), fields(pack = %name, version = %version))]
     async fn tombstone_pack(
         &self,
@@ -765,26 +792,106 @@ impl CatalogBackend for PostgresCatalog {
         let status_json =
             serde_json::to_value(&status).map_err(|e| CatalogError::BackendError(Box::new(e)))?;
 
-        let rows_affected = diesel::update(
-            pack_versions::table.filter(
-                pack_versions::pack_name
-                    .eq(name)
-                    .and(pack_versions::version.eq(version)),
-            ),
-        )
-        .set(pack_versions::status.eq(status_json))
-        .execute(&mut *conn)
-        .await
-        .map_err(|e| map_diesel_error(e, "pack_version", format!("{name}@{version}")))?;
+        let name_owned = name.to_string();
+        let version_owned = version.to_string();
 
-        if rows_affected == 0 {
-            return Err(CatalogError::NotFound {
-                kind: "pack_version",
-                key: format!("{name}@{version}"),
-            });
+        // Same `TxError` wrapper pattern as `register_pack_version`: diesel-async's
+        // `transaction` requires `E: From<diesel::result::Error>`, and `CatalogError`
+        // is a cross-crate type we cannot implement that for directly.
+        enum TxError {
+            Catalog(CatalogError),
+            Diesel(diesel::result::Error),
+        }
+        /// Required by `diesel_async::AsyncConnection::transaction`.
+        impl From<diesel::result::Error> for TxError {
+            /// Wrap a raw Diesel error in `TxError::Diesel` for transport
+            /// through the transaction boundary.
+            fn from(e: diesel::result::Error) -> Self {
+                TxError::Diesel(e)
+            }
         }
 
-        Ok(())
+        use diesel_async::AsyncConnection as _;
+        let tx_result = conn
+            .transaction::<(), TxError, _>(async move |conn| {
+                let pack_name = name_owned;
+                let version = version_owned;
+
+                let rows_affected = diesel::update(
+                    pack_versions::table.filter(
+                        pack_versions::pack_name
+                            .eq(&pack_name)
+                            .and(pack_versions::version.eq(&version)),
+                    ),
+                )
+                .set(pack_versions::status.eq(status_json))
+                .execute(conn)
+                .await
+                .map_err(|e| {
+                    TxError::Catalog(map_diesel_error(
+                        e,
+                        "pack_version",
+                        format!("{pack_name}@{version}"),
+                    ))
+                })?;
+
+                if rows_affected == 0 {
+                    return Err(TxError::Catalog(CatalogError::NotFound {
+                        kind: "pack_version",
+                        key: format!("{pack_name}@{version}"),
+                    }));
+                }
+
+                // Recompute the head: read back every version's (version, status)
+                // pair, keep the Active ones, and fold to find the newest by
+                // true semver precedence (mirrors D8's `semver_gt` in
+                // `register_pack_version`, not a new comparator).
+                let rows: Vec<(String, serde_json::Value)> = pack_versions::table
+                    .filter(pack_versions::pack_name.eq(&pack_name))
+                    .select((pack_versions::version, pack_versions::status))
+                    .load(conn)
+                    .await
+                    .map_err(|e| {
+                        TxError::Catalog(map_diesel_error(e, "pack_version", pack_name.clone()))
+                    })?;
+
+                let newest_active = rows
+                    .into_iter()
+                    .filter_map(|(v, status_json)| {
+                        let status: frameshift_catalog::PackStatus =
+                            serde_json::from_value(status_json).ok()?;
+                        matches!(status, frameshift_catalog::PackStatus::Active).then_some(v)
+                    })
+                    .fold(None::<String>, |best, candidate| match best {
+                        None => Some(candidate),
+                        Some(cur) if semver_gt(&candidate, &cur) => Some(candidate),
+                        Some(cur) => Some(cur),
+                    });
+
+                // A no-op when the pack head row does not exist (cannot happen
+                // via the public API, since `register_pack_version` always
+                // creates the head before a version can be tombstoned).
+                diesel::update(packs::table.filter(packs::name.eq(&pack_name)))
+                    .set(packs::latest_version.eq(newest_active))
+                    .execute(conn)
+                    .await
+                    .map_err(|e| {
+                        TxError::Catalog(map_diesel_error(e, "pack", pack_name.clone()))
+                    })?;
+
+                Ok(())
+            })
+            .await;
+
+        match tx_result {
+            Ok(()) => Ok(()),
+            Err(TxError::Catalog(e)) => Err(e),
+            Err(TxError::Diesel(e)) => Err(map_diesel_error(
+                e,
+                "pack_version",
+                format!("{name}@{version}"),
+            )),
+        }
     }
 
     /// Retrieve the Ed25519 public key currently mapped to a handle.
@@ -1093,7 +1200,12 @@ impl PostgresCatalog {
             offset,
         } = params;
         let mut bind_idx: usize = 1;
-        let mut where_parts: Vec<String> = Vec::new();
+        // `latest_version IS NOT NULL` is unconditional (a literal, not a bind
+        // parameter) so it does not shift `bind_idx`. It excludes dead packs
+        // (zero Active versions -- see search_packs's doc for the mechanism)
+        // from every filtered search, matching the plain-DSL branches in
+        // `search_packs` for the unfiltered case.
+        let mut where_parts: Vec<String> = vec!["latest_version IS NOT NULL".to_string()];
 
         if tag.is_some() {
             where_parts.push(format!("tags @> ARRAY[${bind_idx}]::TEXT[]"));
@@ -1123,11 +1235,8 @@ impl PostgresCatalog {
             bind_idx += 1;
         }
 
-        let where_sql = if where_parts.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {}", where_parts.join(" AND "))
-        };
+        // `where_parts` always has at least the latest_version clause above.
+        let where_sql = format!("WHERE {}", where_parts.join(" AND "));
 
         let order_sql = match sort {
             SortMode::TopRated | SortMode::Trending => "ORDER BY total_downloads DESC, name ASC",
@@ -1468,7 +1577,11 @@ impl PostgresCatalog {
         // Bind order matches the branch arms below: tag, target_context, author,
         // query_text, extends. The window interval is bound last before limit/offset.
         let mut bind_idx: usize = 1;
-        let mut where_parts: Vec<String> = Vec::new();
+        // `p.latest_version IS NOT NULL` is unconditional (a literal, not a bind
+        // parameter) so it does not shift `bind_idx`. It excludes dead packs
+        // (zero Active versions -- see search_packs's doc for the mechanism)
+        // from every trending search, filtered or not.
+        let mut where_parts: Vec<String> = vec!["p.latest_version IS NOT NULL".to_string()];
 
         if tag.is_some() {
             where_parts.push(format!("p.tags @> ARRAY[${bind_idx}]::TEXT[]"));
@@ -1494,11 +1607,8 @@ impl PostgresCatalog {
             bind_idx += 1;
         }
 
-        let where_sql = if where_parts.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {}", where_parts.join(" AND "))
-        };
+        // `where_parts` always has at least the latest_version clause above.
+        let where_sql = format!("WHERE {}", where_parts.join(" AND "));
 
         // The subquery interval bound index comes after all filter params.
         let interval_idx = bind_idx;
@@ -1884,7 +1994,14 @@ fn parse_semver(s: &str) -> Option<(u64, u64, u64, Option<String>)> {
 ///
 /// Unparseable versions are treated as lower than any parseable version.
 /// If both sides are unparseable, returns `false` (not strictly greater).
-fn semver_gt(a: &str, b: &str) -> bool {
+///
+/// `pub` (not `pub(crate)`) so that other in-workspace `CatalogBackend`
+/// implementations -- notably the in-memory mock used by
+/// `frameshift-server`'s integration tests -- can recompute a pack head's
+/// `latest_version` using the exact same ordering `register_pack_version`
+/// and `tombstone_pack` use here, instead of reimplementing (and risking
+/// drift from) the comparator.
+pub fn semver_gt(a: &str, b: &str) -> bool {
     match (parse_semver(a), parse_semver(b)) {
         // `a` is unparseable -- can never be greater.
         (None, _) => false,

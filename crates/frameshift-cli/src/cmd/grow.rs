@@ -41,6 +41,16 @@ pub struct AppendArgs {
     /// Text content to append.
     #[arg(long)]
     pub text: String,
+
+    /// Write a structured global-scope entry instead of a project-scope one.
+    ///
+    /// When set, this writes ONLY a structured `Scope::Global` entry via
+    /// `frameshift_growth::append_global` to the persona's global
+    /// growth.jsonl (`<data_root>/personas/<name>/growth.jsonl`). The legacy
+    /// markdown growth.md append stays project-scoped and is skipped
+    /// entirely in this mode -- there is no global markdown growth file.
+    #[arg(long)]
+    pub global: bool,
 }
 
 /// Arguments for grow log.
@@ -96,18 +106,38 @@ pub fn run(args: GrowArgs) -> Result<(), CliError> {
     }
 }
 
-/// Execute grow append -- write a timestamped entry to the persona's growth.md
-/// and structured growth.jsonl (via `frameshift_growth::append`'s dual-write).
+/// Execute grow append.
+///
+/// Default (no `--global`): writes a timestamped entry to the persona's
+/// growth.md and structured growth.jsonl (via `frameshift_growth::append`'s
+/// dual-write), both project-scoped.
+///
+/// With `--global`: writes ONLY a structured `Scope::Global` entry via
+/// `frameshift_growth::append_global`. The legacy markdown append is skipped
+/// entirely -- there is no global markdown growth file.
 fn run_append(args: AppendArgs) -> Result<(), CliError> {
     let client = frameshift_client::Client::with_default_data_root()?;
     let project_root = std::env::current_dir()
         .map_err(|e| CliError::Growth(format!("cannot determine current directory: {}", e)))?;
     let project_id = client.project_id(&project_root)?;
 
-    frameshift_growth::append(client.data_root(), &project_id, &args.persona, &args.text)
+    if args.global {
+        frameshift_growth::append_global(
+            client.data_root(),
+            &project_id,
+            &args.persona,
+            &args.text,
+        )
         .map_err(|e| CliError::Growth(e.to_string()))?;
-
-    println!("Growth entry appended for persona '{}'.", args.persona);
+        println!(
+            "Global growth entry appended for persona '{}'.",
+            args.persona
+        );
+    } else {
+        frameshift_growth::append(client.data_root(), &project_id, &args.persona, &args.text)
+            .map_err(|e| CliError::Growth(e.to_string()))?;
+        println!("Growth entry appended for persona '{}'.", args.persona);
+    }
     Ok(())
 }
 
@@ -199,7 +229,8 @@ mod tests {
         action: GrowAction,
     }
 
-    /// `grow append --persona <p> --text <t>` parses both required flags.
+    /// `grow append --persona <p> --text <t>` parses both required flags,
+    /// leaving `--global` at its default of `false`.
     #[test]
     fn parse_append_with_persona_and_text() {
         let parsed = TestCli::try_parse_from(["append", "--persona", "rust", "--text", "hi"])
@@ -208,7 +239,20 @@ mod tests {
             GrowAction::Append(args) => {
                 assert_eq!(args.persona, "rust");
                 assert_eq!(args.text, "hi");
+                assert!(!args.global);
             }
+            other => panic!("expected Append, got {other:?}"),
+        }
+    }
+
+    /// `grow append --persona <p> --text <t> --global` sets the `global` flag.
+    #[test]
+    fn parse_append_with_global_flag() {
+        let parsed =
+            TestCli::try_parse_from(["append", "--persona", "rust", "--text", "hi", "--global"])
+                .expect("append --global should parse");
+        match parsed.action {
+            GrowAction::Append(args) => assert!(args.global),
             other => panic!("expected Append, got {other:?}"),
         }
     }

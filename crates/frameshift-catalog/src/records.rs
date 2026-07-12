@@ -85,7 +85,10 @@ pub struct OauthLink {
 ///
 /// - `name` is unique within the catalog.
 /// - `latest_version` is `None` until at least one version has been published,
-///   and is updated atomically when a new version is registered.
+///   is updated atomically when a new version is registered, and is
+///   recomputed (possibly back to `None`) whenever a version is tombstoned --
+///   see [`crate::backend::CatalogBackend::tombstone_pack`]'s recompute
+///   contract.
 /// - `total_downloads` is a monotonically increasing counter; it is never
 ///   decremented even if a version is tombstoned.
 /// - `tags` may be empty; duplicates within the vec are discouraged but not
@@ -113,10 +116,14 @@ pub struct PackRecord {
     /// UTC timestamp when this pack was first created in the catalog.
     pub created_at: DateTime<Utc>,
 
-    /// The semver string of the most-recently published version.
+    /// The semver string of the newest `PackStatus::Active` version.
     ///
-    /// `None` until the first version is registered. Updated atomically by
-    /// `register_pack_version`.
+    /// `None` until the first version is registered, and also `None` again if
+    /// every version is later tombstoned. Updated atomically by
+    /// `register_pack_version` on publish and recomputed by `tombstone_pack`
+    /// on takedown (see that method's doc for the recompute contract). This
+    /// field, not any per-version status, is what `search_packs` uses to
+    /// decide whether a pack is currently installable.
     pub latest_version: Option<String>,
 
     /// Cumulative download count across all versions of this pack.

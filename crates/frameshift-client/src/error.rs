@@ -190,6 +190,64 @@ pub enum ClientError {
         /// The central project config.toml that would declare the adapter.
         config_path: PathBuf,
     },
+
+    /// A templated pack (one shipping a `pack.template.toml` manifest, see
+    /// `frameshift_template::TemplateManifest`) declares one or more
+    /// `required = true` tokens that have no value available. This fires in
+    /// three situations that all boil down to "no usable value exists":
+    /// no [`crate::VaultProvider`] was configured on the `Client`, the
+    /// project's vault file does not exist yet, or the vault exists but is
+    /// missing one or more of the required values. Every missing token is
+    /// named, not just the first, so a single failure gives the complete
+    /// remediation list. This check runs before any render output is
+    /// written, so a failure here never leaves a persona's `rendered/`
+    /// directory partially updated.
+    #[error(
+        "persona {persona:?} requires vault token(s) {tokens:?} but they have no value in the \
+         vault at {vault_path}; run `frameshift vault init` (if the vault does not exist yet) \
+         then `frameshift vault set <key>` for each listed token"
+    )]
+    MissingRequiredTokens {
+        /// The persona whose template render was blocked.
+        persona: String,
+        /// The project's vault file path (see `ProjectPaths::vault_path`).
+        vault_path: PathBuf,
+        /// Every required token name with no value, in sorted (`BTreeMap`) order.
+        tokens: Vec<String>,
+    },
+
+    /// A configured [`crate::VaultProvider`] failed to open the project
+    /// vault for a reason other than "the file does not exist" -- a wrong
+    /// passphrase, corrupt ciphertext, or an unsupported schema version, for
+    /// example. Wraps the underlying `VaultError` unchanged so the real
+    /// cause reaches the caller instead of a generic message.
+    /// The error is boxed to keep `ClientError` small; an inline
+    /// `VaultError` trips `clippy::result_large_err` on every function that
+    /// returns `Result<_, ClientError>` (same treatment as `Compose`).
+    #[error("failed to open vault at {vault_path}: {source}")]
+    VaultOpen {
+        /// The vault file path that failed to open.
+        vault_path: PathBuf,
+        /// The underlying vault-backend error.
+        #[source]
+        source: Box<frameshift_vault::VaultError>,
+    },
+
+    /// A templated pack's `pack.template.toml` manifest, or its rendered
+    /// markdown once vault values are substituted in, failed to parse as a
+    /// `frameshift_template` document. `context` names what was being
+    /// parsed (the manifest path, or the persona/target being rendered) so
+    /// the error is actionable without a second lookup.
+    /// The error is boxed to keep `ClientError` small, mirroring `Compose`
+    /// and `VaultOpen`.
+    #[error("template parse error ({context}): {source}")]
+    Template {
+        /// Human-readable description of what was being parsed.
+        context: String,
+        /// The underlying template parse error.
+        #[source]
+        source: Box<frameshift_template::TemplateError>,
+    },
 }
 
 /// Box the composition error so `ClientError` stays small while `?` on a bare

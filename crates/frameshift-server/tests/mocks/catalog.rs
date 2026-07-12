@@ -22,6 +22,10 @@ use frameshift_catalog::filters::{PackSearchFilters, PackSearchResult};
 use frameshift_catalog::identity::Ed25519PublicKey;
 use frameshift_catalog::records::{AuthorRecord, PackRecord, PackVersionRecord};
 use frameshift_catalog::status::{PackStatus, TombstoneRecord};
+// Reuse the exact same version-precedence comparator the Postgres adapter
+// uses for `register_pack_version`'s D8 `latest_version` selection, so the
+// mock's tombstone head-recompute can never drift from the real ordering.
+use frameshift_catalog_postgres::backend::semver_gt;
 
 /// Shared mutable state for [`MockCatalog`].
 ///
@@ -256,7 +260,12 @@ impl CatalogBackend for MockCatalog {
         Ok(versions)
     }
 
-    /// Search packs (returns all stored packs with score 1.0, ignoring filters).
+    /// Search packs (returns stored packs with score 1.0, ignoring filters
+    /// other than the tombstone-driven `latest_version` exclusion).
+    ///
+    /// Mirrors the Postgres adapter's `latest_version IS NOT NULL` predicate:
+    /// a pack whose head has zero remaining `Active` versions (recomputed by
+    /// `tombstone_pack` to `None`) is excluded from every search result set.
     async fn search_packs(
         &self,
         _filters: &PackSearchFilters,
@@ -268,6 +277,7 @@ impl CatalogBackend for MockCatalog {
         let results = state
             .packs
             .values()
+            .filter(|pack| pack.latest_version.is_some())
             .cloned()
             .map(|pack| PackSearchResult { pack, score: 1.0 })
             .collect();
@@ -299,6 +309,14 @@ impl CatalogBackend for MockCatalog {
     /// (last-writer-wins on `reason`/`recorded_at`), never `Conflict`.
     /// Returns `NotFound` when the `(name, version)` pair has no version
     /// record, matching the trait's documented contract.
+    ///
+    /// After flipping the status, recomputes the pack head's `latest_version`
+    /// (when a head row exists) to the newest remaining `Active` version using
+    /// [`semver_gt`] -- the exact same comparator the Postgres adapter uses
+    /// for `register_pack_version`'s D8 ordering -- or clears it to `None`
+    /// when no `Active` version remains. A head that was never seeded (tests
+    /// that only call `seed_active_version`-style helpers without inserting a
+    /// `PackRecord`) is left absent; there is nothing to recompute.
     async fn tombstone_pack(
         &self,
         name: &str,
@@ -316,13 +334,33 @@ impl CatalogBackend for MockCatalog {
                     reason: record.reason,
                     recorded_at: record.recorded_at,
                 };
-                Ok(())
             }
-            None => Err(CatalogError::NotFound {
-                kind: "pack_version",
-                key: format!("{name}@{version}"),
-            }),
+            None => {
+                return Err(CatalogError::NotFound {
+                    kind: "pack_version",
+                    key: format!("{name}@{version}"),
+                });
+            }
         }
+
+        // Recompute the newest remaining Active version for this pack, the
+        // same way the Postgres adapter does inside its transaction.
+        let newest_active = state
+            .versions
+            .values()
+            .filter(|v| v.pack_name == name && matches!(v.status, PackStatus::Active))
+            .map(|v| v.version.clone())
+            .fold(None::<String>, |best, candidate| match best {
+                None => Some(candidate),
+                Some(cur) if semver_gt(&candidate, &cur) => Some(candidate),
+                Some(cur) => Some(cur),
+            });
+
+        if let Some(pack) = state.packs.get_mut(name) {
+            pack.latest_version = newest_active;
+        }
+
+        Ok(())
     }
 
     /// Get the public key for a handle.

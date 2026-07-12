@@ -432,6 +432,197 @@ async fn test_tombstone_not_found() {
     );
 }
 
+/// Tombstoning the current latest of two `Active` versions recomputes the
+/// pack head's `latest_version` to the older remaining `Active` version
+/// (spec_42eb1942 item 1: the head, not just the version row, must reflect
+/// the tombstone). The pack must remain visible in `search_packs` because it
+/// still has one `Active` version left.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn test_tombstone_latest_recomputes_head_to_older_active_version() {
+    let (catalog, _container) = setup_catalog().await;
+
+    catalog
+        .register_author(make_author(50, "morgan"))
+        .await
+        .expect("register author failed");
+
+    catalog
+        .register_pack_version(make_version("head-recompute-pack", "1.0.0", 50, 100))
+        .await
+        .expect("register 1.0.0 failed");
+    catalog
+        .register_pack_version(make_version("head-recompute-pack", "2.0.0", 50, 101))
+        .await
+        .expect("register 2.0.0 failed");
+
+    // Sanity: latest_version is "2.0.0" before the tombstone.
+    let before = catalog
+        .get_pack("head-recompute-pack")
+        .await
+        .expect("get_pack before tombstone failed");
+    assert_eq!(before.latest_version, Some("2.0.0".to_string()));
+
+    catalog
+        .tombstone_pack(
+            "head-recompute-pack",
+            "2.0.0",
+            TombstoneRecord {
+                reason: TombstoneReason::AuthorRequest,
+                recorded_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .expect("tombstone_pack failed");
+
+    let after = catalog
+        .get_pack("head-recompute-pack")
+        .await
+        .expect("get_pack after tombstone failed");
+    assert_eq!(
+        after.latest_version,
+        Some("1.0.0".to_string()),
+        "latest_version must fall back to the newest remaining Active version"
+    );
+
+    let results = catalog
+        .search_packs(&PackSearchFilters {
+            sort: SortMode::Recent,
+            limit: 50,
+            offset: 0,
+            ..Default::default()
+        })
+        .await
+        .expect("search_packs failed");
+    assert!(
+        results.iter().any(|r| r.pack.name == "head-recompute-pack"),
+        "pack must still appear in search after tombstoning its (non-only) latest version"
+    );
+}
+
+/// Tombstoning the ONLY version of a pack clears the head's `latest_version`
+/// to `NULL`, which removes the pack from `search_packs` entirely. The
+/// version record itself remains readable via `get_pack_version` with
+/// `Tombstone` status.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn test_tombstone_only_version_clears_head_and_hides_from_search() {
+    let (catalog, _container) = setup_catalog().await;
+
+    catalog
+        .register_author(make_author(51, "nadia"))
+        .await
+        .expect("register author failed");
+
+    catalog
+        .register_pack_version(make_version("solo-pack", "1.0.0", 51, 102))
+        .await
+        .expect("register 1.0.0 failed");
+
+    catalog
+        .tombstone_pack(
+            "solo-pack",
+            "1.0.0",
+            TombstoneRecord {
+                reason: TombstoneReason::TosViolation,
+                recorded_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .expect("tombstone_pack failed");
+
+    let after = catalog
+        .get_pack("solo-pack")
+        .await
+        .expect("get_pack after tombstone failed");
+    assert_eq!(
+        after.latest_version, None,
+        "latest_version must clear to NULL when no Active version remains"
+    );
+
+    let results = catalog
+        .search_packs(&PackSearchFilters {
+            sort: SortMode::Recent,
+            limit: 50,
+            offset: 0,
+            ..Default::default()
+        })
+        .await
+        .expect("search_packs failed");
+    assert!(
+        !results.iter().any(|r| r.pack.name == "solo-pack"),
+        "pack must disappear from search once its only version is tombstoned"
+    );
+
+    let version = catalog
+        .get_pack_version("solo-pack", "1.0.0")
+        .await
+        .expect("get_pack_version must still return the tombstoned record");
+    assert!(
+        matches!(version.status, PackStatus::Tombstone { .. }),
+        "tombstoned version record must remain directly readable with its status intact"
+    );
+}
+
+/// Tombstoning a non-latest version leaves the head's `latest_version`
+/// untouched and does not affect search visibility.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn test_tombstone_non_latest_version_leaves_head_unchanged() {
+    let (catalog, _container) = setup_catalog().await;
+
+    catalog
+        .register_author(make_author(52, "oscar"))
+        .await
+        .expect("register author failed");
+
+    catalog
+        .register_pack_version(make_version("stable-pack", "1.0.0", 52, 103))
+        .await
+        .expect("register 1.0.0 failed");
+    catalog
+        .register_pack_version(make_version("stable-pack", "2.0.0", 52, 104))
+        .await
+        .expect("register 2.0.0 failed");
+
+    // Tombstone the OLDER, non-latest version.
+    catalog
+        .tombstone_pack(
+            "stable-pack",
+            "1.0.0",
+            TombstoneRecord {
+                reason: TombstoneReason::Dmca,
+                recorded_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .expect("tombstone_pack failed");
+
+    let after = catalog
+        .get_pack("stable-pack")
+        .await
+        .expect("get_pack after tombstone failed");
+    assert_eq!(
+        after.latest_version,
+        Some("2.0.0".to_string()),
+        "latest_version must be unchanged when a non-latest version is tombstoned"
+    );
+
+    let results = catalog
+        .search_packs(&PackSearchFilters {
+            sort: SortMode::Recent,
+            limit: 50,
+            offset: 0,
+            ..Default::default()
+        })
+        .await
+        .expect("search_packs failed");
+    assert!(
+        results.iter().any(|r| r.pack.name == "stable-pack"),
+        "pack must remain in search after tombstoning a non-latest version"
+    );
+}
+
 /// set_handle_pubkey transfers handle ownership; get_handle_pubkey reflects it.
 #[tokio::test]
 #[ignore = "requires Docker"]

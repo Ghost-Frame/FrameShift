@@ -151,6 +151,16 @@ pub trait CatalogBackend: Send + Sync {
 
     /// Retrieve a specific version record for the given pack and version string.
     ///
+    /// This method DOES return tombstoned records, with `status` set to
+    /// `PackStatus::Tombstone { .. }` so the caller can see exactly what
+    /// happened and when. It never hides a version just because it was taken
+    /// down -- direct, targeted lookup by `(name, version)` is precisely the
+    /// operation an auditor or a consumer chasing a broken dependency needs,
+    /// and answering it honestly (rather than returning `NotFound` for a
+    /// version that in fact exists) is the deliberate design choice here.
+    /// Callers that want to reject serving tombstoned content (e.g. the pack
+    /// download route) MUST check `status` themselves after the call.
+    ///
     /// # Errors
     ///
     /// - `CatalogError::NotFound` (kind `"pack_version"`) -- no such version.
@@ -170,6 +180,15 @@ pub trait CatalogBackend: Send + Sync {
     /// Returns an empty `Vec` if the pack has no published versions. Returns
     /// `CatalogError::NotFound` if the pack does not exist at all.
     ///
+    /// This method returns EVERY version, including tombstoned ones, with
+    /// `status` set to `PackStatus::Tombstone { .. }` on those records. This is
+    /// deliberate transparency (the same norm most package registries follow:
+    /// a takedown removes a version from discovery/installation, but the
+    /// version history itself stays visible so consumers can see what
+    /// happened to a version they may already depend on). Callers that want to
+    /// hide tombstoned versions from an end-user-facing list must filter on
+    /// `status` themselves; this method does not do it for them.
+    ///
     /// # Errors
     ///
     /// - `CatalogError::NotFound` (kind `"pack"`) -- pack does not exist.
@@ -183,9 +202,19 @@ pub trait CatalogBackend: Send + Sync {
     /// Search for packs matching the given filters.
     ///
     /// Returns results ordered by the sort mode specified in `filters`, with a
-    /// deterministic `name ASC` tiebreaker for equal scores. Tombstoned versions
-    /// are excluded from results unless the adapter explicitly supports
-    /// `include_tombstoned` (which this filter set does not -- future extension).
+    /// deterministic `name ASC` tiebreaker for equal scores.
+    ///
+    /// Tombstoned content is excluded from results via the pack head's
+    /// `latest_version` field: `tombstone_pack` recomputes `latest_version` to
+    /// the newest remaining `Active` version every time it tombstones a
+    /// version, clearing it to `None` when no `Active` version remains. A pack
+    /// with `latest_version == None` (zero `Active` versions) MUST NOT appear
+    /// in `search_packs` results. There is no per-version status check inside
+    /// this method -- it operates entirely on the pack head, and the head's
+    /// `latest_version` is the single source of truth for "is this pack
+    /// currently installable." Adapters MUST implement the `latest_version IS
+    /// NOT NULL` exclusion (or equivalent) in every code path this method can
+    /// take, not just the default/no-filter path.
     ///
     /// Returns an empty `Vec` (not an error) when no packs match.
     ///
@@ -226,6 +255,30 @@ pub trait CatalogBackend: Send + Sync {
     /// The version record is retained; only its `status` field transitions from
     /// `PackStatus::Active` to `PackStatus::Tombstone`. Content-addressed
     /// retrieval by hash still works after tombstoning.
+    ///
+    /// # Head recompute contract
+    ///
+    /// After flipping the version's status, the implementation MUST recompute
+    /// the parent pack's `latest_version` field so that it never points at a
+    /// tombstoned version:
+    ///
+    /// - Find the newest remaining `PackStatus::Active` version for the pack,
+    ///   using the SAME version-precedence ordering `register_pack_version`
+    ///   uses to decide `latest_version` (true semver precedence, not
+    ///   lexicographic or insertion order -- see the adapter's
+    ///   `register_pack_version` doc for specifics).
+    /// - Set `latest_version` to that version.
+    /// - If no `Active` version remains for the pack (this was the last one),
+    ///   clear `latest_version` to `None` rather than leaving it pointing at
+    ///   the version that was just tombstoned. This is what makes the pack
+    ///   disappear from `search_packs` (which excludes packs with
+    ///   `latest_version == None`) while still allowing direct lookups
+    ///   (`get_pack_version`, `list_pack_versions`) to see it.
+    ///
+    /// This recompute MUST happen atomically with the status update (same
+    /// transaction where the adapter supports transactions), so a reader can
+    /// never observe a pack head whose `latest_version` points at a
+    /// `Tombstone` version.
     ///
     /// Adapter MUST document whether re-tombstoning an already-tombstoned version
     /// is idempotent or returns `CatalogError::Conflict`.

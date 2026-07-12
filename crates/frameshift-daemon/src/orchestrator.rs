@@ -211,6 +211,7 @@ mod tests {
         Client::new(ClientOptions {
             data_root: data_root.to_path_buf(),
             config_root: None,
+            vault: None,
         })
     }
 

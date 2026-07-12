@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -169,7 +170,12 @@ pub struct InstallRequest {
 }
 
 /// Options for constructing a Frameshift `Client`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug`/`PartialEq`/`Eq` are implemented manually (rather than derived)
+/// because `vault` holds a trait object: [`crate::VaultProvider`]
+/// implementations are not generally `Debug` or comparable by value. See
+/// the manual impls below for exactly what each derives to.
+#[derive(Clone)]
 pub struct ClientOptions {
     /// Root of the Frameshift data directory (e.g. ~/.local/share/frameshift).
     pub data_root: PathBuf,
@@ -177,7 +183,53 @@ pub struct ClientOptions {
     /// When set, the engine looks for `frameshift/infrastructure.md`
     /// under this path and composes it into rendered output.
     pub config_root: Option<PathBuf>,
+    /// Optional supplier of decrypted vault data, used to substitute
+    /// `{{token}}` placeholders when materializing a templated pack (one
+    /// that ships `pack.template.toml`). `None` means templated packs fail
+    /// render with [`crate::ClientError::MissingRequiredTokens`] rather than
+    /// silently leaving `{{token}}` placeholders unsubstituted.
+    ///
+    /// # Never-prompts contract
+    ///
+    /// The client library itself never prompts for a vault passphrase.
+    /// Implementations of [`crate::VaultProvider`] passed here MUST NOT
+    /// block on interactive input (stdin reads, TTY prompts, etc.); any
+    /// interactive passphrase prompting belongs in the caller (e.g. the
+    /// `frameshift` CLI's `make_client`), performed before the passphrase is
+    /// captured into the provider closure/impl.
+    pub vault: Option<Arc<dyn crate::VaultProvider>>,
 }
+
+impl std::fmt::Debug for ClientOptions {
+    /// Prints whether a vault provider is configured, without attempting to
+    /// format the trait object itself (arbitrary `VaultProvider` impls are
+    /// not required to be `Debug`).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientOptions")
+            .field("data_root", &self.data_root)
+            .field("config_root", &self.config_root)
+            .field("vault_configured", &self.vault.is_some())
+            .finish()
+    }
+}
+
+impl PartialEq for ClientOptions {
+    /// Compares `data_root`/`config_root` structurally and `vault` by
+    /// `Arc` pointer identity (`Arc::ptr_eq`) -- trait objects have no
+    /// general notion of value equality, but pointer identity is still a
+    /// well-defined equivalence relation, so this remains a lawful `Eq`.
+    fn eq(&self, other: &Self) -> bool {
+        self.data_root == other.data_root
+            && self.config_root == other.config_root
+            && match (&self.vault, &other.vault) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            }
+    }
+}
+
+impl Eq for ClientOptions {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectPaths {
@@ -188,6 +240,11 @@ pub struct ProjectPaths {
     /// Central-store lock path: `$XDG_DATA_HOME/frameshift/projects/<id>/lock.toml`.
     /// This is the canonical lock location -- nothing is written to the project root.
     pub lock_path: PathBuf,
+    /// Central-store vault path: `$XDG_DATA_HOME/frameshift/projects/<id>/vault.age`.
+    /// Sibling of `config_path`. Holds this project's `{{token}}` values for
+    /// templated packs, age-encrypted via `frameshift-vault-local`. Nothing
+    /// is written to the project root.
+    pub vault_path: PathBuf,
     pub cache_dir: PathBuf,
     pub project_state_dir: PathBuf,
     pub active_path: PathBuf,

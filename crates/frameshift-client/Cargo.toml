@@ -16,9 +16,23 @@ frameshift-source = { path = "../frameshift-source" }
 # path (RegressionGate::evaluate_cross_version); default features only, no
 # cli-runner (no `agy`/tokio-process dependency needed here).
 frameshift-conformance = { path = "../frameshift-conformance" }
+# Template manifest/placeholder parsing for `{{token}}` substitution in
+# templated packs (those shipping `pack.template.toml`).
+frameshift-template = { path = "../frameshift-template" }
+# Vault schema/error/backend-trait types (`VaultData`, `VaultError`,
+# `VaultBackend`, `validate`) consumed by the `VaultProvider` contract.
+frameshift-vault = { path = "../frameshift-vault" }
+# Ready-made `VaultProvider` constructors (`open_vault_with_passphrase`,
+# `env_only_vault_provider`) open the project vault through the age-encrypted
+# local backend; kept here (rather than pushed out to every caller) so the
+# CLI, daemon, and MCP server share one passphrase-to-`VaultData` path.
+frameshift-vault-local = { path = "../frameshift-vault-local" }
 base64.workspace = true
 ed25519-dalek.workspace = true
 hex.workspace = true
+# Wraps the vault passphrase so it is never accidentally `Debug`-printed or
+# logged; matches how frameshift-vault-local's own recipients are typed.
+secrecy.workspace = true
 serde.workspace = true
 # JSON request bodies (author registration) and publish response parsing.
 serde_json.workspace = true

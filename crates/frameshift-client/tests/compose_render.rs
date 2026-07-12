@@ -53,6 +53,7 @@ fn install_composes_extends_base() {
     let client = Client::new(ClientOptions {
         data_root: data_root.clone(),
         config_root: None,
+        vault: None,
     });
 
     // Base pack: typed source with one L1 rule, no composition of its own.
@@ -143,6 +144,7 @@ fn install_fails_when_extends_missing() {
     let client = Client::new(ClientOptions {
         data_root: data_root.clone(),
         config_root: None,
+        vault: None,
     });
 
     let child_dir = temp.path().join("child-pack");
@@ -194,6 +196,7 @@ fn mixin_l1_override_fails_install() {
     let client = Client::new(ClientOptions {
         data_root: data_root.clone(),
         config_root: None,
+        vault: None,
     });
 
     // Base pack owns L1 rule "no-panic".

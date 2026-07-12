@@ -74,3 +74,5 @@ mimalloc = "0.1"
 clap = { version = "4", features = ["derive"] }
 regex = "1"
 notify = { version = "6", default-features = false, features = ["macos_kqueue"] }
+# Hidden-input passphrase/value prompts for the `frameshift vault` CLI subcommand.
+rpassword = "7"

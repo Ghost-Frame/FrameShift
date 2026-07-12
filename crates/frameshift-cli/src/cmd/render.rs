@@ -112,6 +112,7 @@ mod tests {
         let client = Client::new(ClientOptions {
             data_root,
             config_root: None,
+            vault: None,
         });
         let args = RenderArgs {
             persona: "render-test".to_string(),
