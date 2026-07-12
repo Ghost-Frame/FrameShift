@@ -181,11 +181,15 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "frameshift_search".to_string(),
-            description: "Search the registry's pack catalog by free-text query and return matching packs with name, latest version, download count, tags, and description. Read-only; does not install anything. Use this to discover packs before calling frameshift_install.".to_string(),
+            description: "Search the registry's pack catalog by free-text query, optionally restricted to a single tag, and return matching packs with name, latest version, download count, tags, and description. Read-only; does not install anything. Use this to discover packs before calling frameshift_install.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
+                    "tag": {
+                        "type": "string",
+                        "description": "Restrict results to packs carrying this tag."
+                    },
                     "limit": {
                         "type": "integer",
                         "description": "Maximum number of results to return (default 20, capped at 100)."
@@ -953,14 +957,26 @@ fn parse_search_limit(arguments: &serde_json::Value) -> u32 {
         .unwrap_or(DEFAULT_SEARCH_LIMIT)
 }
 
+/// Resolve the optional `tag` argument for `frameshift_search`.
+///
+/// Returns `None` when `tag` is absent or not a JSON string, matching how
+/// `RegistrySearchQuery::tag` treats "no filter" -- mirrors the CLI's
+/// `--tag` flag, which is likewise optional.
+fn parse_search_tag(arguments: &serde_json::Value) -> Option<String> {
+    arguments
+        .get("tag")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
 /// Handle the frameshift_search tool call.
 ///
 /// Searches the registry's pack catalog (`GET /v1/packs`) via
 /// `client.search_registry`, mirroring the CLI's `frameshift search`
-/// subcommand (`frameshift_cli::cmd::search::run_search`). Returns
-/// `{ "results": [{name, latest_version, description, tags, total_downloads,
-/// score}, ...] }` so MCP-only agents can discover packs before calling
-/// `frameshift_install`.
+/// subcommand (`frameshift_cli::cmd::search::run_search`), including its
+/// optional `--tag` filter. Returns `{ "results": [{name, latest_version,
+/// description, tags, total_downloads, score}, ...] }` so MCP-only agents can
+/// discover packs before calling `frameshift_install`.
 fn call_search(arguments: &serde_json::Value, client: &Client) -> ToolResult {
     let query = match arguments.get("query").and_then(|v| v.as_str()) {
         Some(s) => s,
@@ -968,10 +984,11 @@ fn call_search(arguments: &serde_json::Value, client: &Client) -> ToolResult {
     };
 
     let limit = parse_search_limit(arguments);
+    let tag = parse_search_tag(arguments);
 
     let search_query = RegistrySearchQuery {
         query: Some(query.to_string()),
-        tag: None,
+        tag,
         limit: Some(limit),
     };
 
@@ -1048,6 +1065,7 @@ mod tests {
         Client::new(ClientOptions {
             data_root: data_root.to_path_buf(),
             config_root: None,
+            vault: None,
         })
     }
 
@@ -1060,7 +1078,8 @@ mod tests {
     }
 
     /// frameshift_search is present in tool_definitions with `query` required
-    /// and `limit` present but optional in its input schema.
+    /// and `limit`/`tag` present but optional in its input schema, matching
+    /// the CLI's `frameshift search --tag` surface.
     #[test]
     fn tool_definitions_includes_search() {
         let defs = tool_definitions();
@@ -1081,8 +1100,16 @@ mod tests {
             "limit must not be required"
         );
         assert!(
+            !required.iter().any(|v| v == "tag"),
+            "tag must not be required"
+        );
+        assert!(
             search.input_schema["properties"]["limit"].is_object(),
             "limit must be a declared property"
+        );
+        assert!(
+            search.input_schema["properties"]["tag"].is_object(),
+            "tag must be a declared property"
         );
     }
 
@@ -1643,6 +1670,18 @@ mod tests {
         assert_eq!(
             parse_search_limit(&serde_json::json!({"limit": MAX_SEARCH_LIMIT as u64 + 1000})),
             MAX_SEARCH_LIMIT
+        );
+    }
+
+    /// parse_search_tag returns `None` when `tag` is absent or not a string,
+    /// and `Some(_)` with the string value when present.
+    #[test]
+    fn parse_search_tag_extracts_optional_string() {
+        assert_eq!(parse_search_tag(&serde_json::json!({})), None);
+        assert_eq!(parse_search_tag(&serde_json::json!({"tag": 5})), None);
+        assert_eq!(
+            parse_search_tag(&serde_json::json!({"tag": "rust"})),
+            Some("rust".to_string())
         );
     }
 }

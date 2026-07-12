@@ -88,6 +88,35 @@ pub fn append(
     append_jsonl(data_root, project_id, persona_name, &entry)
 }
 
+/// Append a structured `Scope::Global` growth entry with the current UTC
+/// timestamp, writing ONLY to the persona's global growth.jsonl
+/// (`<data_root>/personas/<persona_name>/growth.jsonl`).
+///
+/// Unlike [`append`], this never touches the legacy markdown growth.md --
+/// there is no global markdown growth file, so global entries are
+/// structured-only from the start. Structured fields not derivable from
+/// these parameters (`auto_selected`, `task`, `intent`) are populated with
+/// their default/`None` forms, matching `append`'s best-effort projection.
+pub fn append_global(
+    data_root: &Path,
+    project_id: &str,
+    persona_name: &str,
+    entry_text: &str,
+) -> Result<(), GrowthError> {
+    let entry = GrowthEntry {
+        ts: format_utc_now(),
+        session: current_session_id(),
+        project_id: project_id.to_string(),
+        persona: persona_name.to_string(),
+        auto_selected: false,
+        task: None,
+        intent: None,
+        text: entry_text.to_string(),
+        scope: Scope::Global,
+    };
+    append_jsonl(data_root, project_id, persona_name, &entry)
+}
+
 /// Return a best-effort session identifier for structured growth entries.
 ///
 /// Uses the current process ID, which is stable for the lifetime of the
@@ -756,6 +785,44 @@ mod tests {
 
         let path = tmp.path().join("personas/rust/growth.jsonl");
         assert!(path.exists());
+    }
+
+    /// `append_global` writes a `Scope::Global` entry that `summarize` finds
+    /// under `Scope::Global` and that is entirely absent from `Scope::Project`
+    /// -- the CLI's `grow append --global` path relies on this separation to
+    /// avoid leaking a global entry into a project-scoped read.
+    #[test]
+    fn append_global_is_visible_in_global_scope_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        append_global(tmp.path(), "proj1", "rust", "prefer thiserror in libraries").unwrap();
+
+        let global_entries = read_entries(tmp.path(), "proj1", "rust", Scope::Global).unwrap();
+        assert_eq!(global_entries.len(), 1);
+        assert_eq!(global_entries[0].text, "prefer thiserror in libraries");
+        assert_eq!(global_entries[0].scope, Scope::Global);
+
+        let project_entries = read_entries(tmp.path(), "proj1", "rust", Scope::Project).unwrap();
+        assert!(
+            project_entries.is_empty(),
+            "a global append must not appear in project scope"
+        );
+
+        let summary = summarize(tmp.path(), "proj1", "rust", Scope::Global).unwrap();
+        assert!(summary.contains("prefer thiserror in libraries"));
+    }
+
+    /// `append_global` never touches growth.md -- there is no global markdown
+    /// growth file, so the legacy markdown path must not be created.
+    #[test]
+    fn append_global_does_not_write_markdown() {
+        let tmp = tempfile::tempdir().unwrap();
+        append_global(tmp.path(), "proj1", "rust", "global-only note").unwrap();
+
+        let md_path = tmp.path().join("projects/proj1/personas/rust/growth.md");
+        assert!(
+            !md_path.exists(),
+            "append_global must not create a project-scoped growth.md"
+        );
     }
 
     #[test]
