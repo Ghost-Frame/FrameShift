@@ -16,9 +16,9 @@ memory_required_ops = []
 
 # Signed, tamper-evident behavioral claim. bundle_hash is the sha256 of the
 # canonical TOML for this persona's private conformance bundle
-# (personas-private/security/conformance/bundle.toml, 5 regex cases:
+# (not shipped; 5 regex cases:
 # noise-level classification, reject-undetectable, authorization-scope gate,
-# cred-not-hardcode, quietest-sufficient). The bundle is not shipped in the
+# secrets-manager-not-hardcode, quietest-sufficient). The bundle is not shipped in the
 # manifest-only public catalog; this claim travels with the pack and the
 # regression gate rejects a version bump whose bundle no longer hashes to this.
 # score is the measured floor: 1.0 across 2 runs (Gemini 3.1 Pro, 2026-07-07), all cases pass.

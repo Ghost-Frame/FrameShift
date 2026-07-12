@@ -16,7 +16,7 @@ memory_required_ops = []
 
 # Signed, tamper-evident behavioral claim. bundle_hash is the sha256 of the
 # canonical TOML for this persona's private conformance bundle
-# (personas-private/rust/conformance/bundle.toml, 5 regex cases:
+# (not shipped; 5 regex cases:
 # no-unwrap-in-library, thiserror-not-anyhow, Axum, tracing-not-log,
 # api-surface-first). The bundle is not shipped in the manifest-only public
 # catalog; this claim travels with the pack and the regression gate rejects a
