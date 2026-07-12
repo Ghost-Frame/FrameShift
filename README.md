@@ -89,7 +89,7 @@ filesystem_scope = "project-only"
 memory_required = "none"
 ```
 
-`description` and `tags` feed registry search; `capability_manifest` declares the tools, network egress, filesystem scope, and memory requirement the persona expects (see Capabilities and Memory below). `extends` and `mixin` drive composition. `parent_hash` and `conformance_baseline` track version lineage.
+`description` and `tags` feed registry search; `capability_manifest` declares the tools, network egress, filesystem scope, and memory requirement the persona expects (see Capabilities and Memory below). `extends` and `mixin` drive composition. `parent_hash` tracks version lineage; `conformance_baseline` feeds the install-time regression gate (see Conformance below).
 
 ### Content addressing and signatures
 
@@ -99,11 +99,15 @@ Signing is Ed25519 over that 32-byte hash; the signature travels alongside the p
 
 ### Trust: handle-bound keys, no central authority
 
-There is no central signing authority. An author **claims a handle** (e.g. `ghost-frame`) with a signed request, and the registry binds that handle to the key that signed it, first-claim-wins. Key rotation must be signed by the current key -- the old key authorizes its own replacement. At publish, the server checks that the live signer owns the handle and that the pack signature verifies against that registered key. On install from the registry, the client verifies the pack signature against the key in the **registry's record** for that version, not the key embedded in the manifest, so a tampered manifest cannot smuggle in a different key. Installing directly from a local path verifies a signature if one is present, and installs unsigned local packs as-is.
+There is no central signing authority. An author **claims a handle** (e.g. `ghost-frame`) with a signed request, and the registry binds that handle to the key that signed it, first-claim-wins. Key rotation must be signed by the current key -- the old key authorizes its own replacement. At publish, the server checks that the live signer owns the handle and that the pack signature verifies against that registered key. On install from the registry, the client verifies the pack signature against the key in the **registry's record** for that version, not the key embedded in the manifest, so a tampered manifest cannot smuggle in a different key. Installing directly from a local path verifies a signature if one is present, and installs unsigned local packs as-is. Registered authors are publicly listable via `GET /v1/authors`.
 
 ### Downloads
 
-`frameshift install` and `publish --server` fetch pack bytes from the direct, unauthenticated `GET /v1/packs/{name}/versions/{version}/pack` route -- this is the supported download path today. The server also implements a signed-download flow: `POST .../download-url` mints a short-lived, HMAC-signed `/dl/{hash}` URL (gated on the `DOWNLOAD_SECRET` env var, disabled when it is unset). That flow is fully built and tested server-side but has no caller yet in the CLI or client, so treat it as experimental / not-yet-default until something mints and follows those URLs.
+`frameshift install` fetches pack bytes from the direct, unauthenticated `GET /v1/packs/{name}/versions/{version}/pack` route -- this is the supported download path today. The server also implements a signed-download flow: `POST .../download-url` mints a short-lived, HMAC-signed `/dl/{hash}` URL (gated on the `DOWNLOAD_SECRET` env var, disabled when it is unset). That flow is fully built and tested server-side but has no caller yet in the CLI or client, so treat it as experimental / not-yet-default until something mints and follows those URLs.
+
+### Admin
+
+The registry server exposes one operator endpoint: `POST /v1/admin/packs/{name}/{version}/tombstone`, which marks a published version as removed from public availability. Like the handle-claim and rotation calls, it requires a signed request; the signer's key must also appear on `FRAMESHIFT_ADMIN_PUBKEYS`, a separate comma-separated allowlist of Ed25519 public keys. An empty allowlist disables the endpoint outright (`404`, indistinguishable from an unmapped route); a signed request from a key not on the list gets `403`. No CLI or client command calls this endpoint today -- it's reached directly.
 
 ### Install and the central store
 
@@ -124,10 +128,22 @@ projects/<project-id>/
   personas/<name>/
     source/                                  The pack's own files
     rendered/{claude,codex,gemini,generic}/  Per-agent rendered output
-    growth.md                                Append-only local growth log
+    growth.md  growth.jsonl                  Append-only growth log: markdown + JSONL
 ```
 
 The lockfile records each installed persona as name, version, author handle, author pubkey, and canonical hash. Re-running `install`/`sync` rebuilds the per-project `personas/` tree from the content-addressed cache to match the lockfile.
+
+### Conformance
+
+A pack's `pack.toml` can ship a `[conformance_baseline]` -- a score from 0.0 to 1.0, plus the hash of the conformance bundle it was measured against. When `install` would overwrite an already-installed version of the same persona in the current project, the client compares the incoming pack's baseline against the installed one, without re-running any tests:
+
+- **Pass** -- the incoming score meets or exceeds the installed score.
+- **Regression** -- the incoming score is lower. Warn-only; the install proceeds.
+- **MissingBaseline** -- either side ships no baseline. Non-fatal; baselines are optional.
+- **InvalidScore** -- a score is non-finite or outside 0.0-1.0. Warn-only.
+- **IntegrityFailure** -- the incoming pack's declared `bundle_hash` doesn't match the hash of its own shipped conformance bundle, or it ships none at all. This **hard-blocks the install** -- an unverifiable score can't be trusted regardless of what it claims. Override with `FRAMESHIFT_ALLOW_CONFORMANCE_INTEGRITY_FAILURE=1`.
+
+A fresh install of a persona with no prior version in the project skips the comparison entirely. `frameshift verify` (see CLI, below) is what produces a baseline in the first place: it runs a persona's conformance bundle through a runner and scores the results.
 
 ### Rendering: one source, per-agent outputs
 
@@ -162,7 +178,7 @@ frameshift grow summary --persona rust --scope project
 The same selection engine backs every surface:
 
 - **CLI** -- `frameshift <command>` (see below).
-- **Stdio MCP server** -- a JSON-RPC server exposing tools (install, activate, list, select, use, automate, prefs, grow, capabilities) and prompts (`active_persona`, `select_persona`, `automate_status`) as slash commands in any MCP-capable agent.
+- **Stdio MCP server** -- a JSON-RPC server exposing tools (install, activate, list, select, use, automate, prefs, grow, capabilities, search) and prompts (`active_persona`, `select_persona`, `automate_status`) as slash commands in any MCP-capable agent.
 - **Watch daemon** -- an optional background service over a peer-authenticated Unix socket, offering install/activate/sync/gc operations to editor integrations.
 - **Registry / marketplace HTTP server** -- publish, search, download, and author/handle registration.
 
@@ -184,7 +200,7 @@ frameshift use <name> --from <library>                     Install + activate + 
 frameshift list                                            List installed personas and mark the active one
 frameshift sync                                            Reconcile the central store with the lockfile
 frameshift gc                                              Remove unreferenced cache entries
-frameshift migrate                                         Move legacy files into the central store
+frameshift migrate                                         Move legacy files into the central store (also migrates growth logs to JSONL)
 ```
 
 Selection and automate mode:
@@ -263,7 +279,7 @@ cargo run -p frameshift-cli -- select --task "optimize a hot loop" --format json
 
 ### Server
 
-All variables are read with no prefix (e.g. `BIND_ADDR`, not `FRAMESHIFT_BIND_ADDR`); see `crates/frameshift-server/src/config.rs` for the authoritative parser.
+All variables are read with no prefix (e.g. `BIND_ADDR`, not `FRAMESHIFT_BIND_ADDR`) -- except `FRAMESHIFT_ADMIN_PUBKEYS`, deliberately prefixed so it can't be confused with an unrelated `ADMIN_PUBKEYS` some other tool in the deployment might own; see `crates/frameshift-server/src/config.rs` for the authoritative parser.
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -289,6 +305,7 @@ All variables are read with no prefix (e.g. `BIND_ADDR`, not `FRAMESHIFT_BIND_AD
 | `R2_SECRET_ACCESS_KEY` | `""` | Secret access key |
 | `TRUST_FORWARDED_FOR` | `false` | Trust `X-Forwarded-For` for rate-limit key extraction; set `true` only behind a trusted proxy |
 | `SIGNED_REQUEST_MAX_SKEW_SECS` | `300` | Max clock skew (seconds) allowed between a signed write request's timestamp and server time |
+| `FRAMESHIFT_ADMIN_PUBKEYS` | `""` | Comma-separated base64url-no-pad Ed25519 public keys allowed to call `/v1/admin/*` endpoints; empty disables all admin endpoints (404) |
 | `MEMORY_BACKEND` | `none` | `none`, `http`, or `sqlite` |
 | `MEMORY_HTTP_ENDPOINT` | `""` | Base URL for the HTTP memory endpoint; used when `MEMORY_BACKEND=http` |
 | `MEMORY_HTTP_AUTH` | `none` | `none` or `bearer:<token>`; used when `MEMORY_BACKEND=http` |
