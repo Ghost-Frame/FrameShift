@@ -33,6 +33,9 @@
 //!   content signature against the handle's currently-registered key.
 //! - Signed download URLs: `POST /v1/downloads` (mint) and `GET /dl/{hash}`.
 //! - Operational endpoints: `/healthz`, `/metrics` (real Prometheus registry).
+//! - Admin: `POST /v1/admin/packs/{name}/{version}/tombstone`, gated by the
+//!   same signed-request middleware plus an operator-controlled pubkey
+//!   allowlist (`FRAMESHIFT_ADMIN_PUBKEYS`; see [`crate::routes::admin`]).
 //! - MCP placeholder: `/mcp/*` returns 501.
 //!
 //! Deferred (M5+): OAuth 2.1, transparency log, full MCP surface, and a shared

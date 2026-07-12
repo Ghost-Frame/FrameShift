@@ -3,12 +3,16 @@
 //! Each sub-module corresponds to a logical grouping of endpoints:
 //!
 //! - [`packs`] -- `GET /v1/packs*` read endpoints.
-//! - [`authors`] -- `GET /v1/authors/{pubkey}` lookup.
+//! - [`authors`] -- `GET /v1/authors` paginated listing and
+//!   `GET /v1/authors/{pubkey}` lookup.
 //! - [`handles`] -- `GET /v1/handles/{handle}` lookup.
 //! - [`ops`] -- `GET /healthz` and `GET /metrics` operational endpoints.
 //! - [`telemetry`] -- `POST /v1/telemetry/selection` opt-in selection telemetry sink.
 //! - [`memory`] -- `GET /v1/memory/health` read-only memory backend health.
+//! - [`admin`] -- `POST /v1/admin/packs/{name}/{version}/tombstone` and other
+//!   allowlist-gated operator endpoints.
 
+pub mod admin;
 pub mod authors;
 pub mod downloads;
 pub mod handles;

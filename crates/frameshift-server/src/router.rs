@@ -33,11 +33,14 @@
 //! layer (governor) applied only to its sub-router, so the rest of the
 //! API (including the verifier `/dl/{hash}`) is not impacted.
 //!
-//! The mutating endpoints -- `POST /v1/packs`, `POST /v1/authors`, and
-//! `POST /v1/authors/{handle}/rotate` -- carry the Ed25519 signed-request
-//! `route_layer` ([`crate::middleware::auth::require_signed_request`]). It is
-//! applied only to those method-routers, so anonymous reads on the same paths
-//! (e.g. `GET /v1/packs`) never buffer a body or require a signature.
+//! The mutating endpoints -- `POST /v1/packs`, `POST /v1/authors`,
+//! `POST /v1/authors/{handle}/rotate`, and
+//! `POST /v1/admin/packs/{name}/{version}/tombstone` -- carry the Ed25519
+//! signed-request `route_layer` ([`crate::middleware::auth::require_signed_request`]).
+//! It is applied only to those method-routers, so anonymous reads on the same
+//! paths (e.g. `GET /v1/packs`) never buffer a body or require a signature.
+//! The admin router additionally enforces an allowlist on top of signature
+//! verification -- see [`crate::routes::admin`].
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -59,6 +62,7 @@ use crate::middleware::auth::require_signed_request;
 use crate::middleware::metrics::MetricsLayer;
 use crate::middleware::request_id::RequestIdGenerator;
 use crate::middleware::tracing::make_trace_layer;
+use crate::routes::admin::admin_router;
 use crate::routes::authors::{authors_router, authors_write_router};
 use crate::routes::downloads::{dl_router, pack_download_url_router};
 use crate::routes::handles::handles_router;
@@ -78,10 +82,11 @@ use crate::state::AppState;
 ///   /metrics    -- ops
 ///   /v1
 ///     /packs    -- pack read endpoints + POST publish (signed-request)
-///     /authors  -- author lookup + POST register / POST {handle}/rotate (signed-request)
+///     /authors  -- GET list (paginated) + lookup; POST register / rotate (signed-request)
 ///     /handles  -- handle lookup
 ///     /telemetry -- POST /selection opt-in selection telemetry sink
 ///     /memory   -- GET /health read-only memory backend health
+///     /admin    -- POST /packs/{name}/{version}/tombstone (signed + allowlist)
 ///   /mcp        -- MCP placeholder (501 for all methods)
 /// ```
 ///
@@ -124,12 +129,18 @@ pub fn app(state: AppState) -> Router {
     // (registration + key rotation).
     let authors = authors_router().merge(authors_write_router().route_layer(signed.clone()));
 
+    // Admin: every route in this sub-router is mutating and allowlist-gated,
+    // so the whole router carries the signed-request layer (unlike `packs`
+    // and `authors`, there is no anonymous-read counterpart to merge with).
+    let admin = admin_router().route_layer(signed.clone());
+
     let v1 = Router::new()
         .nest("/packs", packs)
         .nest("/authors", authors)
         .nest("/handles", handles_router())
         .nest("/telemetry", telemetry_router())
-        .nest("/memory", memory_router());
+        .nest("/memory", memory_router())
+        .nest("/admin", admin);
 
     let x_request_id = axum::http::HeaderName::from_static("x-request-id");
 

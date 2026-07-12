@@ -21,7 +21,7 @@ use frameshift_catalog::error::{CatalogError, HealthStatus};
 use frameshift_catalog::filters::{PackSearchFilters, PackSearchResult};
 use frameshift_catalog::identity::Ed25519PublicKey;
 use frameshift_catalog::records::{AuthorRecord, PackRecord, PackVersionRecord};
-use frameshift_catalog::status::TombstoneRecord;
+use frameshift_catalog::status::{PackStatus, TombstoneRecord};
 
 /// Shared mutable state for [`MockCatalog`].
 ///
@@ -165,17 +165,26 @@ impl CatalogBackend for MockCatalog {
             })
     }
 
-    /// List authors (returns all stored authors, ignoring pagination).
+    /// List authors, paginated by `limit`/`offset` and ordered by
+    /// `created_at ASC` for a stable order matching the trait's documented
+    /// contract (mirrors the real Postgres backend's `ORDER BY created_at`).
     async fn list_authors(
         &self,
-        _limit: u32,
-        _offset: u32,
+        limit: u32,
+        offset: u32,
     ) -> Result<Vec<AuthorRecord>, CatalogError> {
         let state = self
             .state
             .read()
             .map_err(|e| CatalogError::BackendError(e.to_string().into()))?;
-        Ok(state.authors.values().cloned().collect())
+        let mut authors: Vec<AuthorRecord> = state.authors.values().cloned().collect();
+        authors.sort_by_key(|a| a.created_at);
+        let page = authors
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect();
+        Ok(page)
     }
 
     /// Register a pack version.
@@ -284,14 +293,36 @@ impl CatalogBackend for MockCatalog {
         Ok(*count)
     }
 
-    /// Tombstone a pack version (no-op in mock).
+    /// Tombstone a pack version, mirroring the Postgres adapter's documented
+    /// choice (`crates/frameshift-catalog-postgres/src/backend.rs`):
+    /// re-tombstoning an already-tombstoned version is idempotent
+    /// (last-writer-wins on `reason`/`recorded_at`), never `Conflict`.
+    /// Returns `NotFound` when the `(name, version)` pair has no version
+    /// record, matching the trait's documented contract.
     async fn tombstone_pack(
         &self,
-        _name: &str,
-        _version: &str,
-        _record: TombstoneRecord,
+        name: &str,
+        version: &str,
+        record: TombstoneRecord,
     ) -> Result<(), CatalogError> {
-        Ok(())
+        let mut state = self
+            .state
+            .write()
+            .map_err(|e| CatalogError::BackendError(e.to_string().into()))?;
+        let key = (name.to_string(), version.to_string());
+        match state.versions.get_mut(&key) {
+            Some(v) => {
+                v.status = PackStatus::Tombstone {
+                    reason: record.reason,
+                    recorded_at: record.recorded_at,
+                };
+                Ok(())
+            }
+            None => Err(CatalogError::NotFound {
+                kind: "pack_version",
+                key: format!("{name}@{version}"),
+            }),
+        }
     }
 
     /// Get the public key for a handle.

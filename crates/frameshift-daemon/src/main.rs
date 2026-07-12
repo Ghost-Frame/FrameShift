@@ -69,8 +69,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
     tracing::info!(path = %socket_path.display(), "daemon listening");
 
-    // Shutdown signalling channel; `serve` watches this for `true`.
-    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    // Shutdown signalling channel. `serve`'s accept loop watches `shutdown_rx`
+    // for `true`; `shutdown_tx` is cloned into every accepted connection so a
+    // `shutdown` RPC on any one of them can flip the flag and stop the loop.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     // Start file watcher on the data root so the daemon can react to external changes.
     // Events are forwarded to the orchestrator evaluation hook; the watcher is kept
@@ -113,8 +115,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Drive the JSON-RPC server loop. The watcher handle above stays alive for
-    // the duration of this call.
-    frameshift_daemon::socket::serve(listener, client, shutdown_rx).await;
+    // the duration of this call. `shutdown_tx` is threaded through so that a
+    // `shutdown` RPC received on any connection can signal the accept loop
+    // to stop.
+    frameshift_daemon::socket::serve(listener, client, shutdown_rx, shutdown_tx).await;
 
     // Best-effort socket cleanup on graceful shutdown.
     let _ = std::fs::remove_file(&socket_path);

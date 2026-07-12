@@ -2,10 +2,16 @@
 //!
 //! Two distinct concerns live here, deliberately separated by privacy posture:
 //!
-//! - **Selection history** is a per-project, append-only JSONL log of which
-//!   persona was selected and why. It is written to the central project state
-//!   directory and never leaves the machine; the intelligent-selection feature
-//!   reads it back to learn from past choices.
+//! - **Selection history** is a per-project, append-only, write-only JSONL
+//!   audit log of which persona was selected and why. It is written to the
+//!   central project state directory and never leaves the machine. Nothing in
+//!   this codebase reads it back today -- it is not the mechanism the
+//!   intelligent-selection feature learns from. That mechanism is the
+//!   separate `Preferences` store persisted to `automate-prefs.json`
+//!   (`frameshift_orchestrator::Preferences`, written by the CLI's `use`,
+//!   `feedback`, and `prefs` commands and read by `select`/`automate`).
+//!   `selection-history.jsonl` exists purely as a local record for future
+//!   analysis or export.
 //! - **Telemetry** is the optional, off-by-default network side. It is sent
 //!   only when the project has explicitly opted in *and* a telemetry endpoint is
 //!   configured via the environment. There is intentionally no default

@@ -34,7 +34,8 @@ pub struct PersonaProfile {
 
     /// Deduplicated lowercase keyword tokens extracted from name, description,
     /// voice (tone + text), anchor texts, rule texts, skill `invoke_when` fields,
-    /// and pattern category/items. Stopwords and short tokens removed.
+    /// pattern category/items, antipattern text/replacement/reasoning, and
+    /// general-pattern text. Stopwords and short tokens removed.
     pub keywords: Vec<String>,
 
     /// Required tools declared in the capability manifest (empty if none).
@@ -151,6 +152,23 @@ impl PersonaProfile {
             text_parts.push(ex.language.clone());
             text_parts.push(ex.context.clone());
         }
+        // Anti-patterns and general patterns are first-class pattern categories
+        // (schema, validation, merge, conflict, and render all treat them as
+        // such) so their text must feed the same keyword corpus as stack items
+        // and examples do, or a persona whose distinguishing content lives here
+        // is systematically under-ranked during selection.
+        for antipattern in &src.patterns.antipatterns {
+            text_parts.push(antipattern.text.clone());
+            if let Some(use_instead) = &antipattern.use_instead {
+                text_parts.push(use_instead.clone());
+            }
+            if let Some(reasoning) = &antipattern.reasoning {
+                text_parts.push(reasoning.clone());
+            }
+        }
+        for pattern in &src.patterns.patterns {
+            text_parts.push(pattern.text.clone());
+        }
 
         let combined = text_parts.join(" ");
         let keywords = extract_keywords(&combined);
@@ -202,8 +220,15 @@ impl PersonaProfile {
     /// `dir` must contain `AGENTS.md`. `pack.toml` is optional but used for
     /// name, description, and capability_manifest when present. The markdown
     /// body is tokenized for keywords; high-signal sections (L2 anchor, Tech
-    /// Stack, Concrete Patterns, Operating Frame) are weighted by including
-    /// their tokens twice. Language detection runs the language lexicon over
+    /// Stack, Concrete Patterns, Operating Frame) are weighted by being
+    /// prepended to the corpus ahead of the full body. `extract_keywords`
+    /// dedups by first-seen order, so a section's tokens must be the first
+    /// occurrence it sees to matter at all -- appending them after a body that
+    /// already contains the same text (the sections are extracted from the
+    /// body, so it always does) would contribute nothing. Prepending instead
+    /// makes the tokens land first in the resulting keyword vector, which is
+    /// what `persona_text` (policy.rs) and any future length-limited embedder
+    /// rely on for priority. Language detection runs the language lexicon over
     /// the resulting keyword set.
     pub fn from_agents_md(dir: &Path) -> Result<Self, OrchestratorError> {
         let agents_md_path = dir.join("AGENTS.md");
@@ -228,16 +253,21 @@ impl PersonaProfile {
                 .unwrap_or_else(|| "unknown".to_string())
         });
 
-        // Build keyword corpus: always include the full body.
-        // High-signal sections are included twice for weighting.
-        let mut corpus = body.clone();
+        // Build keyword corpus. High-signal sections go first so their tokens
+        // are the first occurrence `extract_keywords` records (see doc comment
+        // above); the persona name follows for the same reason, then the full
+        // body supplies everything else. Appending the sections after the body
+        // instead (the previous behavior) made them inert: every token they
+        // contain already occurred once when the body was scanned.
+        let mut corpus = String::new();
         for section in extract_high_signal_sections(&body) {
-            corpus.push(' ');
             corpus.push_str(&section);
+            corpus.push(' ');
         }
         // Include the persona name itself for self-match.
-        corpus.push(' ');
         corpus.push_str(&name);
+        corpus.push(' ');
+        corpus.push_str(&body);
         // Fold curated pack.toml metadata into the corpus so the persona's
         // description and topical tags bias keyword-based selection alongside
         // the AGENTS.md body. Empty values contribute nothing.
@@ -434,7 +464,11 @@ const KNOWN_LANGUAGES: &[&str] = &[
 ///
 /// Scans `body` for headings containing any of the high-signal keywords
 /// (case-insensitive). Returns the text under each matching heading until the
-/// next heading of the same or higher level.
+/// next heading of the same or higher level -- a deeper subheading (e.g. a
+/// `###` nested under a matching `##`) does not end the section; its own
+/// heading text is folded into the captured content instead, so subsections
+/// like "### Anti-patterns (do NOT use)" nested under "## Concrete Patterns"
+/// still contribute their tokens.
 fn extract_high_signal_sections(body: &str) -> Vec<String> {
     const HIGH_SIGNAL: &[&str] = &[
         "l2 anchor",
@@ -454,24 +488,38 @@ fn extract_high_signal_sections(body: &str) -> Vec<String> {
 
     for line in body.lines() {
         if line.starts_with('#') {
-            // Save the previous section if it was a signal section.
-            if current_is_signal && !current_section.is_empty() {
-                sections.push(current_section.clone());
-            }
-            current_section.clear();
-
             // Compute heading level (number of leading '#' chars).
             let level = line.chars().take_while(|c| *c == '#').count();
-            let heading_text = line.trim_start_matches('#').trim().to_lowercase();
 
-            current_heading_level = level;
-            current_is_signal = HIGH_SIGNAL.iter().any(|s| heading_text.contains(s));
+            // A heading only ends the current signal section when its level is
+            // the same as or shallower than (numerically <=) the level that
+            // opened the section. A deeper heading is a subsection of the
+            // signal content, not a sibling boundary.
+            if current_is_signal && level <= current_heading_level {
+                if !current_section.is_empty() {
+                    sections.push(current_section.clone());
+                }
+                current_section.clear();
+                current_is_signal = false;
+            }
+
+            if current_is_signal {
+                // Nested subheading inside an already-open signal section:
+                // fold its own heading text into the captured content rather
+                // than treating it as a new section boundary.
+                current_section.push_str(line);
+                current_section.push('\n');
+            } else {
+                // Either no section was open, or the one that was open just
+                // closed above -- evaluate this heading as a fresh candidate.
+                let heading_text = line.trim_start_matches('#').trim().to_lowercase();
+                current_heading_level = level;
+                current_is_signal = HIGH_SIGNAL.iter().any(|s| heading_text.contains(s));
+            }
         } else if current_is_signal {
             current_section.push_str(line);
             current_section.push('\n');
         }
-        // Suppress unused warning on level variable (used for context only).
-        let _ = current_heading_level;
     }
 
     // Capture trailing section.
@@ -873,5 +921,138 @@ mod tests {
         let names: Vec<&str> = index.profiles.iter().map(|p| p.name.as_str()).collect();
         assert!(names.contains(&"rust"), "rust persona must be indexed");
         assert!(names.contains(&"typed"), "typed persona must be indexed");
+    }
+
+    /// from_source feeds anti-pattern text (text, use_instead, reasoning) and
+    /// general-pattern text into the keyword corpus, not just stack/examples.
+    #[test]
+    fn profile_includes_antipattern_and_general_pattern_text_in_keywords() {
+        use frameshift_source::*;
+        let mut src = minimal_source("crypto-guard", "wary and precise");
+        src.patterns.antipatterns = vec![AntiPattern {
+            id: "no-openssl".to_string(),
+            text: "roll your own xchachapoly implementation".to_string(),
+            use_instead: Some("ring or rustcrypto primitives".to_string()),
+            reasoning: Some("handrolled ciphers leak timing sidechannels".to_string()),
+        }];
+        src.patterns.patterns = vec![GeneralPattern {
+            id: "config-lookup".to_string(),
+            text: "envelopeencryption keyrotation schedule".to_string(),
+        }];
+
+        let profile = PersonaProfile::from_source(&src);
+
+        assert!(
+            profile.keywords.iter().any(|k| k == "xchachapoly"),
+            "antipattern.text should be in keywords; got: {:?}",
+            profile.keywords
+        );
+        assert!(
+            profile.keywords.iter().any(|k| k == "rustcrypto"),
+            "antipattern.use_instead should be in keywords; got: {:?}",
+            profile.keywords
+        );
+        assert!(
+            profile.keywords.iter().any(|k| k == "sidechannels"),
+            "antipattern.reasoning should be in keywords; got: {:?}",
+            profile.keywords
+        );
+        assert!(
+            profile.keywords.iter().any(|k| k == "envelopeencryption"),
+            "general pattern text should be in keywords; got: {:?}",
+            profile.keywords
+        );
+    }
+
+    /// extract_high_signal_sections must not close a section on a deeper
+    /// subheading: content nested under "### Signing" and "### Anti-patterns"
+    /// inside a matching "## Concrete Patterns" section belongs to that one
+    /// section, mirroring how render.rs actually nests generated documents.
+    #[test]
+    fn extract_high_signal_sections_captures_nested_subheadings() {
+        let body = "## Concrete Patterns\n\n### Signing\n\ned25519dalek\n\n### Anti-patterns (do NOT use)\n\nrot13warning\n\n## Some Other Heading\n\nirrelevant\n";
+
+        let sections = extract_high_signal_sections(body);
+
+        assert_eq!(
+            sections.len(),
+            1,
+            "expected exactly one captured section, got: {:?}",
+            sections
+        );
+        assert!(
+            sections[0].contains("ed25519dalek"),
+            "content nested under a ### subheading must survive; got: {:?}",
+            sections[0]
+        );
+        assert!(
+            sections[0].contains("rot13warning"),
+            "content nested under a second ### subheading must survive; got: {:?}",
+            sections[0]
+        );
+        assert!(
+            !sections[0].contains("irrelevant"),
+            "a sibling ## heading (same level as the opener) must still close the section; got: {:?}",
+            sections[0]
+        );
+    }
+
+    /// A same-or-shallower heading closes the section as documented, so two
+    /// consecutive top-level signal headings produce two separate sections
+    /// rather than merging into one.
+    #[test]
+    fn extract_high_signal_sections_closes_on_same_level_heading() {
+        let body = "## Tech Stack\n\nzzalpha\n\n## Concrete Patterns\n\nzzbravo\n";
+
+        let sections = extract_high_signal_sections(body);
+
+        assert_eq!(
+            sections.len(),
+            2,
+            "expected two sections, got: {:?}",
+            sections
+        );
+        assert!(sections[0].contains("zzalpha"));
+        assert!(sections[1].contains("zzbravo"));
+    }
+
+    /// from_agents_md previously appended high-signal sections after the full
+    /// body, so extract_keywords's first-seen dedup meant they contributed
+    /// nothing (every token already occurred once in the body). Prepending
+    /// them means signal-section-only tokens now appear earlier in the
+    /// resulting keyword vector than tokens that occur only outside a signal
+    /// section -- proof the weighting is no longer inert.
+    #[test]
+    fn from_agents_md_high_signal_tokens_precede_body_only_tokens() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("weighted");
+        fs::create_dir_all(&dir).unwrap();
+
+        fs::write(
+            dir.join("AGENTS.md"),
+            "# Weighted Context\n\nzzalpha zzbravo zzcharlie\n\n## Tech Stack\n\nzzdelta zzecho zzfoxtrot\n",
+        )
+        .unwrap();
+
+        let profile = PersonaProfile::from_agents_md(&dir).unwrap();
+
+        let idx_signal = profile
+            .keywords
+            .iter()
+            .position(|k| k == "zzdelta")
+            .expect("zzdelta (from the Tech Stack signal section) must be a keyword");
+        let idx_body_only = profile
+            .keywords
+            .iter()
+            .position(|k| k == "zzalpha")
+            .expect("zzalpha (body-only, non-signal) must be a keyword");
+
+        assert!(
+            idx_signal < idx_body_only,
+            "high-signal token 'zzdelta' (index {}) should precede body-only token 'zzalpha' (index {}); got: {:?}",
+            idx_signal,
+            idx_body_only,
+            profile.keywords
+        );
     }
 }

@@ -276,16 +276,16 @@ mod tests {
         assert_eq!(serialized["error"]["code"], -32601);
     }
 
-    /// Verify that tools/list returns the expected nine tool names.
+    /// Verify that tools/list returns the expected ten tool names.
     #[test]
-    fn tools_list_returns_nine_tools() {
+    fn tools_list_returns_ten_tools() {
         let tmp = tempfile::tempdir().unwrap();
         let client = make_client(tmp.path());
         let line = r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#;
         let response = handle_message(line, &client).expect("should produce a response");
         let serialized = serde_json::to_value(&response).unwrap();
         let tools = serialized["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 10);
     }
 
     /// Verify tools/call with frameshift_install succeeds end-to-end.

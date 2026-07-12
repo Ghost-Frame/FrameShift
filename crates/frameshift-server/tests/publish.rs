@@ -13,6 +13,9 @@
 //! - **bad signature** -- POST a pack with a tampered signature, assert `401`.
 //! - **unregistered author** -- POST with an unknown `author_handle`, assert `401`.
 //! - **duplicate** -- POST the same pack twice, assert second call is `409`.
+//! - **malformed archive/manifest** -- POST a corrupt tar.gz or invalid
+//!   `pack.toml`, assert `400` with a fixed, generic error message that never
+//!   echoes the server's temp-directory path or raw `io::Error`/tar text.
 
 mod mocks;
 
@@ -53,6 +56,7 @@ fn test_config() -> Arc<ServerConfig> {
         max_search_limit: 100,
         trust_forwarded_for: false,
         signed_request_max_skew: Duration::from_secs(300),
+        admin_pubkeys: Vec::new(),
         shutdown_grace: Duration::from_secs(1),
         cors_allowed_origins: String::new(),
         download_secret: SecretString::new(String::new()),
@@ -600,5 +604,82 @@ async fn publish_replayed_request_returns_401() {
         resp2.status(),
         StatusCode::UNAUTHORIZED,
         "replay with the same nonce must be rejected"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// malformed archive / manifest (temp-directory path leak regression)
+// ---------------------------------------------------------------------------
+
+/// POST a `pack` field that is not a valid gzip/tar stream at all -> `400`
+/// with a fixed, generic `"invalid archive: ..."` message. Regression test
+/// for the leak where the raw tar/io error text (which can embed the
+/// server's absolute temp-directory path) was echoed straight into the
+/// response body.
+#[tokio::test]
+async fn publish_malformed_tar_returns_400_generic_message_without_path_leak() {
+    let signing = SigningKey::from_bytes(&[50u8; 32]);
+    let (catalog, _pubkey) = catalog_with_author(&signing, "mallory");
+    // Not a valid gzip stream: decompression fails while the tar reader
+    // pulls the first header block, well before any pack.toml is touched.
+    let garbage_archive = b"not a valid gzip stream at all".to_vec();
+    // The signature field only needs to be 64 bytes; extraction fails before
+    // the signature is ever verified.
+    let fake_signature = vec![0u8; 64];
+
+    let state = make_state(catalog, MockPackStore::new());
+    let resp = post_publish(
+        state,
+        &garbage_archive,
+        &fake_signature,
+        "mallory",
+        Some(&signing),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let body = body_json(resp).await;
+    let msg = body["error"]
+        .as_str()
+        .expect("error message must be a string");
+    assert!(
+        msg.starts_with("invalid archive"),
+        "expected a generic 'invalid archive' message, got: {msg}"
+    );
+    assert!(
+        !msg.contains("/tmp") && !msg.to_lowercase().contains("os error"),
+        "error message must not leak server filesystem details: {msg}"
+    );
+}
+
+/// POST a well-formed tar.gz whose `pack.toml` is not valid TOML -> `400`
+/// with the fixed message `"invalid pack"`, never the underlying
+/// `PackError` text (which can embed the server's absolute
+/// temp-directory path via `PackError::Io`/`NonUtf8Path`).
+#[tokio::test]
+async fn publish_malformed_manifest_returns_400_generic_message_without_path_leak() {
+    let signing = SigningKey::from_bytes(&[51u8; 32]);
+    let (catalog, _pubkey) = catalog_with_author(&signing, "trent");
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    std::fs::write(tmp.path().join("pack.toml"), b"this is not valid toml {{{").unwrap();
+    let archive_bytes = make_targz(tmp.path());
+    let fake_signature = vec![0u8; 64];
+
+    let state = make_state(catalog, MockPackStore::new());
+    let resp = post_publish(
+        state,
+        &archive_bytes,
+        &fake_signature,
+        "trent",
+        Some(&signing),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let body = body_json(resp).await;
+    assert_eq!(
+        body["error"], "invalid pack",
+        "publish must return the fixed generic message, not the underlying PackError text"
     );
 }

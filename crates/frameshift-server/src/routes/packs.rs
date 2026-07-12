@@ -200,11 +200,18 @@ async fn extract_targz(archive_bytes: Vec<u8>, dir: std::path::PathBuf) -> Resul
         archive.set_preserve_permissions(false);
         archive.set_overwrite(true);
 
-        let entries = archive
-            .entries()
-            .map_err(|e| AppError::BadRequest(format!("tar entries: {e}")))?;
+        let entries = archive.entries().map_err(|e| {
+            // The underlying io::Error text may embed the server's temp
+            // directory path; log it internally and return a generic,
+            // path-free message to the client.
+            tracing::warn!(error = %e, "failed to read tar entries");
+            AppError::BadRequest("invalid archive: unreadable tar entries".to_string())
+        })?;
         for entry in entries {
-            let mut entry = entry.map_err(|e| AppError::BadRequest(format!("tar entry: {e}")))?;
+            let mut entry = entry.map_err(|e| {
+                tracing::warn!(error = %e, "failed to read tar entry");
+                AppError::BadRequest("invalid archive: unreadable tar entry".to_string())
+            })?;
             // Reject any entry that is not a regular file or directory. Symlinks,
             // hardlinks, and device nodes have no legitimate place in a pack and
             // could be used to plant a link that escapes the extraction dir or
@@ -218,7 +225,10 @@ async fn extract_targz(archive_bytes: Vec<u8>, dir: std::path::PathBuf) -> Resul
             // Path-traversal protection: only allow paths relative to dir.
             let path = entry
                 .path()
-                .map_err(|e| AppError::BadRequest(format!("tar entry path: {e}")))?
+                .map_err(|e| {
+                    tracing::warn!(error = %e, "failed to read tar entry path");
+                    AppError::BadRequest("invalid archive: unreadable entry path".to_string())
+                })?
                 .into_owned();
             if path.is_absolute()
                 || path
@@ -229,9 +239,13 @@ async fn extract_targz(archive_bytes: Vec<u8>, dir: std::path::PathBuf) -> Resul
                     "pack archive contains unsafe path".to_string(),
                 ));
             }
-            entry
-                .unpack_in(&dir)
-                .map_err(|e| AppError::BadRequest(format!("tar unpack: {e}")))?;
+            entry.unpack_in(&dir).map_err(|e| {
+                // io::Error from unpack_in may embed the server's absolute
+                // temp-directory path; log it internally, keep the client
+                // response generic.
+                tracing::warn!(error = %e, "failed to unpack tar entry");
+                AppError::BadRequest("invalid archive: failed to extract entry".to_string())
+            })?;
         }
         Ok(())
     })
@@ -371,8 +385,13 @@ pub async fn publish_pack(
     std::fs::write(pack_root.join("signature.sig"), &signature_bytes)
         .map_err(|e| AppError::Internal(format!("write signature.sig: {e}")))?;
 
-    let pack = Pack::from_dir(&pack_root)
-        .map_err(|e| AppError::BadRequest(format!("invalid pack: {e}")))?;
+    let pack = Pack::from_dir(&pack_root).map_err(|e| {
+        // `PackError` variants can embed the server's absolute temp-directory
+        // path (e.g. `Io`, `NonUtf8Path`); log the detailed error server-side
+        // and return a generic, path-free message to the client.
+        tracing::warn!(error = %e, "failed to load pack from extracted archive");
+        AppError::BadRequest("invalid pack".to_string())
+    })?;
 
     // Verify signature against canonical hash using the registered pubkey.
     // This is the authentication check: a wrong key means 401.
@@ -766,13 +785,42 @@ pub async fn get_pack(
     Ok(Json(pack))
 }
 
-/// `GET /v1/packs/{name}/versions`
+/// Query parameters accepted by `GET /v1/packs/{name}/versions`.
 ///
-/// List all published versions of a pack, ordered by `published_at ASC`.
+/// Both fields are optional. `limit` defaults to `100` and is clamped to
+/// `config.max_search_limit`, mirroring [`SearchQuery`]; `offset` defaults to
+/// `0`.
+#[derive(Debug, Default, Deserialize)]
+pub struct VersionsQuery {
+    /// Maximum number of version records to return. Clamped to
+    /// `config.max_search_limit`.
+    ///
+    /// A value of `0` is valid and returns an empty array.
+    pub limit: Option<u32>,
+
+    /// Number of version records to skip before returning matches, applied
+    /// after ordering by `published_at ASC`.
+    pub offset: Option<u32>,
+}
+
+/// `GET /v1/packs/{name}/versions?limit=&offset=`
+///
+/// List published versions of a pack, ordered by `published_at ASC`.
+///
+/// The `limit` parameter defaults to `100` and is clamped to
+/// `config.max_search_limit`, the same convention [`search_packs`] uses. When
+/// clamped, the response includes a `Warning` header:
+/// `299 - "limit clamped to <max>"`.
+///
+/// The catalog trait's `list_pack_versions` has no `limit`/`offset` of its
+/// own (unlike [`frameshift_catalog::CatalogBackend::list_authors`]), so
+/// pagination is applied here, over the full version list returned by the
+/// backend, rather than pushed down into the query.
 ///
 /// # Response
 ///
-/// `200 OK` with body `[PackVersionRecord, ...]`.
+/// `200 OK` with body `[PackVersionRecord, ...]`, containing at most `limit`
+/// records starting at `offset`.
 ///
 /// # Backend calls
 ///
@@ -786,14 +834,40 @@ pub async fn get_pack(
 pub async fn list_pack_versions(
     State(state): State<AppState>,
     Path(name): Path<String>,
-) -> Result<Json<Vec<frameshift_catalog::PackVersionRecord>>, AppError> {
+    Query(q): Query<VersionsQuery>,
+) -> Result<Response, AppError> {
     validate_pack_name(&name)?;
+
+    let max = state.config.max_search_limit;
+    let raw_limit = q.limit.unwrap_or(100);
+    let clamped = raw_limit.min(max);
+    let was_clamped = clamped < raw_limit;
+    let offset = q.offset.unwrap_or(0) as usize;
+
     let versions = state
         .catalog
         .list_pack_versions(&name)
         .await
         .map_err(|e| AppError::from_catalog(e, "pack"))?;
-    Ok(Json(versions))
+
+    let page: Vec<_> = versions
+        .into_iter()
+        .skip(offset)
+        .take(clamped as usize)
+        .collect();
+
+    let body = Json(page);
+
+    if was_clamped {
+        let warning_value = format!("299 - \"limit clamped to {max}\"");
+        let mut resp = (StatusCode::OK, body).into_response();
+        if let Ok(hv) = HeaderValue::from_str(&warning_value) {
+            resp.headers_mut().insert("Warning", hv);
+        }
+        Ok(resp)
+    } else {
+        Ok((StatusCode::OK, body).into_response())
+    }
 }
 
 /// `GET /v1/packs/{name}/versions/{version}`

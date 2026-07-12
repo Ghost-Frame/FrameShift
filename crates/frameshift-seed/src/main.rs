@@ -1,10 +1,13 @@
 //! One-shot seeder for the frameshift catalog and object store.
 //!
 //! Reads persona directories from a configurable root path, builds a pack for
-//! each directory that contains an `AGENTS.md` file plus a `pack.toml` manifest
-//! (or synthesizes one), signs it with a generated Ed25519 key, stores the
-//! canonical pack bytes in the object store, and registers the pack version and
-//! author in the catalog.
+//! each directory that carries a `pack.toml` manifest, a legacy `persona.toml`,
+//! or an `AGENTS.md` file. A missing `pack.toml` is synthesized; a `pack.toml`
+//! that already exists (as every curated `personas/*` directory does) has its
+//! placeholder `author_pubkey` repaired in place so the strict manifest parser
+//! can load it. The pack is then signed with a generated Ed25519 key, its
+//! canonical bytes are stored in the object store, and the pack version and
+//! author are registered in the catalog.
 //!
 //! # Usage
 //!
@@ -43,7 +46,7 @@ use frameshift_catalog::{
 use frameshift_catalog_postgres::{PostgresCatalog, PostgresCatalogConfig};
 use frameshift_objects::PackStore;
 use frameshift_objects_fs::{FsPackStore, FsPackStoreConfig};
-use frameshift_pack::{ObjectHash, Pack};
+use frameshift_pack::{ObjectHash, Pack, PackManifest};
 use secrecy::SecretString;
 use tracing::{error, info, warn};
 
@@ -148,9 +151,7 @@ async fn run() -> Result<(), SeedError> {
             continue;
         }
 
-        let persona_toml = path.join("persona.toml");
-        let agents_md = path.join("AGENTS.md");
-        if !persona_toml.exists() && !agents_md.exists() {
+        if !is_persona_dir(&path) {
             continue;
         }
 
@@ -164,15 +165,21 @@ async fn run() -> Result<(), SeedError> {
             continue;
         }
 
-        // Synthesize a pack.toml if one does not exist.
         let pack_toml_path = path.join("pack.toml");
         if !pack_toml_path.exists() {
+            // Synthesize a pack.toml if one does not exist.
             write_synthetic_pack_toml(
                 &pack_toml_path,
                 dir_name,
                 &config.author_handle,
                 &verifying_key,
             )?;
+        } else {
+            // Curated pack.toml files ship with a placeholder `author_pubkey`
+            // (e.g. "UNSIGNED") that fails PackManifest's strict 64-hex-char
+            // validator. Repair it in place with the real key so `Pack::from_dir`
+            // below can parse the manifest; all other fields are left untouched.
+            repair_placeholder_author_pubkey(&pack_toml_path, &verifying_key)?;
         }
 
         match seed_persona(&path, &catalog, &objects, &signing_key, author_pubkey).await {
@@ -229,6 +236,18 @@ impl SeedConfig {
             signing_key_path,
         })
     }
+}
+
+/// Whether a directory looks like a persona pack worth seeding.
+///
+/// Any of the three marker files is sufficient: `pack.toml` (curated
+/// `personas/*` directories in this repo are pack.toml-only by design),
+/// a legacy `persona.toml`, or an `AGENTS.md`. `pack.toml` is synthesized
+/// from the legacy files when it is the only one absent.
+fn is_persona_dir(path: &Path) -> bool {
+    path.join("pack.toml").exists()
+        || path.join("persona.toml").exists()
+        || path.join("AGENTS.md").exists()
 }
 
 /// Derive a stable default key path that is namespaced by author handle.
@@ -482,6 +501,98 @@ fn load_or_create_signing_key(path: &Path) -> Result<SigningKey, SeedError> {
     }
 }
 
+/// Encode an Ed25519 verifying key as the 64-lowercase-hex-character string
+/// that `PackManifest::author_pubkey` requires.
+fn verifying_key_hex(verifying_key: &VerifyingKey) -> String {
+    verifying_key
+        .to_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Whether `s` matches the strict encoding `PackManifest` requires for
+/// `author_pubkey`: exactly 64 lowercase hex characters. Mirrors
+/// `frameshift_pack::manifest`'s private validator so the repair check here
+/// never disagrees with what the real parser will accept.
+fn is_valid_pubkey_hex(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Repair a placeholder `author_pubkey` in an existing `pack.toml`.
+///
+/// Curated repo personas (`personas/*/pack.toml`) ship with a literal
+/// `"UNSIGNED"` placeholder for `author_pubkey` -- fine for humans reading the
+/// file, but rejected by `PackManifest`'s deserializer, which requires exactly
+/// 64 lowercase hex characters. Left unrepaired, `Pack::from_dir` fails to
+/// parse every one of them.
+///
+/// Curated pack.toml files are hand-written persona content: several carry
+/// comments and deliberate key ordering that a parse-and-reserialize round
+/// trip through `toml::Value` would destroy (comments dropped, keys
+/// reordered). The rewrite is therefore a surgical single-line replacement:
+/// only the root-table `author_pubkey = ...` line changes; every other byte
+/// of the file is preserved verbatim. A no-op when the existing value already
+/// satisfies the strict check; an error when the root table has no
+/// `author_pubkey` key at all, since that file needs a human, not a seeder.
+fn repair_placeholder_author_pubkey(
+    path: &Path,
+    verifying_key: &VerifyingKey,
+) -> Result<(), SeedError> {
+    let content = std::fs::read_to_string(path)?;
+    let doc: toml::Value = toml::from_str(&content).map_err(|e| {
+        SeedError::Io(std::io::Error::other(format!(
+            "parse {} for author_pubkey repair: {e}",
+            path.display()
+        )))
+    })?;
+
+    let already_valid = doc
+        .get("author_pubkey")
+        .and_then(|v| v.as_str())
+        .is_some_and(is_valid_pubkey_hex);
+    if already_valid {
+        return Ok(());
+    }
+
+    let hex = verifying_key_hex(verifying_key);
+    let mut in_root_table = true;
+    let mut replaced = false;
+    let mut rewritten = String::with_capacity(content.len() + 80);
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        // `author_pubkey` is a root-table key; a same-named key inside a
+        // sub-table (however unlikely) must not be touched.
+        if trimmed.starts_with('[') {
+            in_root_table = false;
+        }
+        let is_pubkey_line = in_root_table
+            && !replaced
+            && trimmed
+                .strip_prefix("author_pubkey")
+                .is_some_and(|rest| rest.trim_start().starts_with('='));
+        if is_pubkey_line {
+            rewritten.push_str(&format!("author_pubkey = \"{hex}\""));
+            replaced = true;
+        } else {
+            rewritten.push_str(line);
+        }
+        rewritten.push('\n');
+    }
+    if !replaced {
+        return Err(SeedError::Io(std::io::Error::other(format!(
+            "{}: no root-level author_pubkey key found to repair",
+            path.display()
+        ))));
+    }
+    if !content.ends_with('\n') {
+        rewritten.pop();
+    }
+    std::fs::write(path, rewritten)?;
+    info!("repaired placeholder author_pubkey in {}", path.display());
+    Ok(())
+}
+
 /// Write a synthetic `pack.toml` manifest for a persona directory.
 ///
 /// The manifest is minimal but valid. The `author_pubkey` field is encoded as
@@ -494,11 +605,7 @@ fn write_synthetic_pack_toml(
     author_handle: &str,
     verifying_key: &VerifyingKey,
 ) -> Result<(), SeedError> {
-    let pubkey_hex: String = verifying_key
-        .to_bytes()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    let pubkey_hex = verifying_key_hex(verifying_key);
 
     // Guard against TOML injection: dir_name (filesystem) and author_handle (env)
     // are interpolated into quoted TOML strings below. A value containing a quote,
@@ -610,8 +717,43 @@ async fn update_pack_metadata(
     Ok(())
 }
 
-/// Derive pack metadata from persona.toml when present, otherwise from AGENTS.md.
+/// Derive pack metadata for the marketplace listing.
+///
+/// Prefers the pack's own `pack.toml` `description`/`tags` fields -- first-class
+/// since commit b75344d and present on every curated `personas/*` manifest --
+/// and falls back to the legacy `persona.toml` (description + patterns.toml
+/// stack tags) or `AGENTS.md` (first prose line) derivation for packs that
+/// predate curated pack.toml metadata.
 fn derive_pack_metadata(path: &Path, dir_name: &str) -> Result<Option<PackMetadata>, SeedError> {
+    let pack_toml_path = path.join("pack.toml");
+    if pack_toml_path.exists() {
+        let pack_content = std::fs::read_to_string(&pack_toml_path)?;
+        let manifest: PackManifest = toml::from_str(&pack_content).map_err(|e| {
+            SeedError::Io(std::io::Error::other(format!(
+                "parse pack.toml for {dir_name}: {e}"
+            )))
+        })?;
+
+        let mut tags = manifest.tags.clone();
+        if tags.is_empty() {
+            tags = derive_pattern_tags(path)?;
+        }
+        if tags.is_empty() {
+            tags = default_tags(dir_name);
+        }
+
+        let description = match manifest.description.filter(|d| !d.is_empty()) {
+            Some(d) => d,
+            None => derive_legacy_description(path, dir_name),
+        };
+
+        return Ok(Some(PackMetadata {
+            name: manifest.name,
+            description,
+            tags,
+        }));
+    }
+
     let persona_path = path.join("persona.toml");
     if persona_path.exists() {
         let persona_content = std::fs::read_to_string(&persona_path)?;
@@ -651,6 +793,27 @@ fn derive_pack_metadata(path: &Path, dir_name: &str) -> Result<Option<PackMetada
         description,
         tags: default_tags(dir_name),
     }))
+}
+
+/// Fall back to legacy description sources when a `pack.toml` carries no
+/// `description`: the directory's `persona.toml` description, then the first
+/// prose line of its `AGENTS.md`, then a generic templated string.
+fn derive_legacy_description(path: &Path, dir_name: &str) -> String {
+    let persona_path = path.join("persona.toml");
+    if let Ok(content) = std::fs::read_to_string(&persona_path) {
+        if let Ok(persona) = toml::from_str::<PersonaToml>(&content) {
+            if !persona.description.is_empty() {
+                return persona.description;
+            }
+        }
+    }
+
+    let agents_path = path.join("AGENTS.md");
+    if let Some(description) = derive_agents_description(&agents_path) {
+        return description;
+    }
+
+    fallback_description(dir_name)
 }
 
 /// Extract stack-category tags from patterns.toml when that file exists.
@@ -699,4 +862,243 @@ fn derive_agents_description(path: &Path) -> Option<String> {
         return Some(trimmed.to_string());
     }
     None
+}
+
+/// Unit tests for the seeder's persona gate, pack.toml repair, and
+/// metadata derivation.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use tempfile::TempDir;
+
+    /// A pack.toml fixture shaped exactly like the curated `personas/*`
+    /// directories in this repo: pack.toml-only, with the literal
+    /// `"UNSIGNED"` author_pubkey placeholder and first-class
+    /// description/tags (commit b75344d).
+    const CURATED_PACK_TOML: &str = r#"# Curated persona pack manifest.
+schema_version = 1
+name = "agents"
+author_handle = "ghost-frame"
+author_pubkey = "UNSIGNED"
+version = "0.1.0"
+description = "Multi-agent coordination, delegation, and parallel execution workflows."
+tags = ["agents", "coordination", "delegation", "parallel"]
+license = "Elastic-2.0"
+
+# Capability surface this persona expects from the host agent.
+[capability_manifest]
+required_tools = ["Read", "Edit", "Write", "Bash", "Grep", "Glob"]
+network_egress = false
+filesystem_scope = "project-only"
+memory_required = "none"
+memory_required_ops = []
+"#;
+
+    /// Deterministic test keypair (mirrors the pattern used in
+    /// `frameshift_pack::pack::tests`).
+    fn test_verifying_key() -> ed25519_dalek::VerifyingKey {
+        SigningKey::from_bytes(&[7u8; 32]).verifying_key()
+    }
+
+    #[test]
+    /// A pack.toml-only directory (no persona.toml, no AGENTS.md) must pass
+    /// the persona-directory gate -- this is the exact shape of every
+    /// `personas/*` directory in the repo.
+    fn is_persona_dir_accepts_pack_toml_only() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("pack.toml"), CURATED_PACK_TOML).unwrap();
+        assert!(is_persona_dir(tmp.path()));
+    }
+
+    #[test]
+    /// A directory with none of the three marker files is not a persona dir
+    /// (this is the shape of `personas/assets/`, which holds only images).
+    fn is_persona_dir_rejects_directory_with_no_markers() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("banner.png"), b"not a persona").unwrap();
+        assert!(!is_persona_dir(tmp.path()));
+    }
+
+    #[test]
+    /// The strict-hex check must accept only exactly 64 lowercase hex chars,
+    /// matching `frameshift_pack::manifest::deserialize_author_pubkey`.
+    fn pubkey_hex_validation_matches_manifest_parser() {
+        assert!(!is_valid_pubkey_hex("UNSIGNED"));
+        assert!(!is_valid_pubkey_hex(""));
+        assert!(!is_valid_pubkey_hex(&"a".repeat(63)));
+        assert!(!is_valid_pubkey_hex(&"A".repeat(64))); // uppercase rejected
+        assert!(is_valid_pubkey_hex(&"a".repeat(64)));
+    }
+
+    #[test]
+    /// Repairing a curated pack.toml's placeholder author_pubkey must leave
+    /// every other field -- including the first-class description/tags --
+    /// untouched, and the result must parse as a valid `PackManifest`.
+    fn repair_placeholder_author_pubkey_preserves_curated_fields() {
+        let tmp = TempDir::new().unwrap();
+        let pack_toml_path = tmp.path().join("pack.toml");
+        std::fs::write(&pack_toml_path, CURATED_PACK_TOML).unwrap();
+
+        // Before repair: the strict manifest parser must reject "UNSIGNED".
+        let content = std::fs::read_to_string(&pack_toml_path).unwrap();
+        assert!(toml::from_str::<PackManifest>(&content).is_err());
+
+        repair_placeholder_author_pubkey(&pack_toml_path, &test_verifying_key()).unwrap();
+
+        let repaired = std::fs::read_to_string(&pack_toml_path).unwrap();
+        let manifest: PackManifest = toml::from_str(&repaired)
+            .expect("repaired pack.toml must parse as a valid PackManifest");
+
+        assert_eq!(manifest.name, "agents");
+        assert_eq!(manifest.author_handle, "ghost-frame");
+        assert!(is_valid_pubkey_hex(&manifest.author_pubkey));
+        assert_eq!(
+            manifest.description.as_deref(),
+            Some("Multi-agent coordination, delegation, and parallel execution workflows.")
+        );
+        assert_eq!(
+            manifest.tags,
+            vec!["agents", "coordination", "delegation", "parallel"]
+        );
+        assert_eq!(manifest.license.as_deref(), Some("Elastic-2.0"));
+        assert_eq!(
+            manifest.capability_manifest.unwrap().required_tools,
+            vec!["Read", "Edit", "Write", "Bash", "Grep", "Glob"]
+        );
+    }
+
+    #[test]
+    /// The repair must be a surgical single-line rewrite: comments, blank
+    /// lines, key order, and every byte outside the `author_pubkey` line are
+    /// hand-written persona content and must survive verbatim (several real
+    /// curated `personas/*/pack.toml` files carry comments).
+    fn repair_placeholder_author_pubkey_preserves_comments_and_layout() {
+        let tmp = TempDir::new().unwrap();
+        let pack_toml_path = tmp.path().join("pack.toml");
+        std::fs::write(&pack_toml_path, CURATED_PACK_TOML).unwrap();
+
+        repair_placeholder_author_pubkey(&pack_toml_path, &test_verifying_key()).unwrap();
+
+        let repaired = std::fs::read_to_string(&pack_toml_path).unwrap();
+        let expected_line = format!(
+            "author_pubkey = \"{}\"",
+            verifying_key_hex(&test_verifying_key())
+        );
+        let expected = CURATED_PACK_TOML.replace("author_pubkey = \"UNSIGNED\"", &expected_line);
+        assert_eq!(repaired, expected);
+    }
+
+    #[test]
+    /// A pack.toml with no root-level author_pubkey key at all must fail the
+    /// repair loudly rather than have a key silently invented for it.
+    fn repair_placeholder_author_pubkey_errors_when_key_missing() {
+        let tmp = TempDir::new().unwrap();
+        let pack_toml_path = tmp.path().join("pack.toml");
+        std::fs::write(
+            &pack_toml_path,
+            "schema_version = 1\nname = \"x\"\nauthor_handle = \"h\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let err = repair_placeholder_author_pubkey(&pack_toml_path, &test_verifying_key())
+            .expect_err("missing author_pubkey key must be an error");
+        assert!(err.to_string().contains("author_pubkey"));
+    }
+
+    #[test]
+    /// A pack.toml whose author_pubkey is already valid hex must be left
+    /// byte-for-byte unchanged.
+    fn repair_placeholder_author_pubkey_is_noop_when_already_valid() {
+        let tmp = TempDir::new().unwrap();
+        let pack_toml_path = tmp.path().join("pack.toml");
+        let valid_hex = "a".repeat(64);
+        let content = format!(
+            "schema_version = 1\nname = \"x\"\nauthor_handle = \"h\"\n\
+             author_pubkey = \"{valid_hex}\"\nversion = \"0.1.0\"\n"
+        );
+        std::fs::write(&pack_toml_path, &content).unwrap();
+
+        repair_placeholder_author_pubkey(&pack_toml_path, &test_verifying_key()).unwrap();
+
+        let after = std::fs::read_to_string(&pack_toml_path).unwrap();
+        assert_eq!(after, content);
+    }
+
+    #[test]
+    /// End-to-end: a pack.toml-only persona directory shaped exactly like a
+    /// curated `personas/*` entry must survive the full pre-seed pipeline --
+    /// gate, pubkey repair, and `Pack::from_dir` + sign -- without the
+    /// missing persona.toml/AGENTS.md ever being required.
+    fn pack_toml_only_persona_seeds_end_to_end() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("pack.toml"), CURATED_PACK_TOML).unwrap();
+
+        // 1. Gate: must be recognized as a persona dir.
+        assert!(is_persona_dir(tmp.path()));
+
+        // 2. Repair: placeholder author_pubkey must be fixed in place.
+        let pack_toml_path = tmp.path().join("pack.toml");
+        let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+        repair_placeholder_author_pubkey(&pack_toml_path, &verifying_key).unwrap();
+
+        // 3. Load: Pack::from_dir must now succeed against the repaired manifest.
+        let mut pack = Pack::from_dir(tmp.path()).expect("pack.toml-only persona must load");
+        assert_eq!(pack.manifest().name, "agents");
+
+        // 4. Sign: the loaded pack must be signable, exactly as seed_persona does.
+        pack.sign(&signing_key).expect("signing must succeed");
+        assert!(pack.verify(&verifying_key).is_ok());
+
+        // 5. Canonical bytes: the object-store payload must build without error.
+        let bytes = pack_canonical_bytes(tmp.path()).expect("canonical bytes must build");
+        assert!(!bytes.is_empty());
+
+        // 6. Metadata: the marketplace description/tags must come straight from
+        //    pack.toml, not from a nonexistent persona.toml/AGENTS.md fallback.
+        let metadata = derive_pack_metadata(tmp.path(), "agents")
+            .expect("metadata derivation must not error")
+            .expect("pack.toml-only dir must yield metadata");
+        assert_eq!(metadata.name, "agents");
+        assert_eq!(
+            metadata.description,
+            "Multi-agent coordination, delegation, and parallel execution workflows."
+        );
+        assert_eq!(
+            metadata.tags,
+            vec!["agents", "coordination", "delegation", "parallel"]
+        );
+    }
+
+    #[test]
+    /// When a pack.toml carries no description/tags, `derive_pack_metadata`
+    /// must fall back to the legacy AGENTS.md derivation rather than
+    /// returning an empty description.
+    fn derive_pack_metadata_falls_back_to_agents_md_when_pack_toml_has_no_description() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("pack.toml"),
+            "schema_version = 1\nname = \"bare\"\nauthor_handle = \"h\"\n\
+             author_pubkey = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n\
+             version = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("AGENTS.md"),
+            "# Bare Persona\n\nA persona description long enough to pass the filter.\n",
+        )
+        .unwrap();
+
+        let metadata = derive_pack_metadata(tmp.path(), "bare")
+            .unwrap()
+            .expect("must yield metadata");
+        assert_eq!(metadata.name, "bare");
+        assert_eq!(
+            metadata.description,
+            "A persona description long enough to pass the filter."
+        );
+        // No tags anywhere -> falls back to the generic default tags.
+        assert_eq!(metadata.tags, vec!["bare", "persona"]);
+    }
 }

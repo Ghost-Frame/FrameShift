@@ -3,8 +3,8 @@
 # preflight.sh -- run the same gates CI runs, locally, before you push.
 #
 # Mirrors .github/workflows/ci.yml so a green preflight means a green CI (minus
-# the Postgres-integration and mirror jobs, which need Docker / the remote and
-# are not reproduced here). Run this before opening or updating a PR.
+# the Postgres-integration job, which needs Docker and is not reproduced here).
+# Run this before opening or updating a PR.
 #
 # Usage:
 #   scripts/preflight.sh           # fmt + clippy + test + audit

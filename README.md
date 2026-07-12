@@ -6,7 +6,7 @@
 
 A persona engine for AI coding agents. Install behavioral identities as versioned packs, activate them per-project, and let the engine pick the right one for the task.
 
-**Status:** The CLI, pack system, orchestrator, and watch daemon work. The marketplace server and web frontend do not -- both are under active development. You can clone this repo and use the personas today via the CLI.
+**Status:** The CLI, pack system, orchestrator, watch daemon, marketplace server, and web frontend all work. You can clone this repo and use the personas today via the CLI, or publish and browse packs against the live marketplace.
 
 Personas are not instruction lists. They are complete behavioral frames -- identity, rules, skills, operating posture -- that survive long sessions, surprising inputs, and the slow drift that turns careful agents into sloppy ones around turn 200. Same model, different frame.
 
@@ -99,6 +99,10 @@ Signing is Ed25519 over that 32-byte hash; the signature travels alongside the p
 
 There is no central signing authority. An author **claims a handle** (e.g. `ghost-frame`) with a signed request, and the registry binds that handle to the key that signed it, first-claim-wins. Key rotation must be signed by the current key -- the old key authorizes its own replacement. At publish, the server checks that the live signer owns the handle and that the pack signature verifies against that registered key. On install from the registry, the client verifies the pack signature against the key in the **registry's record** for that version, not the key embedded in the manifest, so a tampered manifest cannot smuggle in a different key. Installing directly from a local path verifies a signature if one is present, and installs unsigned local packs as-is.
 
+### Downloads
+
+`frameshift install` and `publish --server` fetch pack bytes from the direct, unauthenticated `GET /v1/packs/{name}/versions/{version}/pack` route -- this is the supported download path today. The server also implements a signed-download flow: `POST .../download-url` mints a short-lived, HMAC-signed `/dl/{hash}` URL (gated on the `DOWNLOAD_SECRET` env var, disabled when it is unset). That flow is fully built and tested server-side but has no caller yet in the CLI or client, so treat it as experimental / not-yet-default until something mints and follows those URLs.
+
 ### Install and the central store
 
 `frameshift install` resolves a pack (from the registry, or `--from-path`), verifies it, and materializes it into a central store -- your project tree is never written to. The project is keyed by `project-id = sha256(realpath(project_root))`, so the same directory always maps to the same state regardless of how you path to it.
@@ -143,10 +147,12 @@ A persona can declare a memory requirement in its manifest, and it is enforced a
 
 ### Growth
 
-Each persona keeps an append-only local growth log at `personas/<name>/growth.md` -- things learned, mistakes caught, patterns discovered over a working session.
+Each persona keeps an append-only local growth log -- things learned, mistakes caught, patterns discovered over a working session. Entries are dual-written to the legacy `personas/<name>/growth.md` and a structured `growth.jsonl`; `grow log` and `grow summary` read the structured form back.
 
 ```bash
-frameshift grow append rust "orphan rules prevent implementing foreign traits on foreign types"
+frameshift grow append --persona rust --text "orphan rules prevent implementing foreign traits on foreign types"
+frameshift grow log --persona rust --limit 5
+frameshift grow summary --persona rust --scope project
 ```
 
 ### Interfaces
@@ -156,7 +162,7 @@ The same selection engine backs every surface:
 - **CLI** -- `frameshift <command>` (see below).
 - **Stdio MCP server** -- a JSON-RPC server exposing tools (install, activate, list, select, use, automate, prefs, grow, capabilities) and prompts (`active_persona`, `select_persona`, `automate_status`) as slash commands in any MCP-capable agent.
 - **Watch daemon** -- an optional background service over a peer-authenticated Unix socket, offering install/activate/sync/gc operations to editor integrations.
-- **Registry / marketplace HTTP server** -- publish, search, download, and author/handle registration. The server and web frontend are under active development.
+- **Registry / marketplace HTTP server** -- publish, search, download, and author/handle registration.
 
 Automate mode itself is applied by the host integration: a session hook (or equivalent) reads the per-project automate flag, calls `frameshift select` for the current task, and activates the best-fit persona.
 
@@ -187,7 +193,10 @@ frameshift automate on [--sensitivity 0.0-1.0]                          Enable a
 frameshift automate off | status | lock | unlock                        Disable / inspect / pin / unpin
 frameshift feedback --chosen <name> [--auto-pick <name>]                Record a selection override
            [--intent <intent>] [--reason <text>]
-frameshift prefs [show|reset]                                           View or reset preference biases
+frameshift prefs show                                                   View current per-persona bias values
+frameshift prefs bump <persona>                                         Increase a persona's bias
+frameshift prefs decay <persona>                                        Decrease a persona's bias
+frameshift prefs reset                                                  Clear all recorded preferences
 ```
 
 Authoring and registry:
@@ -197,15 +206,21 @@ frameshift rule add <persona> --id <id> --layer <L1|L2|L3> --text <text>   Add a
 frameshift rule remove <persona> --id <id>                                 Remove a rule
 frameshift skill add <persona> --id <id> --text <when>                     Add a skill entry to a persona
 frameshift skill remove <persona> --id <id>                                Remove a skill entry
-frameshift grow append <persona> <text>                                    Append to a persona's growth log
+frameshift grow append --persona <name> --text <text>                      Append to a persona's growth log
+frameshift grow log --persona <name> [--limit <n>]                         Show recent structured growth entries (default limit: 10)
+frameshift grow summary --persona <name> [--scope project|global]          Summarize growth entries (default scope: project)
 frameshift diff <a> <b>                                                    Semantic diff between two personas
 frameshift render <persona>                                                Render persona source to markdown
-frameshift verify <persona>                                                Run conformance checks
+frameshift verify (--persona <name> | --bundle <dir>)                      Run conformance checks (exactly one of the two)
+           [--runner mock|cli] [--model <name>] [--threshold <0.0-1.0>]
 frameshift register --server <url> --handle <handle> [--display-name <name>]   Claim an author handle
-frameshift publish <persona>                                               Publish a persona pack
+frameshift publish --persona <name> [--out <dir>]                          Build a persona pack (add --server + --handle to sign and upload)
+           [--server <url> --handle <handle>]
 frameshift search [QUERY] [--tag <tag>] [--limit <n>]                      Search the registry
 frameshift project-id                                                      Print the hashed project ID
 ```
+
+`verify` defaults to `--runner mock` (canned, offline responses, used by CI) with `--threshold 0.5`; pass `--runner cli` to drive the subscription-backed `agy` runner against `--model` (default `Gemini 3.1 Pro (High)`), which needs a logged-in `agy`. `publish` writes the pack to `--out` (default `publish-output/<persona>`) unconditionally; the upload step only runs when `--server` is set, and `--handle` is then required.
 
 ## What this repo contains
 
@@ -213,6 +228,16 @@ frameshift project-id                                                      Print
 - `personas/` -- pack manifests for the persona library
 
 ## Building
+
+Requires `libpq` (the PostgreSQL client library) for the diesel/pq-sys-backed catalog crate -- install it before building the workspace:
+
+```bash
+# Debian/Ubuntu
+sudo apt-get install libpq-dev
+
+# macOS
+brew install libpq
+```
 
 ```bash
 cargo build
@@ -236,16 +261,37 @@ cargo run -p frameshift-cli -- select --task "optimize a hot loop" --format json
 
 ### Server
 
+All variables are read with no prefix (e.g. `BIND_ADDR`, not `FRAMESHIFT_BIND_ADDR`); see `crates/frameshift-server/src/config.rs` for the authoritative parser.
+
 | Variable | Default | Purpose |
 |---|---|---|
 | `BIND_ADDR` | `0.0.0.0:3000` | HTTP bind address |
-| `POSTGRES_URL` | `""` | PostgreSQL connection URL |
+| `POSTGRES_URL` | `""` | PostgreSQL connection URL (production must override) |
 | `OBJECT_STORE_ROOT` | `/tmp/frameshift-objects` | Filesystem object store root |
-| `LOG_LEVEL` | `info` | Log filter |
+| `LOG_LEVEL` | `info` | `tracing` subscriber filter string |
 | `LOG_FORMAT` | `text` | `text` or `json` |
 | `MAX_REQUEST_BYTES` | `1048576` | Max request body size |
 | `MAX_SEARCH_LIMIT` | `200` | Max search `limit` |
 | `SHUTDOWN_GRACE` | `30` | Grace period in seconds |
+| `CORS_ALLOWED_ORIGINS` | `""` | Comma-separated allowed CORS origins; empty disables CORS |
+| `DOWNLOAD_SECRET` | `""` | 64-char hex (32 bytes) HMAC key for signed download URLs; empty disables the signed-download endpoints |
+| `DOWNLOAD_TOKEN_TTL` | `300` | Default TTL (seconds) for newly minted download tokens |
+| `DOWNLOAD_MAX_TOKEN_TTL` | `1800` | Hard cap (seconds) on token TTL accepted by the verifier |
+| `DOWNLOAD_RATE_PER_MIN` | `10` | Per-IP rate limit on the mint endpoint (requests/minute); `0` disables |
+| `OBJECT_STORE_BACKEND` | `fs` | `fs` (filesystem) or `r2` (S3-compatible / Cloudflare R2) |
+| `R2_ENDPOINT` | `""` | S3 endpoint URL for R2 (required when backend is `r2`) |
+| `R2_BUCKET` | `""` | Bucket name (required when backend is `r2`) |
+| `R2_PREFIX` | `objects` | Key prefix for pack blobs inside the bucket |
+| `R2_REGION` | `auto` | S3 region (R2 always uses `auto`) |
+| `R2_ACCESS_KEY_ID` | `""` | Access key ID for the bucket |
+| `R2_SECRET_ACCESS_KEY` | `""` | Secret access key |
+| `TRUST_FORWARDED_FOR` | `false` | Trust `X-Forwarded-For` for rate-limit key extraction; set `true` only behind a trusted proxy |
+| `SIGNED_REQUEST_MAX_SKEW_SECS` | `300` | Max clock skew (seconds) allowed between a signed write request's timestamp and server time |
+| `MEMORY_BACKEND` | `none` | `none`, `http`, or `sqlite` |
+| `MEMORY_HTTP_ENDPOINT` | `""` | Base URL for the HTTP memory endpoint; used when `MEMORY_BACKEND=http` |
+| `MEMORY_HTTP_AUTH` | `none` | `none` or `bearer:<token>`; used when `MEMORY_BACKEND=http` |
+| `MEMORY_HTTP_TIMEOUT_SECS` | `30` | Per-attempt request timeout for the HTTP memory adapter |
+| `MEMORY_SQLITE_PATH` | `""` | Path to the SQLite database file; required when `MEMORY_BACKEND=sqlite` |
 
 ## License
 

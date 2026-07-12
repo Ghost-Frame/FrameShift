@@ -2,6 +2,8 @@
 //!
 //! # Read (anonymous)
 //!
+//! - `GET /` -> [`list_authors_route`] -- paginated listing of all
+//!   registered authors.
 //! - `GET /{pubkey}` -> [`get_author`] -- look up an author by base64url
 //!   Ed25519 public key.
 //!
@@ -17,8 +19,8 @@
 //!   a new key. The request MUST be signed by the handle's *current* owner key
 //!   (the old key authorizes its own replacement).
 
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
@@ -38,12 +40,18 @@ use crate::state::AppState;
 /// Build the authors **read** sub-router, mounted at `/v1/authors`.
 ///
 /// Routes:
+/// - `GET /` -> [`list_authors_route`]
 /// - `GET /{pubkey}` -> [`get_author`]
 ///
 /// The mutating routes are built by [`authors_write_router`] and wired with the
-/// signed-request layer in [`crate::router::app`].
+/// signed-request layer in [`crate::router::app`]; that router also declares a
+/// `POST /` (`register_author_route`), which axum merges with this router's
+/// `GET /` onto the same path, mirroring how `packs_router`'s `GET /` and
+/// [`crate::routes::packs::publish_pack`]'s `POST /` share `/v1/packs`.
 pub fn authors_router() -> Router<AppState> {
-    Router::new().route("/{pubkey}", get(get_author))
+    Router::new()
+        .route("/", get(list_authors_route))
+        .route("/{pubkey}", get(get_author))
 }
 
 /// Build the authors **write** sub-router (mutating routes only).
@@ -90,6 +98,88 @@ pub async fn get_author(
         .await
         .map_err(|e| AppError::from_catalog(e, "author"))?;
     Ok(Json(author))
+}
+
+/// Query parameters accepted by `GET /v1/authors`.
+///
+/// Both fields are optional. `limit` defaults to `100` and is clamped to
+/// `config.max_search_limit`, mirroring
+/// [`crate::routes::packs::SearchQuery`] and
+/// [`crate::routes::packs::VersionsQuery`]; `offset` defaults to `0`.
+#[derive(Debug, Default, Deserialize)]
+pub struct AuthorsListQuery {
+    /// Maximum number of author records to return. Clamped to
+    /// `config.max_search_limit`.
+    ///
+    /// A value of `0` is valid and returns an empty array.
+    pub limit: Option<u32>,
+
+    /// Number of author records to skip before returning matches.
+    pub offset: Option<u32>,
+}
+
+/// Response body for `GET /v1/authors`.
+#[derive(Debug, Serialize)]
+pub struct AuthorsListResponse {
+    /// The requested page of registered authors, in the stable order
+    /// documented on [`frameshift_catalog::CatalogBackend::list_authors`].
+    pub authors: Vec<frameshift_catalog::AuthorRecord>,
+}
+
+/// `GET /v1/authors?limit=&offset=`
+///
+/// List registered authors. Anonymous; no auth required.
+///
+/// The `limit` parameter defaults to `100` and is clamped to
+/// `config.max_search_limit`, the same convention
+/// [`crate::routes::packs::search_packs`] and
+/// [`crate::routes::packs::list_pack_versions`] use. When clamped, the
+/// response includes a `Warning` header: `299 - "limit clamped to <max>"`.
+///
+/// Unlike `GET /v1/packs/{name}/versions`, pagination here is pushed all the
+/// way down into `catalog.list_authors(limit, offset)`, which already
+/// accepts both parameters at the trait level.
+///
+/// # Response
+///
+/// `200 OK` with body `{"authors": [AuthorRecord, ...]}`.
+///
+/// # Backend calls
+///
+/// - `catalog.list_authors(limit, offset)` -- single catalog read.
+///
+/// # Errors
+///
+/// - `500 Internal Server Error` on backend failure (request-id only; no
+///   internal details in body).
+pub async fn list_authors_route(
+    State(state): State<AppState>,
+    Query(q): Query<AuthorsListQuery>,
+) -> Result<Response, AppError> {
+    let max = state.config.max_search_limit;
+    let raw_limit = q.limit.unwrap_or(100);
+    let clamped = raw_limit.min(max);
+    let was_clamped = clamped < raw_limit;
+    let offset = q.offset.unwrap_or(0);
+
+    let authors = state
+        .catalog
+        .list_authors(clamped, offset)
+        .await
+        .map_err(|e| AppError::from_catalog(e, "author"))?;
+
+    let body = Json(AuthorsListResponse { authors });
+
+    if was_clamped {
+        let warning_value = format!("299 - \"limit clamped to {max}\"");
+        let mut resp = (StatusCode::OK, body).into_response();
+        if let Ok(hv) = HeaderValue::from_str(&warning_value) {
+            resp.headers_mut().insert("Warning", hv);
+        }
+        Ok(resp)
+    } else {
+        Ok((StatusCode::OK, body).into_response())
+    }
 }
 
 /// Request body for `POST /v1/authors`.

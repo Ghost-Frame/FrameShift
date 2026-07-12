@@ -194,11 +194,25 @@ pub struct ProjectPaths {
     pub personas_dir: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Outcome of [`crate::Client::install`].
+///
+/// `conformance_upgrade` is additive: it carries a best-effort, warn-only
+/// comparison of the incoming pack's shipped conformance baseline against
+/// the previously-installed version's baseline (see
+/// `frameshift_conformance::RegressionGate::evaluate_cross_version`).
+/// No derive of `Eq` here (unlike the other report types) because
+/// `CrossVersionDecision` carries `f32` score deltas, which are not `Eq`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct InstallReport {
     pub project_id: String,
     pub persona: LockedPersona,
     pub cache_path: PathBuf,
+    /// Cross-version conformance-baseline comparison against the version
+    /// previously installed for this project, when there was one. `None`
+    /// for a fresh install (no prior version) or when the comparison could
+    /// not be attempted for any reason -- this field is advisory only and
+    /// never blocks or fails the install. See [`crate::Client::install`].
+    pub conformance_upgrade: Option<frameshift_conformance::CrossVersionDecision>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
