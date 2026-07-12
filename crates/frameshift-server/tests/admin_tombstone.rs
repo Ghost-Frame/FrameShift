@@ -33,7 +33,7 @@ use secrecy::SecretString;
 use tower::ServiceExt as _;
 
 use frameshift_catalog::identity::Ed25519PublicKey;
-use frameshift_catalog::records::PackVersionRecord;
+use frameshift_catalog::records::{PackRecord, PackVersionRecord};
 use frameshift_catalog::status::PackStatus;
 use frameshift_objects::ObjectHash;
 
@@ -122,6 +122,29 @@ fn seed_active_version(catalog: &MockCatalog, name: &str, version: &str) {
     state
         .versions
         .insert((name.to_string(), version.to_string()), record);
+}
+
+/// Insert a pack head record for `name` directly into `catalog`'s in-memory
+/// state, bypassing the publish flow, with `latest_version` set to
+/// `latest_version`.
+///
+/// Paired with [`seed_active_version`] to build a pack whose head has a
+/// working `latest_version` -- required for the head-recompute tests below,
+/// since [`seed_active_version`] alone only writes a `pack_versions` row and
+/// (matching the real publish path being bypassed) never touches the head.
+fn seed_pack_head(catalog: &MockCatalog, name: &str, latest_version: &str) {
+    let mut state = catalog.state.write().unwrap();
+    let record = PackRecord {
+        name: name.to_string(),
+        current_author: Ed25519PublicKey([7u8; 32]),
+        tags: vec![],
+        description: String::new(),
+        created_at: Utc::now(),
+        latest_version: Some(latest_version.to_string()),
+        total_downloads: 0,
+        extends: None,
+    };
+    state.packs.insert(name.to_string(), record);
 }
 
 /// Issue a signed (or unsigned, when `key` is `None`) JSON POST against the
@@ -293,5 +316,203 @@ async fn repeat_tombstone_is_idempotent_200() {
         r2.status(),
         StatusCode::OK,
         "re-tombstoning must be idempotent, not a conflict"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Tombstone read-path: head recompute + search/download visibility
+// (spec_42eb1942 item 1). MockCatalog's `tombstone_pack` mirrors the
+// Postgres adapter's `latest_version` recompute exactly (see
+// `crates/frameshift-server/tests/mocks/catalog.rs`), so these assertions
+// hold for both backends.
+// ---------------------------------------------------------------------------
+
+/// Issue a plain unsigned GET against the real router and return the response.
+async fn get_unsigned(state: AppState, path: &str) -> axum::http::Response<Body> {
+    let req = Request::builder()
+        .method("GET")
+        .uri(path)
+        .body(Body::empty())
+        .unwrap();
+    app(state).oneshot(req).await.unwrap()
+}
+
+/// Parse a response body as JSON.
+async fn json_body(resp: axum::http::Response<Body>) -> serde_json::Value {
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+/// Tombstoning the current latest of two `Active` versions recomputes the
+/// pack head's `latest_version` to the older remaining `Active` version, and
+/// the pack stays visible in search because it still has one `Active`
+/// version left.
+#[tokio::test]
+async fn tombstone_latest_of_two_recomputes_head_to_older_version() {
+    let admin = SigningKey::from_bytes(&[60u8; 32]);
+    let catalog = MockCatalog::new();
+    seed_active_version(&catalog, "multi-pack", "1.0.0");
+    seed_active_version(&catalog, "multi-pack", "2.0.0");
+    seed_pack_head(&catalog, "multi-pack", "2.0.0");
+
+    let resp = post_signed_json(
+        mk_state(catalog.clone(), vec![pubkey_b64(&admin)]),
+        "/v1/admin/packs/multi-pack/2.0.0/tombstone",
+        tombstone_body(),
+        Some(&admin),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK, "tombstone should 200");
+
+    // Head recompute: latest_version falls back to the older Active version.
+    {
+        let s = catalog.state.read().unwrap();
+        let head = s
+            .packs
+            .get("multi-pack")
+            .expect("pack head must still exist");
+        assert_eq!(
+            head.latest_version,
+            Some("1.0.0".to_string()),
+            "latest_version must fall back to the newest remaining Active version"
+        );
+    }
+
+    // Search still returns the pack -- it has one Active version left.
+    let search_resp = get_unsigned(
+        mk_state(catalog.clone(), vec![pubkey_b64(&admin)]),
+        "/v1/packs",
+    )
+    .await;
+    assert_eq!(search_resp.status(), StatusCode::OK);
+    let body = json_body(search_resp).await;
+    let results = body["results"].as_array().expect("results is an array");
+    assert!(
+        results.iter().any(|r| r["pack"]["name"] == "multi-pack"),
+        "multi-pack must still appear in search after tombstoning its \
+         (non-only) latest version, got: {results:?}"
+    );
+
+    // GET /v1/packs/multi-pack reflects the recomputed latest_version too.
+    let head_resp = get_unsigned(
+        mk_state(catalog, vec![pubkey_b64(&admin)]),
+        "/v1/packs/multi-pack",
+    )
+    .await;
+    let head_body = json_body(head_resp).await;
+    assert_eq!(head_body["latest_version"], "1.0.0");
+}
+
+/// Tombstoning the ONLY version of a pack clears the head's `latest_version`
+/// to `None`. The pack then disappears from search and its (only) version can
+/// no longer be downloaded, but a direct `GET` of the version record still
+/// shows it with `Tombstone` status (deliberate transparency).
+#[tokio::test]
+async fn tombstone_only_version_clears_head_hides_search_and_download_404s() {
+    let admin = SigningKey::from_bytes(&[61u8; 32]);
+    let catalog = MockCatalog::new();
+    seed_active_version(&catalog, "solo-pack", "1.0.0");
+    seed_pack_head(&catalog, "solo-pack", "1.0.0");
+
+    let resp = post_signed_json(
+        mk_state(catalog.clone(), vec![pubkey_b64(&admin)]),
+        "/v1/admin/packs/solo-pack/1.0.0/tombstone",
+        tombstone_body(),
+        Some(&admin),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK, "tombstone should 200");
+
+    // Head recompute: latest_version clears -- zero Active versions remain.
+    {
+        let s = catalog.state.read().unwrap();
+        let head = s
+            .packs
+            .get("solo-pack")
+            .expect("pack head record is retained, not deleted");
+        assert_eq!(
+            head.latest_version, None,
+            "latest_version must clear when no Active version remains"
+        );
+    }
+
+    // The pack disappears from search entirely.
+    let search_resp = get_unsigned(
+        mk_state(catalog.clone(), vec![pubkey_b64(&admin)]),
+        "/v1/packs",
+    )
+    .await;
+    let body = json_body(search_resp).await;
+    let results = body["results"].as_array().expect("results is an array");
+    assert!(
+        !results.iter().any(|r| r["pack"]["name"] == "solo-pack"),
+        "solo-pack must disappear from search once its only version is \
+         tombstoned, got: {results:?}"
+    );
+
+    // A direct GET of the version record still shows it, with Tombstone
+    // status visible -- get_pack_version does not hide tombstoned records.
+    let version_resp = get_unsigned(
+        mk_state(catalog.clone(), vec![pubkey_b64(&admin)]),
+        "/v1/packs/solo-pack/versions/1.0.0",
+    )
+    .await;
+    assert_eq!(version_resp.status(), StatusCode::OK);
+    let version_body = json_body(version_resp).await;
+    assert_eq!(version_body["status"]["kind"], "tombstone");
+
+    // Install-by-name/latest resolution 404s: a real client resolves latest
+    // via GET /v1/packs/{name} (latest_version is now None here, so a client
+    // has no version to request) and, were it to still request the formerly
+    // latest version directly, download_pack_bytes refuses to serve a
+    // Tombstone-status version even via the direct URL -- this closes the
+    // takedown bypass regardless of how the caller arrived at the version.
+    let download_resp = get_unsigned(
+        mk_state(catalog, vec![pubkey_b64(&admin)]),
+        "/v1/packs/solo-pack/versions/1.0.0/pack",
+    )
+    .await;
+    assert_eq!(download_resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// Tombstoning a non-latest version leaves the head's `latest_version`
+/// unchanged and does not affect search visibility.
+#[tokio::test]
+async fn tombstone_non_latest_version_leaves_head_and_search_unchanged() {
+    let admin = SigningKey::from_bytes(&[62u8; 32]);
+    let catalog = MockCatalog::new();
+    seed_active_version(&catalog, "stable-pack", "1.0.0");
+    seed_active_version(&catalog, "stable-pack", "2.0.0");
+    seed_pack_head(&catalog, "stable-pack", "2.0.0");
+
+    // Tombstone the OLDER, non-latest version.
+    let resp = post_signed_json(
+        mk_state(catalog.clone(), vec![pubkey_b64(&admin)]),
+        "/v1/admin/packs/stable-pack/1.0.0/tombstone",
+        tombstone_body(),
+        Some(&admin),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK, "tombstone should 200");
+
+    {
+        let s = catalog.state.read().unwrap();
+        let head = s
+            .packs
+            .get("stable-pack")
+            .expect("pack head must still exist");
+        assert_eq!(
+            head.latest_version,
+            Some("2.0.0".to_string()),
+            "latest_version must be unchanged when a non-latest version is tombstoned"
+        );
+    }
+
+    let search_resp = get_unsigned(mk_state(catalog, vec![pubkey_b64(&admin)]), "/v1/packs").await;
+    let body = json_body(search_resp).await;
+    let results = body["results"].as_array().expect("results is an array");
+    assert!(
+        results.iter().any(|r| r["pack"]["name"] == "stable-pack"),
+        "stable-pack must remain in search after tombstoning a non-latest version"
     );
 }
