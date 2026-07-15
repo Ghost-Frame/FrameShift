@@ -5,8 +5,8 @@
 //! or an `AGENTS.md` file. A missing `pack.toml` is synthesized; a `pack.toml`
 //! that already exists (as every curated `personas/*` directory does) has its
 //! placeholder `author_pubkey` repaired in place so the strict manifest parser
-//! can load it. The pack is then signed with a generated Ed25519 key, its
-//! canonical bytes are stored in the object store, and the pack version and
+//! can load it. The pack is then signed with the seed Ed25519 key, packaged into
+//! a gzipped tar archive stored in the object store, and the pack version and
 //! author are registered in the catalog.
 //!
 //! # Usage
@@ -293,9 +293,9 @@ async fn register_author(
 ///
 /// Steps:
 /// 1. Load Pack from directory (requires pack.toml to exist).
-/// 2. Sign with signing key.
-/// 3. Compute canonical bytes for the object store.
-/// 4. Store bytes via PackStore.
+/// 2. Sign the pack's canonical hash with the signing key.
+/// 3. Package the directory into a gzipped tar archive.
+/// 4. Store the archive via PackStore (content-addressed by its SHA-256).
 /// 5. Register pack version in catalog.
 async fn seed_persona(
     dir: &Path,
@@ -307,19 +307,16 @@ async fn seed_persona(
     let mut pack = Pack::from_dir(dir)?;
     let signature = pack.sign(signing_key)?;
 
-    let canonical_bytes = pack_canonical_bytes(dir)?;
-    let content_hash = ObjectHash::of(&canonical_bytes);
+    // Store the pack as a gzipped tar archive -- the exact format the client's
+    // registry install path (`extract_targz`) decompresses. The object-store
+    // content_hash addresses these archive bytes and is deliberately independent
+    // of the pack's canonical hash (which the signature above still covers).
+    // Storing the raw canonical byte stream here instead made every registry
+    // install fail with "invalid gzip header".
+    let archive_bytes = targz_dir(dir)?;
+    let content_hash = ObjectHash::of(&archive_bytes);
 
-    // Verify the content hash matches the pack's canonical hash.
-    let pack_hash = ObjectHash::from_bytes(pack.canonical_hash());
-    if content_hash != pack_hash {
-        // This should never happen -- both are SHA-256 of the same data.
-        return Err(SeedError::Io(std::io::Error::other(format!(
-            "content hash mismatch: {content_hash} != {pack_hash}"
-        ))));
-    }
-
-    objects.put(&content_hash, &canonical_bytes).await?;
+    objects.put(&content_hash, &archive_bytes).await?;
 
     let manifest = pack.manifest();
     let cap_json = manifest
@@ -344,104 +341,58 @@ async fn seed_persona(
             .unwrap_or_else(|| "UNKNOWN".to_string()),
         published_at: Utc::now(),
         status: PackStatus::Active,
-        size_bytes: canonical_bytes.len() as u64,
+        size_bytes: archive_bytes.len() as u64,
     };
 
     catalog.register_pack_version(version_record).await?;
     Ok(())
 }
 
-/// Serialize a pack directory into a canonical byte stream.
+/// Package a persona directory into an in-memory gzipped tar archive.
 ///
-/// The byte stream is the same data that the canonical hash function hashes:
-/// for each entry (sorted byte-lexicographically by normalized path, excluding
-/// `signature.sig`): `path NUL length NUL bytes NUL`.
-///
-/// This is the byte content stored in the object store. The SHA-256 of this
-/// byte stream equals the pack's canonical hash.
-fn pack_canonical_bytes(dir: &Path) -> Result<Vec<u8>, SeedError> {
-    // Re-implement the serialization by reading directory entries the same way
-    // the canonical module does, then building the byte stream.
-    use std::collections::BTreeMap;
+/// Files are added at the archive root so the client's `find_pack_root` locates
+/// `pack.toml` at the top level; `signature.sig` is never included (the pack
+/// signature travels in the catalog record, not the archive), and non-regular
+/// files (symlinks, devices) are skipped. This mirrors the publish path's
+/// `targz_dir` so the seeder and CLI produce the identical on-the-wire format,
+/// and the object-store content hash addresses these archive bytes.
+fn targz_dir(dir: &Path) -> Result<Vec<u8>, SeedError> {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
 
-    const SIGNATURE_FILENAME: &str = "signature.sig";
-    const MAX_FILE_SIZE: u64 = 1024 * 1024;
+    let encoder = GzEncoder::new(Vec::new(), Compression::default());
+    let mut builder = tar::Builder::new(encoder);
+    append_dir_files(&mut builder, dir, dir)?;
 
-    let mut entries: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-    collect_entries_for_bytes(dir, dir, &mut entries, MAX_FILE_SIZE)?;
-
-    let mut out = Vec::new();
-    for (path, content) in &entries {
-        if path == SIGNATURE_FILENAME {
-            continue;
-        }
-        out.extend_from_slice(path.as_bytes());
-        out.push(0);
-        out.extend_from_slice(content.len().to_string().as_bytes());
-        out.push(0);
-        out.extend_from_slice(content);
-        out.push(0);
-    }
-
-    Ok(out)
+    let encoder = builder.into_inner()?;
+    Ok(encoder.finish()?)
 }
 
-/// Recursively collect files into a BTreeMap (keyed by normalized path) for
-/// canonical byte serialization.
-fn collect_entries_for_bytes(
+/// Recursively append regular files under `current` to `builder`, keyed by their
+/// path relative to `base`. Skips `signature.sig` and any non-regular file.
+fn append_dir_files<W: std::io::Write>(
+    builder: &mut tar::Builder<W>,
     base: &Path,
     current: &Path,
-    entries: &mut std::collections::BTreeMap<String, Vec<u8>>,
-    max_file_size: u64,
 ) -> Result<(), SeedError> {
-    use unicode_normalization::UnicodeNormalization as _;
-
     for entry in std::fs::read_dir(current)? {
         let entry = entry?;
         let path = entry.path();
-        let ft = entry.file_type()?;
+        let file_type = entry.file_type()?;
 
-        if ft.is_dir() {
-            collect_entries_for_bytes(base, &path, entries, max_file_size)?;
+        if file_type.is_dir() {
+            append_dir_files(builder, base, &path)?;
             continue;
         }
-        if !ft.is_file() {
-            continue;
-        }
-
-        let rel = path
-            .strip_prefix(base)
-            .expect("path is under base")
-            .to_str()
-            .ok_or_else(|| {
-                SeedError::Io(std::io::Error::other(format!(
-                    "non-UTF-8 path: {}",
-                    path.display()
-                )))
-            })?;
-
-        let normalized: String = rel.nfc().collect();
-        let canonical = normalized
-            .replace('\\', "/")
-            .strip_prefix("./")
-            .map(|s| s.to_string())
-            .unwrap_or(normalized.replace('\\', "/"));
-
-        if canonical == "signature.sig" {
+        if !file_type.is_file() {
             continue;
         }
 
-        let content = std::fs::read(&path)?;
-        if content.len() as u64 > max_file_size {
-            warn!(
-                "file {} exceeds max size ({} bytes), skipping",
-                canonical,
-                content.len()
-            );
+        let rel = path.strip_prefix(base).unwrap_or(&path);
+        if rel.to_string_lossy() == "signature.sig" {
             continue;
         }
-
-        entries.insert(canonical, content);
+        builder.append_path_with_name(&path, rel)?;
     }
 
     Ok(())
@@ -1051,9 +1002,12 @@ memory_required_ops = []
         pack.sign(&signing_key).expect("signing must succeed");
         assert!(pack.verify(&verifying_key).is_ok());
 
-        // 5. Canonical bytes: the object-store payload must build without error.
-        let bytes = pack_canonical_bytes(tmp.path()).expect("canonical bytes must build");
-        assert!(!bytes.is_empty());
+        // 5. Archive: the object-store payload must build as a non-empty gzip.
+        let bytes = targz_dir(tmp.path()).expect("gzip-tar archive must build");
+        assert!(
+            bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b,
+            "object-store payload must be a gzip stream"
+        );
 
         // 6. Metadata: the marketplace description/tags must come straight from
         //    pack.toml, not from a nonexistent persona.toml/AGENTS.md fallback.
@@ -1068,6 +1022,39 @@ memory_required_ops = []
         assert_eq!(
             metadata.tags,
             vec!["agents", "coordination", "delegation", "parallel"]
+        );
+    }
+
+    #[test]
+    /// The object-store payload must be a gzipped tar (not the raw canonical
+    /// byte stream): valid gzip, `pack.toml` present at the archive root, and
+    /// `signature.sig` excluded. Storing canonical bytes here was the defect
+    /// that made every registry install fail with "invalid gzip header".
+    fn targz_dir_produces_gzip_with_pack_toml_and_excludes_signature() {
+        use flate2::read::GzDecoder;
+
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("pack.toml"), CURATED_PACK_TOML).unwrap();
+        std::fs::write(tmp.path().join("AGENTS.md"), b"# body").unwrap();
+        std::fs::write(tmp.path().join("signature.sig"), b"SIG").unwrap();
+
+        let archive = targz_dir(tmp.path()).expect("archive must build");
+        assert_eq!(&archive[..2], &[0x1f, 0x8b], "must be a gzip stream");
+
+        let mut names = Vec::new();
+        let mut ar = tar::Archive::new(GzDecoder::new(std::io::Cursor::new(&archive)));
+        for entry in ar.entries().unwrap() {
+            let entry = entry.unwrap();
+            names.push(entry.path().unwrap().to_string_lossy().into_owned());
+        }
+        assert!(names.iter().any(|n| n == "pack.toml"), "pack.toml at root");
+        assert!(
+            names.iter().any(|n| n == "AGENTS.md"),
+            "content file present"
+        );
+        assert!(
+            !names.iter().any(|n| n == "signature.sig"),
+            "signature.sig must be excluded from the archive"
         );
     }
 
