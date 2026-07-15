@@ -2014,6 +2014,7 @@ dependencies = [
  "diesel",
  "diesel-async",
  "ed25519-dalek",
+ "flate2",
  "frameshift-catalog",
  "frameshift-catalog-postgres",
  "frameshift-objects",
@@ -2023,13 +2024,13 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "tar",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
- "unicode-normalization",
 ]
 
 [[package]]

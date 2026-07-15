@@ -26,8 +26,12 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 ed25519-dalek = { workspace = true }
 rand_core = { version = "0.6", features = ["getrandom"] }
-unicode-normalization = { workspace = true }
 toml = { workspace = true }
+# Persona packs are stored in the object store as gzipped tar archives -- the exact
+# format the client's registry install path decompresses. These mirror the versions
+# the publish path (frameshift-client) already depends on.
+tar = "0.4"
+flate2 = "1"
 diesel = { workspace = true }
 diesel-async = { workspace = true }
 
