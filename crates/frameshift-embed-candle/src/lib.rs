@@ -200,16 +200,46 @@ fn l2_normalized(mut v: Vec<f32>) -> Vec<f32> {
 /// cache file scoped to `model_id`.
 ///
 /// Resolves `$XDG_CACHE_HOME/frameshift/` (falling back to `~/.cache/` and,
-/// as a last resort, the current directory) and derives the filename from the
-/// model id with path separators flattened, so distinct models never share a
-/// cache file: mixing models would serve vectors from the wrong geometry.
+/// as a last resort, the system temp directory) and derives the filename from
+/// the model id with path separators flattened, so distinct models never
+/// share a cache file: mixing models would serve vectors from the wrong
+/// geometry.
 pub fn default_cache_path(model_id: &str) -> std::path::PathBuf {
-    let cache_root = std::env::var_os("XDG_CACHE_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let file = format!("embed-cache-{}.json", model_id.replace(['/', '\\'], "--"));
-    cache_root.join("frameshift").join(file)
+    resolve_cache_root(std::env::var_os("XDG_CACHE_HOME"), std::env::var_os("HOME"))
+        .join("frameshift")
+        .join(cache_file_name(model_id))
+}
+
+/// Pick the base cache directory from candidate environment values.
+///
+/// Non-absolute candidates are ignored per the XDG Base Directory spec (a
+/// relative `XDG_CACHE_HOME` must be treated as unset), and the terminal
+/// fallback is the system temp directory rather than the current working
+/// directory -- a CWD-relative cache would drop a stray `frameshift/` folder
+/// inside whatever project the CLI happens to run from.
+fn resolve_cache_root(
+    xdg_cache_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> std::path::PathBuf {
+    if let Some(xdg) = xdg_cache_home {
+        let path = std::path::PathBuf::from(xdg);
+        if path.is_absolute() {
+            return path;
+        }
+    }
+    if let Some(home) = home {
+        let path = std::path::PathBuf::from(home);
+        if path.is_absolute() {
+            return path.join(".cache");
+        }
+    }
+    std::env::temp_dir()
+}
+
+/// Cache filename for `model_id`, with path separators flattened so a model
+/// id like `org/name` maps to a single path component.
+fn cache_file_name(model_id: &str) -> String {
+    format!("embed-cache-{}.json", model_id.replace(['/', '\\'], "--"))
 }
 
 #[cfg(test)]
@@ -238,6 +268,40 @@ mod tests {
     #[test]
     fn l2_normalized_empty_is_empty() {
         assert!(l2_normalized(Vec::new()).is_empty());
+    }
+
+    /// An absolute XDG_CACHE_HOME wins outright; HOME is not consulted.
+    #[test]
+    fn cache_root_prefers_absolute_xdg() {
+        let root = resolve_cache_root(Some("/xdg-cache".into()), Some("/home/user".into()));
+        assert_eq!(root, std::path::PathBuf::from("/xdg-cache"));
+    }
+
+    /// A relative XDG_CACHE_HOME is treated as unset per the XDG spec, and an
+    /// absolute HOME resolves to HOME/.cache.
+    #[test]
+    fn cache_root_ignores_relative_xdg_and_uses_home() {
+        let root = resolve_cache_root(Some("relative/cache".into()), Some("/home/user".into()));
+        assert_eq!(root, std::path::PathBuf::from("/home/user/.cache"));
+    }
+
+    /// With neither variable usable, the fallback is the system temp dir --
+    /// never the current working directory.
+    #[test]
+    fn cache_root_falls_back_to_temp_dir() {
+        let root = resolve_cache_root(None, Some("relative-home".into()));
+        assert_eq!(root, std::env::temp_dir());
+        assert!(root.is_absolute());
+    }
+
+    /// Model-id path separators are flattened into a single path component.
+    #[test]
+    fn cache_file_name_flattens_separators() {
+        assert_eq!(
+            cache_file_name("sentence-transformers/all-MiniLM-L6-v2"),
+            "embed-cache-sentence-transformers--all-MiniLM-L6-v2.json"
+        );
+        assert!(!cache_file_name("a/b\\c").contains(['/', '\\']));
     }
 
     /// End-to-end embedding sanity: related texts score above unrelated ones.

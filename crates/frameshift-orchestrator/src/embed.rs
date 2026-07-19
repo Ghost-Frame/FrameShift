@@ -9,6 +9,11 @@
 //! stack. Without an embedder the semantic channel contributes `0.0`
 //! everywhere and selection behavior is unchanged.
 
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard};
+use std::{fs, io};
+
 /// Produces a dense vector embedding for a piece of text.
 ///
 /// Implementations map natural-language text to a fixed-dimensional vector
@@ -63,6 +68,24 @@ pub fn semantic_similarity(embedder: &dyn Embedder, a: &str, b: &str) -> f32 {
     cosine_similarity(&va, &vb)
 }
 
+/// Longest text (in bytes) admitted to the cache.
+///
+/// Oversized texts are still embedded, just never cached: caller-supplied task
+/// strings (CLI `--task`, the MCP `task` argument) are unbounded, and admitting
+/// them would let a single chatty client balloon the cache file that every
+/// later construction has to parse. Persona corpus texts and reasonable task
+/// hints fit comfortably under this cap.
+pub const MAX_CACHED_TEXT_LEN: usize = 1024;
+
+/// Hard ceiling on the number of cached entries.
+///
+/// Once reached, new texts still embed correctly but are no longer admitted
+/// (no eviction: the hot set -- the persona corpus -- is embedded first in
+/// every selection pass, so freeze-when-full preserves exactly the entries
+/// worth keeping). Bounds both the on-disk file and the per-construction
+/// parse cost.
+pub const MAX_CACHE_ENTRIES: usize = 1024;
+
 /// A memoizing wrapper around any [`Embedder`], persisted to a JSON file.
 ///
 /// Real embedding models are expensive to invoke: without a cache, every
@@ -73,82 +96,147 @@ pub fn semantic_similarity(embedder: &dyn Embedder, a: &str, b: &str) -> f32 {
 /// file -- the inner model runs once per distinct text.
 ///
 /// The cache file is best-effort: a missing or corrupt file degrades to an
-/// empty cache, and writes go through a temp file + rename so a concurrent
-/// writer can lose the race but never corrupt a reader (last write wins,
-/// entries are re-computable). The file must be scoped to one model -- mixing
-/// models in one file would serve vectors from the wrong geometry.
+/// empty cache, and writes go through a per-process temp file + atomic rename,
+/// so concurrent writers race harmlessly (last write wins, entries are
+/// re-computable) and a reader never observes a torn file. Growth is bounded
+/// by [`MAX_CACHED_TEXT_LEN`] and [`MAX_CACHE_ENTRIES`]. The file must be
+/// scoped to one model -- the format does not self-describe its model, so
+/// pointing two different models at one path would serve vectors from the
+/// wrong geometry; `frameshift_embed_candle::default_cache_path` derives the
+/// filename from the model id for exactly this reason.
 pub struct CachedEmbedder<E> {
     /// The wrapped embedder that produces vectors on a cache miss. May be an
     /// owned model or a borrow (see the blanket `impl Embedder for &T`).
     inner: E,
     /// Location of the persisted text -> vector map (JSON).
-    cache_path: std::path::PathBuf,
+    cache_path: PathBuf,
     /// In-memory view of the cache, pre-loaded from `cache_path` at
-    /// construction and appended to on every miss.
-    entries: std::sync::Mutex<std::collections::HashMap<String, Vec<f32>>>,
+    /// construction and appended to on every admitted miss.
+    entries: Mutex<HashMap<String, Vec<f32>>>,
 }
 
+/// Construction and persistence for the cache wrapper.
 impl<E: Embedder> CachedEmbedder<E> {
     /// Wrap `inner`, loading any previously persisted entries from
     /// `cache_path`. A missing or unparsable file yields an empty cache.
-    pub fn new(inner: E, cache_path: std::path::PathBuf) -> Self {
-        let entries = std::fs::read_to_string(&cache_path)
+    pub fn new(inner: E, cache_path: PathBuf) -> Self {
+        let entries = fs::read_to_string(&cache_path)
             .ok()
             .and_then(|raw| serde_json::from_str(&raw).ok())
             .unwrap_or_default();
         Self {
             inner,
             cache_path,
-            entries: std::sync::Mutex::new(entries),
+            entries: Mutex::new(entries),
         }
     }
 
-    /// Persist the current entry map to `cache_path` via temp file + rename.
+    /// Lock the entry map, recovering from poisoning.
     ///
-    /// Best-effort by design: an unwritable cache directory must never fail an
-    /// embed, so errors are swallowed after a `tracing` warning.
-    fn persist(&self, entries: &std::collections::HashMap<String, Vec<f32>>) {
-        let Ok(raw) = serde_json::to_string(entries) else {
-            return;
-        };
+    /// A poisoned lock only means another thread panicked mid-operation; the
+    /// map has no invariant a partial insert could violate, so adopting its
+    /// state is strictly better than panicking on every later embed.
+    fn lock_entries(&self) -> MutexGuard<'_, HashMap<String, Vec<f32>>> {
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Persist pre-serialized cache content via per-process temp file + rename.
+    ///
+    /// The temp name embeds the PID so concurrent processes never truncate
+    /// each other's in-flight write; rename is atomic, so readers only ever
+    /// see a complete file. On Unix the cache directory is created `0o700`
+    /// and the file `0o600` -- task descriptions can be sensitive, matching
+    /// the daemon's socket-dir hardening. Best-effort by design: an
+    /// unwritable cache location must never fail an embed, so errors are
+    /// swallowed after a `tracing` warning.
+    fn persist_raw(&self, raw: &str) {
         if let Some(parent) = self.cache_path.parent() {
-            if std::fs::create_dir_all(parent).is_err() {
+            if create_private_dir_all(parent).is_err() {
                 return;
             }
         }
-        let tmp = self.cache_path.with_extension("json.tmp");
-        if std::fs::write(&tmp, raw).is_err() {
+        let tmp = self
+            .cache_path
+            .with_extension(format!("tmp.{}", std::process::id()));
+        if write_private_file(&tmp, raw.as_bytes()).is_err() {
             tracing::warn!(path = %self.cache_path.display(), "embedding cache not writable");
             return;
         }
-        if std::fs::rename(&tmp, &self.cache_path).is_err() {
+        if fs::rename(&tmp, &self.cache_path).is_err() {
             tracing::warn!(path = %self.cache_path.display(), "embedding cache rename failed");
         }
     }
 }
 
+/// The cache wrapper is itself an embedder, so it drops in anywhere the
+/// wrapped model would be used.
 impl<E: Embedder> Embedder for CachedEmbedder<E> {
-    /// Return the cached vector for `text`, running the inner embedder and
-    /// persisting the result only on a miss.
+    /// Return the cached vector for `text`, running the inner embedder on a
+    /// miss and persisting the result only when the text is admissible
+    /// (within [`MAX_CACHED_TEXT_LEN`], map below [`MAX_CACHE_ENTRIES`]).
     fn embed(&self, text: &str) -> Vec<f32> {
-        if let Some(hit) = self
-            .entries
-            .lock()
-            .expect("embedding cache lock poisoned")
-            .get(text)
-        {
+        if let Some(hit) = self.lock_entries().get(text) {
             return hit.clone();
         }
 
-        // Miss: run the model OUTSIDE the lock (embedding is the slow part),
-        // then insert and persist. A concurrent miss of the same text does
-        // redundant work but converges to the same value.
+        // Miss: run the model OUTSIDE the lock (inference is the slow part).
+        // A concurrent miss of the same text does redundant work but
+        // converges to the same value.
         let vector = self.inner.embed(text);
-        let mut entries = self.entries.lock().expect("embedding cache lock poisoned");
-        entries.insert(text.to_string(), vector.clone());
-        self.persist(&entries);
+
+        if text.len() > MAX_CACHED_TEXT_LEN {
+            return vector;
+        }
+
+        // Insert and serialize under the lock, but perform the file IO
+        // outside it so a concurrent cache hit never blocks on disk.
+        let serialized = {
+            let mut entries = self.lock_entries();
+            if entries.len() >= MAX_CACHE_ENTRIES && !entries.contains_key(text) {
+                None
+            } else {
+                entries.insert(text.to_string(), vector.clone());
+                serde_json::to_string(&*entries).ok()
+            }
+        };
+        if let Some(raw) = serialized {
+            self.persist_raw(&raw);
+        }
         vector
     }
+}
+
+/// Create `dir` (and parents) restricted to the owner on Unix (`0o700`).
+///
+/// Pre-existing directories are left untouched -- only directories this call
+/// creates get the restrictive mode, so pointing the cache at a shared parent
+/// never tightens permissions on a directory the user already owns elsewhere.
+fn create_private_dir_all(dir: &std::path::Path) -> io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder.create(dir)
+}
+
+/// Write `contents` to `path`, creating the file owner-readable only on Unix
+/// (`0o600`). The mode is applied at open time, so the content is never
+/// world-readable even for an instant; rename preserves it.
+fn write_private_file(path: &std::path::Path, contents: &[u8]) -> io::Result<()> {
+    use std::io::Write as _;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(contents)
 }
 
 /// A deterministic bag-of-words embedder used only by tests.
@@ -286,6 +374,79 @@ mod tests {
         cached.embed("beta");
         cached.embed("alpha");
         assert_eq!(counting.count(), 2, "two distinct texts -> two model runs");
+    }
+
+    /// Oversized texts are embedded correctly but never cached: the inner
+    /// model runs every time and nothing is persisted for them.
+    #[test]
+    fn cached_embedder_skips_caching_oversized_text() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache_path = dir.path().join("c.json");
+        let counting = CountingEmbedder::new();
+        let cached = CachedEmbedder::new(&counting, cache_path.clone());
+
+        let big = "x ".repeat(MAX_CACHED_TEXT_LEN); // 2x the cap in bytes
+        let expected = counting.inner.embed(&big);
+        assert_eq!(
+            cached.embed(&big),
+            expected,
+            "oversized embed must be correct"
+        );
+        assert_eq!(cached.embed(&big), expected);
+        assert_eq!(
+            counting.count(),
+            2,
+            "oversized text must never be served from cache"
+        );
+        assert!(
+            !cache_path.exists(),
+            "oversized text must not create a cache file"
+        );
+    }
+
+    /// The entry count is hard-capped: past the cap, new texts still embed
+    /// correctly but are not admitted to the cache, while already-cached
+    /// entries keep serving hits.
+    #[test]
+    fn cached_embedder_caps_total_entries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let counting = CountingEmbedder::new();
+        let cached = CachedEmbedder::new(&counting, dir.path().join("c.json"));
+
+        for i in 0..MAX_CACHE_ENTRIES + 10 {
+            cached.embed(&format!("text-{i}"));
+        }
+        let baseline = counting.count();
+        assert_eq!(
+            baseline,
+            MAX_CACHE_ENTRIES + 10,
+            "every distinct text misses once"
+        );
+
+        // An early (admitted) entry still hits; a post-cap entry misses again.
+        cached.embed("text-0");
+        assert_eq!(counting.count(), baseline, "admitted entry must still hit");
+        cached.embed(&format!("text-{}", MAX_CACHE_ENTRIES + 5));
+        assert_eq!(
+            counting.count(),
+            baseline + 1,
+            "post-cap entry is never admitted"
+        );
+    }
+
+    /// A cache path whose parent directories do not exist yet is created on
+    /// the first persist, and a fresh instance disk-hits through it.
+    #[test]
+    fn cached_embedder_creates_missing_parent_dirs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache_path = dir.path().join("nested/deeper/c.json");
+
+        let counting = CountingEmbedder::new();
+        CachedEmbedder::new(&counting, cache_path.clone()).embed("alpha");
+        assert!(cache_path.is_file(), "persist must create missing parents");
+
+        CachedEmbedder::new(&counting, cache_path).embed("alpha");
+        assert_eq!(counting.count(), 1, "fresh instance must disk-hit");
     }
 
     /// A corrupt cache file degrades to an empty cache: embeds still work and
