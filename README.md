@@ -184,9 +184,9 @@ required = true
 description = "How the agent should address you"
 ```
 
-Token values live in a per-project **vault**: a single age-encrypted file in the central store (never in the project root, never in the pack). At render time every `{{token}}` is substituted from the vault. A missing `required = true` token fails the render with one error naming every missing token; an optional token without a value keeps its literal `{{name}}` placeholder. Packs that ship no `pack.template.toml` -- every pack today -- render byte-identically to how they always have; the vault is never opened for them.
+Token values live in a per-project **vault**: a single age-encrypted file in the central store (never in the project root, never in the pack). When install/activate/use/sync write a persona's `rendered/<target>/` outputs, every `{{token}}` is substituted from the vault (the separate `frameshift render` debug command renders typed source directly and does not substitute tokens). A missing `required = true` token fails the render with one error naming every missing token; an optional token without a value keeps its literal `{{name}}` placeholder. Packs that ship no `pack.template.toml` -- every pack today -- render byte-identically to how they always have; the vault is never opened for them.
 
-The vault passphrase comes from `FRAMESHIFT_VAULT_PASSPHRASE`, or a hidden interactive prompt when the CLI runs in a terminal. Only the CLI ever prompts: the daemon and MCP server read the environment variable or render without a vault.
+The vault passphrase comes from `FRAMESHIFT_VAULT_PASSPHRASE`, or a hidden interactive prompt when the CLI runs in a terminal. Only the CLI ever prompts. The daemon and MCP server resolve the passphrase from the environment variable alone: rendering a templated pack there without it set fails with an error rather than degrading silently (packs without `pack.template.toml` are unaffected either way). There is no built-in passphrase recovery -- losing the passphrase means losing the vault's contents, so keep your own backup.
 
 ```bash
 frameshift vault init                     # create this project's empty vault
@@ -242,7 +242,8 @@ Vault and project config:
 
 ```
 frameshift vault init                                    Create this project's vault (refuses if one exists)
-frameshift vault set <key> [--value <v>]                 Set a token value (prompts hidden when --value is omitted)
+frameshift vault set <key> [--value <v>]                 Set a token value (prompts hidden when --value is omitted;
+                                                         prefer the prompt -- --value lands in shell history)
 frameshift vault get <key>                               Print a token's raw value
 frameshift vault rm <key>                                Remove a token
 frameshift vault list                                    List token keys (never values)
