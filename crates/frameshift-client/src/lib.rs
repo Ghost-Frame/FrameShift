@@ -387,10 +387,12 @@ impl Client {
     ///
     /// First re-syncs the project (see [`Client::sync`]), then errors with
     /// [`ClientError::PersonaNotInstalled`] if `persona` is not among the
-    /// synced personas. Refuses to activate (returns
-    /// [`ClientError::MemoryRequirementUnmet`]) when the persona's memory
-    /// contract is hard-required but the project declares no memory adapter.
-    /// On success, writes `persona` into the project's `active` marker file.
+    /// synced personas, or with [`ClientError::PersonaMaterializeFailed`] if
+    /// `persona` is locked but failed to materialize during the sync. Refuses
+    /// to activate (returns [`ClientError::MemoryRequirementUnmet`]) when the
+    /// persona's memory contract is hard-required but the project declares no
+    /// memory adapter. On success, writes `persona` into the project's
+    /// `active` marker file.
     pub fn activate(&self, project_root: &Path, persona: &str) -> Result<(), ClientError> {
         let report = self.sync(project_root)?;
         if !report.personas.iter().any(|installed| installed == persona) {
@@ -834,10 +836,15 @@ impl Client {
     /// `raw_lock` to `lock_path`, removes any `personas/<name>` directory not
     /// present in `lockfile`, and for each locked persona re-copies its
     /// source from the content-addressed cache and re-renders its output via
-    /// `materialize_persona_rendered_outputs`. Returns
-    /// [`ClientError::MissingCacheEntry`] if a locked persona's hash is not
-    /// present in the cache. Also clears the `active` marker file if it
-    /// points at a persona no longer present in `lockfile`.
+    /// `materialize_persona_rendered_outputs`.
+    ///
+    /// Per-persona failures (missing cache entry, unparsable manifest,
+    /// unrenderable pack) do NOT abort the loop: they are collected and
+    /// returned as `(persona name, original error)` pairs so callers can
+    /// surface them, while every other persona still materializes. `Err` is
+    /// reserved for genuinely fatal project-level failures: an invalid
+    /// persona name, or an unwritable central store. Also clears the `active`
+    /// marker file if it points at a persona no longer present in `lockfile`.
     fn materialize_project_state(
         &self,
         paths: &ProjectPaths,
@@ -888,10 +895,10 @@ impl Client {
         let mut failures: Vec<(String, ClientError)> = Vec::new();
         for persona in &lockfile.personas {
             if let Err(error) = self.materialize_one_persona(paths, lockfile, persona) {
-                // Best-effort cleanup so a failed persona is "not materialized"
-                // rather than left half-built; the dir may not exist at all.
-                let persona_dir = paths.personas_dir.join(&persona.name);
-                let _ = fs::remove_dir_all(&persona_dir);
+                // Cleanup of a half-built persona dir is materialize_one_persona's
+                // own job -- it alone knows whether it started mutating. Failures
+                // that occur before any mutation (a missing cache entry) leave the
+                // last successfully-materialized content untouched and usable.
                 failures.push((persona.name.clone(), error));
             }
         }
@@ -916,6 +923,13 @@ impl Client {
     ///
     /// Extracted from [`Client::materialize_project_state`] so per-persona
     /// errors can be isolated by the caller instead of aborting the loop.
+    ///
+    /// Failure cleanup is owned here, because only this function knows
+    /// whether it started mutating `personas/<name>`: pre-mutation failures
+    /// (the cache entry is missing) return early and leave any previously
+    /// materialized content untouched and usable, while a failure after the
+    /// wipe-and-rebuild begins removes the half-built directory so the
+    /// persona reads as "not materialized" rather than corrupt.
     fn materialize_one_persona(
         &self,
         paths: &ProjectPaths,
@@ -924,6 +938,8 @@ impl Client {
     ) -> Result<(), ClientError> {
         let cache_path = paths.cache_dir.join(&persona.hash);
         if !cache_path.exists() {
+            // Pre-mutation failure: the persona's existing materialized dir
+            // (if any) is deliberately preserved as last-known-good content.
             return Err(ClientError::MissingCacheEntry {
                 hash: persona.hash.clone(),
                 path: cache_path,
@@ -931,26 +947,35 @@ impl Client {
         }
 
         let persona_dir = paths.personas_dir.join(&persona.name);
-        if persona_dir.exists() {
-            remove_dir_all(&persona_dir)?;
-        }
-        ensure_dir(&persona_dir)?;
 
-        let source_dir = persona_dir.join("source");
-        copy_dir_recursive(&cache_path, &source_dir)?;
+        // Everything past this point mutates persona_dir, so any failure
+        // below must remove the half-built directory on the way out.
+        let mutate = || -> Result<(), ClientError> {
+            if persona_dir.exists() {
+                remove_dir_all(&persona_dir)?;
+            }
+            ensure_dir(&persona_dir)?;
 
-        let rendered_root = persona_dir.join("rendered");
-        self.materialize_persona_rendered_outputs(
-            &paths.cache_dir,
-            &cache_path,
-            &rendered_root,
-            &paths.vault_path,
-            &persona.name,
-            lockfile,
-        )?;
+            let source_dir = persona_dir.join("source");
+            copy_dir_recursive(&cache_path, &source_dir)?;
 
-        // Growth is local-only and append-only -- a single file per persona, never published upstream.
-        touch_empty(&persona_dir.join("growth.md"))
+            let rendered_root = persona_dir.join("rendered");
+            self.materialize_persona_rendered_outputs(
+                &paths.cache_dir,
+                &cache_path,
+                &rendered_root,
+                &paths.vault_path,
+                &persona.name,
+                lockfile,
+            )?;
+
+            // Growth is local-only and append-only -- a single file per persona, never published upstream.
+            touch_empty(&persona_dir.join("growth.md"))
+        };
+
+        mutate().inspect_err(|_| {
+            let _ = fs::remove_dir_all(&persona_dir);
+        })
     }
 
     /// Renders a single persona's output into `rendered_root`, composing with

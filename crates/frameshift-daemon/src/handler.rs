@@ -78,10 +78,18 @@ fn handle_install(params: Option<Value>, client: &Client) -> Result<Value, (i32,
         })
         .map_err(|e| (crate::protocol::INTERNAL_ERROR, e.to_string()))?;
 
+    // Same additive `failures` shape as `handle_sync`: OTHER locked personas
+    // that could not be materialized while installing this one.
+    let failures: Vec<serde_json::Value> = report
+        .materialize_failures
+        .iter()
+        .map(|f| serde_json::json!({ "persona": f.persona, "error": f.error }))
+        .collect();
     Ok(serde_json::json!({
         "persona": report.persona.name,
         "version": report.persona.version,
         "hash": report.persona.hash,
+        "failures": failures,
     }))
 }
 

@@ -456,8 +456,6 @@ async fn publish_pack_description_and_tags_are_searchable() {
 // bad signature
 // ---------------------------------------------------------------------------
 
-/// POST a pack with a structurally-valid-length but cryptographically-wrong
-/// signature -> 401 Unauthorized.
 /// A validly-signed pack whose MANIFEST still carries the local-unsigned
 /// sentinel must be rejected with 400: the sentinel is reserved for unsigned
 /// local packs and must never enter the catalog, even under a real signature.
@@ -485,6 +483,8 @@ async fn publish_local_unsigned_manifest_returns_400() {
     );
 }
 
+/// POST a pack with a structurally-valid-length but cryptographically-wrong
+/// signature -> 401 Unauthorized.
 #[tokio::test]
 async fn publish_bad_signature_returns_401() {
     let signing = SigningKey::from_bytes(&[8u8; 32]);

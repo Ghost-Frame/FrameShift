@@ -305,8 +305,10 @@ fn find_pack_root(extract_dir: &std::path::Path) -> Result<std::path::PathBuf, A
 /// # Errors
 ///
 /// - `400 Bad Request` -- missing required multipart field, malformed pack
-///   archive, signature is not 64 bytes, or the pack's declared author handle
-///   does not match the supplied `author_handle`.
+///   archive, signature is not 64 bytes, the pack's declared author handle
+///   does not match the supplied `author_handle`, or the manifest carries the
+///   `local-unsigned` author_pubkey sentinel (reserved for unsigned local
+///   packs, never publishable).
 /// - `401 Unauthorized` -- author handle not registered, the verified request
 ///   signer is not the handle's owner, or the pack content signature does not
 ///   verify against the registered key.

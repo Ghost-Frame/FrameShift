@@ -91,6 +91,9 @@ fn project_with_broken_beta(temp: &TempDir) -> (Client, PathBuf) {
     (client, project_root)
 }
 
+/// One unrenderable persona degrades to a reported failure while every other
+/// persona still materializes, and the broken persona's half-built dir is
+/// removed rather than left corrupt.
 #[test]
 fn sync_isolates_unrenderable_persona() {
     let temp = TempDir::new().expect("tempdir");
@@ -126,6 +129,8 @@ fn sync_isolates_unrenderable_persona() {
     );
 }
 
+/// Activating the persona that failed materialization yields the typed
+/// `PersonaMaterializeFailed` error; activating a healthy persona still works.
 #[test]
 fn activate_persona_that_failed_materialize_errors_typed() {
     let temp = TempDir::new().expect("tempdir");
@@ -145,6 +150,8 @@ fn activate_persona_that_failed_materialize_errors_typed() {
         .expect("alpha must activate despite beta's failure");
 }
 
+/// Installing a healthy persona while another locked persona is broken
+/// succeeds and carries the unrelated failure on the report as a warning.
 #[test]
 fn install_reports_unrelated_materialize_failure_as_warning() {
     let temp = TempDir::new().expect("tempdir");
@@ -166,6 +173,162 @@ fn install_reports_unrelated_materialize_failure_as_warning() {
     assert_eq!(report.materialize_failures[0].persona, "beta");
 }
 
+/// A persona whose cache entry disappears AFTER a successful materialization
+/// keeps its last-known-good content: the failure occurs before any mutation,
+/// so sync reports it without destroying the still-usable rendered output.
+#[test]
+fn missing_cache_entry_preserves_last_good_materialization() {
+    let temp = TempDir::new().expect("tempdir");
+    let data_root = temp.path().join("data-root");
+    let project_root = temp.path().join("project");
+    fs::create_dir_all(&project_root).expect("create project");
+    let client = Client::new(ClientOptions {
+        data_root,
+        config_root: None,
+        vault: None,
+    });
+
+    let beta_root = temp.path().join("beta-pack");
+    write_pack(
+        &beta_root,
+        &[
+            ("pack.toml", &manifest_toml("beta")),
+            ("AGENTS.md", "# beta\n"),
+        ],
+    );
+    let report = install(&client, &project_root, beta_root, "beta");
+
+    // Simulate cache rot: the whole content-addressed entry vanishes while
+    // the lockfile still references it.
+    fs::remove_dir_all(&report.cache_path).expect("remove cache entry");
+
+    let sync = client.sync(&project_root).expect("sync must not abort");
+    assert_eq!(sync.failures.len(), 1);
+    assert_eq!(sync.failures[0].persona, "beta");
+    assert!(
+        sync.failures[0].error.contains("cache entry"),
+        "failure must be the missing cache entry, got: {}",
+        sync.failures[0].error
+    );
+
+    // The previously materialized content survives as last-known-good.
+    let project_id = client.project_id(&project_root).expect("project id");
+    let rendered = temp
+        .path()
+        .join("data-root/projects")
+        .join(&project_id)
+        .join("personas/beta/rendered/claude/CLAUDE.md");
+    assert_eq!(
+        fs::read_to_string(rendered).expect("last-known-good render must survive"),
+        "# beta\n"
+    );
+}
+
+/// The persona BEING installed failing to materialize re-raises its own typed
+/// error even when other healthy personas coexist in the project, and leaves
+/// the healthy personas' materialized state intact.
+#[test]
+fn install_of_failing_persona_errors_typed_with_others_healthy() {
+    let temp = TempDir::new().expect("tempdir");
+    let data_root = temp.path().join("data-root");
+    let project_root = temp.path().join("project");
+    fs::create_dir_all(&project_root).expect("create project");
+    let client = Client::new(ClientOptions {
+        data_root,
+        config_root: None,
+        vault: None,
+    });
+
+    let alpha_root = temp.path().join("alpha-pack");
+    write_pack(
+        &alpha_root,
+        &[
+            ("pack.toml", &manifest_toml("alpha")),
+            ("AGENTS.md", "# alpha\n"),
+        ],
+    );
+    install(&client, &project_root, alpha_root, "alpha");
+
+    // A pack declaring a composition base that is not installed fails its own
+    // materialization with the typed Compose error. Typed source is required
+    // for the composer path to engage.
+    let child_root = temp.path().join("child-pack");
+    write_pack(
+        &child_root,
+        &[
+            (
+                "pack.toml",
+                "schema_version = 1\nname = \"child\"\nauthor_handle = \"alice\"\nauthor_pubkey = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\nversion = \"0.1.0\"\nextends = \"missing-base@0.1.0\"\n",
+            ),
+            ("AGENTS.md", "# child\n"),
+        ],
+    );
+    frameshift_source::PersonaSource::new(frameshift_source::Persona::new("child"))
+        .write_to_dir(&child_root)
+        .expect("write typed child source");
+    let err = client
+        .install(InstallRequest {
+            project_root: project_root.clone(),
+            spec: PersonaSpec {
+                name: "child".to_string(),
+                version: "0.1.0".to_string(),
+            },
+            source: InstallSource::LocalPath(child_root),
+        })
+        .expect_err("install of composing pack without its base must fail");
+    assert!(
+        matches!(err, ClientError::Compose(_)),
+        "own-persona failure must re-raise the ORIGINAL typed error, got: {err:?}"
+    );
+
+    // Alpha's materialized state is untouched by the failed install.
+    let project_id = client.project_id(&project_root).expect("project id");
+    let alpha_rendered = temp
+        .path()
+        .join("data-root/projects")
+        .join(&project_id)
+        .join("personas/alpha/rendered/claude/CLAUDE.md");
+    assert!(alpha_rendered.is_file(), "healthy persona must survive");
+}
+
+/// Every locked persona failing at once still returns Ok: all failures are
+/// reported, nothing renders, and nothing panics.
+#[test]
+fn sync_reports_all_personas_failing() {
+    let temp = TempDir::new().expect("tempdir");
+    let data_root = temp.path().join("data-root");
+    let project_root = temp.path().join("project");
+    fs::create_dir_all(&project_root).expect("create project");
+    let client = Client::new(ClientOptions {
+        data_root,
+        config_root: None,
+        vault: None,
+    });
+
+    // Install two healthy personas, then vandalize BOTH cache entries.
+    for name in ["alpha", "beta"] {
+        let pack_root = temp.path().join(format!("{name}-pack"));
+        write_pack(
+            &pack_root,
+            &[
+                ("pack.toml", &manifest_toml(name)),
+                ("AGENTS.md", "# pack\n"),
+            ],
+        );
+        let report = install(&client, &project_root, pack_root, name);
+        fs::remove_file(report.cache_path.join("AGENTS.md")).expect("vandalize cache");
+    }
+
+    let report = client.sync(&project_root).expect("sync must still be Ok");
+    assert_eq!(report.personas.len(), 2);
+    assert_eq!(report.failures.len(), 2, "failures: {:?}", report.failures);
+    let mut failed: Vec<&str> = report.failures.iter().map(|f| f.persona.as_str()).collect();
+    failed.sort_unstable();
+    assert_eq!(failed, vec!["alpha", "beta"]);
+}
+
+/// The exact pack.toml shape written by pre-hardening local installs
+/// (author_pubkey = "local-unsigned") still installs and renders.
 #[test]
 fn legacy_local_unsigned_pack_installs_and_renders() {
     let temp = TempDir::new().expect("tempdir");

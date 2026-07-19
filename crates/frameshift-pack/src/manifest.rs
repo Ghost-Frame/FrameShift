@@ -40,7 +40,9 @@ pub struct PackManifest {
     pub schema_version: u32,
     pub name: String,
     pub author_handle: String,
-    /// Ed25519 verifying key of the author; exactly 64 lowercase hex characters.
+    /// Ed25519 verifying key of the author: exactly 64 lowercase hex
+    /// characters, or the exact [`LOCAL_UNSIGNED_PUBKEY`] sentinel for
+    /// unsigned local packs (see [`PackManifest::is_local_unsigned`]).
     #[serde(deserialize_with = "deserialize_author_pubkey")]
     pub author_pubkey: String,
     pub version: String,

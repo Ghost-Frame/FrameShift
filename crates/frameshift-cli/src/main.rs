@@ -302,6 +302,14 @@ fn run() -> Result<(), RunError> {
                     eprintln!("warning: {message}");
                 }
             }
+            // Other locked personas failing to materialize is advisory for
+            // THIS install, but the user should know their state degraded.
+            for failure in &report.materialize_failures {
+                eprintln!(
+                    "warning: persona {} failed to materialize and was skipped: {}",
+                    failure.persona, failure.error
+                );
+            }
             Ok(())
         }
 

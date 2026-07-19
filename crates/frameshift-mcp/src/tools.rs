@@ -455,7 +455,14 @@ fn call_install(arguments: &serde_json::Value, client: &Client) -> ToolResult {
     match client.install(request) {
         Ok(report) => {
             let label = format!("{}@{}", report.persona.name, report.persona.version);
-            let text = serde_json::json!({"installed": label}).to_string();
+            // Same additive `failures` shape as `call_list`: OTHER locked
+            // personas that could not be materialized during this install.
+            let failures: Vec<serde_json::Value> = report
+                .materialize_failures
+                .iter()
+                .map(|f| serde_json::json!({"persona": f.persona, "error": f.error}))
+                .collect();
+            let text = serde_json::json!({"installed": label, "failures": failures}).to_string();
             ok_result(text)
         }
         Err(e) => err_result(format!("install failed: {}", e)),
