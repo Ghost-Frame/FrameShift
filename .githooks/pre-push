@@ -16,6 +16,19 @@
 
 set -euo pipefail
 
+# Optional machine-local gate, run FIRST (it is a cheap content check). If an
+# executable exists at ~/.config/frameshift/pre-push.local (override via
+# FRAMESHIFT_PREPUSH_LOCAL), it receives the standard pre-push stdin and a
+# nonzero exit blocks the push. The file is intentionally NOT part of this
+# repository: it is where a machine keeps private push policy.
+local_gate="${FRAMESHIFT_PREPUSH_LOCAL:-$HOME/.config/frameshift/pre-push.local}"
+if [[ -x "$local_gate" ]]; then
+    if ! "$local_gate"; then
+        echo "pre-push: BLOCKED by local gate ($local_gate)." >&2
+        exit 1
+    fi
+fi
+
 repo_root="$(git rev-parse --show-toplevel)"
 preflight="$repo_root/scripts/preflight.sh"
 
