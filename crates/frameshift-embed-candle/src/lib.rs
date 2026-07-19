@@ -196,6 +196,22 @@ fn l2_normalized(mut v: Vec<f32>) -> Vec<f32> {
     v
 }
 
+/// Default on-disk location for a [`frameshift_orchestrator::CachedEmbedder`]
+/// cache file scoped to `model_id`.
+///
+/// Resolves `$XDG_CACHE_HOME/frameshift/` (falling back to `~/.cache/` and,
+/// as a last resort, the current directory) and derives the filename from the
+/// model id with path separators flattened, so distinct models never share a
+/// cache file: mixing models would serve vectors from the wrong geometry.
+pub fn default_cache_path(model_id: &str) -> std::path::PathBuf {
+    let cache_root = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let file = format!("embed-cache-{}.json", model_id.replace(['/', '\\'], "--"));
+    cache_root.join("frameshift").join(file)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

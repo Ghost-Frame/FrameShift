@@ -18,7 +18,12 @@ use crate::util::CliError;
 #[cfg(feature = "embeddings")]
 fn make_embedder() -> Option<Box<dyn Embedder>> {
     match frameshift_embed_candle::CandleEmbedder::from_hub() {
-        Ok(embedder) => Some(Box::new(embedder)),
+        // Wrapped in the persistent cache so repeated selections embed each
+        // distinct text once instead of re-running the model per invocation.
+        Ok(embedder) => Some(Box::new(frameshift_orchestrator::CachedEmbedder::new(
+            embedder,
+            frameshift_embed_candle::default_cache_path(frameshift_embed_candle::DEFAULT_MODEL_ID),
+        ))),
         Err(e) => {
             eprintln!("warning: semantic embeddings unavailable ({e}); using lexical ranking only");
             None
