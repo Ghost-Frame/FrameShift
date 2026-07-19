@@ -28,7 +28,7 @@ pub mod run;
 pub use audit::{now_timestamp, AuditLog, Transition};
 pub use context::{sense, ContextSignal};
 pub use controller::{AutomateState, Decision, SwitchController, SwitchPolicy};
-pub use embed::{cosine_similarity, semantic_similarity, Embedder};
+pub use embed::{cosine_similarity, semantic_similarity, CachedEmbedder, Embedder};
 pub use error::OrchestratorError;
 pub use feedback::Preferences;
 pub use index::{PersonaIndex, PersonaProfile};

@@ -24,11 +24,19 @@ use frameshift_orchestrator::{
 #[cfg(feature = "embeddings")]
 fn shared_embedder() -> Option<&'static dyn Embedder> {
     use std::sync::OnceLock;
-    static EMBEDDER: OnceLock<Option<frameshift_embed_candle::CandleEmbedder>> = OnceLock::new();
+    /// Model wrapped in the persistent embedding cache, so each distinct text
+    /// is embedded once per model even across daemon restarts.
+    type Cached = frameshift_orchestrator::CachedEmbedder<frameshift_embed_candle::CandleEmbedder>;
+    static EMBEDDER: OnceLock<Option<Cached>> = OnceLock::new();
     EMBEDDER
         .get_or_init(
             || match frameshift_embed_candle::CandleEmbedder::from_hub() {
-                Ok(e) => Some(e),
+                Ok(e) => Some(frameshift_orchestrator::CachedEmbedder::new(
+                    e,
+                    frameshift_embed_candle::default_cache_path(
+                        frameshift_embed_candle::DEFAULT_MODEL_ID,
+                    ),
+                )),
                 Err(e) => {
                     tracing::warn!(error = %e, "semantic embeddings unavailable; lexical ranking only");
                     None
