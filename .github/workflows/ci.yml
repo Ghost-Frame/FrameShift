@@ -17,6 +17,14 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# Default token scope for every job. checks:write exists for rustsec/audit-check,
+# which posts its results as a check run on push events: without it, an audit
+# WARNING (e.g. a yanked transitive crate) on a push to main fails the job with
+# "Resource not accessible by integration" even when zero vulnerabilities exist.
+permissions:
+  contents: read
+  checks: write
+
 # Only keep the latest run per ref alive; cancel superseded runs to save minutes.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
