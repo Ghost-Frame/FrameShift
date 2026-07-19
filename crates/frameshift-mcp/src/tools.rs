@@ -521,7 +521,15 @@ fn call_list(arguments: &serde_json::Value, client: &Client) -> ToolResult {
 
     match client.sync(&project_root) {
         Ok(report) => {
-            let text = serde_json::json!({"personas": report.personas}).to_string();
+            // `failures` is additive: locked personas that could not be
+            // materialized this sync, each with its cause.
+            let failures: Vec<serde_json::Value> = report
+                .failures
+                .iter()
+                .map(|f| serde_json::json!({"persona": f.persona, "error": f.error}))
+                .collect();
+            let text =
+                serde_json::json!({"personas": report.personas, "failures": failures}).to_string();
             ok_result(text)
         }
         Err(e) => err_result(format!("list failed: {}", e)),

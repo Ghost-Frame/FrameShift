@@ -119,6 +119,15 @@ pub enum ClientError {
     #[error("persona {0:?} is not present in frameshift.lock")]
     PersonaNotInstalled(String),
 
+    #[error("persona {persona:?} is installed but failed to materialize: {cause}")]
+    PersonaMaterializeFailed { persona: String, cause: String },
+
+    #[error(
+        "pack {name:?} declares author_pubkey = \"local-unsigned\"; publishing requires a real \
+         Ed25519 author key (set author_pubkey to your signing key's 64-char hex)"
+    )]
+    PublishLocalUnsigned { name: String },
+
     #[error("author_pubkey is not a supported ed25519 public key encoding: {0}")]
     InvalidAuthorPublicKey(String),
 

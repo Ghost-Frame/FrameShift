@@ -411,6 +411,17 @@ pub async fn publish_pack(
         )));
     }
 
+    // The local-unsigned author_pubkey sentinel is reserved for unsigned local
+    // packs; it must never enter the catalog, even under a valid signature
+    // from a registered author (clients would misclassify the installed pack).
+    if manifest.is_local_unsigned() {
+        return Err(AppError::BadRequest(
+            "manifest author_pubkey \"local-unsigned\" is not publishable; declare the author's \
+             real Ed25519 public key (64 lowercase hex chars)"
+                .to_string(),
+        ));
+    }
+
     let canonical_hex = pack.canonical_hash_hex();
 
     // Reject duplicates BEFORE touching the object store. We use the existing

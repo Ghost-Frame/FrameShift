@@ -111,7 +111,14 @@ fn handle_sync(params: Option<Value>, client: &Client) -> Result<Value, (i32, St
         .sync(&PathBuf::from(&root))
         .map_err(|e| (crate::protocol::INTERNAL_ERROR, e.to_string()))?;
 
-    Ok(serde_json::json!({ "personas": report.personas }))
+    // `failures` is additive: locked personas that could not be materialized
+    // this sync (e.g. an unrenderable cached pack), each with its cause.
+    let failures: Vec<serde_json::Value> = report
+        .failures
+        .iter()
+        .map(|f| serde_json::json!({ "persona": f.persona, "error": f.error }))
+        .collect();
+    Ok(serde_json::json!({ "personas": report.personas, "failures": failures }))
 }
 
 /// Handle the `gc` method.

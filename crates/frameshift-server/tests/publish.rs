@@ -304,6 +304,32 @@ fn prepare_pack_with_metadata(
     }
 }
 
+/// Build a signed pack whose manifest carries the `local-unsigned`
+/// author_pubkey sentinel (reserved for unsigned local packs). The signature
+/// itself is valid -- it is produced by the registered author key -- so the
+/// only thing standing between this pack and the catalog is the server's
+/// explicit sentinel rejection.
+fn prepare_local_unsigned_pack(
+    name: &str,
+    version: &str,
+    handle: &str,
+    signing: &SigningKey,
+) -> PreparedPack {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let manifest = format!(
+        "schema_version = 1\nname = \"{name}\"\nauthor_handle = \"{handle}\"\nauthor_pubkey = \"local-unsigned\"\nversion = \"{version}\"\nlicense = \"MIT\"\n"
+    );
+    std::fs::create_dir_all(tmp.path()).unwrap();
+    std::fs::write(tmp.path().join("pack.toml"), manifest).unwrap();
+    std::fs::write(tmp.path().join("README.md"), b"# test pack\n").unwrap();
+    let pack = Pack::from_dir(tmp.path()).unwrap();
+    let sig = signing.sign(&pack.canonical_hash());
+    PreparedPack {
+        targz: make_targz(tmp.path()),
+        signature: sig.to_bytes().to_vec(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // happy path
 // ---------------------------------------------------------------------------
@@ -432,6 +458,33 @@ async fn publish_pack_description_and_tags_are_searchable() {
 
 /// POST a pack with a structurally-valid-length but cryptographically-wrong
 /// signature -> 401 Unauthorized.
+/// A validly-signed pack whose MANIFEST still carries the local-unsigned
+/// sentinel must be rejected with 400: the sentinel is reserved for unsigned
+/// local packs and must never enter the catalog, even under a real signature.
+#[tokio::test]
+async fn publish_local_unsigned_manifest_returns_400() {
+    let signing = SigningKey::from_bytes(&[7u8; 32]);
+    let (catalog, _pubkey) = catalog_with_author(&signing, "alice");
+    let objects = MockPackStore::new();
+    let prepared = prepare_local_unsigned_pack("demo-pack", "0.1.0", "alice", &signing);
+
+    let state = make_state(catalog, objects);
+    let resp = post_publish(
+        state,
+        &prepared.targz,
+        &prepared.signature,
+        "alice",
+        Some(&signing),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "sentinel manifest must be rejected, got {}",
+        resp.status()
+    );
+}
+
 #[tokio::test]
 async fn publish_bad_signature_returns_401() {
     let signing = SigningKey::from_bytes(&[8u8; 32]);

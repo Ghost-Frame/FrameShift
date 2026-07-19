@@ -270,12 +270,32 @@ pub struct InstallReport {
     /// not be attempted for any reason -- this field is advisory only and
     /// never blocks or fails the install. See [`crate::Client::install`].
     pub conformance_upgrade: Option<frameshift_conformance::CrossVersionDecision>,
+    /// Per-persona materialization failures of OTHER locked personas hit while
+    /// re-materializing project state for this install. The persona being
+    /// installed failing is a hard error, never an entry here. Advisory:
+    /// callers should surface these as warnings.
+    pub materialize_failures: Vec<MaterializeFailure>,
+}
+
+/// A single persona that could not be materialized from the cache during
+/// project-state materialization (unrenderable pack, missing cache entry,
+/// unparsable manifest). Carried on [`SyncReport`]/[`InstallReport`] so one
+/// rotten pack degrades to a warning instead of bricking every persona.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaterializeFailure {
+    /// Name of the locked persona that failed.
+    pub persona: String,
+    /// Human-readable cause, rendered from the underlying [`crate::ClientError`].
+    pub error: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncReport {
     pub project_id: String,
     pub personas: Vec<String>,
+    /// Locked personas that failed to materialize this sync (advisory; the
+    /// healthy personas listed in `personas` still rendered).
+    pub failures: Vec<MaterializeFailure>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

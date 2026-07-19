@@ -200,6 +200,16 @@ pub fn publish_pack_dir(
     // rather than via Pack::sign so the on-disk pack directory is not mutated
     // (no signature.sig is written into the source the caller owns).
     let pack = Pack::from_dir(pack_dir)?;
+
+    // Unsigned local packs (author_pubkey sentinel) must never reach the
+    // registry: refuse before signing or any network activity so the caller
+    // gets a typed, actionable error instead of a server rejection.
+    if pack.manifest().is_local_unsigned() {
+        return Err(ClientError::PublishLocalUnsigned {
+            name: pack.manifest().name.clone(),
+        });
+    }
+
     let signature = key.sign(&pack.canonical_hash()).to_bytes();
 
     // Build the gzipped tar archive of the pack contents.
@@ -444,6 +454,30 @@ mod tests {
             first.to_bytes(),
             second.to_bytes(),
             "reload must return the same key"
+        );
+    }
+
+    /// A pack still carrying the local-unsigned author_pubkey sentinel must be
+    /// refused before signing or any network activity, with a typed error.
+    #[test]
+    fn publish_rejects_local_unsigned_pack() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack_dir = dir.path().join("pack");
+        fs::create_dir_all(&pack_dir).unwrap();
+        fs::write(
+            pack_dir.join("pack.toml"),
+            b"schema_version = 1\nname = \"legacy\"\nauthor_handle = \"local\"\nauthor_pubkey = \"local-unsigned\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(pack_dir.join("AGENTS.md"), b"# legacy\n").unwrap();
+
+        // Unroutable URL: if the guard is missing, the failure mode would be a
+        // network error instead of the typed rejection this asserts on.
+        let err = publish_pack_dir("http://127.0.0.1:1", &test_key(), &pack_dir, "local")
+            .expect_err("sentinel pack must not publish");
+        assert!(
+            matches!(err, ClientError::PublishLocalUnsigned { ref name } if name == "legacy"),
+            "expected PublishLocalUnsigned, got: {err:?}"
         );
     }
 

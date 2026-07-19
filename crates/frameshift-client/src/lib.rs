@@ -21,8 +21,8 @@ pub use frameshift_conformance::CrossVersionDecision;
 pub use frameshift_vault::{VaultData, VaultError};
 pub use model::{
     ClientOptions, GcReport, InstallReport, InstallRequest, InstallSource, LockedPersona, Lockfile,
-    MemoryConfig, MemoryRequirementStatus, PersonaSpec, ProjectConfig, ProjectPaths, SyncReport,
-    SCHEMA_VERSION,
+    MaterializeFailure, MemoryConfig, MemoryRequirementStatus, PersonaSpec, ProjectConfig,
+    ProjectPaths, SyncReport, SCHEMA_VERSION,
 };
 pub use publish::PublishOutcome;
 pub use registry::{RegistryPackSummary, RegistrySearchQuery, RegistrySearchResult};
@@ -397,6 +397,20 @@ impl Client {
             return Err(ClientError::PersonaNotInstalled(persona.to_string()));
         }
 
+        // A persona that is locked but failed to materialize cannot be
+        // activated -- and the check must precede the memory-requirement
+        // probe below, which reads the (cleaned-up) materialized dir.
+        if let Some(failure) = report
+            .failures
+            .iter()
+            .find(|failure| failure.persona == persona)
+        {
+            return Err(ClientError::PersonaMaterializeFailed {
+                persona: failure.persona.clone(),
+                cause: failure.error.clone(),
+            });
+        }
+
         // Enforce the pack's declared memory contract: a hard requirement
         // refuses to activate when the project declares no memory adapter.
         // Soft requirements are surfaced as warnings by the CLI/MCP callers
@@ -486,7 +500,10 @@ impl Client {
 
         lockfile.personas.retain(|p| p.name != persona);
         let raw_lock = toml::to_string_pretty(&lockfile)?;
+        // Materialize failures of the personas that REMAIN are advisory here;
+        // the uninstall of `persona` itself succeeded once the lock is written.
         self.materialize_project_state(&paths, &lockfile, &raw_lock)
+            .map(|_| ())
     }
 
     /// Read the central project config (`projects/<id>/config.toml`), returning
@@ -632,12 +649,21 @@ impl Client {
             return Ok(SyncReport {
                 project_id: paths.project_id,
                 personas: Vec::new(),
+                failures: Vec::new(),
             });
         };
 
-        self.materialize_project_state(&paths, &lockfile, &raw_lock)?;
+        let failures = self
+            .materialize_project_state(&paths, &lockfile, &raw_lock)?
+            .into_iter()
+            .map(|(persona, error)| MaterializeFailure {
+                persona,
+                error: error.to_string(),
+            })
+            .collect();
         Ok(SyncReport {
             project_id: paths.project_id,
+            failures,
             personas: lockfile
                 .personas
                 .iter()
@@ -817,7 +843,7 @@ impl Client {
         paths: &ProjectPaths,
         lockfile: &Lockfile,
         raw_lock: &str,
-    ) -> Result<(), ClientError> {
+    ) -> Result<Vec<(String, ClientError)>, ClientError> {
         // Validate every persona name before it is joined into the central
         // store. A name like `../../x` would otherwise escape personas_dir and
         // drive remove_dir_all/copy against an arbitrary directory below.
@@ -851,36 +877,23 @@ impl Client {
             }
         }
 
+        // Per-persona failures are isolated: one rotten cache entry (stub pack,
+        // unparsable manifest, missing hash) degrades to a reported failure
+        // instead of aborting materialization of every other persona. The
+        // ORIGINAL typed error is preserved per persona so `finish_install`
+        // can re-raise the incoming persona's own failure verbatim (e.g. a
+        // `ClientError::Compose` callers downcast); report-level consumers
+        // stringify into [`MaterializeFailure`]. `activate` hard-errors only
+        // when the requested persona is among the failures.
+        let mut failures: Vec<(String, ClientError)> = Vec::new();
         for persona in &lockfile.personas {
-            let cache_path = paths.cache_dir.join(&persona.hash);
-            if !cache_path.exists() {
-                return Err(ClientError::MissingCacheEntry {
-                    hash: persona.hash.clone(),
-                    path: cache_path,
-                });
+            if let Err(error) = self.materialize_one_persona(paths, lockfile, persona) {
+                // Best-effort cleanup so a failed persona is "not materialized"
+                // rather than left half-built; the dir may not exist at all.
+                let persona_dir = paths.personas_dir.join(&persona.name);
+                let _ = fs::remove_dir_all(&persona_dir);
+                failures.push((persona.name.clone(), error));
             }
-
-            let persona_dir = paths.personas_dir.join(&persona.name);
-            if persona_dir.exists() {
-                remove_dir_all(&persona_dir)?;
-            }
-            ensure_dir(&persona_dir)?;
-
-            let source_dir = persona_dir.join("source");
-            copy_dir_recursive(&cache_path, &source_dir)?;
-
-            let rendered_root = persona_dir.join("rendered");
-            self.materialize_persona_rendered_outputs(
-                &paths.cache_dir,
-                &cache_path,
-                &rendered_root,
-                &paths.vault_path,
-                &persona.name,
-                lockfile,
-            )?;
-
-            // Growth is local-only and append-only -- a single file per persona, never published upstream.
-            touch_empty(&persona_dir.join("growth.md"))?;
         }
 
         if paths.active_path.exists() {
@@ -895,7 +908,49 @@ impl Client {
             }
         }
 
-        Ok(())
+        Ok(failures)
+    }
+
+    /// Materialize a single locked persona from the cache into
+    /// `personas/<name>` (source copy + rendered outputs + growth file).
+    ///
+    /// Extracted from [`Client::materialize_project_state`] so per-persona
+    /// errors can be isolated by the caller instead of aborting the loop.
+    fn materialize_one_persona(
+        &self,
+        paths: &ProjectPaths,
+        lockfile: &Lockfile,
+        persona: &LockedPersona,
+    ) -> Result<(), ClientError> {
+        let cache_path = paths.cache_dir.join(&persona.hash);
+        if !cache_path.exists() {
+            return Err(ClientError::MissingCacheEntry {
+                hash: persona.hash.clone(),
+                path: cache_path,
+            });
+        }
+
+        let persona_dir = paths.personas_dir.join(&persona.name);
+        if persona_dir.exists() {
+            remove_dir_all(&persona_dir)?;
+        }
+        ensure_dir(&persona_dir)?;
+
+        let source_dir = persona_dir.join("source");
+        copy_dir_recursive(&cache_path, &source_dir)?;
+
+        let rendered_root = persona_dir.join("rendered");
+        self.materialize_persona_rendered_outputs(
+            &paths.cache_dir,
+            &cache_path,
+            &rendered_root,
+            &paths.vault_path,
+            &persona.name,
+            lockfile,
+        )?;
+
+        // Growth is local-only and append-only -- a single file per persona, never published upstream.
+        touch_empty(&persona_dir.join("growth.md"))
     }
 
     /// Renders a single persona's output into `rendered_root`, composing with
@@ -1707,13 +1762,33 @@ fn finish_install(
     let mut lockfile = load_lockfile(&paths.lock_path)?.unwrap_or_default();
     upsert_locked_persona(&mut lockfile, locked.clone());
     let raw_lock = toml::to_string_pretty(&lockfile)?;
-    client.materialize_project_state(paths, &lockfile, &raw_lock)?;
+    let mut raw_failures = client.materialize_project_state(paths, &lockfile, &raw_lock)?;
+
+    // The persona being installed failing to materialize is a hard install
+    // error, re-raised as its ORIGINAL typed error (callers downcast, e.g.
+    // `ClientError::Compose`); failures of OTHER locked personas ride along
+    // on the report as warnings.
+    if let Some(own_index) = raw_failures
+        .iter()
+        .position(|(persona, _)| *persona == locked.name)
+    {
+        return Err(raw_failures.swap_remove(own_index).1);
+    }
+
+    let materialize_failures = raw_failures
+        .into_iter()
+        .map(|(persona, error)| MaterializeFailure {
+            persona,
+            error: error.to_string(),
+        })
+        .collect();
 
     Ok(InstallReport {
         project_id: paths.project_id.clone(),
         cache_path: paths.cache_dir.join(&locked.hash),
         persona: locked,
         conformance_upgrade,
+        materialize_failures,
     })
 }
 
