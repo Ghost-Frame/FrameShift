@@ -1,21 +1,35 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// Sentinel `author_pubkey` value carried by unsigned local packs.
+///
+/// Local `--from-path` installs predating the strict pubkey validation wrote
+/// this placeholder, and personal persona libraries still use it. It is valid
+/// ONLY for unsigned local packs: every trust boundary that actually consumes
+/// the key (publish, registry signature verification, server ingest) rejects
+/// it, because it cannot parse as an Ed25519 key.
+pub const LOCAL_UNSIGNED_PUBKEY: &str = "local-unsigned";
+
 /// Serde deserializer for `author_pubkey`.
 ///
-/// Accepts only exactly 64 lowercase hex characters, which is the canonical
-/// encoding of a 32-byte Ed25519 verifying key used throughout the workspace
-/// (see `frameshift_client::publish::public_key_hex` and the seed tool).
+/// Accepts exactly 64 lowercase hex characters (the canonical encoding of a
+/// 32-byte Ed25519 verifying key, see `frameshift_client::publish::public_key_hex`
+/// and the seed tool) or the exact [`LOCAL_UNSIGNED_PUBKEY`] sentinel used by
+/// unsigned local packs. Anything else is rejected at parse time.
 fn deserialize_author_pubkey<'de, D>(d: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     use serde::Deserialize as _;
     let s = String::deserialize(d)?;
+    if s == LOCAL_UNSIGNED_PUBKEY {
+        return Ok(s);
+    }
     // Must be exactly 64 characters of lowercase hex (32 bytes * 2 hex digits).
     if s.len() != 64 || !s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
         return Err(serde::de::Error::custom(
-            "author_pubkey must be 64 lowercase hex characters (32-byte Ed25519 public key)",
+            "author_pubkey must be 64 lowercase hex characters (32-byte Ed25519 public key) \
+             or the exact string \"local-unsigned\" for unsigned local packs",
         ));
     }
     Ok(s)
@@ -26,7 +40,9 @@ pub struct PackManifest {
     pub schema_version: u32,
     pub name: String,
     pub author_handle: String,
-    /// Ed25519 verifying key of the author; exactly 64 lowercase hex characters.
+    /// Ed25519 verifying key of the author: exactly 64 lowercase hex
+    /// characters, or the exact [`LOCAL_UNSIGNED_PUBKEY`] sentinel for
+    /// unsigned local packs (see [`PackManifest::is_local_unsigned`]).
     #[serde(deserialize_with = "deserialize_author_pubkey")]
     pub author_pubkey: String,
     pub version: String,
@@ -66,6 +82,15 @@ pub struct PackManifest {
     /// and to power marketplace search/filtering. Defaults to empty for legacy manifests.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+}
+
+impl PackManifest {
+    /// Whether this manifest carries the [`LOCAL_UNSIGNED_PUBKEY`] sentinel,
+    /// i.e. it is an unsigned local pack that must never reach a trust
+    /// boundary (publish/registry) requiring a real author key.
+    pub fn is_local_unsigned(&self) -> bool {
+        self.author_pubkey == LOCAL_UNSIGNED_PUBKEY
+    }
 }
 
 #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize, PartialEq)]
@@ -184,6 +209,61 @@ optional = true
         assert_eq!(tokens.len(), 2);
         assert!(tokens["favorite_motto"].optional);
         assert!(!tokens["principal_address"].optional);
+    }
+
+    #[test]
+    fn author_pubkey_accepts_local_unsigned_sentinel() {
+        let toml_str = r#"
+schema_version = 1
+name = "legacy"
+author_handle = "local"
+author_pubkey = "local-unsigned"
+version = "0.1.0"
+"#;
+        let manifest: PackManifest = toml::from_str(toml_str).expect("sentinel must parse");
+        assert_eq!(manifest.author_pubkey, LOCAL_UNSIGNED_PUBKEY);
+        assert!(manifest.is_local_unsigned());
+    }
+
+    #[test]
+    fn author_pubkey_rejects_malformed_values() {
+        // Everything that is neither the exact sentinel nor 64 lowercase hex.
+        let bad = [
+            "",
+            "unsigned",
+            "local-unsigned2",
+            "LOCAL-UNSIGNED",
+            // uppercase hex
+            "DEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEF",
+            // 63 chars
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbee",
+            // 65 chars
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefa",
+            // non-hex chars at the right length
+            "zzzzbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        ];
+        for value in bad {
+            let toml_str = format!(
+                "schema_version = 1\nname = \"x\"\nauthor_handle = \"t\"\nauthor_pubkey = \"{value}\"\nversion = \"0.1.0\"\n"
+            );
+            assert!(
+                toml::from_str::<PackManifest>(&toml_str).is_err(),
+                "must reject author_pubkey {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hex_pubkey_manifest_is_not_local_unsigned() {
+        let toml_str = r#"
+schema_version = 1
+name = "signed"
+author_handle = "alice"
+author_pubkey = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+version = "0.1.0"
+"#;
+        let manifest: PackManifest = toml::from_str(toml_str).unwrap();
+        assert!(!manifest.is_local_unsigned());
     }
 
     #[test]

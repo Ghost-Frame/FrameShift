@@ -56,7 +56,7 @@ pub fn run_use(client: &Client, args: UseArgs) -> Result<(), CliError> {
             let persona_dir = lib_dir.join(&args.name);
             let version = read_pack_version(&persona_dir).unwrap_or_else(|| "0.1.0".to_string());
 
-            client
+            let report = client
                 .install(InstallRequest {
                     project_root: project_root.clone(),
                     spec: PersonaSpec {
@@ -66,6 +66,15 @@ pub fn run_use(client: &Client, args: UseArgs) -> Result<(), CliError> {
                     source: InstallSource::LocalPath(persona_dir),
                 })
                 .map_err(|e| CliError::Orchestrator(e.to_string()))?;
+
+            // Other locked personas failing to materialize is advisory for
+            // THIS install, but the user should know their state degraded.
+            for failure in &report.materialize_failures {
+                eprintln!(
+                    "warning: persona {} failed to materialize and was skipped: {}",
+                    failure.persona, failure.error
+                );
+            }
         }
     }
 

@@ -305,8 +305,10 @@ fn find_pack_root(extract_dir: &std::path::Path) -> Result<std::path::PathBuf, A
 /// # Errors
 ///
 /// - `400 Bad Request` -- missing required multipart field, malformed pack
-///   archive, signature is not 64 bytes, or the pack's declared author handle
-///   does not match the supplied `author_handle`.
+///   archive, signature is not 64 bytes, the pack's declared author handle
+///   does not match the supplied `author_handle`, or the manifest carries the
+///   `local-unsigned` author_pubkey sentinel (reserved for unsigned local
+///   packs, never publishable).
 /// - `401 Unauthorized` -- author handle not registered, the verified request
 ///   signer is not the handle's owner, or the pack content signature does not
 ///   verify against the registered key.
@@ -409,6 +411,17 @@ pub async fn publish_pack(
             "manifest author_handle '{}' does not match form author_handle '{}'",
             manifest.author_handle, author_handle
         )));
+    }
+
+    // The local-unsigned author_pubkey sentinel is reserved for unsigned local
+    // packs; it must never enter the catalog, even under a valid signature
+    // from a registered author (clients would misclassify the installed pack).
+    if manifest.is_local_unsigned() {
+        return Err(AppError::BadRequest(
+            "manifest author_pubkey \"local-unsigned\" is not publishable; declare the author's \
+             real Ed25519 public key (64 lowercase hex chars)"
+                .to_string(),
+        ));
     }
 
     let canonical_hex = pack.canonical_hash_hex();
