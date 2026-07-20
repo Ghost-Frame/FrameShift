@@ -15,9 +15,6 @@
 //! - `POST /` -> [`register_author_route`] -- claim a handle for the *signing*
 //!   key. The new author's pubkey is taken from the verified signer, so a
 //!   caller can only register a handle for a key they actually control.
-//! - `POST /{handle}/rotate` -> [`rotate_handle_route`] -- repoint a handle to
-//!   a new key. The request MUST be signed by the handle's *current* owner key
-//!   (the old key authorizes its own replacement).
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderValue, StatusCode};
@@ -27,7 +24,6 @@ use axum::{Extension, Json, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use chrono::Utc;
-use ed25519_dalek::VerifyingKey;
 use frameshift_catalog::identity::Ed25519PublicKey;
 use frameshift_catalog::records::AuthorRecord;
 use frameshift_catalog::CatalogError;
@@ -61,11 +57,8 @@ pub fn authors_router() -> Router<AppState> {
 ///
 /// Routes:
 /// - `POST /` -> [`register_author_route`]
-/// - `POST /{handle}/rotate` -> [`rotate_handle_route`]
 pub fn authors_write_router() -> Router<AppState> {
-    Router::new()
-        .route("/", post(register_author_route))
-        .route("/{handle}/rotate", post(rotate_handle_route))
+    Router::new().route("/", post(register_author_route))
 }
 
 /// `GET /v1/authors/{pubkey}`
@@ -242,9 +235,9 @@ pub async fn register_author_route(
     // guards the `authors` table, but a handle can exist in the `handles` table
     // with no matching `authors` row (the seed tool calls `set_handle_pubkey`
     // directly), so without this check an attacker could register such a handle
-    // and have the `set_handle_pubkey` call below overwrite its owner. Mirror
-    // `rotate_handle_route`: only the current owner may (idempotently) re-point
-    // their own handle; a different owner is a 409. Done before any write so a
+    // and have the `set_handle_pubkey` call below overwrite its owner. Only
+    // the current owner may idempotently confirm their own handle; a
+    // different owner is a 409. Done before any write so a
     // rejected registration leaves no partial `authors` row behind.
     match state.catalog.get_handle_pubkey(&body.handle).await {
         Ok(current) if current != signer.pubkey => {
@@ -290,95 +283,6 @@ pub async fn register_author_route(
         pubkey: signer.pubkey.to_string(),
     };
     Ok((StatusCode::CREATED, Json(resp)).into_response())
-}
-
-/// Request body for `POST /v1/authors/{handle}/rotate`.
-#[derive(Debug, Deserialize)]
-pub struct RotateHandleRequest {
-    /// The base64url-no-pad Ed25519 public key the handle should point to next.
-    pub new_pubkey: String,
-}
-
-/// Response body for a successful key rotation.
-#[derive(Debug, Serialize)]
-pub struct RotateHandleResponse {
-    /// The handle that was rotated.
-    pub handle: String,
-    /// The base64url-no-pad new owner key the handle now maps to.
-    pub new_pubkey: String,
-}
-
-/// `POST /v1/authors/{handle}/rotate`
-///
-/// Repoint `handle` to a new Ed25519 key. The request MUST be signed by the
-/// handle's **current** owner key (verified by the signed-request layer); the
-/// old key thereby authorizes its own replacement. After rotation, the publish
-/// path (which resolves the owner via `get_handle_pubkey`) follows the new key.
-///
-/// # Response
-///
-/// `200 OK` with body [`RotateHandleResponse`].
-///
-/// # Errors
-///
-/// - `400 Bad Request` -- the handle is malformed, `new_pubkey` is not a valid
-///   Ed25519 key, or `new_pubkey` equals the current key.
-/// - `403 Forbidden` -- the verified signer is not the handle's current owner.
-/// - `404 Not Found` -- the handle does not exist.
-/// - `500 Internal Server Error` -- catalog backend failure.
-pub async fn rotate_handle_route(
-    State(state): State<AppState>,
-    Path(handle): Path<String>,
-    Extension(signer): Extension<VerifiedSigner>,
-    Json(body): Json<RotateHandleRequest>,
-) -> Result<Response, AppError> {
-    validate_handle(&handle)?;
-    let new_pubkey = parse_pubkey(&body.new_pubkey)?;
-
-    // Reject a structurally-32-byte value that is not a valid curve point: it
-    // could never verify a future signature, so accepting it would brick the
-    // handle.
-    VerifyingKey::from_bytes(&new_pubkey.0).map_err(|_| {
-        AppError::BadRequest("new_pubkey is not a valid Ed25519 public key".to_string())
-    })?;
-
-    // Current owner. Handle existence is already public via `GET /v1/handles`,
-    // so a 404 here discloses nothing new.
-    let current = state
-        .catalog
-        .get_handle_pubkey(&handle)
-        .await
-        .map_err(|e| AppError::from_catalog(e, "handle"))?;
-
-    // Authorization: only the current owner key may rotate the handle.
-    if signer.pubkey != current {
-        tracing::warn!(
-            handle = %handle,
-            signer = %signer.pubkey,
-            "rotate attempt by a key that does not own the handle"
-        );
-        return Err(AppError::Forbidden(format!(
-            "signer does not own handle {handle}"
-        )));
-    }
-
-    if new_pubkey == current {
-        return Err(AppError::BadRequest(
-            "new_pubkey must differ from the current key".to_string(),
-        ));
-    }
-
-    state
-        .catalog
-        .set_handle_pubkey(&handle, new_pubkey)
-        .await
-        .map_err(|e| AppError::from_catalog(e, "handle"))?;
-
-    let resp = RotateHandleResponse {
-        handle,
-        new_pubkey: new_pubkey.to_string(),
-    };
-    Ok((StatusCode::OK, Json(resp)).into_response())
 }
 
 /// Validate a handle string.

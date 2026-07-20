@@ -40,10 +40,9 @@ pub struct MockState {
 
     /// Handle -> current owner pubkey mapping (the publish authority).
     ///
-    /// `set_handle_pubkey` writes here and `get_handle_pubkey` reads here first,
-    /// so handle key rotation is observable in tests. When a handle is absent
-    /// from this map, `get_handle_pubkey` falls back to scanning `authors` by
-    /// handle (the pre-rotation registration path).
+    /// `set_handle_pubkey` writes here and `get_handle_pubkey` reads here first.
+    /// When a handle is absent from this map, `get_handle_pubkey` falls back to
+    /// scanning `authors` by handle for compatibility with older fixtures.
     pub handles: HashMap<String, Ed25519PublicKey>,
 
     /// Top-level pack records, keyed by pack name.
@@ -232,6 +231,20 @@ impl CatalogBackend for MockCatalog {
         if quota.max_bytes.is_some_and(|limit| next_bytes > limit) {
             return Err(CatalogError::Validation(
                 "publisher storage quota exceeded".to_string(),
+            ));
+        }
+        let next_total_bytes = state
+            .versions
+            .values()
+            .fold(record.size_bytes, |total, version| {
+                total.saturating_add(version.size_bytes)
+            });
+        if quota
+            .max_total_bytes
+            .is_some_and(|limit| next_total_bytes > limit)
+        {
+            return Err(CatalogError::Validation(
+                "registry storage quota exceeded".to_string(),
             ));
         }
         let k = (record.pack_name.clone(), record.version.clone());
@@ -424,9 +437,8 @@ impl CatalogBackend for MockCatalog {
 
     /// Get the public key for a handle.
     ///
-    /// Reads the `handles` map first (so rotation via `set_handle_pubkey` is
-    /// reflected), then falls back to scanning `authors` by handle for setups
-    /// that only pre-populated author records.
+    /// Reads the `handles` map first, then falls back to scanning `authors` by
+    /// handle for setups that only pre-populated author records.
     async fn get_handle_pubkey(&self, handle: &str) -> Result<Ed25519PublicKey, CatalogError> {
         let state = self
             .state

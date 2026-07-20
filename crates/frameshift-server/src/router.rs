@@ -33,8 +33,7 @@
 //! Signed writes and anonymous telemetry use a separate abuse rate to bound
 //! nonce-cache and log-amplification pressure before handler work.
 //!
-//! The mutating endpoints -- `POST /v1/packs`, `POST /v1/authors`,
-//! `POST /v1/authors/{handle}/rotate`, and
+//! The mutating endpoints -- `POST /v1/packs`, `POST /v1/authors`, and
 //! `POST /v1/admin/packs/{name}/{version}/tombstone` -- carry the Ed25519
 //! signed-request `route_layer` ([`crate::middleware::auth::require_signed_request`]).
 //! It is applied only to those method-routers, so anonymous reads on the same
@@ -82,7 +81,7 @@ use crate::state::AppState;
 ///   /metrics    -- ops
 ///   /v1
 ///     /packs    -- pack read endpoints + POST publish (signed-request)
-///     /authors  -- GET list (paginated) + lookup; POST register / rotate (signed-request)
+///     /authors  -- GET list (paginated) + lookup; POST register (signed-request)
 ///     /handles  -- handle lookup
 ///     /telemetry -- POST /selection opt-in selection telemetry sink
 ///     /memory   -- GET /health read-only memory backend health
@@ -126,8 +125,7 @@ pub fn app(state: AppState) -> Router {
         .merge(publish)
         .nest("/{name}/versions/{version}/download-url", mint_router);
 
-    // Authors: anonymous reads merged with signed-request-gated writes
-    // (registration + key rotation).
+    // Authors: anonymous reads merged with signed-request-gated registration.
     let author_writes = authors_write_router().route_layer(signed.clone());
     let author_writes = apply_ip_rate_limit(author_writes, &state, state.config.abuse_rate_per_min);
     let authors = authors_router().merge(author_writes);
@@ -253,7 +251,8 @@ fn apply_ip_rate_limit(router: Router<AppState>, state: &AppState, rate: u32) ->
 /// configured with:
 ///
 /// - methods: `GET`, `POST`, `PUT`, `DELETE`, `OPTIONS`, `HEAD`
-/// - allowed headers: `Authorization`, `Content-Type`
+/// - allowed headers: `Authorization`, `Content-Type`, and the four
+///   `X-Frameshift-*` signed-request headers
 /// - exposed headers: `X-Request-Id` (lets browsers correlate logs)
 /// - max age: 600 seconds (10 minute preflight cache)
 ///
@@ -278,7 +277,6 @@ fn build_cors_layer(state: &AppState) -> Option<CorsLayer> {
     }
 
     let expose: HeaderName = HeaderName::from_static("x-request-id");
-
     Some(
         CorsLayer::new()
             .allow_origin(origins)
@@ -290,7 +288,14 @@ fn build_cors_layer(state: &AppState) -> Option<CorsLayer> {
                 Method::OPTIONS,
                 Method::HEAD,
             ])
-            .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+            .allow_headers([
+                header::AUTHORIZATION,
+                header::CONTENT_TYPE,
+                HeaderName::from_static("x-frameshift-pubkey"),
+                HeaderName::from_static("x-frameshift-timestamp"),
+                HeaderName::from_static("x-frameshift-nonce"),
+                HeaderName::from_static("x-frameshift-signature"),
+            ])
             .expose_headers([expose])
             .max_age(std::time::Duration::from_secs(600)),
     )

@@ -261,7 +261,7 @@ pub fn search_registry(
 
     // Bound the body read the same way ureq_get_json does, so an oversized
     // response cannot be buffered without limit before serde ever sees it.
-    let limited = LimitedReader::new(response.into_reader(), MAX_ARCHIVE_BYTES);
+    let limited = LimitedReader::new(response.into_reader(), MAX_JSON_RESPONSE_BYTES);
     let body: SearchResponseBody =
         serde_json::from_reader(limited).map_err(|err| ClientError::RegistryHttp {
             url,
@@ -761,7 +761,7 @@ impl<R: std::io::Read> std::io::Read for LimitedReader<R> {
         if self.read > self.limit {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "pack archive exceeds maximum decompressed size",
+                "response exceeds maximum allowed size",
             ));
         }
         Ok(n)
@@ -927,6 +927,44 @@ mod tests {
         let err = search_registry(&base, &RegistrySearchQuery::default()).unwrap_err();
         handle.join().unwrap();
         assert!(matches!(err, ClientError::RegistryHttp { .. }));
+    }
+
+    /// Search responses larger than the JSON ceiling are rejected even when
+    /// their prefix and trailing whitespace form otherwise valid JSON.
+    #[test]
+    fn search_registry_rejects_oversized_json() {
+        let mut body = b"{\"results\":[]}".to_vec();
+        body.resize(MAX_JSON_RESPONSE_BYTES as usize + 1, b' ');
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.write_all(&body).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let base = format!("http://127.0.0.1:{port}");
+        let error = search_registry(&base, &RegistrySearchQuery::default()).unwrap_err();
+        handle.join().unwrap();
+
+        assert!(matches!(error, ClientError::RegistryHttp { .. }));
     }
 
     /// resolve_latest_version returns the pack's latest_version from a real

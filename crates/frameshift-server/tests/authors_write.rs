@@ -1,11 +1,8 @@
-//! Integration tests for the signed-request write routes on `/v1/authors`:
-//! `POST /v1/authors` (registration) and `POST /v1/authors/{handle}/rotate`
-//! (key rotation).
+//! Integration tests for the signed-request registration route on `/v1/authors`.
 //!
 //! Each request is signed with the Ed25519 signed-request envelope (the only
 //! accepted auth). All catalog interaction goes through the in-memory
-//! `MockCatalog`, whose `handles` map is the publish authority that rotation
-//! moves.
+//! `MockCatalog`, whose `handles` map is the publish authority.
 
 mod mocks;
 
@@ -51,6 +48,7 @@ fn test_config() -> Arc<ServerConfig> {
         publisher_pubkeys: vec!["*".to_string()],
         max_versions_per_author: 0,
         max_bytes_per_author: 0,
+        max_total_bytes: 0,
         object_store_backend: "fs".to_string(),
         r2_endpoint: String::new(),
         r2_bucket: String::new(),
@@ -79,11 +77,6 @@ fn mk_state(catalog: MockCatalog) -> AppState {
             Duration::from_secs(600),
         )),
     }
-}
-
-/// base64url-no-pad encoding of a signing key's public key.
-fn pubkey_b64(key: &SigningKey) -> String {
-    Ed25519PublicKey(key.verifying_key().to_bytes()).to_string()
 }
 
 /// Issue a signed (or unsigned, when `key` is `None`) JSON POST and return the
@@ -228,13 +221,12 @@ async fn register_handle_owned_only_in_handles_table_returns_409() {
 }
 
 // ---------------------------------------------------------------------------
-// rotation
+// unsupported key rotation
 // ---------------------------------------------------------------------------
 
-/// The current owner can rotate the handle to a new key; the handles map (the
-/// publish authority) then points at the new key.
+/// Key rotation is not exposed until a verifiable continuity protocol exists.
 #[tokio::test]
-async fn rotate_moves_handle_to_new_key() {
+async fn rotate_route_is_not_exposed() {
     let old = SigningKey::from_bytes(&[33u8; 32]);
     let new = SigningKey::from_bytes(&[34u8; 32]);
     let catalog = MockCatalog::new();
@@ -251,91 +243,18 @@ async fn rotate_moves_handle_to_new_key() {
     let r2 = post_signed_json(
         mk_state(catalog.clone()),
         "/v1/authors/carol/rotate",
-        serde_json::json!({ "new_pubkey": pubkey_b64(&new) }),
+        serde_json::json!({
+            "new_pubkey": Ed25519PublicKey(new.verifying_key().to_bytes()).to_string()
+        }),
         Some(&old),
     )
     .await;
-    assert_eq!(r2.status(), StatusCode::OK, "owner rotation should 200");
+    assert_eq!(r2.status(), StatusCode::NOT_FOUND);
 
     let s = catalog.state.read().unwrap();
     assert_eq!(
         s.handles.get("carol").copied(),
-        Some(Ed25519PublicKey(new.verifying_key().to_bytes())),
-        "handle must now point at the new key"
+        Some(Ed25519PublicKey(old.verifying_key().to_bytes())),
+        "an unavailable route must not alter handle ownership"
     );
-}
-
-/// A rotation request signed by a key that does not own the handle -> 403.
-#[tokio::test]
-async fn rotate_by_non_owner_returns_403() {
-    let owner = SigningKey::from_bytes(&[35u8; 32]);
-    let attacker = SigningKey::from_bytes(&[36u8; 32]);
-    let target = SigningKey::from_bytes(&[37u8; 32]);
-    let catalog = MockCatalog::new();
-
-    let r1 = post_signed_json(
-        mk_state(catalog.clone()),
-        "/v1/authors",
-        serde_json::json!({ "handle": "dave" }),
-        Some(&owner),
-    )
-    .await;
-    assert_eq!(r1.status(), StatusCode::CREATED);
-
-    let r2 = post_signed_json(
-        mk_state(catalog.clone()),
-        "/v1/authors/dave/rotate",
-        serde_json::json!({ "new_pubkey": pubkey_b64(&target) }),
-        Some(&attacker),
-    )
-    .await;
-    assert_eq!(r2.status(), StatusCode::FORBIDDEN);
-
-    // The handle must be unchanged.
-    let s = catalog.state.read().unwrap();
-    assert_eq!(
-        s.handles.get("dave").copied(),
-        Some(Ed25519PublicKey(owner.verifying_key().to_bytes())),
-    );
-}
-
-/// Rotating an unknown handle -> 404 (handle existence is already public).
-#[tokio::test]
-async fn rotate_unknown_handle_returns_404() {
-    let key = SigningKey::from_bytes(&[38u8; 32]);
-    let target = SigningKey::from_bytes(&[39u8; 32]);
-    let catalog = MockCatalog::new();
-    let resp = post_signed_json(
-        mk_state(catalog),
-        "/v1/authors/ghost/rotate",
-        serde_json::json!({ "new_pubkey": pubkey_b64(&target) }),
-        Some(&key),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-}
-
-/// Rotating to the same key is a no-op request and is rejected -> 400.
-#[tokio::test]
-async fn rotate_to_same_key_returns_400() {
-    let key = SigningKey::from_bytes(&[40u8; 32]);
-    let catalog = MockCatalog::new();
-
-    let r1 = post_signed_json(
-        mk_state(catalog.clone()),
-        "/v1/authors",
-        serde_json::json!({ "handle": "erin" }),
-        Some(&key),
-    )
-    .await;
-    assert_eq!(r1.status(), StatusCode::CREATED);
-
-    let r2 = post_signed_json(
-        mk_state(catalog),
-        "/v1/authors/erin/rotate",
-        serde_json::json!({ "new_pubkey": pubkey_b64(&key) }),
-        Some(&key),
-    )
-    .await;
-    assert_eq!(r2.status(), StatusCode::BAD_REQUEST);
 }

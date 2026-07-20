@@ -1,7 +1,6 @@
 //! Ed25519 signed-request authentication for the mutating ("write") endpoints.
 //!
-//! Every mutating request (`POST /v1/packs`, `POST /v1/authors`,
-//! `POST /v1/authors/{handle}/rotate`) must carry an Ed25519 signature that
+//! Every mutating request (`POST /v1/packs`, `POST /v1/authors`) must carry an Ed25519 signature that
 //! proves the live request was produced by the holder of a specific public
 //! key. This replaces the previous `X-Frameshift-Session` stub, which accepted
 //! any non-empty value.

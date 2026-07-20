@@ -41,6 +41,7 @@ fn test_config(abuse_rate_per_min: u32, trust_forwarded_for: bool) -> Arc<Server
         publisher_pubkeys: vec!["*".to_string()],
         max_versions_per_author: 0,
         max_bytes_per_author: 0,
+        max_total_bytes: 0,
         object_store_backend: "fs".to_string(),
         r2_endpoint: String::new(),
         r2_bucket: String::new(),

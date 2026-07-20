@@ -64,6 +64,14 @@ pub struct PostgresCatalog {
     pool: PgPool,
 }
 
+/// Bounded result row for registry-wide storage accounting.
+#[derive(QueryableByName)]
+struct TotalBytesRow {
+    /// Total bytes represented by all published pack versions.
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    total: i64,
+}
+
 /// Inherent methods on [`PostgresCatalog`]: constructor, pool accessor.
 impl PostgresCatalog {
     /// Create a new [`PostgresCatalog`], open the connection pool, and run
@@ -397,6 +405,13 @@ impl CatalogBackend for PostgresCatalog {
                 let version = version_clone;
                 let incoming_author = incoming_author_bytes;
                 let incoming_size = incoming_size_bytes;
+                // Serialize registry-wide quota accounting with concurrent
+                // version inserts before reading the aggregate byte total.
+                if quota.max_total_bytes.is_some() {
+                    diesel::sql_query("LOCK TABLE pack_versions IN SHARE ROW EXCLUSIVE MODE")
+                        .execute(conn)
+                        .await?;
+                }
                 // Serialize quota accounting for this author so concurrent
                 // publishes cannot both observe the same pre-insert usage.
                 let _locked_author: Vec<u8> = authors::table
@@ -447,6 +462,23 @@ impl CatalogBackend for PostgresCatalog {
                     return Err(TxError::Catalog(CatalogError::Validation(
                         "publisher storage quota exceeded".to_string(),
                     )));
+                }
+                if let Some(limit) = quota.max_total_bytes {
+                    let total_row: TotalBytesRow = diesel::sql_query(
+                        "SELECT COALESCE(SUM(size_bytes), 0)::BIGINT AS total FROM pack_versions",
+                    )
+                    .get_result(conn)
+                    .await
+                    .map_err(|e| {
+                        TxError::Catalog(map_diesel_error(e, "pack_version", pack_name.clone()))
+                    })?;
+                    let stored_total = u64::try_from(total_row.total).unwrap_or(u64::MAX);
+                    let next_total_bytes = stored_total.saturating_add(incoming_size);
+                    if next_total_bytes > limit {
+                        return Err(TxError::Catalog(CatalogError::Validation(
+                            "registry storage quota exceeded".to_string(),
+                        )));
+                    }
                 }
                 // D5: If the pack head already exists, verify the publishing
                 // author matches the stored current_author. First-publish

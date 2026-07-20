@@ -76,6 +76,7 @@ fn test_config_with_abuse_rate(
         publisher_pubkeys: vec!["*".to_string()],
         max_versions_per_author: 0,
         max_bytes_per_author: 0,
+        max_total_bytes: 0,
         object_store_backend: "fs".to_string(),
         r2_endpoint: String::new(),
         r2_bucket: String::new(),
@@ -716,7 +717,7 @@ async fn publish_author_version_quota_is_enforced() {
 
     let second = prepare_pack("quota-pack-two", "1.0.0", "quota-author", &signing);
     let response = post_publish(
-        make_state_with_config(catalog, objects, config),
+        make_state_with_config(catalog, objects.clone(), config),
         &second.targz,
         &second.signature,
         "quota-author",
@@ -724,6 +725,54 @@ async fn publish_author_version_quota_is_enforced() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        objects.blobs.read().unwrap().len(),
+        1,
+        "quota rejection must reclaim the newly uploaded object"
+    );
+}
+
+/// Registry-wide byte quotas cannot be bypassed with a second author key.
+#[tokio::test]
+async fn publish_total_storage_quota_spans_authors() {
+    let first_key = SigningKey::from_bytes(&[41u8; 32]);
+    let second_key = SigningKey::from_bytes(&[42u8; 32]);
+    let (catalog, _) = catalog_with_author(&first_key, "first-author");
+    {
+        let mut state = catalog.state.write().unwrap();
+        let pubkey = Ed25519PublicKey(second_key.verifying_key().to_bytes());
+        state.authors.insert(
+            pubkey.to_string(),
+            mocks::catalog::make_author(pubkey.0, "second-author"),
+        );
+    }
+    let objects = MockPackStore::new();
+    let first = prepare_pack("total-quota-one", "1.0.0", "first-author", &first_key);
+    let second = prepare_pack("total-quota-two", "1.0.0", "second-author", &second_key);
+    let mut config = (*test_config()).clone();
+    config.max_total_bytes = first.targz.len() as u64;
+    let config = Arc::new(config);
+
+    let response = post_publish(
+        make_state_with_config(catalog.clone(), objects.clone(), config.clone()),
+        &first.targz,
+        &first.signature,
+        "first-author",
+        Some(&first_key),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = post_publish(
+        make_state_with_config(catalog, objects.clone(), config),
+        &second.targz,
+        &second.signature,
+        "second-author",
+        Some(&second_key),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(objects.blobs.read().unwrap().len(), 1);
 }
 
 // ---------------------------------------------------------------------------

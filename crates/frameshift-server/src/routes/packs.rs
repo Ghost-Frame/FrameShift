@@ -477,6 +477,11 @@ pub async fn publish_pack(
     // holds. The canonical pack hash (independent of archive encoding) is
     // recorded as `pack_hash` in the response.
     let content_hash = ObjectHash::of(&pack_archive);
+    let object_existed = state
+        .objects
+        .exists(&content_hash)
+        .await
+        .map_err(|e| AppError::Internal(format!("object store exists check failed: {e}")))?;
     if let Err(e) = state.objects.put(&content_hash, &pack_archive).await {
         return Err(map_object_put_error(e));
     }
@@ -508,21 +513,57 @@ pub async fn publish_pack(
         size_bytes: pack_archive.len() as u64,
     };
 
-    // We deliberately do NOT roll back the object store on a catalog conflict.
-    // The store is content-addressed so a re-put of the same bytes is a no-op,
-    // and orphan blobs are reclaimable by a separate GC sweep. At-least-once
-    // semantics are acceptable here.
     let quota = frameshift_catalog::PublishQuota {
         max_versions: (state.config.max_versions_per_author != 0)
             .then_some(state.config.max_versions_per_author),
         max_bytes: (state.config.max_bytes_per_author != 0)
             .then_some(state.config.max_bytes_per_author),
+        max_total_bytes: (state.config.max_total_bytes != 0)
+            .then_some(state.config.max_total_bytes),
     };
     if let Err(e) = state
         .catalog
         .register_pack_version_with_quota(version_record, quota)
         .await
     {
+        // Deterministic policy rejections must not consume object-store space.
+        // Before deleting, search by content hash because an identical
+        // concurrent publish may have committed after our duplicate precheck.
+        // Catalog read failures retain the object: leaking space is safer than
+        // deleting a blob that may back a committed version.
+        if !object_existed
+            && matches!(
+                &e,
+                CatalogError::Validation(_) | CatalogError::Unauthorized { .. }
+            )
+        {
+            let referenced = match state
+                .catalog
+                .get_active_pack_version_by_hash(&content_hash)
+                .await
+            {
+                Ok(_) => true,
+                Err(CatalogError::NotFound { .. }) => false,
+                Err(read_error) => {
+                    tracing::error!(
+                        pack = %manifest.name,
+                        version = %manifest.version,
+                        error = %read_error,
+                        "retaining rejected publication object after catalog read failure"
+                    );
+                    true
+                }
+            };
+            if !referenced {
+                if let Err(delete_error) = state.objects.delete(&content_hash).await {
+                    tracing::error!(
+                        hash = %content_hash,
+                        error = %delete_error,
+                        "failed to reclaim object after rejected publication"
+                    );
+                }
+            }
+        }
         return Err(AppError::from_catalog(e, "pack_version"));
     }
 

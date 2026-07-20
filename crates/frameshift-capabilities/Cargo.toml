@@ -10,3 +10,6 @@ license.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 frameshift-pack = { path = "../frameshift-pack" }
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -952,6 +952,7 @@ async fn security_publish_quota_is_transactional_under_concurrency() {
     let quota = PublishQuota {
         max_versions: Some(1),
         max_bytes: Some(2048),
+        max_total_bytes: None,
     };
     let first_version = make_version("quota-race-a", "1.0.0", 73, 73);
     let second_version = make_version("quota-race-b", "1.0.0", 73, 74);

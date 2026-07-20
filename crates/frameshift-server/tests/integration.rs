@@ -73,6 +73,7 @@ fn test_config() -> Arc<ServerConfig> {
         publisher_pubkeys: vec!["*".to_string()],
         max_versions_per_author: 0,
         max_bytes_per_author: 0,
+        max_total_bytes: 0,
         object_store_backend: "fs".to_string(),
         r2_endpoint: String::new(),
         r2_bucket: String::new(),
@@ -118,6 +119,46 @@ async fn oneshot_get(state: AppState, path: &str) -> axum::http::Response<axum::
         .body(axum::body::Body::empty())
         .unwrap();
     router.oneshot(request).await.unwrap()
+}
+
+/// Configured browser origins may preflight every signed-request header.
+#[tokio::test]
+async fn cors_preflight_allows_signed_request_headers() {
+    let mut config = (*test_config()).clone();
+    config.cors_allowed_origins = "https://app.frameshift.example".to_string();
+    let state = AppState {
+        config: Arc::new(config),
+        ..make_state(MockCatalog::new(), MockPackStore::new())
+    };
+    let request = Request::builder()
+        .method("OPTIONS")
+        .uri("/v1/authors")
+        .header("origin", "https://app.frameshift.example")
+        .header("access-control-request-method", "POST")
+        .header(
+            "access-control-request-headers",
+            "content-type,x-frameshift-pubkey,x-frameshift-timestamp,x-frameshift-nonce,x-frameshift-signature",
+        )
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let response = app(state).oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let allowed = response
+        .headers()
+        .get("access-control-allow-headers")
+        .expect("preflight must include allowed headers")
+        .to_str()
+        .unwrap()
+        .to_ascii_lowercase();
+    for required in [
+        "x-frameshift-pubkey",
+        "x-frameshift-timestamp",
+        "x-frameshift-nonce",
+        "x-frameshift-signature",
+    ] {
+        assert!(allowed.contains(required), "missing CORS header {required}");
+    }
 }
 
 /// Read the response body as a JSON `serde_json::Value`.
@@ -1001,6 +1042,7 @@ fn dl_state_with_rate(catalog: MockCatalog, objects: MockPackStore, rate: u32) -
         publisher_pubkeys: vec!["*".to_string()],
         max_versions_per_author: 0,
         max_bytes_per_author: 0,
+        max_total_bytes: 0,
         object_store_backend: "fs".to_string(),
         r2_endpoint: String::new(),
         r2_bucket: String::new(),

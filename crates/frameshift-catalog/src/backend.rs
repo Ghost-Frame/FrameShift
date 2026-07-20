@@ -22,6 +22,8 @@ pub struct PublishQuota {
     pub max_versions: Option<u64>,
     /// Maximum cumulative archive bytes an author may retain.
     pub max_bytes: Option<u64>,
+    /// Maximum cumulative archive bytes retained across all authors.
+    pub max_total_bytes: Option<u64>,
 }
 
 /// Constructors for publisher quota policies.
@@ -31,6 +33,7 @@ impl PublishQuota {
         Self {
             max_versions: None,
             max_bytes: None,
+            max_total_bytes: None,
         }
     }
 }

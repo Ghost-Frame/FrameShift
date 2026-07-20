@@ -190,6 +190,9 @@ pub struct ServerConfig {
     /// Maximum retained archive bytes per author; `0` disables this limit.
     pub max_bytes_per_author: u64,
 
+    /// Maximum retained archive bytes across the registry; `0` disables this limit.
+    pub max_total_bytes: u64,
+
     /// Selected object store backend: `"fs"` (default) or `"r2"`.
     ///
     /// `main.rs` reads this to choose between [`frameshift_objects_fs`] and
@@ -234,7 +237,7 @@ pub struct ServerConfig {
     /// `now` (in either direction) are rejected with `401`. This bounds the
     /// replay window: a captured signed request can only be re-sent for at
     /// most `2 * signed_request_max_skew` before the nonce can be safely
-    /// forgotten. Applies to publish, author registration, and key rotation.
+    /// forgotten. Applies to publish and author registration.
     /// Default: 300 seconds (5 minutes).
     pub signed_request_max_skew: Duration,
 
@@ -361,6 +364,7 @@ impl std::fmt::Debug for ServerConfig {
             )
             .field("max_versions_per_author", &self.max_versions_per_author)
             .field("max_bytes_per_author", &self.max_bytes_per_author)
+            .field("max_total_bytes", &self.max_total_bytes)
             .field("object_store_backend", &self.object_store_backend)
             .field("r2_endpoint", &self.r2_endpoint)
             .field("r2_bucket", &self.r2_bucket)
@@ -448,6 +452,9 @@ struct RawConfig {
     /// Maximum retained archive bytes per author.
     max_bytes_per_author: u64,
 
+    /// Maximum retained archive bytes across the registry.
+    max_total_bytes: u64,
+
     /// Object store backend selector (`fs` | `r2`).
     object_store_backend: String,
     /// R2 endpoint URL.
@@ -528,6 +535,7 @@ impl RawConfig {
             publisher_pubkeys: split_comma_list(&self.publisher_pubkeys),
             max_versions_per_author: self.max_versions_per_author,
             max_bytes_per_author: self.max_bytes_per_author,
+            max_total_bytes: self.max_total_bytes,
             object_store_backend: self.object_store_backend,
             r2_endpoint: self.r2_endpoint,
             r2_bucket: self.r2_bucket,
@@ -571,6 +579,7 @@ fn default_raw_config() -> RawConfig {
         publisher_pubkeys: String::new(),
         max_versions_per_author: 100,
         max_bytes_per_author: 1024 * 1024 * 1024,
+        max_total_bytes: 100 * 1024 * 1024 * 1024,
         object_store_backend: "fs".to_string(),
         r2_endpoint: String::new(),
         r2_bucket: String::new(),
@@ -651,6 +660,7 @@ mod tests {
             publisher_pubkeys: vec!["*".to_string()],
             max_versions_per_author: 0,
             max_bytes_per_author: 0,
+            max_total_bytes: 0,
             object_store_backend: "fs".to_string(),
             r2_endpoint: String::new(),
             r2_bucket: String::new(),
@@ -697,6 +707,7 @@ mod tests {
             publisher_pubkeys: vec!["*".to_string()],
             max_versions_per_author: 0,
             max_bytes_per_author: 0,
+            max_total_bytes: 0,
             object_store_backend: "fs".to_string(),
             r2_endpoint: String::new(),
             r2_bucket: String::new(),
@@ -739,6 +750,7 @@ mod tests {
             publisher_pubkeys: vec!["*".to_string()],
             max_versions_per_author: 0,
             max_bytes_per_author: 0,
+            max_total_bytes: 0,
             object_store_backend: "fs".to_string(),
             r2_endpoint: String::new(),
             r2_bucket: String::new(),
@@ -811,6 +823,7 @@ mod tests {
             publisher_pubkeys: vec!["*".to_string()],
             max_versions_per_author: 0,
             max_bytes_per_author: 0,
+            max_total_bytes: 0,
             object_store_backend: "fs".to_string(),
             r2_endpoint: String::new(),
             r2_bucket: String::new(),

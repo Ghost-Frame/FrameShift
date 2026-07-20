@@ -1,3 +1,5 @@
+//! Filters runtime tools against capabilities declared by a persona pack.
+
 use std::collections::BTreeSet;
 
 use frameshift_pack::CapabilityManifest;
@@ -7,8 +9,9 @@ use serde::{Deserialize, Serialize};
 /// capability names it requires the persona to have declared in order to be exposed.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Tool {
+    /// Runtime-advertised tool name.
     pub name: String,
-    #[serde(default)]
+    /// Capabilities that must all be declared before the tool is exposed.
     pub required_capabilities: Vec<String>,
 }
 
@@ -16,9 +19,11 @@ pub struct Tool {
 /// are all present in the persona's declared manifest.
 #[derive(Debug, Clone)]
 pub struct CapabilityFilter {
+    /// Canonical capability names declared by the active persona.
     declared: BTreeSet<String>,
 }
 
+/// Construction, inspection, and filtering operations for capability policy.
 impl CapabilityFilter {
     /// Build a filter from a pack capability manifest.
     ///
@@ -62,9 +67,11 @@ impl CapabilityFilter {
 }
 
 #[cfg(test)]
+/// Regression tests for restrictive capability filtering and deserialization.
 mod tests {
     use super::*;
 
+    /// Tools requiring any undeclared capability are excluded.
     #[test]
     fn filter_drops_tools_requiring_undeclared_capabilities() {
         let filter = CapabilityFilter::from_declared(["Read", "Edit"]);
@@ -87,6 +94,7 @@ mod tests {
         assert_eq!(names, vec!["Read", "Edit"]);
     }
 
+    /// Explicitly unrestricted tools remain usable with an empty declaration set.
     #[test]
     fn tool_with_no_required_capabilities_is_always_allowed() {
         let filter = CapabilityFilter::from_declared::<[&str; 0], _>([]);
@@ -95,5 +103,12 @@ mod tests {
             required_capabilities: vec![],
         };
         assert!(filter.allows(&tool));
+    }
+
+    /// Missing capability metadata is rejected instead of becoming unrestricted.
+    #[test]
+    fn tool_deserialization_requires_capability_metadata() {
+        let error = serde_json::from_str::<Tool>(r#"{"name":"Bash"}"#).unwrap_err();
+        assert!(error.to_string().contains("required_capabilities"));
     }
 }

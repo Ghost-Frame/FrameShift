@@ -25,9 +25,8 @@
 //! Currently shipped:
 //! - READ endpoints for `/v1/packs*`, `/v1/authors/*`, `/v1/handles/*`.
 //! - WRITE endpoints gated by Ed25519 *signed-request* authentication (see
-//!   [`crate::auth`]): `POST /v1/packs` (publish), `POST /v1/authors`
-//!   (handle registration), and `POST /v1/authors/{handle}/rotate` (key
-//!   rotation). Every mutating request carries an Ed25519 signature over
+//!   [`crate::auth`]): `POST /v1/packs` (publish) and `POST /v1/authors`
+//!   (handle registration). Every mutating request carries an Ed25519 signature over
 //!   `method | path | sha256(body) | timestamp | nonce`, with timestamp-skew
 //!   and nonce-replay protection. Publish additionally verifies the pack's own
 //!   content signature against the handle's currently-registered key.
