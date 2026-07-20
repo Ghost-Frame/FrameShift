@@ -75,15 +75,15 @@ pub fn run_automate(client: &Client, args: AutomateArgs) -> Result<(), CliError>
             let mode_state =
                 ModeState::load(&mode_path).map_err(|e| CliError::Orchestrator(e.to_string()))?;
 
-            // Read the active persona name if present.
-            let paths = client.project_paths(&project_root)?;
-            let active = if paths.active_path.exists() {
-                std::fs::read_to_string(&paths.active_path)
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string()
-            } else {
-                String::from("(none)")
+            // Failure-aware active persona: mark a persona whose marker
+            // survived a failed sync so status never claims a healthy active
+            // persona that has no materialized content.
+            let active = match client.active_persona_state(&project_root) {
+                Ok(frameshift_client::ActivePersonaState::Materialized(name)) => name,
+                Ok(frameshift_client::ActivePersonaState::Unmaterialized(name)) => {
+                    format!("{name} (not materialized -- run `frameshift sync`)")
+                }
+                Ok(frameshift_client::ActivePersonaState::None) | Err(_) => String::from("(none)"),
             };
 
             // Check lock marker.

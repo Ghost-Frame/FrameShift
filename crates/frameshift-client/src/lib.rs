@@ -20,9 +20,9 @@ pub use frameshift_conformance::CrossVersionDecision;
 /// in a provider function's signature.
 pub use frameshift_vault::{VaultData, VaultError};
 pub use model::{
-    ClientOptions, GcReport, InstallReport, InstallRequest, InstallSource, LockedPersona, Lockfile,
-    MaterializeFailure, MemoryConfig, MemoryRequirementStatus, PersonaSpec, ProjectConfig,
-    ProjectPaths, SyncReport, SCHEMA_VERSION,
+    ActivePersonaState, ClientOptions, GcReport, InstallReport, InstallRequest, InstallSource,
+    LockedPersona, Lockfile, MaterializeFailure, MemoryConfig, MemoryRequirementStatus,
+    PersonaSpec, ProjectConfig, ProjectPaths, SyncReport, SCHEMA_VERSION,
 };
 pub use publish::PublishOutcome;
 pub use registry::{RegistryPackSummary, RegistrySearchQuery, RegistrySearchResult};
@@ -636,6 +636,44 @@ impl Client {
                 path: paths.active_path,
                 source,
             }),
+        }
+    }
+
+    /// Resolve the active persona marker together with whether its content is
+    /// actually materialized on disk, without re-syncing.
+    ///
+    /// The `active` marker outlives a failed materialization (it is only
+    /// cleared when the persona leaves the lockfile), so callers that go on
+    /// to read the persona's `source/` or `rendered/` content must not trust
+    /// the marker alone: a persona whose last sync failed had its half-built
+    /// directory cleaned and reads as [`ActivePersonaState::Unmaterialized`].
+    /// Surfacing that state lets consumers produce an actionable message
+    /// (re-sync / reinstall) instead of a raw missing-file error.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Io`] on an unreadable marker, or the
+    /// `validate_persona_name` error if the marker contains an invalid name
+    /// (never joined into a path in that case).
+    pub fn active_persona_state(
+        &self,
+        project_root: &Path,
+    ) -> Result<ActivePersonaState, ClientError> {
+        let Some(name) = self.active_persona(project_root)? else {
+            return Ok(ActivePersonaState::None);
+        };
+        validate_persona_name(&name)?;
+
+        let paths = self.project_paths(project_root)?;
+        let manifest = paths
+            .personas_dir
+            .join(&name)
+            .join("source")
+            .join("pack.toml");
+        if manifest.is_file() {
+            Ok(ActivePersonaState::Materialized(name))
+        } else {
+            Ok(ActivePersonaState::Unmaterialized(name))
         }
     }
 

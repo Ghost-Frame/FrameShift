@@ -275,15 +275,22 @@ fn load_capability_manifest(
 
     let name = match persona {
         Some(p) => p.to_string(),
-        None => {
-            if !paths.active_path.exists() {
+        // Marker path goes through the failure-aware resolver so a persona
+        // whose last sync failed produces an actionable message instead of a
+        // raw missing-pack.toml IO error below.
+        None => match client.active_persona_state(project_root) {
+            Ok(frameshift_client::ActivePersonaState::Materialized(name)) => name,
+            Ok(frameshift_client::ActivePersonaState::Unmaterialized(name)) => {
+                return Err(format!(
+                    "active persona '{name}' is not materialized (its last sync failed); \
+                     run `frameshift sync` to see why, then reinstall or activate another persona"
+                ));
+            }
+            Ok(frameshift_client::ActivePersonaState::None) => {
                 return Err("no active persona and no persona specified".to_string());
             }
-            std::fs::read_to_string(&paths.active_path)
-                .map_err(|e| format!("failed to read active persona marker: {}", e))?
-                .trim()
-                .to_string()
-        }
+            Err(e) => return Err(format!("failed to resolve active persona: {e}")),
+        },
     };
 
     if let Err(e) = frameshift_client::validate_persona_name(&name) {

@@ -303,6 +303,21 @@ pub struct GcReport {
     pub removed_hashes: Vec<String>,
 }
 
+/// Result of [`crate::Client::active_persona_state`]: the active marker
+/// cross-checked against whether the persona's content is actually on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActivePersonaState {
+    /// No active marker (or an empty one).
+    None,
+    /// The marker names a persona whose `source/pack.toml` is materialized.
+    Materialized(String),
+    /// The marker names a persona whose materialized content is absent --
+    /// typically because its last sync failed and the half-built directory
+    /// was cleaned. Reading its source or rendered output will fail; the
+    /// actionable remedies are a re-sync or a reinstall.
+    Unmaterialized(String),
+}
+
 const fn default_schema_version() -> u32 {
     SCHEMA_VERSION
 }
