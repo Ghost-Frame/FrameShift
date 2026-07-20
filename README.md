@@ -8,6 +8,8 @@ A persona engine for AI coding agents. Install behavioral identities as versione
 
 **Status:** The CLI, pack system, orchestrator, watch daemon, marketplace server, and web frontend all work. You can clone this repo and use the personas today via the CLI, or publish and browse packs against the live marketplace.
 
+**Marketplace:** [frameshift.syntheos.dev](https://frameshift.syntheos.dev/) -- browse, search, and install published persona packs; the same registry the CLI talks to.
+
 **Desktop app:** [download.frameshift.syntheos.dev](https://download.frameshift.syntheos.dev/) -- a proprietary companion app for browsing the marketplace and managing personas with one click. This repo is the engine it drives; the app ships separately with Ed25519-signed self-updates.
 
 Personas are not instruction lists. They are complete behavioral frames -- identity, rules, skills, operating posture -- that survive long sessions, surprising inputs, and the slow drift that turns careful agents into sloppy ones around turn 200. Same model, different frame.
