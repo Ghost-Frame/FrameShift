@@ -104,31 +104,34 @@ fn call_active_persona(
 ) -> Result<PromptResult, String> {
     let project_root = get_required_path(arguments, "project_root")?;
 
-    let paths = client
-        .project_paths(&project_root)
-        .map_err(|e| format!("could not resolve project paths: {e}"))?;
-
-    if !paths.active_path.exists() {
-        return Ok(text_message_result(
-            None,
-            "No Frameshift persona is active for this project. \
-             Invoke the `select_persona` prompt to choose one, then activate \
-             it via the `frameshift_use` tool."
-                .to_string(),
-        ));
-    }
-
-    let active_name = std::fs::read_to_string(&paths.active_path)
-        .map_err(|e| format!("could not read active marker: {e}"))?
-        .trim()
-        .to_string();
-
-    if active_name.is_empty() {
-        return Ok(text_message_result(
-            None,
-            "No Frameshift persona is active for this project.".to_string(),
-        ));
-    }
+    // Failure-aware resolution: a persona can be active-by-marker while its
+    // materialized content is gone (its last sync failed and the half-built
+    // dir was cleaned). Surface that as guidance, not a raw render error.
+    let active_name = match client
+        .active_persona_state(&project_root)
+        .map_err(|e| format!("could not resolve active persona: {e}"))?
+    {
+        frameshift_client::ActivePersonaState::Materialized(name) => name,
+        frameshift_client::ActivePersonaState::Unmaterialized(name) => {
+            return Ok(text_message_result(
+                None,
+                format!(
+                    "The active Frameshift persona '{name}' is not materialized: its last \
+                     sync failed. Run `frameshift sync` to see why, then reinstall it or \
+                     activate another persona via the `frameshift_use` tool."
+                ),
+            ));
+        }
+        frameshift_client::ActivePersonaState::None => {
+            return Ok(text_message_result(
+                None,
+                "No Frameshift persona is active for this project. \
+                 Invoke the `select_persona` prompt to choose one, then activate \
+                 it via the `frameshift_use` tool."
+                    .to_string(),
+            ));
+        }
+    };
 
     let rendered = client
         .rendered_persona(&project_root, &active_name, "claude")

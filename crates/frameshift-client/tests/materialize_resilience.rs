@@ -327,6 +327,48 @@ fn sync_reports_all_personas_failing() {
     assert_eq!(failed, vec!["alpha", "beta"]);
 }
 
+/// `active_persona_state` distinguishes a healthy active persona from one
+/// whose materialization failed after activation (marker still set, dir
+/// cleaned), without requiring a re-sync.
+#[test]
+fn active_persona_state_reports_materialization() {
+    use frameshift_client::ActivePersonaState;
+
+    let temp = TempDir::new().expect("tempdir");
+    let (client, project_root) = project_with_broken_beta(&temp);
+
+    // No marker yet.
+    assert!(matches!(
+        client.active_persona_state(&project_root).expect("state"),
+        ActivePersonaState::None
+    ));
+
+    // Healthy persona activates and reads back as materialized.
+    client.activate(&project_root, "alpha").expect("activate");
+    assert!(matches!(
+        client.active_persona_state(&project_root).expect("state"),
+        ActivePersonaState::Materialized(ref name) if name == "alpha"
+    ));
+
+    // Re-point the marker at beta by hand (activation would refuse), then
+    // sync so beta's broken cache cleans its materialized dir: the marker
+    // survives (beta is still locked) but the content is gone.
+    let project_id = client.project_id(&project_root).expect("project id");
+    fs::write(
+        temp.path()
+            .join("data-root/projects")
+            .join(&project_id)
+            .join("active"),
+        "beta",
+    )
+    .expect("write marker");
+    client.sync(&project_root).expect("sync");
+    assert!(matches!(
+        client.active_persona_state(&project_root).expect("state"),
+        ActivePersonaState::Unmaterialized(ref name) if name == "beta"
+    ));
+}
+
 /// The exact pack.toml shape written by pre-hardening local installs
 /// (author_pubkey = "local-unsigned") still installs and renders.
 #[test]
