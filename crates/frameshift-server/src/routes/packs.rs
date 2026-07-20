@@ -84,6 +84,9 @@ pub struct PublishResponse {
 /// malicious gzip bomb cannot exhaust the temp directory.
 const MAX_DECOMPRESSED_BYTES: u64 = 16 * 1024 * 1024;
 
+/// Maximum number of filesystem entries accepted from one uploaded archive.
+const MAX_ARCHIVE_ENTRIES: usize = 256;
+
 /// Multipart fields collected from a publish upload.
 ///
 /// All three are required; missing any of them produces `400 Bad Request`.
@@ -157,6 +160,7 @@ struct LimitedReader<R> {
     read: u64,
 }
 
+/// Construction helpers for [`LimitedReader`].
 impl<R: std::io::Read> LimitedReader<R> {
     /// Wrap `inner`, allowing at most `limit` total bytes to be read.
     fn new(inner: R, limit: u64) -> Self {
@@ -168,6 +172,7 @@ impl<R: std::io::Read> LimitedReader<R> {
     }
 }
 
+/// Enforces the decompressed-byte ceiling while forwarding reads.
 impl<R: std::io::Read> std::io::Read for LimitedReader<R> {
     /// Read into `buf`, returning an error once the cumulative byte count would
     /// exceed `limit`.
@@ -185,7 +190,7 @@ impl<R: std::io::Read> std::io::Read for LimitedReader<R> {
 }
 
 /// Extract a `.tar.gz` archive into `dir`, enforcing
-/// [`MAX_DECOMPRESSED_BYTES`] across all entries.
+/// [`MAX_DECOMPRESSED_BYTES`] and [`MAX_ARCHIVE_ENTRIES`] across all entries.
 ///
 /// Uses synchronous tar/flate2 inside `tokio::task::spawn_blocking` so the
 /// async runtime stays responsive on large uploads.
@@ -207,7 +212,12 @@ async fn extract_targz(archive_bytes: Vec<u8>, dir: std::path::PathBuf) -> Resul
             tracing::warn!(error = %e, "failed to read tar entries");
             AppError::BadRequest("invalid archive: unreadable tar entries".to_string())
         })?;
-        for entry in entries {
+        for (index, entry) in entries.enumerate() {
+            if index >= MAX_ARCHIVE_ENTRIES {
+                return Err(AppError::BadRequest(
+                    "pack archive contains too many entries".to_string(),
+                ));
+            }
             let mut entry = entry.map_err(|e| {
                 tracing::warn!(error = %e, "failed to read tar entry");
                 AppError::BadRequest("invalid archive: unreadable tar entry".to_string())
@@ -319,6 +329,12 @@ pub async fn publish_pack(
     Extension(signer): Extension<VerifiedSigner>,
     multipart: Multipart,
 ) -> Result<Response, AppError> {
+    if state.config.publisher_pubkeys.is_empty() {
+        return Err(AppError::NotFound("pack publishing disabled".to_string()));
+    }
+    if !state.config.publisher_allowed(&signer.pubkey) {
+        return Err(AppError::Forbidden("publisher is not admitted".to_string()));
+    }
     let fields = collect_multipart(multipart).await?;
 
     let pack_archive = fields
@@ -423,6 +439,15 @@ pub async fn publish_pack(
                 .to_string(),
         ));
     }
+    if manifest.author_pubkey != hex::encode(pubkey.0) {
+        tracing::warn!(
+            handle = %author_handle,
+            "manifest author key does not match registered author key"
+        );
+        return Err(AppError::BadRequest(
+            "manifest author_pubkey does not match the registered author".to_string(),
+        ));
+    }
 
     let canonical_hex = pack.canonical_hash_hex();
 
@@ -487,7 +512,17 @@ pub async fn publish_pack(
     // The store is content-addressed so a re-put of the same bytes is a no-op,
     // and orphan blobs are reclaimable by a separate GC sweep. At-least-once
     // semantics are acceptable here.
-    if let Err(e) = state.catalog.register_pack_version(version_record).await {
+    let quota = frameshift_catalog::PublishQuota {
+        max_versions: (state.config.max_versions_per_author != 0)
+            .then_some(state.config.max_versions_per_author),
+        max_bytes: (state.config.max_bytes_per_author != 0)
+            .then_some(state.config.max_bytes_per_author),
+    };
+    if let Err(e) = state
+        .catalog
+        .register_pack_version_with_quota(version_record, quota)
+        .await
+    {
         return Err(AppError::from_catalog(e, "pack_version"));
     }
 

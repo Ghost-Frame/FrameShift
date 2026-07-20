@@ -20,7 +20,8 @@ use ed25519_dalek::VerifyingKey;
 use flate2::read::GzDecoder;
 use frameshift_pack::{ObjectHash, Pack};
 use serde::Deserialize;
-use std::io::Read as _;
+use std::fs::OpenOptions;
+use std::io::{Read as _, Write as _};
 use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -48,6 +49,9 @@ const DEFAULT_REGISTRY_URL: &str = "https://frameshift-api.syntheos.dev";
 /// to the cache. This is a decompression-bomb guard analogous to the server-side limit.
 const MAX_DECOMPRESSED_BYTES: u64 = 16 * 1024 * 1024;
 
+/// Maximum number of filesystem entries accepted from one registry archive.
+const MAX_ARCHIVE_ENTRIES: usize = 256;
+
 /// Maximum number of compressed (wire) bytes we will read from an HTTP registry response.
 ///
 /// Applied via [`LimitedReader`] around the raw HTTP response body *before* `read_to_end`
@@ -55,6 +59,15 @@ const MAX_DECOMPRESSED_BYTES: u64 = 16 * 1024 * 1024;
 /// A valid `.tar.gz` archive cannot expand beyond [`MAX_DECOMPRESSED_BYTES`] of useful
 /// content, so the same cap is a safe upper bound on the compressed wire size as well.
 const MAX_ARCHIVE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Maximum accepted JSON response body for small registry control responses.
+const MAX_JSON_RESPONSE_BYTES: u64 = 1024 * 1024;
+
+/// Maximum accepted error response text retained for diagnostics.
+const MAX_ERROR_RESPONSE_BYTES: u64 = 64 * 1024;
+
+/// Maximum size of one author key pin file.
+const MAX_TRUST_PIN_BYTES: u64 = 1024;
 
 /// Minimal JSON shape returned by `GET /v1/packs/{name}/versions/{version}`.
 ///
@@ -353,12 +366,146 @@ pub fn fetch_and_install(
         .map_err(|_| ClientError::SignatureVerification)?;
     debug!("pack signature verified against registry pubkey");
 
+    // Cryptographic validity is not enough when the registry supplies both
+    // the signature and key. Pin the first verified key and reject later
+    // substitutions for the same registry and author.
+    check_or_create_author_pin(
+        paths,
+        &base,
+        &pack.manifest().author_handle,
+        &record.author_pubkey.0,
+    )?;
+
     // Step 8: cache the extracted pack directory.
     let canonical_hash = pack.canonical_hash_hex();
     let cache_path = paths.cache_dir.join(&canonical_hash);
     crate::ensure_cached_pack(&pack_root, &cache_path)?;
 
     Ok(crate::locked_persona_from_pack(&pack))
+}
+
+/// Verify or atomically establish an author key continuity pin.
+fn check_or_create_author_pin(
+    paths: &ProjectPaths,
+    registry: &str,
+    author: &str,
+    pubkey: &[u8; 32],
+) -> Result<(), ClientError> {
+    let data_root = paths.cache_dir.parent().unwrap_or(&paths.cache_dir);
+    let namespace = ObjectHash::of(format!("{registry}\0{author}").as_bytes()).to_hex();
+    let pin_dir = data_root.join("trust").join("registry-authors");
+    std::fs::create_dir_all(&pin_dir).map_err(|source| ClientError::Io {
+        path: pin_dir.clone(),
+        source,
+    })?;
+    set_private_dir_permissions(&pin_dir)?;
+
+    let pin_path = pin_dir.join(format!("{namespace}.pin"));
+    let presented = hex::encode(pubkey);
+    let contents = format!("frameshift-author-key-v1\n{registry}\n{author}\n{presented}\n");
+
+    match create_private_file(&pin_path) {
+        Ok(mut file) => file
+            .write_all(contents.as_bytes())
+            .map_err(|source| ClientError::Io {
+                path: pin_path,
+                source,
+            }),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            verify_author_pin(&pin_path, registry, author, &presented)
+        }
+        Err(source) => Err(ClientError::Io {
+            path: pin_path,
+            source,
+        }),
+    }
+}
+
+/// Compare an existing bounded pin file with the newly presented key.
+fn verify_author_pin(
+    pin_path: &Path,
+    registry: &str,
+    author: &str,
+    presented: &str,
+) -> Result<(), ClientError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(pin_path).map_err(|source| ClientError::Io {
+        path: pin_path.to_path_buf(),
+        source,
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|source| ClientError::Io {
+                path: pin_path.to_path_buf(),
+                source,
+            })?;
+    }
+    let mut raw = String::new();
+    LimitedReader::new(file, MAX_TRUST_PIN_BYTES)
+        .read_to_string(&mut raw)
+        .map_err(|source| ClientError::Io {
+            path: pin_path.to_path_buf(),
+            source,
+        })?;
+    let mut lines = raw.lines();
+    let valid_header = lines.next() == Some("frameshift-author-key-v1");
+    let stored_registry = lines.next();
+    let stored_author = lines.next();
+    let stored_key = lines.next();
+    if !valid_header || stored_registry != Some(registry) || stored_author != Some(author) {
+        return Err(ClientError::Io {
+            path: pin_path.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "registry author trust pin is malformed",
+            ),
+        });
+    }
+    let expected = stored_key.unwrap_or_default();
+    if expected != presented {
+        return Err(ClientError::RegistryAuthorKeyChanged {
+            registry: registry.to_string(),
+            author: author.to_string(),
+            expected: expected.to_string(),
+            actual: presented.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Open a new private file without following an existing path.
+fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+/// Restrict a trust directory to its owner on Unix.
+fn set_private_dir_permissions(path: &Path) -> Result<(), ClientError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(
+            |source| ClientError::Io {
+                path: path.to_path_buf(),
+                source,
+            },
+        )?;
+    }
+    Ok(())
 }
 
 /// Perform a GET request and deserialize the response body as JSON.
@@ -424,11 +571,47 @@ fn ureq_get_bytes(url: &str) -> Result<Vec<u8>, ClientError> {
     Ok(bytes)
 }
 
+/// Deserialize a bounded registry response body as JSON.
+pub(crate) fn response_json_bounded<T: serde::de::DeserializeOwned>(
+    response: ureq::Response,
+    url: &str,
+) -> Result<T, ClientError> {
+    let bytes = response_bytes_bounded(response, url, MAX_JSON_RESPONSE_BYTES)?;
+    serde_json::from_slice(&bytes).map_err(|error| ClientError::RegistryHttp {
+        url: url.to_string(),
+        detail: format!("failed to deserialize response JSON: {error}"),
+    })
+}
+
+/// Read a bounded registry error body as UTF-8 text.
+pub(crate) fn response_text_bounded(response: ureq::Response, url: &str) -> String {
+    response_bytes_bounded(response, url, MAX_ERROR_RESPONSE_BYTES)
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_else(|_| "<unreadable or oversized response body>".to_string())
+}
+
+/// Read at most `limit` bytes from a registry response.
+fn response_bytes_bounded(
+    response: ureq::Response,
+    url: &str,
+    limit: u64,
+) -> Result<Vec<u8>, ClientError> {
+    let mut bytes = Vec::new();
+    LimitedReader::new(response.into_reader(), limit)
+        .read_to_end(&mut bytes)
+        .map_err(|source| ClientError::Io {
+            path: std::path::PathBuf::from(url),
+            source,
+        })?;
+    Ok(bytes)
+}
+
 /// Extract a `.tar.gz` archive into `dir`.
 ///
 /// Enforces the following security constraints (mirroring the server-side extractor):
 ///
 /// - Decompressed total byte count is capped at [`MAX_DECOMPRESSED_BYTES`] (bomb guard).
+/// - Filesystem entry count is capped at [`MAX_ARCHIVE_ENTRIES`] (inode/IO guard).
 /// - Entries with absolute paths are rejected.
 /// - Entries with `..` path components are rejected.
 /// - Non-regular-file / non-directory entries (symlinks, device nodes, etc.) are rejected.
@@ -444,7 +627,16 @@ fn extract_targz(archive_bytes: &[u8], dir: &Path) -> Result<(), ClientError> {
         source: err,
     })?;
 
-    for entry in entries {
+    for (index, entry) in entries.enumerate() {
+        if index >= MAX_ARCHIVE_ENTRIES {
+            return Err(ClientError::Io {
+                path: dir.to_path_buf(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "pack archive contains too many entries",
+                ),
+            });
+        }
         let mut entry = entry.map_err(|err| ClientError::Io {
             path: dir.to_path_buf(),
             source: err,
@@ -547,6 +739,7 @@ struct LimitedReader<R> {
     read: u64,
 }
 
+/// Construction helpers for [`LimitedReader`].
 impl<R: std::io::Read> LimitedReader<R> {
     /// Wrap `inner`, allowing at most `limit` total bytes before returning an error.
     fn new(inner: R, limit: u64) -> Self {
@@ -558,6 +751,7 @@ impl<R: std::io::Read> LimitedReader<R> {
     }
 }
 
+/// Enforces the response-byte ceiling while forwarding reads.
 impl<R: std::io::Read> std::io::Read for LimitedReader<R> {
     /// Read into `buf`, returning `InvalidData` once the cumulative byte count
     /// exceeds `limit`.
@@ -575,10 +769,53 @@ impl<R: std::io::Read> std::io::Read for LimitedReader<R> {
 }
 
 #[cfg(test)]
+/// Unit tests for bounded registry transport and archive extraction.
 mod tests {
     use super::*;
-    use std::io::{BufRead as _, Write as _};
+    use std::io::BufRead as _;
     use std::net::TcpListener;
+
+    /// Build project paths whose cache parent is an isolated data root.
+    fn trust_test_paths(root: &Path) -> ProjectPaths {
+        let project_state_dir = root.join("projects").join("test-project");
+        ProjectPaths {
+            project_root: root.join("worktree"),
+            project_id: "test-project".to_string(),
+            config_path: project_state_dir.join("config.toml"),
+            lock_path: project_state_dir.join("lock.toml"),
+            vault_path: project_state_dir.join("vault.age"),
+            cache_dir: root.join("cache"),
+            project_state_dir: project_state_dir.clone(),
+            active_path: project_state_dir.join("active"),
+            personas_dir: project_state_dir.join("personas"),
+        }
+    }
+
+    /// The first verified author key is pinned and an exact repeat is accepted.
+    #[test]
+    fn author_key_tofu_pin_accepts_continuity() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = trust_test_paths(temp.path());
+        let key = [7u8; 32];
+        check_or_create_author_pin(&paths, "https://registry.example", "alice", &key).unwrap();
+        check_or_create_author_pin(&paths, "https://registry.example", "alice", &key).unwrap();
+    }
+
+    /// A later registry response cannot silently substitute a new author key.
+    #[test]
+    fn author_key_tofu_pin_rejects_substitution() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = trust_test_paths(temp.path());
+        check_or_create_author_pin(&paths, "https://registry.example", "alice", &[7u8; 32])
+            .unwrap();
+        let error =
+            check_or_create_author_pin(&paths, "https://registry.example", "alice", &[8u8; 32])
+                .unwrap_err();
+        assert!(matches!(
+            error,
+            ClientError::RegistryAuthorKeyChanged { .. }
+        ));
+    }
 
     /// Build a real `frameshift_catalog::PackRecord` fixture for serde-pin tests.
     fn sample_pack_record(
@@ -955,6 +1192,31 @@ mod tests {
         );
     }
 
+    /// extract_targz rejects metadata-heavy archives before creating excessive entries.
+    #[test]
+    fn extract_targz_rejects_too_many_entries() {
+        let mut gz_buf = Vec::new();
+        {
+            let enc = flate2::write::GzEncoder::new(&mut gz_buf, flate2::Compression::default());
+            let mut builder = tar::Builder::new(enc);
+            for index in 0..=MAX_ARCHIVE_ENTRIES {
+                let mut header = tar::Header::new_gnu();
+                header.set_entry_type(tar::EntryType::Directory);
+                header.set_size(0);
+                header.set_mode(0o755);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, format!("entry-{index}"), std::io::empty())
+                    .unwrap();
+            }
+            builder.into_inner().unwrap().finish().unwrap();
+        }
+
+        let out = tempfile::tempdir().unwrap();
+        let result = extract_targz(&gz_buf, out.path());
+        assert!(matches!(result, Err(ClientError::Io { .. })));
+    }
+
     // ---- Test helpers ----
 
     /// Serializes all environment-variable mutation across tests. Cargo runs
@@ -976,6 +1238,7 @@ mod tests {
         _lock: std::sync::MutexGuard<'static, ()>,
     }
 
+    /// Serialized environment mutation helpers for registry tests.
     impl EnvGuard {
         /// Set `key` to `value`, remembering the original value for restoration.
         fn set(key: &'static str, value: &str) -> Self {
@@ -1006,6 +1269,7 @@ mod tests {
         }
     }
 
+    /// Restores environment variables when a guarded test completes.
     impl Drop for EnvGuard {
         /// Restore the environment variable to its original state.
         fn drop(&mut self) {

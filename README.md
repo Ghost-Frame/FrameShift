@@ -330,6 +330,11 @@ All variables are read with no prefix (e.g. `BIND_ADDR`, not `FRAMESHIFT_BIND_AD
 | `DOWNLOAD_TOKEN_TTL` | `300` | Default TTL (seconds) for newly minted download tokens |
 | `DOWNLOAD_MAX_TOKEN_TTL` | `1800` | Hard cap (seconds) on token TTL accepted by the verifier |
 | `DOWNLOAD_RATE_PER_MIN` | `10` | Per-IP rate limit on the mint endpoint (requests/minute); `0` disables |
+| `ABUSE_RATE_PER_MIN` | `60` | Per-IP rate limit on signed writes and telemetry (requests/minute); `0` disables |
+| `METRICS_BEARER_TOKEN` | empty | Bearer token required by `/metrics`; empty disables the endpoint |
+| `FRAMESHIFT_PUBLISHER_PUBKEYS` | empty | Comma-separated admitted Ed25519 keys; empty disables registration and publishing |
+| `MAX_VERSIONS_PER_AUTHOR` | `100` | Maximum retained versions per admitted author; `0` disables |
+| `MAX_BYTES_PER_AUTHOR` | `1073741824` | Maximum retained archive bytes per admitted author; `0` disables |
 | `OBJECT_STORE_BACKEND` | `fs` | `fs` (filesystem) or `r2` (S3-compatible / Cloudflare R2) |
 | `R2_ENDPOINT` | `""` | S3 endpoint URL for R2 (required when backend is `r2`) |
 | `R2_BUCKET` | `""` | Bucket name (required when backend is `r2`) |

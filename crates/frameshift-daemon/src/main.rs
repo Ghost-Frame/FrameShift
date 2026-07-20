@@ -51,9 +51,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("failed to initialize frameshift client"),
     );
 
-    // Determine the socket directory from XDG_RUNTIME_DIR (fallback: /tmp).
-    let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
-    let socket_dir = std::path::PathBuf::from(&runtime_dir).join("frameshift");
+    // Keep the fallback namespace disjoint between local users. XDG runtime
+    // directories are already per-user, while /tmp itself is shared.
+    let socket_dir = match std::env::var("XDG_RUNTIME_DIR") {
+        Ok(runtime_dir) if !runtime_dir.trim().is_empty() => {
+            std::path::PathBuf::from(runtime_dir).join("frameshift")
+        }
+        _ => std::env::temp_dir().join(format!("frameshift-{}", unsafe { libc::getuid() })),
+    };
     std::fs::create_dir_all(&socket_dir)?;
     // Restrict the socket directory to the owner (0700). Critical when
     // XDG_RUNTIME_DIR is unset and we fall back to the world-writable /tmp:

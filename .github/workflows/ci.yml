@@ -17,13 +17,9 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
-# Default token scope for every job. checks:write exists for rustsec/audit-check,
-# which posts its results as a check run on push events: without it, an audit
-# WARNING (e.g. a yanked transitive crate) on a push to main fails the job with
-# "Resource not accessible by integration" even when zero vulnerabilities exist.
+# Default token scope for jobs that only read and test repository content.
 permissions:
   contents: read
-  checks: write
 
 # Only keep the latest run per ref alive; cancel superseded runs to save minutes.
 concurrency:
@@ -37,9 +33,10 @@ jobs:
     name: Format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
         with:
+          toolchain: 1.86.0
           components: rustfmt
       - run: cargo fmt --all -- --check
 
@@ -50,14 +47,15 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
         with:
+          toolchain: 1.86.0
           components: clippy
       - name: Install libpq
         run: sudo apt-get update -q && sudo apt-get install -y libpq-dev
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
   # The embeddings feature is off by default. The workspace-wide jobs above DO
   # compile frameshift-embed-candle itself (it is a plain workspace member with
@@ -69,12 +67,14 @@ jobs:
     name: Check embeddings feature
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: 1.86.0
       - name: Install libpq
         run: sudo apt-get update -q && sudo apt-get install -y libpq-dev
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo check -p frameshift-cli -p frameshift-mcp -p frameshift-daemon --all-targets --features embeddings
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo check --locked -p frameshift-cli -p frameshift-mcp -p frameshift-daemon --all-targets --features embeddings
 
   # Unit and integration tests. The Postgres integration tests are gated behind
   # #[ignore = "requires Docker"], so plain `cargo test --workspace` skips them
@@ -83,12 +83,14 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: 1.86.0
       - name: Install libpq
         run: sudo apt-get update -q && sudo apt-get install -y libpq-dev
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo test --locked --workspace
 
   # The Docker-gated Postgres integration tests. testcontainers starts its own
   # postgres container against the runner's Docker daemon (no service block or
@@ -98,12 +100,14 @@ jobs:
     name: Test (Postgres integration)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: 1.86.0
       - name: Install libpq
         run: sudo apt-get update -q && sudo apt-get install -y libpq-dev
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p frameshift-catalog-postgres -- --include-ignored
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo test --locked -p frameshift-catalog-postgres -- --include-ignored
 
   # Supply-chain advisory scan against the RustSec database. Now blocking: the
   # advisory backlog has been triaged and the vulnerable dependencies bumped, so
@@ -118,9 +122,9 @@ jobs:
   #   to the 0.11 BETA, unacceptable for the crate backing local vault
   #   encryption. Re-evaluate when age ships a stable 0.11.
   #
-  # - RUSTSEC-2024-0436 (proc-macro-error, unmaintained): a second advisory id
-  #   filed against the same build-time-only proc-macro-error crate as -0370,
-  #   same transitive path and same rationale. Drops together with -0370.
+  # - RUSTSEC-2024-0436 (paste, unmaintained): a compile-time macro dependency
+  #   with no runtime parser or network surface. Re-evaluate when upstream
+  #   crates remove it.
   #
   # - RUSTSEC-2026-0194 + RUSTSEC-2026-0195 (quick-xml < 0.41, DoS: quadratic
   #   duplicate-attribute check and unbounded namespace-declaration allocation):
@@ -136,9 +140,12 @@ jobs:
   audit:
     name: Security audit
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: rustsec/audit-check@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           ignore: RUSTSEC-2024-0370,RUSTSEC-2024-0436,RUSTSEC-2026-0194,RUSTSEC-2026-0195

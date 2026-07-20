@@ -19,6 +19,7 @@ bytes = "1"
 object_store = { version = "0.13", features = ["aws"] }
 secrecy = { workspace = true }
 futures = "0.3"
+url = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

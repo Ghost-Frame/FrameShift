@@ -29,9 +29,9 @@
 //!
 //! # Per-route layers
 //!
-//! The `download-url` mint endpoint additionally has a per-IP rate-limit
-//! layer (governor) applied only to its sub-router, so the rest of the
-//! API (including the verifier `/dl/{hash}`) is not impacted.
+//! The `download-url` mint endpoint uses its configured per-IP rate limit.
+//! Signed writes and anonymous telemetry use a separate abuse rate to bound
+//! nonce-cache and log-amplification pressure before handler work.
 //!
 //! The mutating endpoints -- `POST /v1/packs`, `POST /v1/authors`,
 //! `POST /v1/authors/{handle}/rotate`, and
@@ -120,6 +120,7 @@ pub fn app(state: AppState) -> Router {
     let publish = Router::new()
         .route("/", post(publish_pack))
         .route_layer(signed.clone());
+    let publish = apply_ip_rate_limit(publish, &state, state.config.abuse_rate_per_min);
     let mint_router = build_mint_router(&state);
     let packs = packs_router()
         .merge(publish)
@@ -127,18 +128,23 @@ pub fn app(state: AppState) -> Router {
 
     // Authors: anonymous reads merged with signed-request-gated writes
     // (registration + key rotation).
-    let authors = authors_router().merge(authors_write_router().route_layer(signed.clone()));
+    let author_writes = authors_write_router().route_layer(signed.clone());
+    let author_writes = apply_ip_rate_limit(author_writes, &state, state.config.abuse_rate_per_min);
+    let authors = authors_router().merge(author_writes);
 
     // Admin: every route in this sub-router is mutating and allowlist-gated,
     // so the whole router carries the signed-request layer (unlike `packs`
     // and `authors`, there is no anonymous-read counterpart to merge with).
     let admin = admin_router().route_layer(signed.clone());
+    let admin = apply_ip_rate_limit(admin, &state, state.config.abuse_rate_per_min);
+    let telemetry =
+        apply_ip_rate_limit(telemetry_router(), &state, state.config.abuse_rate_per_min);
 
     let v1 = Router::new()
         .nest("/packs", packs)
         .nest("/authors", authors)
         .nest("/handles", handles_router())
-        .nest("/telemetry", telemetry_router())
+        .nest("/telemetry", telemetry)
         .nest("/memory", memory_router())
         .nest("/admin", admin);
 
@@ -187,8 +193,7 @@ pub fn app(state: AppState) -> Router {
     router.with_state(state)
 }
 
-/// Build the download-URL mint sub-router with the per-IP rate-limit layer
-/// applied when `state.config.download_rate_per_min` is positive.
+/// Build the download-URL mint sub-router with its configured per-IP rate limit.
 ///
 /// `0` disables rate limiting (escape hatch for local dev / load tests).
 /// When positive, the [`GovernorLayer`] is configured with:
@@ -205,8 +210,15 @@ pub fn app(state: AppState) -> Router {
 /// the verifier `/dl/{hash}` (HMAC is the gate there) or to any other
 /// endpoint.
 fn build_mint_router(state: &AppState) -> Router<AppState> {
-    let router = pack_download_url_router();
-    let rate = state.config.download_rate_per_min;
+    apply_ip_rate_limit(
+        pack_download_url_router(),
+        state,
+        state.config.download_rate_per_min,
+    )
+}
+
+/// Apply a per-IP governor to `router`, or return it unchanged when `rate` is zero.
+fn apply_ip_rate_limit(router: Router<AppState>, state: &AppState, rate: u32) -> Router<AppState> {
     if rate == 0 {
         return router;
     }

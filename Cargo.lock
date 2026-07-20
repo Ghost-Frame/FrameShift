@@ -1774,6 +1774,7 @@ dependencies = [
  "frameshift-vault",
  "frameshift-vault-local",
  "hex",
+ "libc",
  "rand_core 0.6.4",
  "secrecy",
  "serde",
@@ -1966,6 +1967,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]

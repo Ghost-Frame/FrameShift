@@ -14,6 +14,7 @@ use axum::extract::State;
 use axum::http::Request;
 use axum::middleware::Next;
 use axum::response::Response;
+use chrono::{Duration as ChronoDuration, Utc};
 
 use crate::auth;
 use crate::error::AppError;
@@ -64,6 +65,28 @@ pub async fn require_signed_request(
         state.config.signed_request_max_skew,
         &state.auth_nonces,
     )?;
+
+    let retention = state
+        .config
+        .signed_request_max_skew
+        .checked_mul(2)
+        .unwrap_or(state.config.signed_request_max_skew);
+    let retention = ChronoDuration::from_std(retention).map_err(|error| {
+        tracing::error!(%error, "signed request nonce retention is invalid");
+        AppError::Unauthorized("authentication failed".to_string())
+    })?;
+    let claimed = state
+        .catalog
+        .claim_signed_request_nonce(&pubkey, &params.nonce, Utc::now() + retention)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "shared signed-request nonce claim failed");
+            AppError::Unauthorized("authentication failed".to_string())
+        })?;
+    if !claimed {
+        tracing::warn!(signer = %pubkey, "signed request: shared nonce replay");
+        return Err(AppError::Unauthorized("authentication failed".to_string()));
+    }
 
     // Reinject the buffered body so body-consuming extractors (Multipart, Json)
     // can read it; the content-type header (with multipart boundary) survives

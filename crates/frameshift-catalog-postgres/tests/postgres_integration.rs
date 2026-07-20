@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use frameshift_catalog::{
     AuthorRecord, CatalogBackend, CatalogError, Ed25519PublicKey, ObjectHash, PackSearchFilters,
-    PackStatus, PackVersionRecord, SortMode, TombstoneReason, TombstoneRecord,
+    PackStatus, PackVersionRecord, PublishQuota, SortMode, TombstoneReason, TombstoneRecord,
 };
 use frameshift_catalog_postgres::{PostgresCatalog, PostgresCatalogConfig};
 use secrecy::SecretString;
@@ -863,5 +863,127 @@ async fn test_search_by_fts_query() {
         results.iter().any(|r| r.pack.name == "fts-search-pack"),
         "FTS search should find fts-search-pack, got: {:?}",
         results.iter().map(|r| &r.pack.name).collect::<Vec<_>>()
+    );
+}
+
+/// Concurrent claims permit exactly one use of a signer-scoped nonce.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn security_shared_nonce_claim_is_atomic() {
+    let (catalog, _container) = setup_catalog().await;
+    let pubkey = make_pubkey(70);
+    let expires_at = chrono::Utc::now() + chrono::Duration::minutes(10);
+
+    let (first, second) = tokio::join!(
+        catalog.claim_signed_request_nonce(&pubkey, "postgres-security-nonce", expires_at),
+        catalog.claim_signed_request_nonce(&pubkey, "postgres-security-nonce", expires_at),
+    );
+    let claims = [
+        first.expect("first nonce claim failed"),
+        second.expect("second nonce claim failed"),
+    ];
+
+    assert_eq!(
+        claims.into_iter().filter(|claimed| *claimed).count(),
+        1,
+        "exactly one concurrent nonce claim must succeed"
+    );
+    assert!(
+        catalog
+            .claim_signed_request_nonce(&make_pubkey(71), "postgres-security-nonce", expires_at,)
+            .await
+            .expect("signer-scoped nonce claim failed"),
+        "a different signer must be able to use the same nonce"
+    );
+}
+
+/// Active-hash lookup stops authorizing a version immediately after tombstoning.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn security_active_hash_lookup_respects_tombstone() {
+    let (catalog, _container) = setup_catalog().await;
+    let version = make_version("revoked-download-pack", "1.0.0", 72, 72);
+
+    catalog
+        .register_author(make_author(72, "revocation-author"))
+        .await
+        .expect("register author failed");
+    catalog
+        .register_pack_version(version.clone())
+        .await
+        .expect("register version failed");
+    catalog
+        .get_active_pack_version_by_hash(&version.content_hash)
+        .await
+        .expect("active hash lookup failed before tombstone");
+
+    catalog
+        .tombstone_pack(
+            &version.pack_name,
+            &version.version,
+            TombstoneRecord {
+                reason: TombstoneReason::AuthorRequest,
+                recorded_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .expect("tombstone failed");
+
+    let error = catalog
+        .get_active_pack_version_by_hash(&version.content_hash)
+        .await
+        .expect_err("tombstoned hash must not remain active");
+    assert!(
+        matches!(error, CatalogError::NotFound { .. }),
+        "expected NotFound after tombstone, got {error:?}"
+    );
+}
+
+/// Per-author quota accounting serializes concurrent PostgreSQL publications.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn security_publish_quota_is_transactional_under_concurrency() {
+    let (catalog, _container) = setup_catalog().await;
+    catalog
+        .register_author(make_author(73, "quota-author"))
+        .await
+        .expect("register author failed");
+
+    let quota = PublishQuota {
+        max_versions: Some(1),
+        max_bytes: Some(2048),
+    };
+    let first_version = make_version("quota-race-a", "1.0.0", 73, 73);
+    let second_version = make_version("quota-race-b", "1.0.0", 73, 74);
+    let (first, second) = tokio::join!(
+        catalog.register_pack_version_with_quota(first_version.clone(), quota),
+        catalog.register_pack_version_with_quota(second_version.clone(), quota),
+    );
+
+    assert_eq!(
+        [&first, &second]
+            .into_iter()
+            .filter(|result| result.is_ok())
+            .count(),
+        1,
+        "exactly one concurrent publication must fit a one-version quota"
+    );
+    assert_eq!(
+        [&first, &second]
+            .into_iter()
+            .filter(|result| matches!(result, Err(CatalogError::Validation(_))))
+            .count(),
+        1,
+        "the losing publication must fail with a quota validation error"
+    );
+
+    let (first_persisted, second_persisted) = tokio::join!(
+        catalog.get_pack_version(&first_version.pack_name, &first_version.version),
+        catalog.get_pack_version(&second_version.pack_name, &second_version.version),
+    );
+    assert_ne!(
+        first_persisted.is_ok(),
+        second_persisted.is_ok(),
+        "only the quota-winning version may persist"
     );
 }

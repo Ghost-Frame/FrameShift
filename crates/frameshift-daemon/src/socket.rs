@@ -8,9 +8,22 @@ use crate::handler::dispatch;
 use crate::protocol;
 use frameshift_client::Client;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::watch;
+
+/// Maximum size in bytes of one daemon JSON-RPC request line.
+const MAX_REQUEST_LINE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Outcome of reading one bounded newline-delimited request.
+enum LineRead {
+    /// A complete request was read into the caller's buffer.
+    Line,
+    /// The request exceeded the limit and was discarded through its newline.
+    TooLong,
+    /// The peer closed the connection without leaving a request.
+    Eof,
+}
 
 /// Accept connections on `listener` and serve JSON-RPC requests.
 ///
@@ -86,20 +99,31 @@ async fn handle_connection(
     shutdown_tx: watch::Sender<bool>,
 ) {
     let (read_half, mut write_half) = stream.into_split();
-    let reader = BufReader::new(read_half);
-    let mut lines = reader.lines();
+    let mut reader = BufReader::new(read_half);
+    let mut line = Vec::new();
 
     loop {
-        let line = match lines.next_line().await {
-            Ok(Some(l)) => l,
-            Ok(None) => break, // connection closed
+        match read_capped_line(&mut reader, &mut line, MAX_REQUEST_LINE_BYTES).await {
+            Ok(LineRead::Line) => {}
+            Ok(LineRead::TooLong) => {
+                let response = protocol::error(
+                    serde_json::Value::Null,
+                    protocol::PARSE_ERROR,
+                    "request line exceeds maximum size".to_string(),
+                );
+                if write_half.write_all(response.as_bytes()).await.is_err() {
+                    break;
+                }
+                continue;
+            }
+            Ok(LineRead::Eof) => break,
             Err(err) => {
                 tracing::warn!(error = %err, "read error on connection");
                 break;
             }
-        };
+        }
 
-        let request = match protocol::parse_request(&line) {
+        let request = match protocol::parse_request(&String::from_utf8_lossy(&line)) {
             Ok(req) => req,
             Err(err_response) => {
                 let _ = write_half.write_all(err_response.as_bytes()).await;
@@ -142,12 +166,74 @@ async fn handle_connection(
     }
 }
 
+/// Read and discard one newline-delimited request while retaining at most `max` bytes.
+async fn read_capped_line<R>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+    max: usize,
+) -> std::io::Result<LineRead>
+where
+    R: AsyncBufRead + Unpin,
+{
+    line.clear();
+    let mut too_long = false;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(if line.is_empty() {
+                LineRead::Eof
+            } else if too_long {
+                LineRead::TooLong
+            } else {
+                LineRead::Line
+            });
+        }
+
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(available.len(), |position| position + 1);
+        let content_len = newline.unwrap_or(available.len());
+        if !too_long {
+            let remaining = max.saturating_sub(line.len());
+            line.extend_from_slice(&available[..content_len.min(remaining)]);
+            too_long = content_len > remaining;
+        }
+        reader.consume(consumed);
+
+        if newline.is_some() {
+            return Ok(if too_long {
+                LineRead::TooLong
+            } else {
+                LineRead::Line
+            });
+        }
+    }
+}
+
 #[cfg(test)]
+/// Unit tests for bounded socket framing and daemon shutdown behavior.
 mod tests {
     use super::*;
     use frameshift_client::ClientOptions;
     use tokio::net::UnixStream;
     use tokio::time::{timeout, Duration};
+
+    /// The bounded reader discards oversized requests and resumes at the next line.
+    #[tokio::test]
+    async fn capped_line_reader_recovers_after_oversized_request() {
+        let input = b"123456789\n{}\n";
+        let mut reader = BufReader::new(&input[..]);
+        let mut line = Vec::new();
+
+        assert!(matches!(
+            read_capped_line(&mut reader, &mut line, 8).await.unwrap(),
+            LineRead::TooLong
+        ));
+        assert!(matches!(
+            read_capped_line(&mut reader, &mut line, 8).await.unwrap(),
+            LineRead::Line
+        ));
+        assert_eq!(line, b"{}");
+    }
 
     /// Build a test Client backed by a temporary directory.
     fn test_client(tmp: &tempfile::TempDir) -> Client {

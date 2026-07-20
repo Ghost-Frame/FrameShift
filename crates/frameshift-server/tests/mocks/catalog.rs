@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 
 use frameshift_catalog::backend::CatalogBackend;
 use frameshift_catalog::error::{CatalogError, HealthStatus};
@@ -25,7 +25,9 @@ use frameshift_catalog::status::{PackStatus, TombstoneRecord};
 // Reuse the exact same version-precedence comparator the Postgres adapter
 // uses for `register_pack_version`'s D8 `latest_version` selection, so the
 // mock's tombstone head-recompute can never drift from the real ordering.
+use frameshift_catalog::PublishQuota;
 use frameshift_catalog_postgres::backend::semver_gt;
+use frameshift_pack::ObjectHash;
 
 /// Shared mutable state for [`MockCatalog`].
 ///
@@ -58,6 +60,9 @@ pub struct MockState {
     /// Tests read this to assert that the cumulative download counter was
     /// incremented after a successful download response.
     pub download_counter_increments: HashMap<(String, String), u64>,
+
+    /// Shared signed-request nonce claims keyed by signer and nonce.
+    pub signed_request_nonces: HashMap<(String, String), DateTime<Utc>>,
 }
 
 /// In-memory [`CatalogBackend`] for integration tests.
@@ -75,6 +80,7 @@ pub struct MockCatalog {
     pub state: Arc<RwLock<MockState>>,
 }
 
+/// Constructors for the in-memory catalog test double.
 impl MockCatalog {
     /// Create an empty [`MockCatalog`] with no pre-populated records.
     pub fn new() -> Self {
@@ -84,6 +90,7 @@ impl MockCatalog {
     }
 }
 
+/// Default construction of an empty mock catalog.
 impl Default for MockCatalog {
     /// Returns an empty [`MockCatalog`].
     fn default() -> Self {
@@ -92,6 +99,7 @@ impl Default for MockCatalog {
 }
 
 #[async_trait]
+/// In-memory implementation of every catalog operation used by server tests.
 impl CatalogBackend for MockCatalog {
     /// Register an author, enforcing the trait's uniqueness contract.
     ///
@@ -192,11 +200,40 @@ impl CatalogBackend for MockCatalog {
     }
 
     /// Register a pack version.
-    async fn register_pack_version(&self, record: PackVersionRecord) -> Result<(), CatalogError> {
+    async fn register_pack_version_with_quota(
+        &self,
+        record: PackVersionRecord,
+        quota: PublishQuota,
+    ) -> Result<(), CatalogError> {
         let mut state = self
             .state
             .write()
             .map_err(|e| CatalogError::BackendError(e.to_string().into()))?;
+        let existing: Vec<&PackVersionRecord> = state
+            .versions
+            .values()
+            .filter(|version| version.author_pubkey == record.author_pubkey)
+            .collect();
+        let next_versions = existing.len() as u64 + 1;
+        let next_bytes = existing
+            .iter()
+            .fold(0u64, |total, version| {
+                total.saturating_add(version.size_bytes)
+            })
+            .saturating_add(record.size_bytes);
+        if quota
+            .max_versions
+            .is_some_and(|limit| next_versions > limit)
+        {
+            return Err(CatalogError::Validation(
+                "publisher version quota exceeded".to_string(),
+            ));
+        }
+        if quota.max_bytes.is_some_and(|limit| next_bytes > limit) {
+            return Err(CatalogError::Validation(
+                "publisher storage quota exceeded".to_string(),
+            ));
+        }
         let k = (record.pack_name.clone(), record.version.clone());
         state.versions.insert(k, record);
         Ok(())
@@ -236,6 +273,28 @@ impl CatalogBackend for MockCatalog {
             .ok_or_else(|| CatalogError::NotFound {
                 kind: "pack_version",
                 key: format!("{name}@{version}"),
+            })
+    }
+
+    /// Return an active version that references `content_hash`.
+    async fn get_active_pack_version_by_hash(
+        &self,
+        content_hash: &ObjectHash,
+    ) -> Result<PackVersionRecord, CatalogError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|e| CatalogError::BackendError(e.to_string().into()))?;
+        state
+            .versions
+            .values()
+            .find(|record| {
+                record.content_hash == *content_hash && matches!(record.status, PackStatus::Active)
+            })
+            .cloned()
+            .ok_or_else(|| CatalogError::NotFound {
+                kind: "active_pack_version",
+                key: content_hash.to_string(),
             })
     }
 
@@ -459,6 +518,29 @@ impl CatalogBackend for MockCatalog {
     /// (trending ranking is exercised by the Postgres adapter integration tests).
     async fn record_download(&self, _pack_name: &str, _version: &str) -> Result<(), CatalogError> {
         Ok(())
+    }
+
+    /// Atomically claim a signed-request nonce in shared mock state.
+    async fn claim_signed_request_nonce(
+        &self,
+        pubkey: &Ed25519PublicKey,
+        nonce: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<bool, CatalogError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|e| CatalogError::BackendError(e.to_string().into()))?;
+        let now = Utc::now();
+        state
+            .signed_request_nonces
+            .retain(|_, expiry| *expiry >= now);
+        let key = (pubkey.to_string(), nonce.to_string());
+        if state.signed_request_nonces.contains_key(&key) {
+            return Ok(false);
+        }
+        state.signed_request_nonces.insert(key, expires_at);
+        Ok(true)
     }
 }
 

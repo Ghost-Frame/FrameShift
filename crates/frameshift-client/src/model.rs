@@ -2,8 +2,10 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// Current schema version for client configuration and lock files.
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// Persisted per-project client configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProjectConfig {
     #[serde(default = "default_schema_version")]
@@ -15,6 +17,9 @@ pub struct ProjectConfig {
     /// sent when the user explicitly enables it (and an endpoint is configured).
     #[serde(default)]
     pub telemetry_opt_in: bool,
+    /// Random project identifier used only for opted-in telemetry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry_project_id: Option<String>,
     /// Optional memory-adapter declaration for this project. Personas whose
     /// pack manifest sets `memory_required = "hard"` refuse to activate unless
     /// this is present; `"soft"` personas surface a warning without one.
@@ -22,12 +27,15 @@ pub struct ProjectConfig {
     pub memory: Option<MemoryConfig>,
 }
 
+/// Supplies privacy-preserving defaults for new projects.
 impl Default for ProjectConfig {
+    /// Build a project configuration with telemetry disabled.
     fn default() -> Self {
         Self {
             schema_version: SCHEMA_VERSION,
             project_id: None,
             telemetry_opt_in: false,
+            telemetry_project_id: None,
             memory: None,
         }
     }
@@ -44,6 +52,7 @@ pub struct MemoryRequirementStatus {
     pub memory_declared: bool,
 }
 
+/// Convenience checks for memory requirement enforcement.
 impl MemoryRequirementStatus {
     /// A hard requirement with no declared adapter: activation must refuse.
     pub fn hard_unmet(&self) -> bool {
@@ -73,6 +82,7 @@ pub struct MemoryConfig {
     pub path: Option<PathBuf>,
 }
 
+/// Lock file containing every installed persona.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Lockfile {
     #[serde(default = "default_schema_version")]
@@ -81,7 +91,9 @@ pub struct Lockfile {
     pub personas: Vec<LockedPersona>,
 }
 
+/// Supplies an empty current-version lock file.
 impl Default for Lockfile {
+    /// Build an empty lock file.
     fn default() -> Self {
         Self {
             schema_version: SCHEMA_VERSION,
@@ -90,6 +102,7 @@ impl Default for Lockfile {
     }
 }
 
+/// Immutable identity and cache hash for one installed persona.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LockedPersona {
     pub name: String,
@@ -99,15 +112,19 @@ pub struct LockedPersona {
     pub hash: String,
 }
 
+/// Parsed persona name and explicit version requested by a caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersonaSpec {
     pub name: String,
     pub version: String,
 }
 
+/// Parses strict `name@version` persona specifications.
 impl std::str::FromStr for PersonaSpec {
+    /// Error returned for a malformed persona specification.
     type Err = crate::ClientError;
 
+    /// Parse a strict `name@version` string.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let Some((name, version)) = s.split_once('@') else {
             return Err(crate::ClientError::InvalidPersonaSpec(s.to_string()));
@@ -124,6 +141,7 @@ impl std::str::FromStr for PersonaSpec {
     }
 }
 
+/// Parsing helpers for persona specifications.
 impl PersonaSpec {
     /// Parse a loosely-specified persona spec: either a bare name (`"foo"`)
     /// or a `name@version` pair (`"foo@1.0.0"`).
@@ -156,12 +174,14 @@ impl PersonaSpec {
     }
 }
 
+/// Source from which a requested persona should be installed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallSource {
     LocalPath(PathBuf),
     Registry,
 }
 
+/// Complete request to install one persona into a project.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallRequest {
     pub project_root: PathBuf,
@@ -200,6 +220,7 @@ pub struct ClientOptions {
     pub vault: Option<Arc<dyn crate::VaultProvider>>,
 }
 
+/// Redacted debug formatting for client construction options.
 impl std::fmt::Debug for ClientOptions {
     /// Prints whether a vault provider is configured, without attempting to
     /// format the trait object itself (arbitrary `VaultProvider` impls are
@@ -213,6 +234,7 @@ impl std::fmt::Debug for ClientOptions {
     }
 }
 
+/// Equality based on paths and vault-provider identity.
 impl PartialEq for ClientOptions {
     /// Compares `data_root`/`config_root` structurally and `vault` by
     /// `Arc` pointer identity (`Arc::ptr_eq`) -- trait objects have no
@@ -229,8 +251,10 @@ impl PartialEq for ClientOptions {
     }
 }
 
+/// Marks pointer-identity option comparison as a full equivalence relation.
 impl Eq for ClientOptions {}
 
+/// Resolved central-state and materialization paths for one project.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectPaths {
     pub project_root: PathBuf,
@@ -289,6 +313,7 @@ pub struct MaterializeFailure {
     pub error: String,
 }
 
+/// Outcome of synchronizing all locked personas.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncReport {
     pub project_id: String,
@@ -298,6 +323,7 @@ pub struct SyncReport {
     pub failures: Vec<MaterializeFailure>,
 }
 
+/// Cache hashes removed by garbage collection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GcReport {
     pub removed_hashes: Vec<String>,
@@ -323,6 +349,7 @@ const fn default_schema_version() -> u32 {
 }
 
 #[cfg(test)]
+/// Unit tests for persona specification parsing.
 mod tests {
     use super::*;
 

@@ -53,6 +53,15 @@ pub enum ClientError {
         actual_version: String,
     },
 
+    /// A mutable local source changed between initial verification and cache publication.
+    #[error("local pack changed during install: expected hash {expected}, got {actual}")]
+    LocalPackChanged {
+        /// Canonical hash computed before copying the source.
+        expected: String,
+        /// Canonical hash computed from the private cache snapshot.
+        actual: String,
+    },
+
     /// Kept for backwards compatibility with existing match arms. No longer returned
     /// by the registry install path -- use `RegistryHttp` / `ContentHashMismatch` instead.
     #[error("registry installs are not yet implemented; use --from-path for M0")]
@@ -108,6 +117,21 @@ pub enum ClientError {
     RegistrySignatureMissing {
         /// The pack name/version that had no signature.
         pack: String,
+    },
+
+    /// A registry presented a different key for an author that was previously trusted.
+    #[error(
+        "registry author key changed for {author} at {registry}: expected {expected}, got {actual}"
+    )]
+    RegistryAuthorKeyChanged {
+        /// Registry base URL whose trust namespace contained the pin.
+        registry: String,
+        /// Author handle whose key continuity check failed.
+        author: String,
+        /// Previously trusted Ed25519 key as lowercase hex.
+        expected: String,
+        /// Newly presented Ed25519 key as lowercase hex.
+        actual: String,
     },
 
     #[error("cache entry {hash} is missing at {path}")]

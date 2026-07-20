@@ -6,12 +6,34 @@
 //! imports adapter crates directly.
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use frameshift_pack::ObjectHash;
 
 use crate::error::{CatalogError, HealthStatus};
 use crate::filters::{PackSearchFilters, PackSearchResult};
 use crate::identity::Ed25519PublicKey;
 use crate::records::{AuthorRecord, PackRecord, PackVersionRecord};
 use crate::status::TombstoneRecord;
+
+/// Optional per-author limits applied atomically during pack registration.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PublishQuota {
+    /// Maximum number of versions an author may retain.
+    pub max_versions: Option<u64>,
+    /// Maximum cumulative archive bytes an author may retain.
+    pub max_bytes: Option<u64>,
+}
+
+/// Constructors for publisher quota policies.
+impl PublishQuota {
+    /// Return an unrestricted quota for trusted internal callers and seeders.
+    pub const fn unlimited() -> Self {
+        Self {
+            max_versions: None,
+            max_bytes: None,
+        }
+    }
+}
 
 /// Catalog backend for the persona marketplace.
 ///
@@ -135,7 +157,17 @@ pub trait CatalogBackend: Send + Sync {
     /// # Panics
     ///
     /// Never panics.
-    async fn register_pack_version(&self, record: PackVersionRecord) -> Result<(), CatalogError>;
+    async fn register_pack_version(&self, record: PackVersionRecord) -> Result<(), CatalogError> {
+        self.register_pack_version_with_quota(record, PublishQuota::unlimited())
+            .await
+    }
+
+    /// Register a version while atomically enforcing per-author storage limits.
+    async fn register_pack_version_with_quota(
+        &self,
+        record: PackVersionRecord,
+        quota: PublishQuota,
+    ) -> Result<(), CatalogError>;
 
     /// Retrieve the top-level pack record for the given pack name.
     ///
@@ -173,6 +205,23 @@ pub trait CatalogBackend: Send + Sync {
         &self,
         name: &str,
         version: &str,
+    ) -> Result<PackVersionRecord, CatalogError>;
+
+    /// Retrieve one active pack version that references `content_hash`.
+    ///
+    /// This lookup is the revocation check for content-addressed signed
+    /// downloads. Tombstoned versions MUST NOT satisfy the lookup. If several
+    /// active versions reference identical bytes, implementations may return
+    /// any one of them.
+    ///
+    /// # Errors
+    ///
+    /// - `CatalogError::NotFound` (kind `"active_pack_version"`) if no active
+    ///   version references the hash.
+    /// - `CatalogError::BackendError` for unexpected backend failures.
+    async fn get_active_pack_version_by_hash(
+        &self,
+        content_hash: &ObjectHash,
     ) -> Result<PackVersionRecord, CatalogError>;
 
     /// List all versions of a pack, ordered by `published_at ASC`.
@@ -352,6 +401,22 @@ pub trait CatalogBackend: Send + Sync {
     ///
     /// Never panics.
     async fn record_download(&self, pack_name: &str, version: &str) -> Result<(), CatalogError>;
+
+    /// Atomically claim a signed-request nonce for one public key.
+    ///
+    /// Returns `true` only for the first unexpired claim of `(pubkey, nonce)`.
+    /// Implementations MUST make the insert atomic across all server instances.
+    /// Expired rows may be removed opportunistically.
+    ///
+    /// # Errors
+    ///
+    /// - `CatalogError::BackendError` for unexpected backend failures.
+    async fn claim_signed_request_nonce(
+        &self,
+        pubkey: &Ed25519PublicKey,
+        nonce: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<bool, CatalogError>;
 
     /// Return the current health status of the backend.
     ///

@@ -58,6 +58,20 @@ pub(crate) fn classify_output(
     Ok(trimmed.to_string())
 }
 
+/// Build an `agy` command with only the execution environment it requires.
+fn isolated_command(program: &str, args: &[String], home: &Path) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(program);
+    command
+        .args(args)
+        .current_dir(home)
+        .env_clear()
+        .env("HOME", home)
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    command
+}
+
 /// Files copied from the source `.gemini` into the isolated HOME: an allowlist
 /// of the credential and state files `agy` needs to authenticate and run
 /// headlessly. Everything else in the source directory -- the global
@@ -178,13 +192,8 @@ impl Runner for CliRunner {
     /// non-zero exit status, or empty output.
     async fn run(&self, prompt: &str) -> Result<String, ConformanceError> {
         let args = assemble_args(&self.model, prompt);
-        let fut = tokio::process::Command::new(&self.program)
-            .args(&args)
-            .current_dir(self.iso_home.path())
-            .env("HOME", self.iso_home.path())
-            .stdin(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .output();
+        let mut command = isolated_command(&self.program, &args, self.iso_home.path());
+        let fut = command.output();
 
         let output = tokio::time::timeout(self.timeout, fut)
             .await
@@ -325,6 +334,20 @@ mod tests {
 
         let out = runner.run("which web framework?").await.expect("run");
         assert!(out.contains("Axum 0.8"), "got: {out}");
+    }
+
+    /// The spawned CLI receives only HOME and PATH from the parent process.
+    #[test]
+    fn cli_runner_command_has_minimal_environment() {
+        let home = tempfile::tempdir().expect("home");
+        let command = isolated_command("agy", &[], home.path());
+        let mut keys = command
+            .as_std()
+            .get_envs()
+            .map(|(key, _)| key.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        keys.sort();
+        assert_eq!(keys, vec!["HOME", "PATH"]);
     }
 
     /// Real end-to-end check against `agy`. Run manually:

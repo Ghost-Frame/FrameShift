@@ -163,8 +163,8 @@ fn call_select_persona(
 
     let catalog_root = arguments
         .get("library")
-        .and_then(|v| v.as_str())
-        .map(PathBuf::from);
+        .map(|_| get_required_path(arguments, "library"))
+        .transpose()?;
 
     let state_dir = client
         .orchestrator_state_dir(&project_root)
@@ -349,6 +349,7 @@ fn project_root_arg_from_path(p: &Path) -> serde_json::Value {
 }
 
 #[cfg(test)]
+/// Unit tests for MCP prompt schemas, path guards, and rendered responses.
 mod tests {
     use super::*;
     use frameshift_client::{Client, ClientOptions, InstallRequest, InstallSource, PersonaSpec};
@@ -542,5 +543,21 @@ mod tests {
                 "{name}: expected missing project_root error, got: {err}"
             );
         }
+    }
+
+    /// select_persona applies the filesystem boundary guard to its optional library.
+    #[test]
+    fn select_persona_rejects_unsafe_library_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let client = make_client(&tmp.path().join("data"));
+        let args = serde_json::json!({
+            "project_root": project_root,
+            "library": "/tmp/../etc"
+        });
+
+        let error = call_prompt("select_persona", &args, &client).unwrap_err();
+        assert!(error.contains("must not contain '..'"), "got: {error}");
     }
 }

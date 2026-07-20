@@ -69,20 +69,15 @@ pub struct PublishOutcome {
 /// masquerades as a new identity.
 pub fn load_or_create_signing_key(data_root: &Path) -> Result<SigningKey, ClientError> {
     let path = data_root.join(SIGNING_KEY_REL);
-    if path.exists() {
-        let bytes = fs::read(&path).map_err(|source| ClientError::Io {
-            path: path.clone(),
-            source,
-        })?;
-        let seed: [u8; 32] =
-            bytes
-                .as_slice()
-                .try_into()
-                .map_err(|_| ClientError::InvalidSigningKey {
-                    path: path.clone(),
-                    detail: format!("expected 32-byte seed, found {} bytes", bytes.len()),
-                })?;
-        return Ok(SigningKey::from_bytes(&seed));
+    match fs::symlink_metadata(&path) {
+        Ok(_) => return load_existing_signing_key(&path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(ClientError::Io {
+                path: path.clone(),
+                source,
+            });
+        }
     }
 
     // First use: generate and persist atomically. `create_new` fails if the
@@ -120,26 +115,63 @@ pub fn load_or_create_signing_key(data_root: &Path) -> Result<SigningKey, Client
         }
         // Another process created the key between our `exists` check and here;
         // adopt the winner's key so the author identity stays stable.
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            let bytes = fs::read(&path).map_err(|source| ClientError::Io {
-                path: path.clone(),
-                source,
-            })?;
-            let seed: [u8; 32] =
-                bytes
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| ClientError::InvalidSigningKey {
-                        path: path.clone(),
-                        detail: format!("expected 32-byte seed, found {} bytes", bytes.len()),
-                    })?;
-            Ok(SigningKey::from_bytes(&seed))
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => load_existing_signing_key(&path),
         Err(source) => Err(ClientError::Io {
             path: path.clone(),
             source,
         }),
     }
+}
+
+/// Load a regular signing-key file without following symlinks.
+fn load_existing_signing_key(path: &Path) -> Result<SigningKey, ClientError> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| ClientError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(ClientError::InvalidSigningKey {
+            path: path.to_path_buf(),
+            detail: "key path is not a regular file".to_string(),
+        });
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(path).map_err(|source| ClientError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|source| ClientError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+    }
+    use std::io::Read as _;
+    let mut bytes = Vec::with_capacity(33);
+    file.take(33)
+        .read_to_end(&mut bytes)
+        .map_err(|source| ClientError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let seed: [u8; 32] =
+        bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| ClientError::InvalidSigningKey {
+                path: path.to_path_buf(),
+                detail: format!("expected 32-byte seed, found {} bytes", bytes.len()),
+            })?;
+    Ok(SigningKey::from_bytes(&seed))
 }
 
 /// The base64url-no-pad public key string for a signing key, matching the
@@ -230,12 +262,7 @@ pub fn publish_pack_dir(
     }
     let response = send_signed(req, &url, &body)?;
 
-    response
-        .into_json::<PublishOutcome>()
-        .map_err(|e| ClientError::RegistryHttp {
-            url,
-            detail: format!("failed to deserialize publish response JSON: {e}"),
-        })
+    crate::registry::response_json_bounded::<PublishOutcome>(response, &url)
 }
 
 /// Send a prepared signed request body, mapping non-2xx statuses to
@@ -245,9 +272,7 @@ fn send_signed(req: ureq::Request, url: &str, body: &[u8]) -> Result<ureq::Respo
     match req.send_bytes(body) {
         Ok(response) => Ok(response),
         Err(ureq::Error::Status(status, response)) => {
-            let message = response
-                .into_string()
-                .unwrap_or_else(|_| "<unreadable response body>".to_string());
+            let message = crate::registry::response_text_bounded(response, url);
             Err(ClientError::RegistryRejected {
                 url: url.to_string(),
                 status,
@@ -429,6 +454,7 @@ fn append_dir_files<W: std::io::Write>(
 }
 
 #[cfg(test)]
+/// Unit and transport tests for signing and publishing.
 mod tests {
     use super::*;
     use ed25519_dalek::{Verifier as _, VerifyingKey};
@@ -491,6 +517,24 @@ mod tests {
 
         let err = load_or_create_signing_key(dir.path()).unwrap_err();
         assert!(matches!(err, ClientError::InvalidSigningKey { .. }));
+    }
+
+    /// Existing signing-key symlinks are rejected rather than followed.
+    #[cfg(unix)]
+    #[test]
+    fn signing_key_symlink_is_rejected() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target-key");
+        fs::write(&target, [9u8; 32]).unwrap();
+        let key_path = dir.path().join(SIGNING_KEY_REL);
+        fs::create_dir_all(key_path.parent().unwrap()).unwrap();
+        symlink(&target, &key_path).unwrap();
+
+        assert!(matches!(
+            load_or_create_signing_key(dir.path()),
+            Err(ClientError::InvalidSigningKey { .. })
+        ));
     }
 
     /// The signed-request envelope reproduces the exact server signing string and

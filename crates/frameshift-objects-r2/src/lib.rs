@@ -86,6 +86,7 @@ pub struct R2PackStore {
     prefix: String,
 }
 
+/// Construction and object-key helpers for the R2 adapter.
 impl R2PackStore {
     /// Construct a new R2-backed PackStore.
     ///
@@ -100,6 +101,7 @@ impl R2PackStore {
     /// `AmazonS3Builder` fails to build a client.
     pub fn new(config: R2PackStoreConfig) -> Result<Self, ObjectStoreError> {
         use secrecy::ExposeSecret;
+        let endpoint = validate_endpoint(&config.endpoint)?;
         let inner = AmazonS3Builder::new()
             .with_endpoint(&config.endpoint)
             .with_bucket_name(&config.bucket)
@@ -107,7 +109,7 @@ impl R2PackStore {
             .with_access_key_id(&config.access_key_id)
             .with_secret_access_key(config.secret_access_key.expose_secret())
             .with_virtual_hosted_style_request(false)
-            .with_allow_http(config.endpoint.starts_with("http://"))
+            .with_allow_http(endpoint.scheme() == "http")
             .build()
             .map_err(|e| ObjectStoreError::BackendError(Box::new(e)))?;
         Ok(Self {
@@ -146,7 +148,52 @@ impl R2PackStore {
     }
 }
 
+/// Parse an object-store endpoint and reject credential-bearing or remote plaintext URLs.
+fn validate_endpoint(endpoint: &str) -> Result<url::Url, ObjectStoreError> {
+    let parsed = url::Url::parse(endpoint).map_err(|error| {
+        ObjectStoreError::BackendError(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid object-store endpoint: {error}"),
+        )))
+    })?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(ObjectStoreError::BackendError(Box::new(
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "object-store endpoint must not embed credentials",
+            ),
+        )));
+    }
+    match parsed.scheme() {
+        "https" => Ok(parsed),
+        "http" if endpoint_host_is_loopback(&parsed) => Ok(parsed),
+        "http" => Err(ObjectStoreError::BackendError(Box::new(
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "plaintext object-store endpoints are allowed only on loopback",
+            ),
+        ))),
+        _ => Err(ObjectStoreError::BackendError(Box::new(
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "object-store endpoint must use https or loopback http",
+            ),
+        ))),
+    }
+}
+
+/// Return whether a parsed URL targets a loopback host.
+fn endpoint_host_is_loopback(endpoint: &url::Url) -> bool {
+    match endpoint.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    }
+}
+
 #[async_trait]
+/// S3-backed implementation of the content-addressed object-store contract.
 impl PackStore for R2PackStore {
     /// Verify SHA-256(bytes) matches `hash`, then upload to S3 under the
     /// content-addressed key. Idempotent: re-uploading the same bytes to
@@ -292,9 +339,11 @@ impl PackStore for R2PackStore {
 }
 
 #[cfg(test)]
+/// Unit tests for endpoint validation and key construction.
 mod tests {
     use super::*;
 
+    /// Build a minimal HTTPS R2 configuration for tests.
     fn cfg_with_prefix(prefix: &str) -> R2PackStoreConfig {
         R2PackStoreConfig {
             endpoint: "https://example.r2.cloudflarestorage.com".into(),
@@ -361,5 +410,29 @@ mod tests {
             }
             other => panic!("expected HashMismatch, got {other:?}"),
         }
+    }
+
+    /// Remote plaintext endpoints are rejected before any credentials can be sent.
+    #[test]
+    fn remote_http_endpoint_is_rejected() {
+        let mut config = cfg_with_prefix("objects");
+        config.endpoint = "http://object-store.example:9000".to_string();
+        assert!(R2PackStore::new(config).is_err());
+    }
+
+    /// Loopback HTTP remains available for local S3-compatible development servers.
+    #[test]
+    fn loopback_http_endpoint_is_allowed() {
+        let mut config = cfg_with_prefix("objects");
+        config.endpoint = "http://127.0.0.1:9000".to_string();
+        assert!(R2PackStore::new(config).is_ok());
+    }
+
+    /// Embedded URL credentials are rejected even when the transport is encrypted.
+    #[test]
+    fn embedded_endpoint_credentials_are_rejected() {
+        let mut config = cfg_with_prefix("objects");
+        config.endpoint = "https://user:password@example.invalid".to_string();
+        assert!(R2PackStore::new(config).is_err());
     }
 }

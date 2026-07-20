@@ -357,7 +357,7 @@ impl Client {
                 let hash = pack.canonical_hash_hex();
                 let cache_path = paths.cache_dir.join(&hash);
                 ensure_cached_pack(pack_dir, &cache_path)?;
-                locked_persona_from_pack(&pack)
+                validate_cached_local_pack(&cache_path, &request.spec, &hash)?
             }
             InstallSource::Registry => {
                 // Fetch, extract, verify, and cache the pack from the HTTP registry.
@@ -586,18 +586,33 @@ impl Client {
         &self,
         project_root: &Path,
         persona: &str,
-        session: &str,
+        _session: &str,
     ) -> Result<(), ClientError> {
-        let config = self.project_config(project_root)?;
+        let mut config = self.project_config(project_root)?;
         if !config.telemetry_opt_in {
             return Ok(());
         }
+        let project_id = match config.telemetry_project_id.clone() {
+            Some(project_id) => project_id,
+            None => {
+                use rand_core::{OsRng, RngCore as _};
+                let mut random = [0u8; 16];
+                OsRng.fill_bytes(&mut random);
+                let project_id = hex::encode(random);
+                config.telemetry_project_id = Some(project_id.clone());
+                self.save_project_config(project_root, &config)?;
+                project_id
+            }
+        };
+        use rand_core::{OsRng, RngCore as _};
+        let mut random_session = [0u8; 16];
+        OsRng.fill_bytes(&mut random_session);
+        let telemetry_session = hex::encode(random_session);
         let endpoint = selection::telemetry_endpoint();
-        let paths = self.project_paths(project_root)?;
         let payload = selection::SelectionTelemetry {
             persona,
-            session,
-            project_id: &paths.project_id,
+            session: &telemetry_session,
+            project_id: &project_id,
             recorded_at_unix: selection::now_unix(),
         };
         selection::post_selection_telemetry(&endpoint, &payload)
@@ -1272,7 +1287,7 @@ fn migrate_legacy_project_files(project_root: &Path, paths: &ProjectPaths) {
 
             match fs::read(&legacy_path) {
                 Ok(bytes) => {
-                    if let Err(error) = fs::write(central_path, &bytes) {
+                    if let Err(error) = write_file(central_path, &bytes) {
                         warn!(
                             path = %central_path.display(),
                             error = %error,
@@ -1333,6 +1348,8 @@ fn hashed_project_id(project_root: &Path) -> Result<String, ClientError> {
 /// Verify that the pack manifest matches the requested spec (name and version).
 pub(crate) fn validate_pack_request(pack: &Pack, spec: &PersonaSpec) -> Result<(), ClientError> {
     let manifest = pack.manifest();
+    validate_persona_name(&manifest.name)?;
+    validate_persona_name(&spec.name)?;
     if manifest.name != spec.name || manifest.version != spec.version {
         return Err(ClientError::ManifestMismatch {
             expected_name: spec.name.clone(),
@@ -1342,6 +1359,25 @@ pub(crate) fn validate_pack_request(pack: &Pack, spec: &PersonaSpec) -> Result<(
         });
     }
     Ok(())
+}
+
+/// Re-verify a private local-pack snapshot before it becomes install authority.
+fn validate_cached_local_pack(
+    cache_path: &Path,
+    spec: &PersonaSpec,
+    expected_hash: &str,
+) -> Result<LockedPersona, ClientError> {
+    let cached_pack = Pack::from_dir(cache_path)?;
+    validate_pack_request(&cached_pack, spec)?;
+    verify_pack_signature_if_present(&cached_pack)?;
+    let actual_hash = cached_pack.canonical_hash_hex();
+    if actual_hash != expected_hash {
+        return Err(ClientError::LocalPackChanged {
+            expected: expected_hash.to_string(),
+            actual: actual_hash,
+        });
+    }
+    Ok(locked_persona_from_pack(&cached_pack))
 }
 
 /// Verify `pack`'s Ed25519 signature against its declared author pubkey, if
@@ -1727,7 +1763,29 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<(), ClientError> {
     if let Some(parent) = path.parent() {
         ensure_dir(parent)?;
     }
-    fs::write(path, bytes).map_err(|source| ClientError::Io {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path).map_err(|source| ClientError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|source| ClientError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+    }
+    use std::io::Write as _;
+    file.write_all(bytes).map_err(|source| ClientError::Io {
         path: path.to_path_buf(),
         source,
     })
@@ -2084,6 +2142,51 @@ mod tests {
                 "{bad:?} should be rejected"
             );
         }
+    }
+
+    /// Pack validation rejects a matching traversal name before any install path join.
+    #[test]
+    fn validate_pack_request_rejects_unsafe_matching_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("pack.toml"),
+            "schema_version = 1\nname = \"../escape\"\nauthor_handle = \"test\"\nauthor_pubkey = \"local-unsigned\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(tmp.path().join("AGENTS.md"), "test").unwrap();
+        let pack = Pack::from_dir(tmp.path()).unwrap();
+        let spec = PersonaSpec {
+            name: "../escape".to_string(),
+            version: "0.1.0".to_string(),
+        };
+
+        assert!(matches!(
+            validate_pack_request(&pack, &spec),
+            Err(ClientError::InvalidPersonaName { .. })
+        ));
+    }
+
+    /// A cache snapshot that differs from the verified source hash is rejected.
+    #[test]
+    fn validate_cached_local_pack_rejects_changed_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("pack.toml"),
+            "schema_version = 1\nname = \"safe\"\nauthor_handle = \"test\"\nauthor_pubkey = \"local-unsigned\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(tmp.path().join("AGENTS.md"), "original").unwrap();
+        let original_hash = Pack::from_dir(tmp.path()).unwrap().canonical_hash_hex();
+        fs::write(tmp.path().join("AGENTS.md"), "changed").unwrap();
+        let spec = PersonaSpec {
+            name: "safe".to_string(),
+            version: "0.1.0".to_string(),
+        };
+
+        assert!(matches!(
+            validate_cached_local_pack(tmp.path(), &spec, &original_hash),
+            Err(ClientError::LocalPackChanged { .. })
+        ));
     }
 
     /// Helper: set up a minimal pack and install it, returning the client and project root.

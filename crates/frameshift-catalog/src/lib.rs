@@ -55,7 +55,7 @@ pub(crate) mod serde_helpers {
 }
 
 // Top-level re-exports for the most commonly used types.
-pub use backend::CatalogBackend;
+pub use backend::{CatalogBackend, PublishQuota};
 pub use error::{CatalogError, HealthStatus};
 pub use filters::{PackSearchFilters, PackSearchResult, SortMode};
 pub use frameshift_pack::ObjectHash;

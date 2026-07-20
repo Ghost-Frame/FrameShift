@@ -25,7 +25,8 @@ use tracing::{debug, error, instrument};
 
 use frameshift_catalog::{
     AuthorRecord, CatalogBackend, CatalogError, Ed25519PublicKey, HealthStatus, PackRecord,
-    PackSearchFilters, PackSearchResult, PackVersionRecord, SortMode, TombstoneRecord,
+    PackSearchFilters, PackSearchResult, PackVersionRecord, PublishQuota, SortMode,
+    TombstoneRecord,
 };
 
 use crate::config::PostgresCatalogConfig;
@@ -35,7 +36,9 @@ use crate::models::{
     NewPackRow, NewPackVersionRow, PackRow, PackVersionRow,
 };
 use crate::pool::{build_pool, PgPool};
-use crate::schema::{authors, handles, pack_downloads, pack_versions, packs};
+use crate::schema::{
+    authors, handles, pack_downloads, pack_versions, packs, signed_request_nonces,
+};
 
 /// Embedded migration files compiled into the binary at build time.
 ///
@@ -297,7 +300,11 @@ impl CatalogBackend for PostgresCatalog {
     ///    compared with [`semver_gt`]; the UPDATE only runs when the new
     ///    version has strictly higher precedence.
     #[instrument(skip(self, record), fields(pack = %record.pack_name, version = %record.version))]
-    async fn register_pack_version(&self, record: PackVersionRecord) -> Result<(), CatalogError> {
+    async fn register_pack_version_with_quota(
+        &self,
+        record: PackVersionRecord,
+        quota: PublishQuota,
+    ) -> Result<(), CatalogError> {
         if record.signature.len() != 64 {
             return Err(CatalogError::InvalidArgument(format!(
                 "signature must be exactly 64 bytes, got {}",
@@ -355,6 +362,7 @@ impl CatalogBackend for PostgresCatalog {
         let version_clone = record.version.clone();
         // Capture the incoming author bytes for the ownership check inside the tx.
         let incoming_author_bytes = record.author_pubkey.0.to_vec();
+        let incoming_size_bytes = record.size_bytes;
 
         // `diesel_async::AsyncConnection::transaction` requires
         // `E: From<diesel::result::Error>`. We use a local wrapper that carries
@@ -388,6 +396,58 @@ impl CatalogBackend for PostgresCatalog {
                 let pack_name = pack_name_clone;
                 let version = version_clone;
                 let incoming_author = incoming_author_bytes;
+                let incoming_size = incoming_size_bytes;
+                // Serialize quota accounting for this author so concurrent
+                // publishes cannot both observe the same pre-insert usage.
+                let _locked_author: Vec<u8> = authors::table
+                    .filter(authors::pubkey.eq(&incoming_author))
+                    .for_update()
+                    .select(authors::pubkey)
+                    .first(conn)
+                    .await
+                    .map_err(|e| {
+                        TxError::Catalog(map_diesel_error(
+                            e,
+                            "author",
+                            hex::encode(&incoming_author),
+                        ))
+                    })?;
+                let version_count: i64 = pack_versions::table
+                    .filter(pack_versions::author_pubkey.eq(&incoming_author))
+                    .count()
+                    .get_result(conn)
+                    .await
+                    .map_err(|e| {
+                        TxError::Catalog(map_diesel_error(e, "pack_version", pack_name.clone()))
+                    })?;
+                let stored_sizes: Vec<i64> = pack_versions::table
+                    .filter(pack_versions::author_pubkey.eq(&incoming_author))
+                    .select(pack_versions::size_bytes)
+                    .load(conn)
+                    .await
+                    .map_err(|e| {
+                        TxError::Catalog(map_diesel_error(e, "pack_version", pack_name.clone()))
+                    })?;
+                let next_versions = u64::try_from(version_count)
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(1);
+                let stored_bytes = stored_sizes.into_iter().fold(0u64, |total, size| {
+                    total.saturating_add(u64::try_from(size).unwrap_or(u64::MAX))
+                });
+                let next_bytes = stored_bytes.saturating_add(incoming_size);
+                if quota
+                    .max_versions
+                    .is_some_and(|limit| next_versions > limit)
+                {
+                    return Err(TxError::Catalog(CatalogError::Validation(
+                        "publisher version quota exceeded".to_string(),
+                    )));
+                }
+                if quota.max_bytes.is_some_and(|limit| next_bytes > limit) {
+                    return Err(TxError::Catalog(CatalogError::Validation(
+                        "publisher storage quota exceeded".to_string(),
+                    )));
+                }
                 // D5: If the pack head already exists, verify the publishing
                 // author matches the stored current_author. First-publish
                 // (no existing row) is always allowed.
@@ -519,6 +579,27 @@ impl CatalogBackend for PostgresCatalog {
             .first(&mut *conn)
             .await
             .map_err(|e| map_diesel_error(e, "pack_version", format!("{name}@{version}")))?;
+        row.into_record()
+    }
+
+    /// Retrieve an active version by content hash for signed-download revocation.
+    #[instrument(skip(self, content_hash), fields(hash = %content_hash))]
+    async fn get_active_pack_version_by_hash(
+        &self,
+        content_hash: &frameshift_pack::ObjectHash,
+    ) -> Result<PackVersionRecord, CatalogError> {
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        let active = serde_json::json!({"kind": "active"});
+        let row: PackVersionRow = pack_versions::table
+            .filter(
+                pack_versions::content_hash
+                    .eq(content_hash.as_bytes().to_vec())
+                    .and(pack_versions::status.eq(active)),
+            )
+            .select(PackVersionRow::as_select())
+            .first(&mut *conn)
+            .await
+            .map_err(|e| map_diesel_error(e, "active_pack_version", content_hash.to_string()))?;
         row.into_record()
     }
 
@@ -1047,6 +1128,36 @@ impl CatalogBackend for PostgresCatalog {
             .map_err(|e| map_diesel_error(e, "pack_download", pack_name.to_string()))?;
 
         Ok(())
+    }
+
+    /// Atomically claim a nonce in PostgreSQL so replays fail across instances.
+    #[instrument(skip(self, pubkey, nonce), fields(signer = %pubkey))]
+    async fn claim_signed_request_nonce(
+        &self,
+        pubkey: &Ed25519PublicKey,
+        nonce: &str,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, CatalogError> {
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+
+        diesel::delete(
+            signed_request_nonces::table.filter(signed_request_nonces::expires_at.lt(Utc::now())),
+        )
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| map_diesel_error(e, "signed_request_nonce", "expired".to_string()))?;
+
+        let inserted = diesel::insert_into(signed_request_nonces::table)
+            .values((
+                signed_request_nonces::pubkey.eq(pubkey.0.to_vec()),
+                signed_request_nonces::nonce.eq(nonce),
+                signed_request_nonces::expires_at.eq(expires_at),
+            ))
+            .on_conflict_do_nothing()
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| map_diesel_error(e, "signed_request_nonce", nonce.to_string()))?;
+        Ok(inserted == 1)
     }
 
     /// Return the current health status of this backend.

@@ -26,6 +26,9 @@ use frameshift_orchestrator::Embedder;
 /// de-facto standard for lightweight sentence similarity.
 pub const DEFAULT_MODEL_ID: &str = "sentence-transformers/all-MiniLM-L6-v2";
 
+/// Immutable Hugging Face commit used for the default model artifacts.
+pub const DEFAULT_MODEL_REVISION: &str = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41";
+
 /// BERT's positional-embedding window; longer inputs are truncated by the
 /// tokenizer rather than erroring at the tensor layer.
 const MAX_TOKENS: usize = 512;
@@ -68,11 +71,12 @@ pub struct CandleEmbedder {
     device: Device,
 }
 
+/// Constructors and inference internals for the Candle embedder.
 impl CandleEmbedder {
     /// Load the default model ([`DEFAULT_MODEL_ID`]), downloading it into the
     /// hf-hub cache on first use.
     pub fn from_hub() -> Result<Self, EmbedError> {
-        Self::from_hub_model(DEFAULT_MODEL_ID)
+        Self::from_hub_model_revision(DEFAULT_MODEL_ID, DEFAULT_MODEL_REVISION)
     }
 
     /// Load `model_id` from the hub cache, downloading on first use.
@@ -80,8 +84,28 @@ impl CandleEmbedder {
     /// The model must ship `config.json`, `tokenizer.json`, and
     /// `model.safetensors` (the standard sentence-transformers layout).
     pub fn from_hub_model(model_id: &str) -> Result<Self, EmbedError> {
+        if model_id != DEFAULT_MODEL_ID {
+            return Err(EmbedError::Download(
+                "custom models require from_hub_model_revision with an immutable revision"
+                    .to_string(),
+            ));
+        }
+        Self::from_hub_model_revision(model_id, DEFAULT_MODEL_REVISION)
+    }
+
+    /// Load `model_id` at an immutable hub `revision`.
+    pub fn from_hub_model_revision(model_id: &str, revision: &str) -> Result<Self, EmbedError> {
+        if revision.len() != 40 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(EmbedError::Download(
+                "model revision must be a 40-character commit hash".to_string(),
+            ));
+        }
         let api = Api::new().map_err(|e| EmbedError::Download(e.to_string()))?;
-        let repo = api.repo(Repo::new(model_id.to_string(), RepoType::Model));
+        let repo = api.repo(Repo::with_revision(
+            model_id.to_string(),
+            RepoType::Model,
+            revision.to_string(),
+        ));
         let config = repo
             .get("config.json")
             .map_err(|e| EmbedError::Download(e.to_string()))?;
@@ -162,6 +186,7 @@ impl CandleEmbedder {
     }
 }
 
+/// Semantic embedding implementation consumed by the orchestrator.
 impl Embedder for CandleEmbedder {
     /// Embed `text` into a unit vector; degenerate inputs and inference
     /// failures return an empty vector, which the scorer reads as "no
@@ -243,6 +268,7 @@ fn cache_file_name(model_id: &str) -> String {
 }
 
 #[cfg(test)]
+/// Unit tests for model revision and vector utilities.
 mod tests {
     use super::*;
 
@@ -302,6 +328,13 @@ mod tests {
             "embed-cache-sentence-transformers--all-MiniLM-L6-v2.json"
         );
         assert!(!cache_file_name("a/b\\c").contains(['/', '\\']));
+    }
+
+    /// Mutable or symbolic revisions are rejected before any network request.
+    #[test]
+    fn mutable_model_revision_is_rejected() {
+        let result = CandleEmbedder::from_hub_model_revision(DEFAULT_MODEL_ID, "main");
+        assert!(matches!(result, Err(EmbedError::Download(_))));
     }
 
     /// End-to-end embedding sanity: related texts score above unrelated ones.

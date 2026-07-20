@@ -46,6 +46,14 @@ use mocks::objects::MockPackStore;
 /// Minimal [`ServerConfig`] for tests. Body limit is large enough to fit a
 /// realistic pack upload.
 fn test_config() -> Arc<ServerConfig> {
+    test_config_with_abuse_rate(0, false)
+}
+
+/// Build a test configuration with an explicit abuse limit and proxy trust mode.
+fn test_config_with_abuse_rate(
+    abuse_rate_per_min: u32,
+    trust_forwarded_for: bool,
+) -> Arc<ServerConfig> {
     Arc::new(ServerConfig {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
         postgres_url: SecretString::new("postgres://test".into()),
@@ -54,7 +62,7 @@ fn test_config() -> Arc<ServerConfig> {
         log_format: LogFormat::Text,
         max_request_bytes: 4 * 1024 * 1024,
         max_search_limit: 100,
-        trust_forwarded_for: false,
+        trust_forwarded_for,
         signed_request_max_skew: Duration::from_secs(300),
         admin_pubkeys: Vec::new(),
         shutdown_grace: Duration::from_secs(1),
@@ -63,6 +71,11 @@ fn test_config() -> Arc<ServerConfig> {
         download_token_ttl: Duration::from_secs(300),
         download_max_token_ttl: Duration::from_secs(1800),
         download_rate_per_min: 0,
+        abuse_rate_per_min,
+        metrics_bearer_token: SecretString::new(String::new()),
+        publisher_pubkeys: vec!["*".to_string()],
+        max_versions_per_author: 0,
+        max_bytes_per_author: 0,
         object_store_backend: "fs".to_string(),
         r2_endpoint: String::new(),
         r2_bucket: String::new(),
@@ -80,12 +93,21 @@ fn test_config() -> Arc<ServerConfig> {
 
 /// Build an [`AppState`] from the given catalog and object store mocks.
 fn make_state(catalog: MockCatalog, objects: MockPackStore) -> AppState {
+    make_state_with_config(catalog, objects, test_config())
+}
+
+/// Build an [`AppState`] from mocks and an explicit server configuration.
+fn make_state_with_config(
+    catalog: MockCatalog,
+    objects: MockPackStore,
+    config: Arc<ServerConfig>,
+) -> AppState {
     AppState {
         catalog: Arc::new(catalog),
         objects: Arc::new(objects),
         runtime: None,
         memory: None,
-        config: test_config(),
+        config,
         // Each test gets its own registry for counter isolation.
         metrics: Arc::new(Metrics::new()),
         // Fresh replay-nonce cache per state.
@@ -97,9 +119,10 @@ fn make_state(catalog: MockCatalog, objects: MockPackStore) -> AppState {
 
 /// Write a minimal valid pack directory at `dir` with the given name/version
 /// and author handle.
-fn write_pack(dir: &Path, name: &str, version: &str, handle: &str) {
+fn write_pack(dir: &Path, name: &str, version: &str, handle: &str, signing: &SigningKey) {
+    let author_pubkey = hex::encode(signing.verifying_key().to_bytes());
     let manifest = format!(
-        "schema_version = 1\nname = \"{name}\"\nauthor_handle = \"{handle}\"\nauthor_pubkey = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\nversion = \"{version}\"\nlicense = \"MIT\"\n"
+        "schema_version = 1\nname = \"{name}\"\nauthor_handle = \"{handle}\"\nauthor_pubkey = \"{author_pubkey}\"\nversion = \"{version}\"\nlicense = \"MIT\"\n"
     );
     std::fs::create_dir_all(dir).unwrap();
     std::fs::write(dir.join("pack.toml"), manifest).unwrap();
@@ -115,14 +138,16 @@ fn write_pack_with_metadata(
     handle: &str,
     description: &str,
     tags: &[&str],
+    signing: &SigningKey,
 ) {
+    let author_pubkey = hex::encode(signing.verifying_key().to_bytes());
     let tags_toml = tags
         .iter()
         .map(|t| format!("\"{t}\""))
         .collect::<Vec<_>>()
         .join(", ");
     let manifest = format!(
-        "schema_version = 1\nname = \"{name}\"\nauthor_handle = \"{handle}\"\nauthor_pubkey = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\nversion = \"{version}\"\nlicense = \"MIT\"\ndescription = \"{description}\"\ntags = [{tags_toml}]\n"
+        "schema_version = 1\nname = \"{name}\"\nauthor_handle = \"{handle}\"\nauthor_pubkey = \"{author_pubkey}\"\nversion = \"{version}\"\nlicense = \"MIT\"\ndescription = \"{description}\"\ntags = [{tags_toml}]\n"
     );
     std::fs::create_dir_all(dir).unwrap();
     std::fs::write(dir.join("pack.toml"), manifest).unwrap();
@@ -271,7 +296,7 @@ struct PreparedPack {
 /// Build a signed pack with the given name/version/handle/key.
 fn prepare_pack(name: &str, version: &str, handle: &str, signing: &SigningKey) -> PreparedPack {
     let tmp = tempfile::TempDir::new().unwrap();
-    write_pack(tmp.path(), name, version, handle);
+    write_pack(tmp.path(), name, version, handle, signing);
     let pack = Pack::from_dir(tmp.path()).unwrap();
     let canonical_hash = pack.canonical_hash();
     let sig = signing.sign(&canonical_hash);
@@ -293,7 +318,15 @@ fn prepare_pack_with_metadata(
     tags: &[&str],
 ) -> PreparedPack {
     let tmp = tempfile::TempDir::new().unwrap();
-    write_pack_with_metadata(tmp.path(), name, version, handle, description, tags);
+    write_pack_with_metadata(
+        tmp.path(),
+        name,
+        version,
+        handle,
+        description,
+        tags,
+        signing,
+    );
     let pack = Pack::from_dir(tmp.path()).unwrap();
     let canonical_hash = pack.canonical_hash();
     let sig = signing.sign(&canonical_hash);
@@ -483,6 +516,97 @@ async fn publish_local_unsigned_manifest_returns_400() {
     );
 }
 
+/// A valid signature cannot claim provenance from a key other than the registered author.
+#[tokio::test]
+async fn publish_manifest_author_key_mismatch_returns_400() {
+    let signing = SigningKey::from_bytes(&[17u8; 32]);
+    let (catalog, _pubkey) = catalog_with_author(&signing, "alice");
+    let tmp = tempfile::TempDir::new().unwrap();
+    let other_key = SigningKey::from_bytes(&[18u8; 32]);
+    write_pack(tmp.path(), "demo-pack", "0.1.0", "alice", &other_key);
+    let pack = Pack::from_dir(tmp.path()).unwrap();
+    let signature = signing.sign(&pack.canonical_hash()).to_bytes().to_vec();
+    let archive = make_targz(tmp.path());
+
+    let response = post_publish(
+        make_state(catalog, MockPackStore::new()),
+        &archive,
+        &signature,
+        "alice",
+        Some(&signing),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// Metadata-heavy archives are rejected before excessive filesystem entries are created.
+#[tokio::test]
+async fn publish_archive_with_too_many_entries_returns_400() {
+    let signing = SigningKey::from_bytes(&[19u8; 32]);
+    let (catalog, _pubkey) = catalog_with_author(&signing, "alice");
+    let tmp = tempfile::TempDir::new().unwrap();
+    write_pack(tmp.path(), "demo-pack", "0.1.0", "alice", &signing);
+    for index in 0..300 {
+        std::fs::create_dir(tmp.path().join(format!("empty-{index}"))).unwrap();
+    }
+    let pack = Pack::from_dir(tmp.path()).unwrap();
+    let signature = signing.sign(&pack.canonical_hash()).to_bytes().to_vec();
+    let archive = make_targz(tmp.path());
+
+    let response = post_publish(
+        make_state(catalog, MockPackStore::new()),
+        &archive,
+        &signature,
+        "alice",
+        Some(&signing),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// Signed writes are throttled before they can exhaust the shared nonce cache.
+#[tokio::test]
+async fn publish_rate_limit_returns_429() {
+    let signing = SigningKey::from_bytes(&[20u8; 32]);
+    let (catalog, _pubkey) = catalog_with_author(&signing, "alice");
+    let prepared = prepare_pack("demo-pack", "0.1.0", "alice", &signing);
+    let state = make_state_with_config(
+        catalog,
+        MockPackStore::new(),
+        test_config_with_abuse_rate(1, true),
+    );
+    let router = app(state);
+    let boundary = "frameshiftratelimit";
+    let body = build_multipart(boundary, &prepared.targz, &prepared.signature, "alice");
+    let mut statuses = Vec::new();
+    for _ in 0..3 {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/v1/packs")
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .header("x-forwarded-for", "10.0.0.3");
+        for header in mocks::signing::signed_headers(&signing, "POST", "/v1/packs", &body) {
+            request = request.header(header.name, header.value);
+        }
+        let response = router
+            .clone()
+            .oneshot(request.body(Body::from(body.clone())).unwrap())
+            .await
+            .unwrap();
+        statuses.push(response.status());
+    }
+
+    assert!(
+        statuses.contains(&StatusCode::TOO_MANY_REQUESTS),
+        "expected a 429 response, got {statuses:?}"
+    );
+}
+
 /// POST a pack with a structurally-valid-length but cryptographically-wrong
 /// signature -> 401 Unauthorized.
 #[tokio::test]
@@ -565,6 +689,41 @@ async fn publish_duplicate_returns_409() {
     )
     .await;
     assert_eq!(resp2.status(), StatusCode::CONFLICT);
+}
+
+/// Per-author version quotas reject additional durable catalog entries even
+/// when the second pack has a different name and valid signature.
+#[tokio::test]
+async fn publish_author_version_quota_is_enforced() {
+    let signing = SigningKey::from_bytes(&[31u8; 32]);
+    let (catalog, _pubkey) = catalog_with_author(&signing, "quota-author");
+    let objects = MockPackStore::new();
+    let mut config = (*test_config()).clone();
+    config.max_versions_per_author = 1;
+    config.max_bytes_per_author = 0;
+    let config = Arc::new(config);
+
+    let first = prepare_pack("quota-pack-one", "1.0.0", "quota-author", &signing);
+    let response = post_publish(
+        make_state_with_config(catalog.clone(), objects.clone(), config.clone()),
+        &first.targz,
+        &first.signature,
+        "quota-author",
+        Some(&signing),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let second = prepare_pack("quota-pack-two", "1.0.0", "quota-author", &signing);
+    let response = post_publish(
+        make_state_with_config(catalog, objects, config),
+        &second.targz,
+        &second.signature,
+        "quota-author",
+        Some(&signing),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 // ---------------------------------------------------------------------------
@@ -658,6 +817,46 @@ async fn publish_replayed_request_returns_401() {
         StatusCode::UNAUTHORIZED,
         "replay with the same nonce must be rejected"
     );
+}
+
+/// Replaying one signed request against a second server instance is rejected
+/// by the shared catalog nonce claim even though each instance has a fresh
+/// in-process cache.
+#[tokio::test]
+async fn publish_replay_across_instances_returns_401() {
+    let signing = SigningKey::from_bytes(&[23u8; 32]);
+    let (catalog, _pubkey) = catalog_with_author(&signing, "shared-replay");
+    let objects = MockPackStore::new();
+    let prepared = prepare_pack("shared-replay-pack", "0.1.0", "shared-replay", &signing);
+    let boundary = "frameshiftsharedreplay";
+    let body = build_multipart(
+        boundary,
+        &prepared.targz,
+        &prepared.signature,
+        "shared-replay",
+    );
+    let headers = mocks::signing::signed_headers(&signing, "POST", "/v1/packs", &body);
+    let build_req = || {
+        let mut request = Request::builder().method("POST").uri("/v1/packs").header(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}"),
+        );
+        for header in &headers {
+            request = request.header(header.name, header.value.clone());
+        }
+        request.body(Body::from(body.clone())).unwrap()
+    };
+
+    let first = app(make_state(catalog.clone(), objects.clone()))
+        .oneshot(build_req())
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let replay = app(make_state(catalog, objects))
+        .oneshot(build_req())
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
 }
 
 // ---------------------------------------------------------------------------

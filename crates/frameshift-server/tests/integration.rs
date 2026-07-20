@@ -68,6 +68,11 @@ fn test_config() -> Arc<ServerConfig> {
         download_token_ttl: Duration::from_secs(300),
         download_max_token_ttl: Duration::from_secs(1800),
         download_rate_per_min: 0,
+        abuse_rate_per_min: 0,
+        metrics_bearer_token: SecretString::new(String::new()),
+        publisher_pubkeys: vec!["*".to_string()],
+        max_versions_per_author: 0,
+        max_bytes_per_author: 0,
         object_store_backend: "fs".to_string(),
         r2_endpoint: String::new(),
         r2_bucket: String::new(),
@@ -649,6 +654,69 @@ async fn healthz_does_not_leak_adapter_detail_text() {
     );
 }
 
+/// Metrics are not discoverable when no bearer token is configured.
+#[tokio::test]
+async fn metrics_disabled_without_token_returns_404() {
+    let response = oneshot_get(
+        make_state(MockCatalog::new(), MockPackStore::new()),
+        "/metrics",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+/// Configured metrics reject bad credentials and accept the exact token.
+#[tokio::test]
+async fn metrics_requires_configured_bearer_token() {
+    let mut state = make_state(MockCatalog::new(), MockPackStore::new());
+    let mut config = (*state.config).clone();
+    config.metrics_bearer_token = SecretString::new("metrics-test-secret".to_string());
+    state.config = Arc::new(config);
+    let router = app(state);
+
+    let missing = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+    let wrong = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .header("authorization", "Bearer wrong")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+    let allowed = router
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .header("authorization", "Bearer metrics-test-secret")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(allowed.status(), StatusCode::OK);
+    assert!(allowed
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .starts_with("text/plain"));
+}
+
 // ---------------------------------------------------------------------------
 // /v1/memory/health
 // ---------------------------------------------------------------------------
@@ -928,6 +996,11 @@ fn dl_state_with_rate(catalog: MockCatalog, objects: MockPackStore, rate: u32) -
         download_token_ttl: Duration::from_secs(60),
         download_max_token_ttl: Duration::from_secs(300),
         download_rate_per_min: rate,
+        abuse_rate_per_min: 0,
+        metrics_bearer_token: SecretString::new(String::new()),
+        publisher_pubkeys: vec!["*".to_string()],
+        max_versions_per_author: 0,
+        max_bytes_per_author: 0,
         object_store_backend: "fs".to_string(),
         r2_endpoint: String::new(),
         r2_bucket: String::new(),
@@ -1019,6 +1092,50 @@ async fn download_url_mint_then_stream_succeeds() {
     );
     let bytes = body_bytes(resp).await;
     assert_eq!(bytes, blob);
+}
+
+/// A token minted while a version is active stops working immediately after
+/// the catalog tombstones that version.
+#[tokio::test]
+async fn minted_download_url_is_revoked_by_tombstone() {
+    let blob = b"revoked-signed-download".to_vec();
+    let hash = ObjectHash::of(&blob);
+    let author_key = Ed25519PublicKey([14u8; 32]);
+    let catalog = MockCatalog::new();
+    {
+        let mut state = catalog.state.write().unwrap();
+        state.packs.insert(
+            "revoked-pack".to_string(),
+            make_pack("revoked-pack", author_key),
+        );
+        state.versions.insert(
+            ("revoked-pack".to_string(), "1.0.0".to_string()),
+            make_version("revoked-pack", "1.0.0", hash, author_key),
+        );
+    }
+    let objects = MockPackStore::new();
+    objects.insert(hash, blob);
+    let state = dl_state(catalog.clone(), objects);
+    let minted = oneshot_post_empty(
+        state.clone(),
+        "/v1/packs/revoked-pack/versions/1.0.0/download-url",
+    )
+    .await;
+    let url = body_json(minted).await["url"].as_str().unwrap().to_string();
+    catalog
+        .tombstone_pack(
+            "revoked-pack",
+            "1.0.0",
+            frameshift_catalog::TombstoneRecord {
+                reason: frameshift_catalog::TombstoneReason::AuthorRequest,
+                recorded_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let response = oneshot_get(state, &url).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
 /// Tampering with the token in the URL produces 403 Forbidden.

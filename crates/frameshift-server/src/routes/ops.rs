@@ -1,10 +1,10 @@
 //! Operational endpoints: health check and Prometheus metrics.
 //!
-//! These endpoints are unauthenticated and serve monitoring infrastructure.
+//! Health is public; metrics require an explicitly configured bearer token.
 //! They are mounted at `/healthz` and `/metrics` (outside `/v1`).
 
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
@@ -264,14 +264,8 @@ pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
 ///
 /// Returns Prometheus-format metrics as a plain-text exposition document.
 ///
-/// # Security note
-///
-/// This endpoint is currently unauthenticated. In production deployments the
-/// endpoint should be restricted to internal monitoring infrastructure (e.g.
-/// via a network policy, a reverse-proxy ACL, or a bearer token check added
-/// here). Exposing internal metric names and counts to the public internet is
-/// low-risk but is nonetheless an information leak that should be revisited
-/// before internet-facing deployment.
+/// Requires the configured `METRICS_BEARER_TOKEN`. When no token is configured
+/// the endpoint returns `404`; missing or incorrect credentials return `401`.
 ///
 /// # Response
 ///
@@ -282,7 +276,24 @@ pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
 ///
 /// This handler never returns an HTTP error. If encoding fails internally the
 /// body will be empty (the error is logged via `tracing::error`).
-pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    use secrecy::ExposeSecret as _;
+    let expected = state.config.metrics_bearer_token.expose_secret();
+    if expected.is_empty() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let presented = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .unwrap_or_default();
+    if !constant_time_eq(expected.as_bytes(), presented.as_bytes()) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(axum::http::header::WWW_AUTHENTICATE, "Bearer")],
+        )
+            .into_response();
+    }
     (
         StatusCode::OK,
         [(
@@ -291,4 +302,17 @@ pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
         )],
         state.metrics.encode_text(),
     )
+        .into_response()
+}
+
+/// Compare secret byte strings without data-dependent early exits.
+fn constant_time_eq(expected: &[u8], presented: &[u8]) -> bool {
+    let mut difference = expected.len() ^ presented.len();
+    let length = expected.len().max(presented.len());
+    for index in 0..length {
+        let left = expected.get(index).copied().unwrap_or(0);
+        let right = presented.get(index).copied().unwrap_or(0);
+        difference |= usize::from(left ^ right);
+    }
+    difference == 0
 }

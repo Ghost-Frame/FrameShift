@@ -21,7 +21,7 @@ use mocks::objects::MockPackStore;
 
 /// Build a minimal [`ServerConfig`] suitable for tests. Mirrors `test_config`
 /// in `tests/integration.rs`.
-fn test_config() -> Arc<ServerConfig> {
+fn test_config(abuse_rate_per_min: u32, trust_forwarded_for: bool) -> Arc<ServerConfig> {
     Arc::new(ServerConfig {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
         postgres_url: SecretString::new("postgres://test".into()),
@@ -36,6 +36,11 @@ fn test_config() -> Arc<ServerConfig> {
         download_token_ttl: Duration::from_secs(300),
         download_max_token_ttl: Duration::from_secs(1800),
         download_rate_per_min: 0,
+        abuse_rate_per_min,
+        metrics_bearer_token: SecretString::new(String::new()),
+        publisher_pubkeys: vec!["*".to_string()],
+        max_versions_per_author: 0,
+        max_bytes_per_author: 0,
         object_store_backend: "fs".to_string(),
         r2_endpoint: String::new(),
         r2_bucket: String::new(),
@@ -43,7 +48,7 @@ fn test_config() -> Arc<ServerConfig> {
         r2_region: "auto".to_string(),
         r2_access_key_id: String::new(),
         r2_secret_access_key: SecretString::new(String::new()),
-        trust_forwarded_for: false,
+        trust_forwarded_for,
         signed_request_max_skew: Duration::from_secs(300),
         admin_pubkeys: Vec::new(),
         memory_backend: "none".to_string(),
@@ -56,12 +61,17 @@ fn test_config() -> Arc<ServerConfig> {
 
 /// Build an [`AppState`] with fresh mocks and a fresh metrics registry.
 fn make_state() -> AppState {
+    make_state_with_rate(0, false)
+}
+
+/// Build an [`AppState`] with an explicit abuse rate and proxy trust mode.
+fn make_state_with_rate(abuse_rate_per_min: u32, trust_forwarded_for: bool) -> AppState {
     AppState {
         catalog: Arc::new(MockCatalog::new()),
         objects: Arc::new(MockPackStore::new()),
         runtime: None,
         memory: None,
-        config: test_config(),
+        config: test_config(abuse_rate_per_min, trust_forwarded_for),
         metrics: Arc::new(Metrics::new()),
         auth_nonces: Arc::new(frameshift_server::auth::NonceCache::new(
             Duration::from_secs(600),
@@ -115,4 +125,26 @@ async fn selection_telemetry_oversized_body_is_rejected() {
         .unwrap();
     let resp = router.oneshot(request).await.unwrap();
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+/// Anonymous telemetry is throttled before it can amplify logs indefinitely.
+#[tokio::test]
+async fn selection_telemetry_rate_limit_returns_429() {
+    let router = app(make_state_with_rate(1, true));
+    let mut statuses = Vec::new();
+    for _ in 0..3 {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/telemetry/selection")
+            .header("content-type", "application/json")
+            .header("x-forwarded-for", "10.0.0.2")
+            .body(axum::body::Body::from(VALID_PAYLOAD))
+            .unwrap();
+        statuses.push(router.clone().oneshot(request).await.unwrap().status());
+    }
+
+    assert!(
+        statuses.contains(&StatusCode::TOO_MANY_REQUESTS),
+        "expected a 429 response, got {statuses:?}"
+    );
 }

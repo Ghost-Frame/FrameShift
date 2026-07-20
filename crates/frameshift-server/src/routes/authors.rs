@@ -228,6 +228,14 @@ pub async fn register_author_route(
     Extension(signer): Extension<VerifiedSigner>,
     Json(body): Json<RegisterAuthorRequest>,
 ) -> Result<Response, AppError> {
+    if state.config.publisher_pubkeys.is_empty() {
+        return Err(AppError::NotFound(
+            "publisher registration disabled".to_string(),
+        ));
+    }
+    if !state.config.publisher_allowed(&signer.pubkey) {
+        return Err(AppError::Forbidden("publisher is not admitted".to_string()));
+    }
     validate_handle(&body.handle)?;
 
     // Do not let registration hijack an existing handle. `register_author` below

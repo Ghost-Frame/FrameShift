@@ -38,8 +38,7 @@
 //!   allowlist (`FRAMESHIFT_ADMIN_PUBKEYS`; see [`crate::routes::admin`]).
 //! - MCP placeholder: `/mcp/*` returns 501.
 //!
-//! Deferred (M5+): OAuth 2.1, transparency log, full MCP surface, and a shared
-//! (cross-instance) replay-nonce store for multi-binary deployments.
+//! Deferred (M5+): OAuth 2.1, transparency log, and the full MCP surface.
 
 pub mod auth;
 pub mod config;

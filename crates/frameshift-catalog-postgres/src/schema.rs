@@ -39,6 +39,18 @@ diesel::table! {
 }
 
 diesel::table! {
+    /// Shared replay protection for signed HTTP requests.
+    signed_request_nonces (pubkey, nonce) {
+        /// Raw 32-byte Ed25519 public key that signed the request.
+        pubkey -> Binary,
+        /// Caller-generated request nonce.
+        nonce -> Text,
+        /// Time after which the nonce can no longer accompany a valid request.
+        expires_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     /// The `packs` table stores the mutable "head" record for each named pack.
     ///
     /// Primary key: `name` (TEXT).
@@ -143,4 +155,5 @@ diesel::allow_tables_to_appear_in_same_query!(
     pack_versions,
     handles,
     pack_downloads,
+    signed_request_nonces,
 );

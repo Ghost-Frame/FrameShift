@@ -44,16 +44,10 @@
 //! 1. **Timestamp skew** -- the request is rejected if its timestamp differs
 //!    from server time by more than `max_skew` (config
 //!    `SIGNED_REQUEST_MAX_SKEW_SECS`, default 300s).
-//! 2. **Nonce cache** -- a verified `(nonce)` is recorded in an in-memory
-//!    [`NonceCache`]; a second request reusing that nonce within the retention
-//!    window is rejected. Retention is `2 * max_skew`, after which the
-//!    timestamp check alone rejects any re-send so the nonce can be forgotten.
-//!
-//! The nonce cache is **per process**. A multi-instance deployment behind a
-//! load balancer would need a shared nonce store (Redis/Postgres) to close the
-//! cross-instance replay gap; the timestamp window still bounds it to
-//! `2 * max_skew`. This is documented as a known limitation for the
-//! single-binary milestone.
+//! 2. **Nonce claims** -- a verified `(signer, nonce)` is recorded first in an
+//!    in-process [`NonceCache`] and then atomically in the shared catalog. The
+//!    local cache rejects common replays cheaply; the catalog closes replay
+//!    across server instances. Retention is `2 * max_skew`.
 //!
 //! # Uniform failure
 //!
@@ -262,8 +256,8 @@ pub fn verify(
     nonces: &NonceCache,
 ) -> Result<Ed25519PublicKey, AppError> {
     // 1. Timestamp skew.
-    let skew_secs = max_skew.as_secs() as i64;
-    if (now - params.timestamp).abs() > skew_secs {
+    let skew_secs = max_skew.as_secs();
+    if now.abs_diff(params.timestamp) > skew_secs {
         tracing::warn!(
             ts = params.timestamp,
             now,
@@ -350,6 +344,7 @@ pub struct NonceCache {
     max_entries: usize,
 }
 
+/// Construction and atomic replay checks for [`NonceCache`].
 impl NonceCache {
     /// Default cap on retained nonces.
     ///
@@ -395,6 +390,7 @@ impl NonceCache {
 }
 
 #[cfg(test)]
+/// Unit tests for signed-request parsing, verification, and replay handling.
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
@@ -505,6 +501,28 @@ mod tests {
             &nonces,
         );
         assert!(matches!(err, Err(AppError::Unauthorized(_))));
+    }
+
+    /// Extreme signed timestamps fail closed without overflowing freshness arithmetic.
+    #[test]
+    fn verify_rejects_extreme_timestamps_without_panicking() {
+        let key = SigningKey::from_bytes(&[16u8; 32]);
+        let nonces = NonceCache::new(Duration::from_secs(600));
+
+        for timestamp in [i64::MIN, i64::MAX] {
+            let headers = sign_headers(&key, "POST", "/v1/packs", b"x", timestamp, "nonce-extreme");
+            let params = parse_headers(&headers).expect("parse");
+            let result = verify(
+                &params,
+                "POST",
+                "/v1/packs",
+                b"x",
+                0,
+                Duration::from_secs(300),
+                &nonces,
+            );
+            assert!(matches!(result, Err(AppError::Unauthorized(_))));
+        }
     }
 
     #[test]

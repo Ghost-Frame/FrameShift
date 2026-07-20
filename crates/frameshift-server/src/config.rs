@@ -22,6 +22,11 @@
 //! | `DOWNLOAD_TOKEN_TTL` | `300` | Default TTL in seconds for newly minted download tokens (5 minutes) |
 //! | `DOWNLOAD_MAX_TOKEN_TTL` | `1800` | Hard cap on token TTL accepted by the verifier (30 minutes) |
 //! | `DOWNLOAD_RATE_PER_MIN` | `10` | Per-IP rate limit on the mint endpoint (requests/minute); 0 disables |
+//! | `ABUSE_RATE_PER_MIN` | `60` | Per-IP limit on signed writes and telemetry (requests/minute); 0 disables |
+//! | `METRICS_BEARER_TOKEN` | `""` | Bearer token required by `/metrics`; empty disables the endpoint |
+//! | `FRAMESHIFT_PUBLISHER_PUBKEYS` | `""` | Admitted publisher keys; empty disables registration and publishing |
+//! | `MAX_VERSIONS_PER_AUTHOR` | `100` | Maximum retained versions per admitted author; 0 disables |
+//! | `MAX_BYTES_PER_AUTHOR` | `1073741824` | Maximum retained archive bytes per admitted author; 0 disables |
 //! | `OBJECT_STORE_BACKEND` | `fs` | `fs` (filesystem) or `r2` (S3-compatible / Cloudflare R2) |
 //! | `R2_ENDPOINT` | `""` | S3 endpoint URL for R2 (required when backend is `r2`) |
 //! | `R2_BUCKET` | `""` | Bucket name (required when backend is `r2`) |
@@ -161,6 +166,30 @@ pub struct ServerConfig {
     /// HMAC validation is the gate there. Default: 10.
     pub download_rate_per_min: u32,
 
+    /// Per-IP rate limit for signed writes and anonymous telemetry.
+    ///
+    /// This bounds nonce-cache and log-amplification abuse before expensive
+    /// authentication or handler work. `0` disables the limit. Default: 60.
+    pub abuse_rate_per_min: u32,
+
+    /// Bearer token required to read `/metrics`.
+    ///
+    /// Empty disables the endpoint with `404`. Stored as [`SecretString`] so
+    /// it cannot appear in debug output.
+    pub metrics_bearer_token: SecretString,
+
+    /// Base64url Ed25519 keys admitted to register and publish.
+    ///
+    /// Empty disables both operations. The sentinel `"*"` explicitly opts
+    /// into open registration for development deployments.
+    pub publisher_pubkeys: Vec<String>,
+
+    /// Maximum retained pack versions per author; `0` disables this limit.
+    pub max_versions_per_author: u64,
+
+    /// Maximum retained archive bytes per author; `0` disables this limit.
+    pub max_bytes_per_author: u64,
+
     /// Selected object store backend: `"fs"` (default) or `"r2"`.
     ///
     /// `main.rs` reads this to choose between [`frameshift_objects_fs`] and
@@ -192,7 +221,7 @@ pub struct ServerConfig {
 
     /// Whether to trust the `X-Forwarded-For` header for rate-limit key extraction.
     ///
-    /// Set `true` only when a trusted reverse proxy (e.g. Pangolin Traefik)
+    /// Set `true` only when a trusted reverse proxy
     /// rewrites XFF before requests reach this server. When `false` (default),
     /// the raw socket peer IP is used, preventing rate-limit bypass by clients
     /// spoofing the XFF header.
@@ -253,7 +282,16 @@ pub struct ServerConfig {
     pub memory_sqlite_path: String,
 }
 
+/// Parsing helpers for values stored in [`ServerConfig`].
 impl ServerConfig {
+    /// Return whether the signer is admitted to register and publish.
+    pub fn publisher_allowed(&self, pubkey: &frameshift_catalog::Ed25519PublicKey) -> bool {
+        let encoded = pubkey.to_string();
+        self.publisher_pubkeys
+            .iter()
+            .any(|allowed| allowed == "*" || allowed == &encoded)
+    }
+
     /// Iterator over CORS origins parsed from [`Self::cors_allowed_origins`].
     ///
     /// Splits on `,`, trims each entry, and skips empty segments. Yields
@@ -299,6 +337,7 @@ impl ServerConfig {
 /// replaced with `"[REDACTED]"` so that accidental debug logging never leaks
 /// database credentials.
 impl std::fmt::Debug for ServerConfig {
+    /// Format configuration values while replacing every credential with a marker.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ServerConfig")
             .field("bind_addr", &self.bind_addr)
@@ -314,6 +353,14 @@ impl std::fmt::Debug for ServerConfig {
             .field("download_token_ttl", &self.download_token_ttl)
             .field("download_max_token_ttl", &self.download_max_token_ttl)
             .field("download_rate_per_min", &self.download_rate_per_min)
+            .field("abuse_rate_per_min", &self.abuse_rate_per_min)
+            .field("metrics_bearer_token", &"[REDACTED]")
+            .field(
+                "publisher_pubkeys",
+                &format!("[{} key(s)]", self.publisher_pubkeys.len()),
+            )
+            .field("max_versions_per_author", &self.max_versions_per_author)
+            .field("max_bytes_per_author", &self.max_bytes_per_author)
             .field("object_store_backend", &self.object_store_backend)
             .field("r2_endpoint", &self.r2_endpoint)
             .field("r2_bucket", &self.r2_bucket)
@@ -386,6 +433,21 @@ struct RawConfig {
     /// Per-IP mint-endpoint rate limit (requests / minute).
     download_rate_per_min: u32,
 
+    /// Per-IP signed-write and telemetry rate limit (requests / minute).
+    abuse_rate_per_min: u32,
+
+    /// Raw metrics bearer token, wrapped in [`SecretString`] during conversion.
+    metrics_bearer_token: String,
+
+    /// Comma-separated publisher admission keys.
+    publisher_pubkeys: String,
+
+    /// Maximum retained versions per author.
+    max_versions_per_author: u64,
+
+    /// Maximum retained archive bytes per author.
+    max_bytes_per_author: u64,
+
     /// Object store backend selector (`fs` | `r2`).
     object_store_backend: String,
     /// R2 endpoint URL.
@@ -440,6 +502,7 @@ fn split_comma_list(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// Conversion helpers for the serde-friendly raw configuration.
 impl RawConfig {
     /// Convert this raw configuration into a [`ServerConfig`].
     ///
@@ -460,6 +523,11 @@ impl RawConfig {
             download_token_ttl: Duration::from_secs(self.download_token_ttl),
             download_max_token_ttl: Duration::from_secs(self.download_max_token_ttl),
             download_rate_per_min: self.download_rate_per_min,
+            abuse_rate_per_min: self.abuse_rate_per_min,
+            metrics_bearer_token: SecretString::new(self.metrics_bearer_token),
+            publisher_pubkeys: split_comma_list(&self.publisher_pubkeys),
+            max_versions_per_author: self.max_versions_per_author,
+            max_bytes_per_author: self.max_bytes_per_author,
             object_store_backend: self.object_store_backend,
             r2_endpoint: self.r2_endpoint,
             r2_bucket: self.r2_bucket,
@@ -498,6 +566,11 @@ fn default_raw_config() -> RawConfig {
         download_token_ttl: 300,
         download_max_token_ttl: 1800,
         download_rate_per_min: 10,
+        abuse_rate_per_min: 60,
+        metrics_bearer_token: String::new(),
+        publisher_pubkeys: String::new(),
+        max_versions_per_author: 100,
+        max_bytes_per_author: 1024 * 1024 * 1024,
         object_store_backend: "fs".to_string(),
         r2_endpoint: String::new(),
         r2_bucket: String::new(),
@@ -516,6 +589,7 @@ fn default_raw_config() -> RawConfig {
     }
 }
 
+/// Environment-backed construction for [`ServerConfig`].
 impl ServerConfig {
     /// Parse [`ServerConfig`] from environment variables, applying defaults where
     /// variables are absent.
@@ -538,7 +612,7 @@ impl ServerConfig {
     pub fn from_env() -> Result<Self, Box<figment::Error>> {
         let raw: RawConfig = Figment::from(Serialized::defaults(default_raw_config()))
             .merge(Env::raw())
-            .merge(Env::prefixed("FRAMESHIFT_").only(&["admin_pubkeys"]))
+            .merge(Env::prefixed("FRAMESHIFT_").only(&["admin_pubkeys", "publisher_pubkeys"]))
             .extract()
             .map_err(Box::new)?;
         Ok(raw.into_server_config())
@@ -546,10 +620,12 @@ impl ServerConfig {
 }
 
 #[cfg(test)]
+/// Unit tests for configuration parsing and secret redaction.
 mod tests {
     use super::*;
 
     #[test]
+    /// Debug output redacts database credentials.
     fn debug_redacts_postgres_url() {
         // Use a unique token in the URL so the assertion below cannot be
         // satisfied by the literal field NAME "download_secret" -- the test
@@ -570,6 +646,11 @@ mod tests {
             download_token_ttl: Duration::from_secs(300),
             download_max_token_ttl: Duration::from_secs(1800),
             download_rate_per_min: 0,
+            abuse_rate_per_min: 0,
+            metrics_bearer_token: SecretString::new(String::new()),
+            publisher_pubkeys: vec!["*".to_string()],
+            max_versions_per_author: 0,
+            max_bytes_per_author: 0,
             object_store_backend: "fs".to_string(),
             r2_endpoint: String::new(),
             r2_bucket: String::new(),
@@ -595,6 +676,7 @@ mod tests {
     }
 
     #[test]
+    /// Comma-separated CORS origins are trimmed and empty entries are dropped.
     fn cors_origins_splits_and_trims_comma_separated() {
         let cfg = ServerConfig {
             bind_addr: "127.0.0.1:3000".parse().unwrap(),
@@ -610,6 +692,11 @@ mod tests {
             download_token_ttl: Duration::from_secs(300),
             download_max_token_ttl: Duration::from_secs(1800),
             download_rate_per_min: 0,
+            abuse_rate_per_min: 0,
+            metrics_bearer_token: SecretString::new(String::new()),
+            publisher_pubkeys: vec!["*".to_string()],
+            max_versions_per_author: 0,
+            max_bytes_per_author: 0,
             object_store_backend: "fs".to_string(),
             r2_endpoint: String::new(),
             r2_bucket: String::new(),
@@ -631,6 +718,7 @@ mod tests {
     }
 
     #[test]
+    /// An empty CORS origin setting yields no configured origins.
     fn cors_origins_empty_yields_no_entries() {
         let cfg = ServerConfig {
             bind_addr: "127.0.0.1:3000".parse().unwrap(),
@@ -646,6 +734,11 @@ mod tests {
             download_token_ttl: Duration::from_secs(300),
             download_max_token_ttl: Duration::from_secs(1800),
             download_rate_per_min: 0,
+            abuse_rate_per_min: 0,
+            metrics_bearer_token: SecretString::new(String::new()),
+            publisher_pubkeys: vec!["*".to_string()],
+            max_versions_per_author: 0,
+            max_bytes_per_author: 0,
             object_store_backend: "fs".to_string(),
             r2_endpoint: String::new(),
             r2_bucket: String::new(),
@@ -666,12 +759,14 @@ mod tests {
     }
 
     #[test]
+    /// An empty download secret disables signed download endpoints.
     fn download_key_empty_returns_none() {
         let cfg = make_test_cfg("");
         assert!(matches!(cfg.download_key(), Ok(None)));
     }
 
     #[test]
+    /// A valid 32-byte hex secret decodes without modification.
     fn download_key_valid_hex_returns_bytes() {
         let hex32 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let cfg = make_test_cfg(hex32);
@@ -681,12 +776,14 @@ mod tests {
     }
 
     #[test]
+    /// A download secret with the wrong decoded length is rejected.
     fn download_key_wrong_length_errors() {
         let cfg = make_test_cfg("deadbeef"); // 4 bytes, not 32
         assert!(cfg.download_key().is_err());
     }
 
     #[test]
+    /// Non-hex download secret input is rejected.
     fn download_key_invalid_hex_errors() {
         let cfg = make_test_cfg("zz".repeat(32).as_str());
         assert!(cfg.download_key().is_err());
@@ -709,6 +806,11 @@ mod tests {
             download_token_ttl: Duration::from_secs(300),
             download_max_token_ttl: Duration::from_secs(1800),
             download_rate_per_min: 0,
+            abuse_rate_per_min: 0,
+            metrics_bearer_token: SecretString::new(String::new()),
+            publisher_pubkeys: vec!["*".to_string()],
+            max_versions_per_author: 0,
+            max_bytes_per_author: 0,
             object_store_backend: "fs".to_string(),
             r2_endpoint: String::new(),
             r2_bucket: String::new(),
@@ -728,6 +830,7 @@ mod tests {
     }
 
     #[test]
+    /// Log format variants preserve their serde wire names.
     fn log_format_serde_roundtrip() {
         let j = serde_json::to_string(&LogFormat::Json).unwrap();
         assert_eq!(j, "\"json\"");

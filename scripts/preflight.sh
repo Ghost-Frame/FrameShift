@@ -57,13 +57,13 @@ if [[ "$fast_only" == "1" ]]; then
 fi
 
 # 3. Lints (compiles; matches CI's clippy job).
-step "cargo clippy --workspace --all-targets -- -D warnings"
-cargo clippy --workspace --all-targets -- -D warnings || fail "clippy"
+step "cargo clippy --locked --workspace --all-targets -- -D warnings"
+cargo clippy --locked --workspace --all-targets -- -D warnings || fail "clippy"
 ok "clippy"
 
 # 4. Tests (compiles; matches CI's plain test job, Docker-gated tests skipped).
-step "cargo test --workspace"
-cargo test --workspace || fail "tests"
+step "cargo test --locked --workspace"
+cargo test --locked --workspace || fail "tests"
 ok "tests"
 
 step "preflight complete"

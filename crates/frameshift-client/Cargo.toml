@@ -48,6 +48,7 @@ ureq = { version = "2", features = ["json"] }
 # Tar/gzip extraction for registry pack archives.
 tar = "0.4"
 flate2 = "1"
+libc = "0.2"
 # Temporary directory for registry pack extraction before caching.
 tempfile.workspace = true
 

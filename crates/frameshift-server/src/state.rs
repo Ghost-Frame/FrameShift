@@ -72,6 +72,6 @@ pub struct AppState {
     ///
     /// The signed-request middleware records each verified request nonce here
     /// to reject replays within the timestamp-skew window. Shared via `Arc`;
-    /// see [`crate::auth::NonceCache`] for the single-process caveat.
+    /// the catalog provides the authoritative cross-instance nonce claim.
     pub auth_nonces: Arc<NonceCache>,
 }

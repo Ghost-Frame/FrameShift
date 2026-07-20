@@ -61,7 +61,7 @@ pub struct SelectionTelemetry<'a> {
     pub persona: &'a str,
     /// Opaque session identifier.
     pub session: &'a str,
-    /// Opaque project identifier (content-addressed, not a path).
+    /// Random project identifier persisted only after telemetry opt-in.
     pub project_id: &'a str,
     /// Unix epoch seconds at which the selection occurred.
     pub recorded_at_unix: u64,
@@ -86,14 +86,29 @@ pub fn append_selection_event(
     // Serialize to a single line; JSONL requires exactly one object per line.
     let line =
         serde_json::to_string(event).map_err(|e| ClientError::JsonSerialize(e.to_string()))?;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options
         .open(history_path)
         .map_err(|source| ClientError::Io {
             path: history_path.to_path_buf(),
             source,
         })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|source| ClientError::Io {
+                path: history_path.to_path_buf(),
+                source,
+            })?;
+    }
     writeln!(file, "{line}").map_err(|source| ClientError::Io {
         path: history_path.to_path_buf(),
         source,
@@ -131,7 +146,7 @@ pub fn post_selection_telemetry(
         Err(ureq::Error::Status(status, response)) => Err(ClientError::RegistryRejected {
             url: endpoint.to_string(),
             status,
-            message: response.into_string().unwrap_or_default(),
+            message: crate::registry::response_text_bounded(response, endpoint),
         }),
         // Transport-level failure (DNS, connection, TLS, etc.).
         Err(ureq::Error::Transport(transport)) => Err(ClientError::RegistryHttp {
@@ -142,6 +157,7 @@ pub fn post_selection_telemetry(
 }
 
 #[cfg(test)]
+/// Unit tests for local selection history and endpoint resolution.
 mod tests {
     use super::*;
     use tempfile::TempDir;
