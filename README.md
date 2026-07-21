@@ -2,30 +2,33 @@
   <img src="personas/assets/banner.png" alt="Frameshift" width="100%" />
 </p>
 
-# Frameshift (WIP)
+# Frameshift
 
 A persona engine for AI coding agents. Install behavioral identities as versioned packs, activate them per-project, and let the engine pick the right one for the task.
 
-**Status:** The CLI, pack system, orchestrator, watch daemon, marketplace server, and web frontend all work. You can clone this repo and use the personas today via the CLI, or publish and browse packs against the live marketplace.
+**Status:** Pre-release. The CLI, pack runtime, orchestrator, watch daemon, and marketplace server are implemented. The public registry API is online; the browser marketplace remains behind an access gate while release validation finishes.
 
-**Desktop app:** [download.frameshift.syntheos.dev](https://download.frameshift.syntheos.dev/) -- a proprietary companion app for browsing the marketplace and managing personas with one click. This repo is the engine it drives; the app ships separately with Ed25519-signed self-updates.
+**Desktop app:** [download.frameshift.syntheos.dev](https://download.frameshift.syntheos.dev/) -- a proprietary companion app distributed separately from this engine repository.
 
 Personas are not instruction lists. They are complete behavioral frames -- identity, rules, skills, operating posture -- that survive long sessions, surprising inputs, and the slow drift that turns careful agents into sloppy ones around turn 200. Same model, different frame.
 
 ## Quickstart
 
 ```bash
-# Install + activate + render in one shot:
-frameshift use cryptographic --from ./personas
+# Install the latest signed release from the public registry:
+frameshift install cryptographic
+frameshift use cryptographic
 
-# Or step by step:
-frameshift install cryptographic@0.1.0 --from-path ./personas/cryptographic
+# Or install a complete local pack directory:
+frameshift install cryptographic@0.1.0 --from-path /path/to/cryptographic
 frameshift activate cryptographic
 ```
 
+Registry commands use `https://frameshift-api.syntheos.dev` by default. Set `FRAMESHIFT_REGISTRY_URL` to target another deployment. The `personas/` directory in this repository is a manifest-only public catalog, not a complete local pack library; install those personas from the registry unless you also have their behavioral source.
+
 ## Automate mode
 
-Automate mode picks the persona for you. The engine classifies your task, scores every installed persona against the project context, and switches when the domain shifts.
+Automate mode lets a host integration pick the persona for you. Frameshift classifies the task, ranks installed personas against project context, and stores the mode, sensitivity, lock, preferences, and transition audit. A session hook or other host integration decides when to run selection and activate a result; `frameshift automate on` does not switch personas by itself.
 
 ```bash
 # Turn on for this project:
@@ -38,7 +41,7 @@ frameshift automate on --sensitivity 0.7
 frameshift automate status
 ```
 
-The selection pipeline scores four components: language overlap (how well the persona's language set matches your project), lexical match (IDF-weighted task token hits against persona keywords), intent alignment (10-category task classification), and capability fit. Scores blend into a ranked list with confidence values.
+The default selection pipeline scores four components: language overlap (how well the persona's language set matches your project), lexical match (IDF-weighted task token hits against persona keywords), intent alignment (10-category task classification), and capability fit. Scores blend into a ranked list with confidence values. Hosts can consume JSON output and let the active model rerank the candidates before activation.
 
 ### Intent classification
 
@@ -47,14 +50,14 @@ The engine classifies task descriptions into one of ten intents: Implementation,
 ### Selection output
 
 ```bash
-# Table format (default):
-frameshift select --task "debug a rust compilation error" --library ~/.local/share/frameshift/personas
+# Table format using personas installed for this project (default):
+frameshift select --task "debug a rust compilation error"
 
 # Structured JSON for programmatic consumption or LLM reranking:
-frameshift select --task "debug a rust compilation error" --library ~/.local/share/frameshift/personas --format json
+frameshift select --task "debug a rust compilation error" --format json
 ```
 
-JSON output includes the full context snapshot (detected languages, frameworks, inferred intent), per-candidate component scores, matched tokens, and rationale. Host LLMs can rerank using this data.
+JSON output includes the full context snapshot (detected languages, frameworks, inferred intent), per-candidate component scores, matched tokens, and rationale. Host LLMs can rerank using this data. Pass `--library /path/to/library` only when each persona directory contains `AGENTS.md` or typed persona source; a manifest-only catalog has no behavioral content to rank.
 
 ### Feedback loop
 
@@ -66,11 +69,11 @@ frameshift feedback --auto-pick web-designer --chosen rust --intent debugging
 
 ## How it works
 
-Frameshift takes a typed persona definition, compiles it into the instruction file each agent expects, and distributes it as a signed, content-addressed pack that installs into a central store outside your project tree.
+Frameshift takes a persona body plus a typed manifest, renders the instruction file each agent expects, and distributes the result as a signed, content-addressed pack that installs into a central store outside your project tree. Structured TOML source is available when a persona needs composition or semantic editing.
 
 ### Packs
 
-A persona ships as a **pack**: a `pack.toml` manifest plus the persona's behavioral content. The manifest carries identity and contract metadata:
+A persona ships as a **pack**: a `pack.toml` manifest plus behavioral content. Marketplace packs use freeform `AGENTS.md` as the primary body; `CLAUDE.md`, `GEMINI.md`, or `README.md` are accepted as fallback bodies. Frameshift also supports an optional typed source made from `persona.toml`, `rules.toml`, `skills.toml`, and `patterns.toml` for structured editing and composition. The manifest carries identity and contract metadata:
 
 ```toml
 schema_version = 1
@@ -89,7 +92,7 @@ filesystem_scope = "project-only"
 memory_required = "none"
 ```
 
-`description` and `tags` feed registry search; `capability_manifest` declares the tools, network egress, filesystem scope, and memory requirement the persona expects (see Capabilities and Memory below). `extends` and `mixin` drive composition. `parent_hash` tracks version lineage; `conformance_baseline` feeds the install-time regression gate (see Conformance below).
+`description` and `tags` feed registry search; `capability_manifest` declares the tools, network egress, filesystem scope, and memory requirement the persona expects (see Capabilities and Memory below). For typed packs, `extends` and `mixin` drive composition. `parent_hash` tracks version lineage; `conformance_baseline` feeds the install-time regression gate (see Conformance below).
 
 ### Content addressing and signatures
 
@@ -99,7 +102,7 @@ Signing is Ed25519 over that 32-byte hash; the signature travels alongside the p
 
 ### Trust: handle-bound keys, no central authority
 
-There is no central signing authority. An author **claims a handle** (e.g. `ghost-frame`) with a signed request, and the registry binds that handle to the key that signed it, first-claim-wins. Key rotation must be signed by the current key -- the old key authorizes its own replacement. At publish, the server checks that the live signer owns the handle and that the pack signature verifies against that registered key. On install from the registry, the client verifies the pack signature against the key in the **registry's record** for that version, not the key embedded in the manifest, so a tampered manifest cannot smuggle in a different key. Installing directly from a local path verifies a signature if one is present, and installs unsigned local packs as-is. Registered authors are publicly listable via `GET /v1/authors`.
+There is no central signing authority. An author **claims a handle** (e.g. `ghost-frame`) with a signed request, and the registry binds that handle to the key that signed it, first-claim-wins. Author keys are immutable in the current release: there is no public key-rotation endpoint. At publish, the server checks that the live signer owns the handle and that the pack signature verifies against that registered key. On install from the registry, the client verifies the pack signature against the key in the **registry's record** for that version, not the key embedded in the manifest, so a tampered manifest cannot smuggle in a different key. The client also pins each handle's first observed registry key locally and rejects later key changes. Installing directly from a local path verifies a signature if one is present, and installs unsigned local packs as-is. Registered authors are publicly listable via `GET /v1/authors`.
 
 ### Downloads
 
@@ -107,7 +110,13 @@ There is no central signing authority. An author **claims a handle** (e.g. `ghos
 
 ### Admin
 
-The registry server exposes one operator endpoint: `POST /v1/admin/packs/{name}/{version}/tombstone`, which marks a published version as removed from public availability. Like the handle-claim and rotation calls, it requires a signed request; the signer's key must also appear on `FRAMESHIFT_ADMIN_PUBKEYS`, a separate comma-separated allowlist of Ed25519 public keys. An empty allowlist disables the endpoint outright (`404`, indistinguishable from an unmapped route); a signed request from a key not on the list gets `403`. No CLI or client command calls this endpoint today -- it's reached directly.
+The registry server exposes one operator endpoint: `POST /v1/admin/packs/{name}/{version}/tombstone`, which marks a published version as removed from public availability. Like registration and publishing, it requires a signed request; the signer's key must also appear on `FRAMESHIFT_ADMIN_PUBKEYS`, a separate comma-separated allowlist of Ed25519 public keys. An empty allowlist disables the endpoint outright (`404`, indistinguishable from an unmapped route); a signed request from a key not on the list gets `403`. No CLI or client command calls this endpoint today -- it is reached directly.
+
+### Registry safety controls
+
+Registry reads are public. Registration, publication, and administration require Ed25519-signed requests that bind the method, path, body hash, timestamp, and nonce. The server checks clock skew, claims nonces in the shared catalog to reject cross-instance replay, and admits publishers through `FRAMESHIFT_PUBLISHER_PUBKEYS`.
+
+Request-body and archive limits bound memory and decompression work. Publication also enforces per-author version and byte quotas plus a registry-wide byte quota. Uploaded archives may contain at most 256 regular-file entries and decompress to at most 16 MiB; unsafe paths and non-regular entries are rejected before catalog registration.
 
 ### Install and the central store
 
@@ -143,17 +152,17 @@ A pack's `pack.toml` can ship a `[conformance_baseline]` -- a score from 0.0 to 
 - **InvalidScore** -- a score is non-finite or outside 0.0-1.0. Warn-only.
 - **IntegrityFailure** -- the incoming pack's declared `bundle_hash` doesn't match the hash of its own shipped conformance bundle, or it ships none at all. This **hard-blocks the install** -- an unverifiable score can't be trusted regardless of what it claims. Override with `FRAMESHIFT_ALLOW_CONFORMANCE_INTEGRITY_FAILURE=1`.
 
-A fresh install of a persona with no prior version in the project skips the comparison entirely. `frameshift verify` (see CLI, below) is what produces a baseline in the first place: it runs a persona's conformance bundle through a runner and scores the results.
+A fresh install of a persona with no prior version in the project skips the comparison entirely. `frameshift verify` (see CLI, below) runs a persona's conformance bundle through a runner and reports the score; it does not modify `pack.toml`. A published baseline must correspond to the bundle shipped in the pack.
 
-### Rendering: one source, per-agent outputs
+### Rendering: one pack, per-agent outputs
 
-A persona's typed source is four TOML files -- `persona.toml` (identity, voice, anchors), `rules.toml`, `skills.toml`, and `patterns.toml`. Rules carry a **layer**: L1 (non-negotiable invariants), L2 (contextual defaults, overridable with explicit justification), L3 (preferences).
+Freeform packs use their Markdown body for every target, with Frameshift's host overlay and persona header prepended. Typed packs use four TOML files -- `persona.toml` (identity, voice, anchors), `rules.toml`, `skills.toml`, and `patterns.toml` -- and render target-specific Markdown. Typed rules carry a **layer**: L1 (non-negotiable invariants), L2 (contextual defaults, overridable with explicit justification), L3 (preferences).
 
-Rendering projects that source into Markdown, once per agent target, writing the file each agent expects into `rendered/<target>/`: `CLAUDE.md` for Claude, `AGENTS.md` for Codex and generic, `GEMINI.md` for Gemini. The targets differ in which sections they carry -- Claude and generic get the full document, Codex omits the Design Notes and Safety-Layer sections, Gemini omits Design Notes -- so the same source produces the idiom each agent reads best.
+Both paths write the file each agent expects into `rendered/<target>/`: `CLAUDE.md` for Claude, `AGENTS.md` for Codex and generic, and `GEMINI.md` for Gemini. Typed targets differ in which sections they carry: Claude and generic get the full document, Codex omits Design Notes and Safety-Layer sections, and Gemini omits Design Notes.
 
 ### Composition: extends and mixins
 
-A pack can `extends` a single base persona and `mixin` a list of others. Composition merges in a fixed order -- base, then each mixin in turn, then the persona itself -- with later layers overriding earlier ones by rule or skill id (last write wins). One invariant is protected: a mixin can never override a base's **L1** rule, and a persona can override an inherited L1 rule only by explicitly opting in. A missing base or an illegal L1 override fails the install. Bases and mixins are resolved from the packs already installed in the same project.
+A typed pack can `extends` a single base persona and `mixin` a list of others. Composition merges in a fixed order -- base, then each mixin in turn, then the persona itself -- with later layers overriding earlier ones by rule or skill id (last write wins). One invariant is protected: a mixin can never override a base's **L1** rule, and a persona can override an inherited L1 rule only by explicitly opting in. A missing base or an illegal L1 override fails the install. Bases and mixins are resolved from packs already installed in the same project. A freeform pack that declares composition metadata cannot be structurally composed; Frameshift warns and renders its Markdown body unchanged.
 
 ### Capabilities
 
@@ -184,7 +193,7 @@ required = true
 description = "How the agent should address you"
 ```
 
-Token values live in a per-project **vault**: a single age-encrypted file in the central store (never in the project root, never in the pack). When install/activate/use/sync write a persona's `rendered/<target>/` outputs, every `{{token}}` is substituted from the vault (the separate `frameshift render` debug command renders typed source directly and does not substitute tokens). A missing `required = true` token fails the render with one error naming every missing token; an optional token without a value keeps its literal `{{name}}` placeholder. Packs that ship no `pack.template.toml` -- every pack today -- render byte-identically to how they always have; the vault is never opened for them.
+Token values live in a per-project **vault**: a single age-encrypted file in the central store (never in the project root, never in the pack). When install/activate/use/sync write a persona's `rendered/<target>/` outputs, every `{{token}}` is substituted from the vault (the separate `frameshift render` debug command renders typed source directly and does not substitute tokens). A missing `required = true` token fails the render with one error naming every missing token; an optional token without a value keeps its literal `{{name}}` placeholder. Packs that ship no `pack.template.toml` render without opening the vault.
 
 The vault passphrase comes from `FRAMESHIFT_VAULT_PASSPHRASE`, or a hidden interactive prompt when the CLI runs in a terminal. Only the CLI ever prompts. The daemon and MCP server resolve the passphrase from the environment variable alone: rendering a templated pack there without it set fails with an error rather than degrading silently (packs without `pack.template.toml` are unaffected either way). There is no built-in passphrase recovery -- losing the passphrase means losing the vault's contents, so keep your own backup.
 
@@ -199,11 +208,11 @@ frameshift vault list                     # keys only, never values
 The same selection engine backs every surface:
 
 - **CLI** -- `frameshift <command>` (see below).
-- **Stdio MCP server** -- a JSON-RPC server exposing tools (install, activate, list, select, use, automate, prefs, grow, capabilities, search) and prompts (`active_persona`, `select_persona`, `automate_status`) as slash commands in any MCP-capable agent.
+- **Stdio MCP server** -- a JSON-RPC server exposing tools (install, activate, list, select, use, automate, prefs, grow, capabilities, search) and prompts (`active_persona`, `select_persona`, `automate_status`) to MCP-capable hosts.
 - **Watch daemon** -- an optional background service over a peer-authenticated Unix socket, offering install/activate/sync/gc operations to editor integrations.
 - **Registry / marketplace HTTP server** -- publish, search, download, and author/handle registration.
 
-Automate mode itself is applied by the host integration: a session hook (or equivalent) reads the per-project automate flag, calls `frameshift select` for the current task, and activates the best-fit persona.
+Automate mode itself is applied by the host integration: a session hook (or equivalent) reads the per-project automate flag, calls `frameshift select` for the current task, optionally reranks the candidates with the active model, and activates the selected persona when transition policy allows it.
 
 ### Semantic selection
 
@@ -217,7 +226,7 @@ Persona lifecycle:
 frameshift install <name>[@<version>] [--from-path <dir>]  Install a pack (a bare name resolves the latest registry version)
 frameshift uninstall <persona>                             Remove a persona from this project (cache is kept for gc)
 frameshift activate <name>                                 Set the active persona for this project
-frameshift use <name> --from <library>                     Install + activate + print rendered output
+frameshift use <name> [--from <library>]                   Activate + print output; optionally install from a local library
 frameshift list                                            List installed personas and mark the active one
 frameshift sync                                            Reconcile the central store with the lockfile
 frameshift gc                                              Remove unreferenced cache entries
@@ -228,7 +237,7 @@ Selection and automate mode:
 
 ```
 frameshift select [--task TEXT] [--library DIR] [--format table|json]   Rank personas by score/confidence/rationale
-frameshift automate on [--sensitivity 0.0-1.0]                          Enable automatic persona switching
+frameshift automate on [--sensitivity 0.0-1.0]                          Enable host-driven automate policy
 frameshift automate off | status | lock | unlock                        Disable / inspect / pin / unpin
 frameshift feedback --chosen <name> [--auto-pick <name>]                Record a selection override
            [--intent <intent>] [--reason <text>]
@@ -272,7 +281,7 @@ frameshift search [QUERY] [--tag <tag>] [--limit <n>]                      Searc
 frameshift project-id                                                      Print the hashed project ID
 ```
 
-`verify` defaults to `--runner mock` (canned, offline responses, used by CI) with `--threshold 0.5`; pass `--runner cli` to drive the subscription-backed `agy` runner against `--model` (default `Gemini 3.1 Pro (High)`), which needs a logged-in `agy`. `publish` writes the pack to `--out` (default `publish-output/<persona>`) unconditionally; the upload step only runs when `--server` is set, and `--handle` is then required.
+`verify` defaults to `--runner mock` (canned, offline responses) with `--threshold 0.5`; pass `--runner cli` to drive the subscription-backed `agy` runner against `--model` (default `Gemini 3.1 Pro (High)`), which needs a logged-in `agy`. `publish` writes the pack to `--out` (default `publish-output/<persona>`) unconditionally; the upload step only runs when `--server` is set, and `--handle` is then required.
 
 ## What this repo contains
 
@@ -281,7 +290,7 @@ frameshift project-id                                                      Print
 
 ## Building
 
-Requires `libpq` (the PostgreSQL client library) for the diesel/pq-sys-backed catalog crate -- install it before building the workspace:
+Frameshift requires Rust 1.86 or newer. The full workspace also requires `libpq` (the PostgreSQL client library) for the Diesel-backed catalog crate:
 
 ```bash
 # Debian/Ubuntu
@@ -292,28 +301,51 @@ brew install libpq
 ```
 
 ```bash
-cargo build
-cargo test
+cargo build --locked --workspace
+cargo test --locked --workspace
+```
+
+Install the CLI from the workspace:
+
+```bash
+cargo install --locked --path crates/frameshift-cli
+```
+
+The standard test command skips the Docker-backed PostgreSQL integration tests. Run those separately when Docker is available:
+
+```bash
+cargo test --locked -p frameshift-catalog-postgres -- --include-ignored
 ```
 
 To include the semantic-selection channel (downloads a ~23 MB embedding model on first use):
 
 ```bash
-cargo build -p frameshift-cli --features embeddings
+cargo build --locked -p frameshift-cli --features embeddings
 ```
 
 ### Running from source
 
 ```bash
-cargo run -p frameshift-cli -- use cryptographic --from ./personas
+cargo run -p frameshift-cli -- install cryptographic
+cargo run -p frameshift-cli -- use cryptographic
 cargo run -p frameshift-cli -- select --task "optimize a hot loop" --format json
 ```
 
 ## Configuration
 
+### Client
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `FRAMESHIFT_REGISTRY_URL` | `https://frameshift-api.syntheos.dev` | Registry base URL used by install, search, and telemetry endpoint derivation |
+| `FRAMESHIFT_TELEMETRY_URL` | registry `/v1/telemetry/selection` route | Optional telemetry endpoint override; telemetry still requires project opt-in |
+| `FRAMESHIFT_VAULT_PASSPHRASE` | interactive CLI prompt | Non-interactive passphrase source for encrypted template values |
+| `FRAMESHIFT_PROJECT_ID` | hash of canonical project path | Explicit project identity override for hosts that cannot expose a stable path |
+| `FRAMESHIFT_ALLOW_CONFORMANCE_INTEGRITY_FAILURE` | unset | Set to `1` to explicitly bypass an upgrade's conformance-bundle integrity failure |
+
 ### Server
 
-All variables are read with no prefix (e.g. `BIND_ADDR`, not `FRAMESHIFT_BIND_ADDR`) -- except `FRAMESHIFT_ADMIN_PUBKEYS`, deliberately prefixed so it can't be confused with an unrelated `ADMIN_PUBKEYS` some other tool in the deployment might own; see `crates/frameshift-server/src/config.rs` for the authoritative parser.
+Most variables are read with no prefix (e.g. `BIND_ADDR`, not `FRAMESHIFT_BIND_ADDR`). Publisher and administrator admission lists deliberately use `FRAMESHIFT_PUBLISHER_PUBKEYS` and `FRAMESHIFT_ADMIN_PUBKEYS`; see `crates/frameshift-server/src/config.rs` for the authoritative parser.
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -332,9 +364,10 @@ All variables are read with no prefix (e.g. `BIND_ADDR`, not `FRAMESHIFT_BIND_AD
 | `DOWNLOAD_RATE_PER_MIN` | `10` | Per-IP rate limit on the mint endpoint (requests/minute); `0` disables |
 | `ABUSE_RATE_PER_MIN` | `60` | Per-IP rate limit on signed writes and telemetry (requests/minute); `0` disables |
 | `METRICS_BEARER_TOKEN` | empty | Bearer token required by `/metrics`; empty disables the endpoint |
-| `FRAMESHIFT_PUBLISHER_PUBKEYS` | empty | Comma-separated admitted Ed25519 keys; empty disables registration and publishing |
+| `FRAMESHIFT_PUBLISHER_PUBKEYS` | empty | Comma-separated admitted base64url-no-pad Ed25519 keys; empty disables writes, `*` admits any valid signer |
 | `MAX_VERSIONS_PER_AUTHOR` | `100` | Maximum retained versions per admitted author; `0` disables |
 | `MAX_BYTES_PER_AUTHOR` | `1073741824` | Maximum retained archive bytes per admitted author; `0` disables |
+| `MAX_TOTAL_BYTES` | `107374182400` | Maximum retained archive bytes across the registry; `0` disables |
 | `OBJECT_STORE_BACKEND` | `fs` | `fs` (filesystem) or `r2` (S3-compatible / Cloudflare R2) |
 | `R2_ENDPOINT` | `""` | S3 endpoint URL for R2 (required when backend is `r2`) |
 | `R2_BUCKET` | `""` | Bucket name (required when backend is `r2`) |
@@ -358,5 +391,5 @@ Elastic License 2.0. See [LICENSE](LICENSE) for details.
 ### Commercial licensing
 
 The Elastic License 2.0 prohibits offering Frameshift to third parties as a
-hosted or managed service. To sell, host, or distribute Frameshift on your own
-platform, contact us for a commercial license: support@syntheos.dev.
+hosted or managed service. Commercial terms for hosted or managed offerings
+are available from support@syntheos.dev.
