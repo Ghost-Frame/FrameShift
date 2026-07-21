@@ -365,7 +365,7 @@ frameshift project-id                                                      Print
 
 Source builds are intended for contributors. Most users should install the desktop app or a prebuilt release above.
 
-Frameshift requires Rust 1.86 or newer. The full workspace also requires `libpq` (the PostgreSQL client library) for the Diesel-backed catalog crate:
+Frameshift requires Rust 1.88 or newer. The full workspace also requires `libpq` (the PostgreSQL client library) for the Diesel-backed catalog crate:
 
 ```bash
 # Debian/Ubuntu
