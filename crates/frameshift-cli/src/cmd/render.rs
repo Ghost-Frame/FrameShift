@@ -30,7 +30,22 @@ pub struct RenderArgs {
 #[derive(Debug, Clone, Copy)]
 pub struct RenderTargetArg(pub RenderTarget);
 
+/// Exposes stable client identifiers for parsed render targets.
+impl RenderTargetArg {
+    /// Return the client-facing identifier for this render target.
+    pub fn as_str(self) -> &'static str {
+        match self.0 {
+            RenderTarget::Claude => "claude",
+            RenderTarget::Codex => "codex",
+            RenderTarget::Gemini => "gemini",
+            RenderTarget::Generic => "generic",
+        }
+    }
+}
+
+/// Parses a command-line render target into the shared target enum.
 impl std::str::FromStr for RenderTargetArg {
+    /// Human-readable parse failure returned by clap.
     type Err = String;
 
     /// Parse one of "claude", "codex", "gemini", "generic" (case-insensitive).
@@ -81,6 +96,13 @@ mod tests {
             // through a simple existence check.
             let _ = parsed.0;
         }
+    }
+
+    /// Verify that parsed targets expose the identifiers used by the client store.
+    #[test]
+    fn render_target_arg_exposes_client_identifier() {
+        let target: RenderTargetArg = "codex".parse().unwrap();
+        assert_eq!(target.as_str(), "codex");
     }
 
     /// Verify that RenderTargetArg rejects unrecognized strings.

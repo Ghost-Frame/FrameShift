@@ -8,21 +8,94 @@ A persona engine for AI coding agents. Install behavioral identities as versione
 
 **Status:** Pre-release. The CLI, pack runtime, orchestrator, watch daemon, and marketplace server are implemented. The public registry API is online; the browser marketplace remains behind an access gate while release validation finishes.
 
-**Desktop app:** [download.frameshift.syntheos.dev](https://download.frameshift.syntheos.dev/) -- a proprietary companion app distributed separately from this engine repository.
+**Desktop app:** [download.frameshift.syntheos.dev](https://download.frameshift.syntheos.dev/) -- the easiest way to browse, install, and activate personas without using a terminal.
 
 Personas are not instruction lists. They are complete behavioral frames -- identity, rules, skills, operating posture -- that survive long sessions, surprising inputs, and the slow drift that turns careful agents into sloppy ones around turn 200. Same model, different frame.
 
-## Quickstart
+## Start here
+
+### Desktop app
+
+1. [Download FrameShift Desktop](https://download.frameshift.syntheos.dev/) for your operating system.
+2. Open the app and choose the project folder where you use an AI coding agent.
+3. Open Marketplace, choose a persona, and select Install.
+4. Return to Personas and activate it for the selected project.
+
+The selected project is always shown in the sidebar. Installing or activating a persona affects that project only, and you can switch projects at any time.
+
+### Command line
+
+Every release includes both `frameshift`, for people, and `frameshift-mcp`, for agents. Download the archive for your computer, verify it with the matching checksum in `SHA256SUMS`, extract it, and place both binaries somewhere on your `PATH`.
+
+| Platform | Release archive |
+| --- | --- |
+| Linux x64 | [frameshift-linux-x86_64.tar.gz](https://github.com/Ghost-Frame/FrameShift/releases/latest/download/frameshift-linux-x86_64.tar.gz) |
+| Windows x64 | [frameshift-windows-x86_64.zip](https://github.com/Ghost-Frame/FrameShift/releases/latest/download/frameshift-windows-x86_64.zip) |
+| macOS Apple Silicon | [frameshift-macos-arm64.tar.gz](https://github.com/Ghost-Frame/FrameShift/releases/latest/download/frameshift-macos-arm64.tar.gz) |
+| macOS Intel | [frameshift-macos-x86_64.tar.gz](https://github.com/Ghost-Frame/FrameShift/releases/latest/download/frameshift-macos-x86_64.tar.gz) |
+
+Confirm the installation:
 
 ```bash
-# Install the latest signed release from the public registry:
-frameshift install cryptographic
-frameshift use cryptographic
-
-# Or install a complete local pack directory:
-frameshift install cryptographic@0.1.0 --from-path /path/to/cryptographic
-frameshift activate cryptographic
+frameshift --help
 ```
+
+The MCP setup commands below will report a launch error if `frameshift-mcp` is not on the same `PATH`.
+
+Then run these commands from the project you want FrameShift to manage:
+
+```bash
+# Install the latest signed persona pack from the public registry.
+frameshift install cryptographic
+
+# Activate it and print the instructions for your agent.
+frameshift use cryptographic --target codex
+
+# Or install a complete local pack directory.
+frameshift install cryptographic@0.1.0 --from-path /path/to/cryptographic
+frameshift use cryptographic --target generic
+```
+
+Valid targets are `claude`, `codex`, `gemini`, and `generic`. Use the target matching your agent so FrameShift produces the instruction format that host expects.
+
+## Connect an AI agent with MCP
+
+The MCP server lets an agent search, install, select, activate, and inspect personas without asking you to translate every action into CLI commands. Install the release binaries first, open a terminal in your project, then run the command for your agent.
+
+### Claude Code
+
+```bash
+claude mcp add --scope local --transport stdio \
+  --env FRAMESHIFT_TARGET=claude \
+  frameshift -- frameshift-mcp
+```
+
+Claude Code supplies the project root automatically. Run `/mcp` inside Claude Code and confirm that `frameshift` is connected.
+
+### Codex
+
+```bash
+codex mcp add frameshift \
+  --env FRAMESHIFT_TARGET=codex \
+  --env FRAMESHIFT_PROJECT_ROOT=/absolute/path/to/your/project \
+  -- frameshift-mcp
+```
+
+Run `/mcp` inside Codex and confirm that `frameshift` is connected. Repeat the command with a different server name when you want fixed MCP entries for several projects.
+
+### Gemini CLI
+
+```bash
+gemini mcp add --scope project \
+  --env FRAMESHIFT_TARGET=gemini \
+  frameshift frameshift-mcp
+```
+
+Gemini stores this entry in the current project. Use `gemini mcp list` to confirm the connection.
+
+### MCP defaults
+
+Every project-scoped MCP tool accepts an optional `project_root`. Resolution follows this order: the tool argument, `FRAMESHIFT_PROJECT_ROOT`, Claude Code's `CLAUDE_PROJECT_DIR`, then the MCP process working directory. The render target follows the tool argument, `FRAMESHIFT_TARGET`, then `generic`. This makes simple project-scoped setups work without repeating paths on every tool call while preserving explicit control for multi-project agents.
 
 Registry commands use `https://frameshift-api.syntheos.dev` by default. Set `FRAMESHIFT_REGISTRY_URL` to target another deployment. The `personas/` directory in this repository is a manifest-only public catalog, not a complete local pack library; install those personas from the registry unless you also have their behavioral source.
 
@@ -226,7 +299,7 @@ Persona lifecycle:
 frameshift install <name>[@<version>] [--from-path <dir>]  Install a pack (a bare name resolves the latest registry version)
 frameshift uninstall <persona>                             Remove a persona from this project (cache is kept for gc)
 frameshift activate <name>                                 Set the active persona for this project
-frameshift use <name> [--from <library>]                   Activate + print output; optionally install from a local library
+frameshift use <name> [--from <library>] [--target <agent>] Activate + print output for claude, codex, gemini, or generic
 frameshift list                                            List installed personas and mark the active one
 frameshift sync                                            Reconcile the central store with the lockfile
 frameshift gc                                              Remove unreferenced cache entries
@@ -288,7 +361,9 @@ frameshift project-id                                                      Print
 - `crates/` -- Rust workspace: CLI, client engine, pack tooling, composition, conformance, catalog, memory, vault, object storage, HTTP server, MCP server, watch daemon, orchestrator, embeddings, growth
 - `personas/` -- pack manifests for the persona library
 
-## Building
+## Building from source
+
+Source builds are intended for contributors. Most users should install the desktop app or a prebuilt release above.
 
 Frameshift requires Rust 1.86 or newer. The full workspace also requires `libpq` (the PostgreSQL client library) for the Diesel-backed catalog crate:
 

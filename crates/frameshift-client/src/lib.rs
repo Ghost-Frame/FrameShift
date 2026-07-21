@@ -831,8 +831,8 @@ impl Client {
     /// Resolves the target's output filename via `RENDER_TARGETS` (e.g. target
     /// `"claude"` maps to `CLAUDE.md`) and reads
     /// `personas/<persona>/rendered/<target>/<file>` from the project's central
-    /// state directory. Defaults to target `"claude"` if an empty string is
-    /// passed (callers should pass `"claude"` explicitly).
+    /// state directory. Defaults to the agent-neutral `"generic"` target if
+    /// an empty string is passed.
     ///
     /// Returns `ClientError::UnknownRenderTarget` when `target` is not in
     /// `RENDER_TARGETS`, and `ClientError::RenderedPersonaNotFound` when the
@@ -844,7 +844,7 @@ impl Client {
         target: &str,
     ) -> Result<String, ClientError> {
         validate_persona_name(persona)?;
-        let effective_target = if target.is_empty() { "claude" } else { target };
+        let effective_target = if target.is_empty() { "generic" } else { target };
 
         let filename = RENDER_TARGETS
             .iter()

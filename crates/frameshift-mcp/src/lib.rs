@@ -3,6 +3,8 @@
 //! Exposes the protocol, tool dispatch, and error types as a library so
 //! that unit tests can exercise them without spawning a full binary.
 
+/// Shared project-root and render-target resolution.
+mod context;
 /// MCP server error types.
 pub mod error;
 /// Prompt definitions and dispatch logic (`prompts/list`, `prompts/get`).

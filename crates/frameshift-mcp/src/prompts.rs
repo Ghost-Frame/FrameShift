@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use frameshift_client::Client;
 use frameshift_orchestrator::{feedback::Preferences, policy::PolicyWeights, run::SelectionInputs};
 
+use crate::context::{resolve_render_target, validate_absolute_path, with_project_root};
 use crate::protocol::{PromptArgDef, PromptContent, PromptDef, PromptMessage, PromptResult};
 
 /// Return the static list of prompts this server publishes.
@@ -27,11 +28,14 @@ pub fn prompt_definitions() -> Vec<PromptDef> {
             description: "Insert the project's active Frameshift persona into the conversation. \
                  Use this at session start to load the persona without any hook glue."
                 .to_string(),
-            arguments: vec![PromptArgDef {
-                name: "project_root".to_string(),
-                description: "Absolute path to the project root.".to_string(),
-                required: true,
-            }],
+            arguments: vec![
+                project_root_argument(),
+                PromptArgDef {
+                    name: "target".to_string(),
+                    description: "Optional agent output target: claude, codex, gemini, or generic. Defaults to FRAMESHIFT_TARGET, then generic.".to_string(),
+                    required: false,
+                },
+            ],
         },
         PromptDef {
             name: "select_persona".to_string(),
@@ -40,11 +44,7 @@ pub fn prompt_definitions() -> Vec<PromptDef> {
                  one with the `frameshift_use` tool."
                 .to_string(),
             arguments: vec![
-                PromptArgDef {
-                    name: "project_root".to_string(),
-                    description: "Absolute path to the project root.".to_string(),
-                    required: true,
-                },
+                project_root_argument(),
                 PromptArgDef {
                     name: "task".to_string(),
                     description: "Optional one-line description of the task to steer the ranker."
@@ -65,13 +65,18 @@ pub fn prompt_definitions() -> Vec<PromptDef> {
             description: "Report Frameshift automate-mode state for this project: mode (On/Off), \
                  active persona, and recent persona transitions from the audit log."
                 .to_string(),
-            arguments: vec![PromptArgDef {
-                name: "project_root".to_string(),
-                description: "Absolute path to the project root.".to_string(),
-                required: true,
-            }],
+            arguments: vec![project_root_argument()],
         },
     ]
+}
+
+/// Build the optional project argument shared by every Frameshift prompt.
+fn project_root_argument() -> PromptArgDef {
+    PromptArgDef {
+        name: "project_root".to_string(),
+        description: "Absolute project path. Omit to use FRAMESHIFT_PROJECT_ROOT, Claude Code's CLAUDE_PROJECT_DIR, then the server working directory.".to_string(),
+        required: false,
+    }
 }
 
 /// Dispatch a `prompts/get` invocation to the appropriate prompt handler.
@@ -84,6 +89,13 @@ pub fn call_prompt(
     arguments: &serde_json::Value,
     client: &Client,
 ) -> Result<PromptResult, String> {
+    let resolved_arguments = if known_prompt(name) {
+        with_project_root(arguments)?
+    } else {
+        arguments.clone()
+    };
+    let arguments = &resolved_arguments;
+
     match name {
         "active_persona" => call_active_persona(arguments, client),
         "select_persona" => call_select_persona(arguments, client),
@@ -92,10 +104,18 @@ pub fn call_prompt(
     }
 }
 
+/// Return whether a name identifies one of this server's project-scoped prompts.
+fn known_prompt(name: &str) -> bool {
+    matches!(
+        name,
+        "active_persona" | "select_persona" | "automate_status"
+    )
+}
+
 /// Handle the `active_persona` prompt.
 ///
 /// Reads the per-project `active` marker, then renders the named persona for
-/// the `claude` target and returns it as a single user-role message. When no
+/// the resolved agent target and returns it as a single user-role message. When no
 /// persona is active for the project, returns a hint pointing at the
 /// `select_persona` prompt instead of erroring.
 fn call_active_persona(
@@ -103,6 +123,7 @@ fn call_active_persona(
     client: &Client,
 ) -> Result<PromptResult, String> {
     let project_root = get_required_path(arguments, "project_root")?;
+    let target = resolve_render_target(arguments)?;
 
     // Failure-aware resolution: a persona can be active-by-marker while its
     // materialized content is gone (its last sync failed and the half-built
@@ -134,11 +155,13 @@ fn call_active_persona(
     };
 
     let rendered = client
-        .rendered_persona(&project_root, &active_name, "claude")
+        .rendered_persona(&project_root, &active_name, &target)
         .map_err(|e| format!("could not read rendered persona '{active_name}': {e}"))?;
 
     Ok(text_message_result(
-        Some(format!("Active Frameshift persona: {active_name}")),
+        Some(format!(
+            "Active Frameshift persona: {active_name} ({target})"
+        )),
         rendered,
     ))
 }
@@ -306,19 +329,8 @@ fn get_required_path(arguments: &serde_json::Value, key: &str) -> Result<PathBuf
         .get(key)
         .and_then(|v| v.as_str())
         .ok_or_else(|| format!("missing required argument: {key}"))?;
-    // Same boundary guard as the tool surface: require an absolute path with no
-    // `..` component so a prompt-injected argument cannot traverse the filesystem.
     let path = PathBuf::from(s);
-    if !path.is_absolute() {
-        return Err(format!("path must be absolute: {s:?}"));
-    }
-    if path
-        .components()
-        .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
-        return Err(format!("path must not contain '..': {s:?}"));
-    }
-    Ok(path)
+    validate_absolute_path(&path)
 }
 
 /// Build a one-message PromptResult containing a user-role text block.
@@ -410,16 +422,16 @@ mod tests {
         );
     }
 
-    /// Every prompt declares project_root as a required argument.
+    /// Every prompt declares project_root as an optional defaultable argument.
     #[test]
-    fn every_prompt_requires_project_root() {
+    fn every_prompt_defaults_project_root() {
         for def in prompt_definitions() {
             let arg = def
                 .arguments
                 .iter()
                 .find(|a| a.name == "project_root")
                 .unwrap_or_else(|| panic!("{}: missing project_root", def.name));
-            assert!(arg.required, "{}: project_root must be required", def.name);
+            assert!(!arg.required, "{}: project_root must be optional", def.name);
         }
     }
 
@@ -531,16 +543,15 @@ mod tests {
         );
     }
 
-    /// All prompts reject missing project_root with a clear error message.
+    /// All prompts accept an omitted project root by using the process working directory.
     #[test]
-    fn missing_project_root_returns_error() {
+    fn missing_project_root_uses_working_directory() {
         let tmp = tempfile::tempdir().unwrap();
         let client = make_client(tmp.path());
         for name in ["active_persona", "select_persona", "automate_status"] {
-            let err = call_prompt(name, &serde_json::json!({}), &client).unwrap_err();
             assert!(
-                err.contains("project_root"),
-                "{name}: expected missing project_root error, got: {err}"
+                call_prompt(name, &serde_json::json!({}), &client).is_ok(),
+                "{name}: omitted project_root should resolve from server context"
             );
         }
     }

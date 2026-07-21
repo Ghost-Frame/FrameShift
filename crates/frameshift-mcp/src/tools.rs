@@ -8,6 +8,7 @@ use frameshift_orchestrator::{
 };
 use frameshift_pack::{CapabilityManifest, PackManifest};
 
+use crate::context::{resolve_render_target, validate_absolute_path, with_project_root};
 use crate::protocol::{ToolContent, ToolDef, ToolResult};
 
 /// Return the process-wide semantic embedder, loading the model once on first
@@ -57,10 +58,10 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "spec": {"type": "string"},
-                    "project_root": {"type": "string"},
+                    "project_root": project_root_schema(),
                     "from_path": {"type": "string"}
                 },
-                "required": ["spec", "project_root"]
+                "required": ["spec"]
             }),
         },
         ToolDef {
@@ -70,9 +71,9 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "persona": {"type": "string"},
-                    "project_root": {"type": "string"}
+                    "project_root": project_root_schema()
                 },
-                "required": ["persona", "project_root"]
+                "required": ["persona"]
             }),
         },
         ToolDef {
@@ -81,9 +82,8 @@ pub fn tool_definitions() -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "project_root": {"type": "string"}
-                },
-                "required": ["project_root"]
+                    "project_root": project_root_schema()
+                }
             }),
         },
         ToolDef {
@@ -92,11 +92,11 @@ pub fn tool_definitions() -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "project_root": {"type": "string"},
+                    "project_root": project_root_schema(),
                     "persona": {"type": "string"},
                     "text": {"type": "string"}
                 },
-                "required": ["project_root", "persona", "text"]
+                "required": ["persona", "text"]
             }),
         },
         ToolDef {
@@ -105,11 +105,10 @@ pub fn tool_definitions() -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "project_root": {"type": "string"},
+                    "project_root": project_root_schema(),
                     "task": {"type": "string"},
                     "library": {"type": "string"}
-                },
-                "required": ["project_root"]
+                }
             }),
         },
         ToolDef {
@@ -118,10 +117,11 @@ pub fn tool_definitions() -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "project_root": {"type": "string"},
-                    "persona": {"type": "string"}
+                    "project_root": project_root_schema(),
+                    "persona": {"type": "string"},
+                    "target": render_target_schema()
                 },
-                "required": ["project_root", "persona"]
+                "required": ["persona"]
             }),
         },
         ToolDef {
@@ -130,13 +130,13 @@ pub fn tool_definitions() -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "project_root": {"type": "string"},
+                    "project_root": project_root_schema(),
                     "action": {
                         "type": "string",
                         "enum": ["on", "off", "status", "lock", "unlock"]
                     }
                 },
-                "required": ["project_root", "action"]
+                "required": ["action"]
             }),
         },
         ToolDef {
@@ -145,7 +145,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "project_root": {"type": "string"},
+                    "project_root": project_root_schema(),
                     "persona": {"type": "string"},
                     "tools": {
                         "type": "array",
@@ -168,7 +168,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                         }
                     }
                 },
-                "required": ["project_root"]
+                "required": []
             }),
         },
         ToolDef {
@@ -177,14 +177,14 @@ pub fn tool_definitions() -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "project_root": {"type": "string"},
+                    "project_root": project_root_schema(),
                     "action": {
                         "type": "string",
                         "enum": ["show", "bump", "decay", "reset"]
                     },
                     "persona": {"type": "string"}
                 },
-                "required": ["project_root", "action"]
+                "required": ["action"]
             }),
         },
         ToolDef {
@@ -207,6 +207,23 @@ pub fn tool_definitions() -> Vec<ToolDef> {
             }),
         },
     ]
+}
+
+/// Return the shared schema for the optional project context argument.
+fn project_root_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "string",
+        "description": "Absolute project path. Omit to use FRAMESHIFT_PROJECT_ROOT, Claude Code's CLAUDE_PROJECT_DIR, then the server working directory."
+    })
+}
+
+/// Return the shared schema for an optional agent render target.
+fn render_target_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "string",
+        "enum": ["claude", "codex", "gemini", "generic"],
+        "description": "Agent output target. Omit to use FRAMESHIFT_TARGET, then generic."
+    })
 }
 
 /// Build a successful ToolResult wrapping a single text content block.
@@ -243,15 +260,8 @@ fn err_result(text: String) -> ToolResult {
 /// contain no `..` component: this blocks relative/`..` escapes while still
 /// letting the agent address any real project directory by absolute path.
 fn validate_path_arg(raw: &str) -> Result<std::path::PathBuf, String> {
-    use std::path::Component;
     let path = std::path::PathBuf::from(raw);
-    if !path.is_absolute() {
-        return Err(format!("path must be absolute: {raw:?}"));
-    }
-    if path.components().any(|c| matches!(c, Component::ParentDir)) {
-        return Err(format!("path must not contain '..': {raw:?}"));
-    }
-    Ok(path)
+    validate_absolute_path(&path)
 }
 
 /// Resolve and parse the capability manifest for a persona in a project.
@@ -412,7 +422,18 @@ fn call_capabilities(arguments: &serde_json::Value, client: &Client) -> ToolResu
     ok_result(response.to_string())
 }
 
+/// Applies shared project defaults and dispatches one MCP tool invocation.
 pub fn call_tool(name: &str, arguments: &serde_json::Value, client: &Client) -> ToolResult {
+    let resolved_arguments = if project_scoped_tool(name) {
+        match with_project_root(arguments) {
+            Ok(resolved) => resolved,
+            Err(error) => return err_result(error),
+        }
+    } else {
+        arguments.clone()
+    };
+    let arguments = &resolved_arguments;
+
     match name {
         "frameshift_install" => call_install(arguments, client),
         "frameshift_activate" => call_activate(arguments, client),
@@ -426,6 +447,22 @@ pub fn call_tool(name: &str, arguments: &serde_json::Value, client: &Client) -> 
         "frameshift_search" => call_search(arguments, client),
         _ => err_result(format!("unknown tool: {}", name)),
     }
+}
+
+/// Return whether a tool operates on project-scoped Frameshift state.
+fn project_scoped_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "frameshift_install"
+            | "frameshift_activate"
+            | "frameshift_list"
+            | "frameshift_grow_append"
+            | "frameshift_select"
+            | "frameshift_use"
+            | "frameshift_automate"
+            | "frameshift_capabilities"
+            | "frameshift_prefs"
+    )
 }
 
 /// Handle the frameshift_install tool call.
@@ -699,17 +736,25 @@ fn call_use(arguments: &serde_json::Value, client: &Client) -> ToolResult {
         Ok(p) => p,
         Err(e) => return err_result(e),
     };
+    let target = match resolve_render_target(arguments) {
+        Ok(target) => target,
+        Err(error) => return err_result(error),
+    };
 
     if let Err(e) = client.activate(&project_root, persona) {
         return err_result(format!("activate failed: {}", e));
     }
 
-    let rendered = match client.rendered_persona(&project_root, persona, "claude") {
+    let rendered = match client.rendered_persona(&project_root, persona, &target) {
         Ok(r) => r,
         Err(e) => return err_result(format!("render failed: {}", e)),
     };
 
-    let mut result = serde_json::json!({ "persona": persona, "rendered": rendered });
+    let mut result = serde_json::json!({
+        "persona": persona,
+        "target": target,
+        "rendered": rendered
+    });
 
     // Best-effort capability annotation: a manifest read/parse failure here must
     // never fail the activation that already succeeded above -- just log it.
@@ -1044,6 +1089,7 @@ fn call_search(arguments: &serde_json::Value, client: &Client) -> ToolResult {
 }
 
 #[cfg(test)]
+/// Unit and integration tests for every published MCP tool.
 mod tests {
     use super::*;
     use frameshift_client::{ClientOptions, InstallRequest, InstallSource, PersonaSpec};
@@ -1140,6 +1186,36 @@ mod tests {
         assert!(
             search.input_schema["properties"]["tag"].is_object(),
             "tag must be a declared property"
+        );
+    }
+
+    /// Project-scoped tool schemas expose project_root as an optional default
+    /// and frameshift_use advertises every supported render target.
+    #[test]
+    fn tool_definitions_expose_project_and_target_defaults() {
+        let definitions = tool_definitions();
+        for definition in definitions
+            .iter()
+            .filter(|definition| project_scoped_tool(&definition.name))
+        {
+            let required = definition.input_schema["required"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            assert!(
+                !required.iter().any(|value| value == "project_root"),
+                "{} must allow the server project default",
+                definition.name
+            );
+        }
+
+        let use_tool = definitions
+            .iter()
+            .find(|definition| definition.name == "frameshift_use")
+            .unwrap();
+        assert_eq!(
+            use_tool.input_schema["properties"]["target"]["enum"],
+            serde_json::json!(["claude", "codex", "gemini", "generic"])
         );
     }
 
@@ -1648,10 +1724,32 @@ mod tests {
             result.content[0].text
         );
         let parsed: serde_json::Value = serde_json::from_str(&result.content[0].text).unwrap();
+        assert_eq!(parsed["target"], "generic");
         assert_eq!(
             parsed["capabilities"]["required_tools"],
             serde_json::json!(["Read", "Bash"])
         );
+    }
+
+    /// frameshift_use rejects an unknown render target before activation.
+    #[test]
+    fn tool_call_use_rejects_unknown_render_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let client = make_client(&tmp.path().join("data"));
+
+        let result = call_tool(
+            "frameshift_use",
+            &serde_json::json!({
+                "project_root": project_root,
+                "persona": "missing",
+                "target": "unknown-agent"
+            }),
+            &client,
+        );
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content[0].text.contains("invalid render target"));
     }
 
     /// frameshift_search rejects a call with no `query` argument, without

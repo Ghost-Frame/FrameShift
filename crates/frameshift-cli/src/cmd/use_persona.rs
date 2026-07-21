@@ -1,6 +1,6 @@
 //! CLI handler for the `frameshift use <name>` subcommand.
 //!
-//! Activates the named persona and prints the rendered claude-target content
+//! Activates the named persona and prints its selected target content
 //! to stdout so callers can pipe or review it immediately.
 
 use std::path::{Path, PathBuf};
@@ -9,6 +9,7 @@ use clap::Args;
 use frameshift_client::{Client, ClientError, InstallRequest, InstallSource, PersonaSpec};
 use frameshift_orchestrator::Preferences;
 
+use crate::cmd::render::RenderTargetArg;
 use crate::util::CliError;
 
 /// Arguments for the `use` subcommand.
@@ -25,6 +26,10 @@ pub struct UseArgs {
     /// is used.
     #[arg(long, value_name = "DIR")]
     pub from: Option<PathBuf>,
+
+    /// Agent platform to render for: claude, codex, gemini, or generic.
+    #[arg(long, default_value = "generic")]
+    pub target: RenderTargetArg,
 }
 
 /// Execute the `use` subcommand.
@@ -32,7 +37,7 @@ pub struct UseArgs {
 /// When `--from <DIR>` is given and the persona is not yet installed, installs
 /// it from `<DIR>/<name>` first. Then activates the persona (syncs the lock
 /// first, then writes the active marker) and reads and prints the rendered
-/// output for the `claude` target.
+/// output for the selected agent target.
 pub fn run_use(client: &Client, args: UseArgs) -> Result<(), CliError> {
     // Reject unsafe names before `args.name` is joined to `--from` (or any
     // central-store path); consistent with every other subcommand.
@@ -113,8 +118,8 @@ pub fn run_use(client: &Client, args: UseArgs) -> Result<(), CliError> {
     // (only if the project has opted in) send anonymous selection telemetry.
     record_use_selection_and_telemetry(client, &project_root, &args.name);
 
-    // Read and print the rendered persona for the claude target.
-    let rendered = client.rendered_persona(&project_root, &args.name, "claude")?;
+    // Read and print the rendered persona for the requested agent target.
+    let rendered = client.rendered_persona(&project_root, &args.name, args.target.as_str())?;
     println!("{}", rendered);
 
     Ok(())
@@ -181,6 +186,7 @@ fn record_use_selection_and_telemetry(client: &Client, project_root: &Path, pers
 }
 
 #[cfg(test)]
+/// Tests for persona activation, preference updates, and telemetry recording.
 mod tests {
     use super::*;
     use frameshift_client::ClientOptions;
