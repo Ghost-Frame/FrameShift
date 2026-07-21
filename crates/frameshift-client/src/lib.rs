@@ -1697,7 +1697,7 @@ fn compose_rendered_content(
     if let Some(infra) = &infra_content {
         composed.push_str(infra);
         composed.push_str("\n\n## Persona Context\n\n");
-        composed.push_str(&format!("Active persona: {}\n", persona_name));
+        composed.push_str(&format!("Active persona: {persona_name}\n"));
         composed.push_str("\n---\n\n");
     }
 
