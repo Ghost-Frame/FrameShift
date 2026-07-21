@@ -38,12 +38,27 @@ fn resolve_project_root_from(
     claude_project_root: Option<&OsStr>,
     current_dir: &Path,
 ) -> Result<PathBuf, String> {
-    let candidate = arguments
-        .get("project_root")
-        .and_then(serde_json::Value::as_str)
-        .map(PathBuf::from)
-        .or_else(|| environment_root.map(PathBuf::from))
-        .or_else(|| claude_project_root.map(PathBuf::from))
+    let explicit_root = match arguments.get("project_root") {
+        None => None,
+        Some(serde_json::Value::String(value)) if !value.trim().is_empty() => {
+            Some(PathBuf::from(value))
+        }
+        Some(serde_json::Value::String(_)) => {
+            return Err("project_root must be a non-empty absolute path".to_string());
+        }
+        Some(_) => return Err("project_root must be a JSON string".to_string()),
+    };
+    let candidate = explicit_root
+        .or_else(|| {
+            environment_root
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        })
+        .or_else(|| {
+            claude_project_root
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        })
         .unwrap_or_else(|| current_dir.to_path_buf());
     validate_absolute_path(&candidate)
 }
@@ -75,11 +90,18 @@ fn resolve_render_target_from(
     arguments: &serde_json::Value,
     environment_target: Option<&str>,
 ) -> Result<String, String> {
-    let candidate = arguments
-        .get("target")
-        .and_then(serde_json::Value::as_str)
-        .or(environment_target)
+    let explicit_target = match arguments.get("target") {
+        None => None,
+        Some(serde_json::Value::String(value)) if !value.trim().is_empty() => Some(value.as_str()),
+        Some(serde_json::Value::String(_)) => {
+            return Err("target must be a non-empty string".to_string());
+        }
+        Some(_) => return Err("target must be a JSON string".to_string()),
+    };
+    let candidate = explicit_target
+        .or_else(|| environment_target.filter(|value| !value.trim().is_empty()))
         .unwrap_or("generic")
+        .trim()
         .to_ascii_lowercase();
 
     if RENDER_TARGETS.contains(&candidate.as_str()) {
@@ -163,6 +185,37 @@ mod tests {
         assert_eq!(resolved, Path::new("/working/project"));
     }
 
+    /// Empty environment variables are ignored instead of becoming invalid paths.
+    #[test]
+    fn empty_environment_roots_fall_back_to_working_directory() {
+        let resolved = resolve_project_root_from(
+            &serde_json::json!({}),
+            Some(OsStr::new("")),
+            Some(OsStr::new("")),
+            Path::new("/working/project"),
+        )
+        .unwrap();
+        assert_eq!(resolved, Path::new("/working/project"));
+    }
+
+    /// Explicit project values must be non-empty JSON strings.
+    #[test]
+    fn malformed_explicit_project_roots_are_rejected() {
+        for arguments in [
+            serde_json::json!({"project_root": 42}),
+            serde_json::json!({"project_root": null}),
+            serde_json::json!({"project_root": ""}),
+        ] {
+            assert!(resolve_project_root_from(
+                &arguments,
+                Some(OsStr::new("/environment/project")),
+                None,
+                Path::new("/working/project"),
+            )
+            .is_err());
+        }
+    }
+
     /// Explicit targets win and invalid targets fail before a client operation.
     #[test]
     fn render_target_precedence_and_validation_are_deterministic() {
@@ -181,5 +234,16 @@ mod tests {
         assert!(
             resolve_render_target_from(&serde_json::json!({"target": "unknown"}), None).is_err()
         );
+        assert_eq!(
+            resolve_render_target_from(&serde_json::json!({}), Some("  ")).unwrap(),
+            "generic"
+        );
+        for arguments in [
+            serde_json::json!({"target": 42}),
+            serde_json::json!({"target": null}),
+            serde_json::json!({"target": ""}),
+        ] {
+            assert!(resolve_render_target_from(&arguments, Some("claude")).is_err());
+        }
     }
 }

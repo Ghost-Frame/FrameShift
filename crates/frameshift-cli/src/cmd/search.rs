@@ -34,6 +34,7 @@ pub fn run_search(args: SearchArgs) -> Result<(), CliError> {
         query: args.query,
         tag: args.tag,
         limit: args.limit,
+        offset: None,
     };
 
     let results = client.search_registry(&query)?;

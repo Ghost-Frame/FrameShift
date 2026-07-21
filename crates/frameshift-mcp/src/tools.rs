@@ -1065,6 +1065,7 @@ fn call_search(arguments: &serde_json::Value, client: &Client) -> ToolResult {
         query: Some(query.to_string()),
         tag,
         limit: Some(limit),
+        offset: None,
     };
 
     match client.search_registry(&search_query) {

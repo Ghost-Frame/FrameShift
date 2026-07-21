@@ -1,5 +1,9 @@
 # Builds the two end-user binaries on every supported desktop platform and
 # publishes checksummed archives when a semantic version tag is pushed.
+# Tagged macOS builds require APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD,
+# APPLE_KEYCHAIN_PASSWORD, APPLE_ID, APPLE_PASSWORD, and APPLE_TEAM_ID.
+# Tagged Windows builds require WINDOWS_CERTIFICATE and
+# WINDOWS_CERTIFICATE_PASSWORD. Manual dispatches build but never publish.
 name: Release binaries
 
 on:
@@ -54,6 +58,98 @@ jobs:
           test "$tag_version" = "$mcp_version"
       - name: Build CLI and MCP server
         run: cargo build --locked --release --package frameshift-cli --package frameshift-mcp --target ${{ matrix.target }}
+      - name: Validate platform signing secrets
+        if: github.ref_type == 'tag'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_KEYCHAIN_PASSWORD: ${{ secrets.APPLE_KEYCHAIN_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            test -n "$APPLE_CERTIFICATE"
+            test -n "$APPLE_CERTIFICATE_PASSWORD"
+            test -n "$APPLE_KEYCHAIN_PASSWORD"
+            test -n "$APPLE_ID"
+            test -n "$APPLE_PASSWORD"
+            test -n "$APPLE_TEAM_ID"
+          elif [ "${{ runner.os }}" = "Windows" ]; then
+            test -n "$WINDOWS_CERTIFICATE"
+            test -n "$WINDOWS_CERTIFICATE_PASSWORD"
+          fi
+      - name: Import Apple signing certificate
+        if: github.ref_type == 'tag' && runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_KEYCHAIN_PASSWORD: ${{ secrets.APPLE_KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          certificate="$RUNNER_TEMP/frameshift-certificate.p12"
+          keychain="$RUNNER_TEMP/frameshift-build.keychain-db"
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$certificate"
+          security create-keychain -p "$APPLE_KEYCHAIN_PASSWORD" "$keychain"
+          security unlock-keychain -p "$APPLE_KEYCHAIN_PASSWORD" "$keychain"
+          security set-keychain-settings -t 3600 -u "$keychain"
+          security list-keychains -d user -s "$keychain"
+          security import "$certificate" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$APPLE_KEYCHAIN_PASSWORD" "$keychain"
+          identity="$(security find-identity -v -p codesigning "$keychain" | awk -F'"' '/Developer ID Application/{print $2; exit}')"
+          test -n "$identity"
+          echo "APPLE_SIGNING_IDENTITY=$identity" >> "$GITHUB_ENV"
+      - name: Sign and notarize macOS binaries
+        if: github.ref_type == 'tag' && runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          binary_dir="target/${{ matrix.target }}/release"
+          codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$binary_dir/frameshift"
+          codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$binary_dir/frameshift-mcp"
+          codesign --verify --strict --verbose=2 "$binary_dir/frameshift"
+          codesign --verify --strict --verbose=2 "$binary_dir/frameshift-mcp"
+          notary_dir="$RUNNER_TEMP/frameshift-notary"
+          mkdir -p "$notary_dir"
+          cp "$binary_dir/frameshift" "$binary_dir/frameshift-mcp" "$notary_dir/"
+          ditto -c -k --keepParent "$notary_dir" "$RUNNER_TEMP/frameshift-notary.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/frameshift-notary.zip" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+      - name: Sign Windows binaries
+        if: github.ref_type == 'tag' && runner.os == 'Windows'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $certificate = Join-Path $env:RUNNER_TEMP "frameshift-certificate.pfx"
+          [IO.File]::WriteAllBytes($certificate, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+          $signTool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if (-not $signTool) { throw "signtool.exe was not found" }
+          $binaries = @(
+            "target/${{ matrix.target }}/release/frameshift.exe",
+            "target/${{ matrix.target }}/release/frameshift-mcp.exe"
+          )
+          foreach ($binary in $binaries) {
+            & $signTool.FullName sign /f $certificate /p $env:WINDOWS_CERTIFICATE_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $binary
+            if ($LASTEXITCODE -ne 0) { throw "Signing failed for $binary" }
+            & $signTool.FullName verify /pa /v $binary
+            if ($LASTEXITCODE -ne 0) { throw "Signature verification failed for $binary" }
+          }
       - name: Package Unix archive
         if: ${{ !matrix.windows }}
         shell: bash
