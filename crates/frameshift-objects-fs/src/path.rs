@@ -45,7 +45,7 @@ pub fn object_path(root: &Path, hash: &ObjectHash) -> PathBuf {
 /// Returns `{root}/{aa}` where `aa` is the two-hex-digit encoding of `first_byte`.
 /// Used during prefix-based listing to narrow the walk to a single shard.
 pub fn shard_aa(root: &Path, first_byte: u8) -> PathBuf {
-    root.join(format!("{:02x}", first_byte))
+    root.join(format!("{first_byte:02x}"))
 }
 
 /// Compute the shard directory path for the first two bytes of a hash.
@@ -54,8 +54,8 @@ pub fn shard_aa(root: &Path, first_byte: u8) -> PathBuf {
 /// encodings of the first and second bytes. Used during prefix-based listing
 /// to narrow the walk to a single sub-shard.
 pub fn shard_aabb(root: &Path, first_byte: u8, second_byte: u8) -> PathBuf {
-    root.join(format!("{:02x}", first_byte))
-        .join(format!("{:02x}", second_byte))
+    root.join(format!("{first_byte:02x}"))
+        .join(format!("{second_byte:02x}"))
 }
 
 /// Attempt to parse an [`ObjectHash`] from a filename stem (64-char hex string).
