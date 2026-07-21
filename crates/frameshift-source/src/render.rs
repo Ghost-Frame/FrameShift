@@ -27,6 +27,7 @@ pub enum RenderTarget {
     Generic,
 }
 
+/// Selects platform-specific sections for a render target.
 impl RenderTarget {
     /// Returns `true` if the Design Notes section should be rendered for this target.
     fn include_design_notes(self) -> bool {
@@ -251,11 +252,11 @@ fn render_concrete_patterns(src: &PersonaSource, out: &mut String) {
         let _ = writeln!(out, "### {}\n", ex.title);
         let _ = writeln!(out, "{}\n", ex.context);
         let _ = writeln!(out, "**Bad:**");
-        let _ = writeln!(out, "```{}", safe_lang);
+        let _ = writeln!(out, "```{safe_lang}");
         let _ = writeln!(out, "{}", ex.bad);
         let _ = writeln!(out, "```\n");
         let _ = writeln!(out, "**Good:**");
-        let _ = writeln!(out, "```{}", safe_lang);
+        let _ = writeln!(out, "```{safe_lang}");
         let _ = writeln!(out, "{}", ex.good);
         let _ = writeln!(out, "```\n");
     }

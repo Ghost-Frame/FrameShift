@@ -74,10 +74,7 @@ pub fn audit_manifest(manifest: &crate::persona::CapabilityManifest) -> Manifest
         findings.push(ManifestFinding {
             aspect: ManifestAspect::FilesystemScope,
             severity: ManifestSeverity::Block,
-            detail: format!(
-                "filesystem_scope '{}' grants unrestricted filesystem access",
-                scope
-            ),
+            detail: format!("filesystem_scope '{scope}' grants unrestricted filesystem access"),
         });
     } else if scope.contains("~/.")
         || scope.starts_with("/etc")
@@ -88,10 +85,7 @@ pub fn audit_manifest(manifest: &crate::persona::CapabilityManifest) -> Manifest
         findings.push(ManifestFinding {
             aspect: ManifestAspect::FilesystemScope,
             severity: ManifestSeverity::Warning,
-            detail: format!(
-                "filesystem_scope '{}' may expose sensitive directories",
-                scope
-            ),
+            detail: format!("filesystem_scope '{scope}' may expose sensitive directories"),
         });
     }
 
@@ -114,8 +108,7 @@ pub fn audit_manifest(manifest: &crate::persona::CapabilityManifest) -> Manifest
                 aspect: ManifestAspect::RequiredTool,
                 severity: ManifestSeverity::Warning,
                 detail: format!(
-                    "required tool '{}' provides shell execution and may bypass sandboxing",
-                    tool
+                    "required tool '{tool}' provides shell execution and may bypass sandboxing"
                 ),
             });
         }
@@ -252,6 +245,7 @@ pub struct GrowthFilePermissions {
     pub mode: u32,
 }
 
+/// Provides owner-only permissions for newly created growth files.
 impl Default for GrowthFilePermissions {
     /// Returns the safe default: `0o600` (owner read/write, no group/other access).
     fn default() -> Self {
