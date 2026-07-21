@@ -50,7 +50,7 @@ pub fn run_diff(client: &Client, args: DiffArgs) -> Result<(), CliError> {
 /// Sections with no entries are omitted. Anchor similarity is always shown
 /// if present.
 fn print_diff_human(persona_a: &str, persona_b: &str, d: &SemanticDiff) {
-    println!("diff {} -> {}", persona_a, persona_b);
+    println!("diff {persona_a} -> {persona_b}");
     println!();
 
     let mut has_any = false;
@@ -96,7 +96,7 @@ fn print_diff_human(persona_a: &str, persona_b: &str, d: &SemanticDiff) {
     }
     if let Some(sim) = d.anchor_similarity {
         // Always print anchor similarity so callers get a sense of overall drift.
-        println!("Anchor similarity: {:.3}", sim);
+        println!("Anchor similarity: {sim:.3}");
         has_any = true;
     }
 

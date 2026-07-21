@@ -116,13 +116,13 @@ fn resolve_render_target_from(
 /// Enforce the MCP filesystem boundary for a project or library path.
 pub(crate) fn validate_absolute_path(path: &Path) -> Result<PathBuf, String> {
     if !path.is_absolute() {
-        return Err(format!("path must be absolute: {:?}", path));
+        return Err(format!("path must be absolute: {path:?}"));
     }
     if path
         .components()
         .any(|component| matches!(component, Component::ParentDir))
     {
-        return Err(format!("path must not contain '..': {:?}", path));
+        return Err(format!("path must not contain '..': {path:?}"));
     }
     Ok(path.to_path_buf())
 }

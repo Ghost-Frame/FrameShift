@@ -57,7 +57,7 @@ pub fn run_prefs(client: &Client, args: PrefsArgs) -> Result<(), CliError> {
                 println!("{:<30} {:>8}", "persona", "bias");
                 println!("{}", "-".repeat(40));
                 for (name, bias) in &prefs.bias {
-                    println!("{:<30} {:>+8.3}", name, bias);
+                    println!("{name:<30} {bias:>+8.3}");
                 }
             }
         }
@@ -99,6 +99,7 @@ pub fn run_prefs(client: &Client, args: PrefsArgs) -> Result<(), CliError> {
 }
 
 #[cfg(test)]
+/// Command-line parsing and preference workflow tests.
 mod tests {
     use super::*;
     use clap::Parser;

@@ -281,7 +281,7 @@ fn load_capability_manifest(
 ) -> Result<(String, Option<CapabilityManifest>), String> {
     let paths = client
         .project_paths(project_root)
-        .map_err(|e| format!("project_paths failed: {}", e))?;
+        .map_err(|e| format!("project_paths failed: {e}"))?;
 
     let name = match persona {
         Some(p) => p.to_string(),
@@ -320,7 +320,7 @@ fn load_capability_manifest(
         )
     })?;
     let manifest: PackManifest =
-        toml::from_str(&raw).map_err(|e| format!("failed to parse pack manifest: {}", e))?;
+        toml::from_str(&raw).map_err(|e| format!("failed to parse pack manifest: {e}"))?;
 
     Ok((name, manifest.capability_manifest))
 }
@@ -445,7 +445,7 @@ pub fn call_tool(name: &str, arguments: &serde_json::Value, client: &Client) -> 
         "frameshift_prefs" => call_prefs(arguments, client),
         "frameshift_capabilities" => call_capabilities(arguments, client),
         "frameshift_search" => call_search(arguments, client),
-        _ => err_result(format!("unknown tool: {}", name)),
+        _ => err_result(format!("unknown tool: {name}")),
     }
 }
 
@@ -482,7 +482,7 @@ fn call_install(arguments: &serde_json::Value, client: &Client) -> ToolResult {
 
     let spec = match spec_str.parse::<PersonaSpec>() {
         Ok(s) => s,
-        Err(e) => return err_result(format!("invalid spec \"{}\": {}", spec_str, e)),
+        Err(e) => return err_result(format!("invalid spec \"{spec_str}\": {e}")),
     };
 
     let project_root = match validate_path_arg(project_root_str) {
@@ -517,7 +517,7 @@ fn call_install(arguments: &serde_json::Value, client: &Client) -> ToolResult {
             let text = serde_json::json!({"installed": label, "failures": failures}).to_string();
             ok_result(text)
         }
-        Err(e) => err_result(format!("install failed: {}", e)),
+        Err(e) => err_result(format!("install failed: {e}")),
     }
 }
 
@@ -560,7 +560,7 @@ fn call_activate(arguments: &serde_json::Value, client: &Client) -> ToolResult {
             }
             ok_result(response.to_string())
         }
-        Err(e) => err_result(format!("activate failed: {}", e)),
+        Err(e) => err_result(format!("activate failed: {e}")),
     }
 }
 
@@ -591,7 +591,7 @@ fn call_list(arguments: &serde_json::Value, client: &Client) -> ToolResult {
                 serde_json::json!({"personas": report.personas, "failures": failures}).to_string();
             ok_result(text)
         }
-        Err(e) => err_result(format!("list failed: {}", e)),
+        Err(e) => err_result(format!("list failed: {e}")),
     }
 }
 
@@ -626,7 +626,7 @@ fn call_grow_append(arguments: &serde_json::Value, client: &Client) -> ToolResul
 
     let project_id = match client.project_id(&project_root) {
         Ok(id) => id,
-        Err(e) => return err_result(format!("could not determine project_id: {}", e)),
+        Err(e) => return err_result(format!("could not determine project_id: {e}")),
     };
 
     match frameshift_growth::append(client.data_root(), &project_id, persona, text) {
@@ -634,7 +634,7 @@ fn call_grow_append(arguments: &serde_json::Value, client: &Client) -> ToolResul
             let response_text = serde_json::json!({"appended": true}).to_string();
             ok_result(response_text)
         }
-        Err(e) => err_result(format!("grow append failed: {}", e)),
+        Err(e) => err_result(format!("grow append failed: {e}")),
     }
 }
 
@@ -669,7 +669,7 @@ fn call_select(arguments: &serde_json::Value, client: &Client) -> ToolResult {
     // Resolve orchestrator state dir and load preferences.
     let state_dir = match client.orchestrator_state_dir(&project_root) {
         Ok(d) => d,
-        Err(e) => return err_result(format!("could not determine state dir: {}", e)),
+        Err(e) => return err_result(format!("could not determine state dir: {e}")),
     };
     let prefs = Preferences::load(&state_dir.join("automate-prefs.json")).unwrap_or_default();
 
@@ -679,7 +679,7 @@ fn call_select(arguments: &serde_json::Value, client: &Client) -> ToolResult {
     } else {
         match client.installed_persona_source_dirs(&project_root) {
             Ok(dirs) => (dirs, None),
-            Err(e) => return err_result(format!("could not list personas: {}", e)),
+            Err(e) => return err_result(format!("could not list personas: {e}")),
         }
     };
 
@@ -694,7 +694,7 @@ fn call_select(arguments: &serde_json::Value, client: &Client) -> ToolResult {
 
     let ranked = match frameshift_orchestrator::select_with_embedder(&inputs, shared_embedder()) {
         Ok(r) => r,
-        Err(e) => return err_result(format!("selection failed: {}", e)),
+        Err(e) => return err_result(format!("selection failed: {e}")),
     };
 
     let entries: Vec<serde_json::Value> = ranked
@@ -742,12 +742,12 @@ fn call_use(arguments: &serde_json::Value, client: &Client) -> ToolResult {
     };
 
     if let Err(e) = client.activate(&project_root, persona) {
-        return err_result(format!("activate failed: {}", e));
+        return err_result(format!("activate failed: {e}"));
     }
 
     let rendered = match client.rendered_persona(&project_root, persona, &target) {
         Ok(r) => r,
-        Err(e) => return err_result(format!("render failed: {}", e)),
+        Err(e) => return err_result(format!("render failed: {e}")),
     };
 
     let mut result = serde_json::json!({
@@ -808,7 +808,7 @@ fn call_automate(arguments: &serde_json::Value, client: &Client) -> ToolResult {
 
     let state_dir = match client.orchestrator_state_dir(&project_root) {
         Ok(d) => d,
-        Err(e) => return err_result(format!("could not determine state dir: {}", e)),
+        Err(e) => return err_result(format!("could not determine state dir: {e}")),
     };
 
     let mode_path = state_dir.join("automate.json");
@@ -822,7 +822,7 @@ fn call_automate(arguments: &serde_json::Value, client: &Client) -> ToolResult {
                 sensitivity: 0.5,
             };
             if let Err(e) = state.save(&mode_path) {
-                return err_result(format!("failed to save mode: {}", e));
+                return err_result(format!("failed to save mode: {e}"));
             }
             ok_result(
                 serde_json::json!({ "mode": "on", "sensitivity": state.sensitivity }).to_string(),
@@ -835,7 +835,7 @@ fn call_automate(arguments: &serde_json::Value, client: &Client) -> ToolResult {
                 sensitivity: 0.5,
             };
             if let Err(e) = state.save(&mode_path) {
-                return err_result(format!("failed to save mode: {}", e));
+                return err_result(format!("failed to save mode: {e}"));
             }
             ok_result(serde_json::json!({ "mode": "off" }).to_string())
         }
@@ -843,12 +843,12 @@ fn call_automate(arguments: &serde_json::Value, client: &Client) -> ToolResult {
         "status" => {
             let mode_state = match ModeState::load(&mode_path) {
                 Ok(s) => s,
-                Err(e) => return err_result(format!("failed to load mode: {}", e)),
+                Err(e) => return err_result(format!("failed to load mode: {e}")),
             };
 
             let paths = match client.project_paths(&project_root) {
                 Ok(p) => p,
-                Err(e) => return err_result(format!("project_paths failed: {}", e)),
+                Err(e) => return err_result(format!("project_paths failed: {e}")),
             };
             let active = if paths.active_path.exists() {
                 std::fs::read_to_string(&paths.active_path)
@@ -863,7 +863,7 @@ fn call_automate(arguments: &serde_json::Value, client: &Client) -> ToolResult {
 
             let audit = match AuditLog::load(&audit_path) {
                 Ok(a) => a,
-                Err(e) => return err_result(format!("failed to load audit: {}", e)),
+                Err(e) => return err_result(format!("failed to load audit: {e}")),
             };
             let recent: Vec<serde_json::Value> = audit
                 .recent(5)
@@ -892,12 +892,12 @@ fn call_automate(arguments: &serde_json::Value, client: &Client) -> ToolResult {
         "lock" => {
             if let Some(parent) = lock_path.parent() {
                 if let Err(e) = std::fs::create_dir_all(parent) {
-                    return err_result(format!("failed to create state dir: {}", e));
+                    return err_result(format!("failed to create state dir: {e}"));
                 }
             }
             let content = serde_json::json!({"locked": true}).to_string();
             if let Err(e) = std::fs::write(&lock_path, content) {
-                return err_result(format!("failed to write lock: {}", e));
+                return err_result(format!("failed to write lock: {e}"));
             }
             ok_result(serde_json::json!({ "locked": true }).to_string())
         }
@@ -905,15 +905,14 @@ fn call_automate(arguments: &serde_json::Value, client: &Client) -> ToolResult {
         "unlock" => {
             if lock_path.exists() {
                 if let Err(e) = std::fs::remove_file(&lock_path) {
-                    return err_result(format!("failed to remove lock: {}", e));
+                    return err_result(format!("failed to remove lock: {e}"));
                 }
             }
             ok_result(serde_json::json!({ "locked": false }).to_string())
         }
 
         other => err_result(format!(
-            "unknown action '{}'; expected: on, off, status, lock, unlock",
-            other
+            "unknown action '{other}'; expected: on, off, status, lock, unlock"
         )),
     }
 }
@@ -941,7 +940,7 @@ fn call_prefs(arguments: &serde_json::Value, client: &Client) -> ToolResult {
 
     let state_dir = match client.orchestrator_state_dir(&project_root) {
         Ok(d) => d,
-        Err(e) => return err_result(format!("could not determine state dir: {}", e)),
+        Err(e) => return err_result(format!("could not determine state dir: {e}")),
     };
 
     let prefs_path = state_dir.join("automate-prefs.json");
@@ -962,7 +961,7 @@ fn call_prefs(arguments: &serde_json::Value, client: &Client) -> ToolResult {
             let mut prefs = Preferences::load(&prefs_path).unwrap_or_default();
             prefs.record_override(None, persona);
             if let Err(e) = prefs.save(&prefs_path) {
-                return err_result(format!("failed to save preferences: {}", e));
+                return err_result(format!("failed to save preferences: {e}"));
             }
             let text = serde_json::json!({
                 "persona": persona,
@@ -980,7 +979,7 @@ fn call_prefs(arguments: &serde_json::Value, client: &Client) -> ToolResult {
             let mut prefs = Preferences::load(&prefs_path).unwrap_or_default();
             prefs.decay(persona);
             if let Err(e) = prefs.save(&prefs_path) {
-                return err_result(format!("failed to save preferences: {}", e));
+                return err_result(format!("failed to save preferences: {e}"));
             }
             let text = serde_json::json!({
                 "persona": persona,
@@ -993,14 +992,13 @@ fn call_prefs(arguments: &serde_json::Value, client: &Client) -> ToolResult {
         "reset" => {
             let prefs = Preferences::new();
             if let Err(e) = prefs.save(&prefs_path) {
-                return err_result(format!("failed to save preferences: {}", e));
+                return err_result(format!("failed to save preferences: {e}"));
             }
             ok_result(serde_json::json!({ "reset": true }).to_string())
         }
 
         other => err_result(format!(
-            "unknown action '{}'; expected: show, bump, decay, reset",
-            other
+            "unknown action '{other}'; expected: show, bump, decay, reset"
         )),
     }
 }
@@ -1085,7 +1083,7 @@ fn call_search(arguments: &serde_json::Value, client: &Client) -> ToolResult {
                 .collect();
             ok_result(serde_json::json!({ "results": entries }).to_string())
         }
-        Err(e) => err_result(format!("search failed: {}", e)),
+        Err(e) => err_result(format!("search failed: {e}")),
     }
 }
 
@@ -1109,13 +1107,12 @@ mod tests {
     fn make_pack_dir(dir: &std::path::Path, name: &str, version: &str) {
         fs::create_dir_all(dir).unwrap();
         let manifest = format!(
-            "schema_version = 1\nname = \"{}\"\nversion = \"{}\"\nauthor_handle = \"test\"\nauthor_pubkey = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\n",
-            name, version
+            "schema_version = 1\nname = \"{name}\"\nversion = \"{version}\"\nauthor_handle = \"test\"\nauthor_pubkey = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\n"
         );
         fs::write(dir.join("pack.toml"), manifest).unwrap();
         fs::write(
             dir.join("AGENTS.md"),
-            format!("# {}\n\nTest content.\n", name),
+            format!("# {name}\n\nTest content.\n"),
         )
         .unwrap();
     }
@@ -1126,13 +1123,12 @@ mod tests {
     fn make_pack_dir_with_capabilities(dir: &std::path::Path, name: &str, version: &str) {
         fs::create_dir_all(dir).unwrap();
         let manifest = format!(
-            "schema_version = 1\nname = \"{}\"\nversion = \"{}\"\nauthor_handle = \"test\"\nauthor_pubkey = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\n\n[capability_manifest]\nrequired_tools = [\"Read\", \"Bash\"]\nnetwork_egress = false\n",
-            name, version
+            "schema_version = 1\nname = \"{name}\"\nversion = \"{version}\"\nauthor_handle = \"test\"\nauthor_pubkey = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\n\n[capability_manifest]\nrequired_tools = [\"Read\", \"Bash\"]\nnetwork_egress = false\n"
         );
         fs::write(dir.join("pack.toml"), manifest).unwrap();
         fs::write(
             dir.join("AGENTS.md"),
-            format!("# {}\n\nTest content.\n", name),
+            format!("# {name}\n\nTest content.\n"),
         )
         .unwrap();
     }

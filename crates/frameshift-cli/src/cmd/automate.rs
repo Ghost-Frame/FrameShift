@@ -99,7 +99,7 @@ pub fn run_automate(client: &Client, args: AutomateArgs) -> Result<(), CliError>
                 if locked { "  [locked]" } else { "" }
             );
             println!("sensitivity: {:.1}", mode_state.sensitivity);
-            println!("active persona: {}", active);
+            println!("active persona: {active}");
 
             // Print last 5 audit transitions.
             let audit =

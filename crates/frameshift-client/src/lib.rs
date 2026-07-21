@@ -2196,12 +2196,11 @@ mod tests {
         fs::write(
             pack_dir.join("pack.toml"),
             format!(
-                "schema_version = 1\nname = \"{}\"\nauthor_handle = \"test\"\nauthor_pubkey = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\nversion = \"0.1.0\"\n",
-                name
+                "schema_version = 1\nname = \"{name}\"\nauthor_handle = \"test\"\nauthor_pubkey = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\nversion = \"0.1.0\"\n"
             ),
         )
         .unwrap();
-        fs::write(pack_dir.join("AGENTS.md"), format!("# {}\n\nTest.\n", name)).unwrap();
+        fs::write(pack_dir.join("AGENTS.md"), format!("# {name}\n\nTest.\n")).unwrap();
 
         let project_root = tmp.path().join("project");
         fs::create_dir_all(&project_root).unwrap();

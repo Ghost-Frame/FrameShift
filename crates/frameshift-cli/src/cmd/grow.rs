@@ -87,6 +87,7 @@ pub enum ScopeArg {
     Global,
 }
 
+/// Converts the CLI scope selector into the growth library scope.
 impl From<ScopeArg> for Scope {
     /// Convert the CLI-facing scope argument into the growth crate's `Scope`.
     fn from(arg: ScopeArg) -> Self {
@@ -118,7 +119,7 @@ pub fn run(args: GrowArgs) -> Result<(), CliError> {
 fn run_append(args: AppendArgs) -> Result<(), CliError> {
     let client = frameshift_client::Client::with_default_data_root()?;
     let project_root = std::env::current_dir()
-        .map_err(|e| CliError::Growth(format!("cannot determine current directory: {}", e)))?;
+        .map_err(|e| CliError::Growth(format!("cannot determine current directory: {e}")))?;
     let project_id = client.project_id(&project_root)?;
 
     if args.global {
@@ -146,7 +147,7 @@ fn run_append(args: AppendArgs) -> Result<(), CliError> {
 fn run_log(args: LogArgs) -> Result<(), CliError> {
     let client = frameshift_client::Client::with_default_data_root()?;
     let project_root = std::env::current_dir()
-        .map_err(|e| CliError::Growth(format!("cannot determine current directory: {}", e)))?;
+        .map_err(|e| CliError::Growth(format!("cannot determine current directory: {e}")))?;
     let project_id = client.project_id(&project_root)?;
 
     let entries = frameshift_growth::recent_entries(
@@ -191,7 +192,7 @@ fn print_entries(persona: &str, entries: &[frameshift_growth::GrowthEntry]) {
 fn run_summary(args: SummaryArgs) -> Result<(), CliError> {
     let client = frameshift_client::Client::with_default_data_root()?;
     let project_root = std::env::current_dir()
-        .map_err(|e| CliError::Growth(format!("cannot determine current directory: {}", e)))?;
+        .map_err(|e| CliError::Growth(format!("cannot determine current directory: {e}")))?;
     let project_id = client.project_id(&project_root)?;
 
     let summary = frameshift_growth::summarize(
@@ -214,6 +215,7 @@ fn run_summary(args: SummaryArgs) -> Result<(), CliError> {
 }
 
 #[cfg(test)]
+/// Command-line parsing and growth workflow tests.
 mod tests {
     use super::*;
     use clap::Parser;

@@ -402,8 +402,7 @@ mod tests {
         ] {
             assert!(
                 is_growth_file(name),
-                "'{}' should be recognized as a growth file",
-                name
+                "'{name}' should be recognized as a growth file"
             );
         }
     }
@@ -414,8 +413,7 @@ mod tests {
         for name in &["README.md", "persona.toml", "rules.toml", "main.rs", ""] {
             assert!(
                 !is_growth_file(name),
-                "'{}' should NOT be recognized as a growth file",
-                name
+                "'{name}' should NOT be recognized as a growth file"
             );
         }
     }

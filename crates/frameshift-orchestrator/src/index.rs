@@ -94,6 +94,7 @@ struct PackCapabilityManifest {
     anti_keywords: Vec<String>,
 }
 
+/// Profile construction and persona source loading operations.
 impl PersonaProfile {
     /// Build a `PersonaProfile` from a loaded `PersonaSource`.
     ///
@@ -580,6 +581,7 @@ pub struct PersonaIndex {
     pub profiles: Vec<PersonaProfile>,
 }
 
+/// Index construction and installed-persona discovery operations.
 impl PersonaIndex {
     /// Build a `PersonaIndex` from a slice of already-loaded persona sources.
     pub fn build(sources: &[PersonaSource]) -> Self {
@@ -664,6 +666,7 @@ impl PersonaIndex {
 }
 
 #[cfg(test)]
+/// Persona profile extraction and index loading tests.
 mod tests {
     use super::*;
     use std::fs;
@@ -977,8 +980,7 @@ mod tests {
         assert_eq!(
             sections.len(),
             1,
-            "expected exactly one captured section, got: {:?}",
-            sections
+            "expected exactly one captured section, got: {sections:?}"
         );
         assert!(
             sections[0].contains("ed25519dalek"),
@@ -1009,8 +1011,7 @@ mod tests {
         assert_eq!(
             sections.len(),
             2,
-            "expected two sections, got: {:?}",
-            sections
+            "expected two sections, got: {sections:?}"
         );
         assert!(sections[0].contains("zzalpha"));
         assert!(sections[1].contains("zzbravo"));

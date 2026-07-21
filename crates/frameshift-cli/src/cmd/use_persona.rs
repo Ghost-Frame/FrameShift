@@ -120,7 +120,7 @@ pub fn run_use(client: &Client, args: UseArgs) -> Result<(), CliError> {
 
     // Read and print the rendered persona for the requested agent target.
     let rendered = client.rendered_persona(&project_root, &args.name, args.target.as_str())?;
-    println!("{}", rendered);
+    println!("{rendered}");
 
     Ok(())
 }
