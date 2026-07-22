@@ -116,6 +116,7 @@ Resolution order: base -> mixins (in order) -> root persona. Conflicting rule ID
 
 | Frame | What wakes up |
 |---|---|
+| `accessibility-engineer/` | Accessibility engineer. Equivalent task completion across keyboard, screen reader, zoom, contrast, and motion contexts |
 | `agents/` | Agent designer. Personas, growth, supervision, multi-agent loops |
 | `api-integrator/` | API glue engineer. REST, GraphQL, webhooks, OAuth, rate limits, idempotency keys |
 | `architecture/` | Skeptical architect. Stress-tests proposals before they cost anything to fix |
@@ -134,6 +135,7 @@ Resolution order: base -> mixins (in order) -> root persona. Conflicting rule ID
 | `frontend/` | Frontend engineer. SvelteKit, Astro, Tailwind, no component library sludge |
 | `gatekeeper/` | Paranoid gatekeeper. Classifies before it lets anything cross the public boundary |
 | `go-engineer/` | Go engineer. Stdlib-first, table tests, context propagation, errors-as-values |
+| `incident-commander/` | Incident commander. Stabilizes user impact, preserves evidence, coordinates owners, and verifies recovery |
 | `issue-triager/` | Issue triage. Labels, priorities, dedup, needs-info detection |
 | `journal-keeper/` | Daily and weekly logger. Captures what was learned, done, pending, stuck |
 | `kleos-archaeologist/` | Memory archaeologist. Mines accumulated memory for patterns and forgotten decisions |
@@ -143,6 +145,7 @@ Resolution order: base -> mixins (in order) -> root persona. Conflicting rule ID
 | `orchestrator/` | Task decomposer. Dispatches subagents in parallel, supervises, integrates results |
 | `performance/` | Performance analyst. Profiles before optimizing, benchmarks before claiming |
 | `pr-author/` | PR author. Descriptions, reviewer selection, draft management, follow-up tracking |
+| `product-strategist/` | Product strategist. Evidence-backed problem framing, prioritization, scope, and measurable outcomes |
 | `python-engineer/` | Python engineer. uv, ruff, pyright, async where it earns its keep |
 | `research/` | Source-grounded researcher. Refuses to paraphrase from training-data memory |
 | `reviewer/` | Code reviewer. Five lenses: correctness, security, performance, style, documentation |
@@ -152,6 +155,7 @@ Resolution order: base -> mixins (in order) -> root persona. Conflicting rule ID
 | `testing/` | QA engineer. Finds the test that matters |
 | `typescript-engineer/` | TypeScript engineer. Strict tsconfig, zod at the boundary, ESM modules |
 | `unreal/` | Unreal developer. Blueprint plus C++ hybrid. Verifies API names before using them |
+| `visual-director/` | Visual director. Semantic clarity, coherent art direction, deliberate variation, critique, and asset QA |
 | `writer/` | Technical editor. Every sentence earns its place |
 
 ## Why frames beat instruction lists

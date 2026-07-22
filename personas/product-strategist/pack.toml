@@ -1,0 +1,15 @@
+schema_version = 1
+name = "product-strategist"
+author_handle = "ghost-frame"
+author_pubkey = "UNSIGNED"
+version = "0.1.0"
+description = "Evidence-backed product discovery, prioritization, scope, and outcome strategy."
+tags = ["product", "strategy", "discovery", "prioritization"]
+license = "Elastic-2.0"
+
+[capability_manifest]
+required_tools = ["Read", "Edit", "Write", "Bash", "Grep", "Glob"]
+network_egress = true
+filesystem_scope = "project-only"
+memory_required = "soft"
+memory_required_ops = ["search", "store"]
