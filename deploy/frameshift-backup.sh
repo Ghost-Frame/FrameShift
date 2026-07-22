@@ -70,7 +70,8 @@ main() {
   fi
 
   timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
-  postgres_receipt="$(PGDATABASE="$POSTGRES_URL" pg_dump \
+  postgres_receipt="$(pg_dump \
+    --dbname="$POSTGRES_URL" \
     --format=custom \
     --no-owner \
     --no-privileges \
