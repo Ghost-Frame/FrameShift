@@ -27,6 +27,7 @@ send_backup() {
 
   ssh \
     -i "$BACKUP_SSH_KEY" \
+    -p "$BACKUP_SSH_PORT" \
     -o BatchMode=yes \
     -o IdentitiesOnly=yes \
     -o StrictHostKeyChecking=yes \
@@ -61,6 +62,12 @@ main() {
   : "${BACKUP_SSH_KEY:?BACKUP_SSH_KEY is required}"
   : "${BACKUP_SSH_TARGET:?BACKUP_SSH_TARGET is required}"
   : "${BACKUP_KNOWN_HOSTS_FILE:?BACKUP_KNOWN_HOSTS_FILE is required}"
+  : "${BACKUP_SSH_PORT:=22}"
+  if [[ ! "$BACKUP_SSH_PORT" =~ ^[0-9]+$ ]] \
+    || (( BACKUP_SSH_PORT < 1 || BACKUP_SSH_PORT > 65535 )); then
+    echo "BACKUP_SSH_PORT must be an integer from 1 through 65535" >&2
+    return 64
+  fi
 
   timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
   postgres_receipt="$(PGDATABASE="$POSTGRES_URL" pg_dump \
