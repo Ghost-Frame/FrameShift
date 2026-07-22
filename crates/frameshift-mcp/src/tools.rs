@@ -126,7 +126,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "frameshift_automate".to_string(),
-            description: "Manage automate-mode state for a project. Actions: on, off, status, lock, unlock.".to_string(),
+            description: "Manage automate-mode state for a project. Actions: on, off, status, lock, unlock. Enabling Automate stores policy only; the connected host or daemon must invoke selection and activation.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -134,6 +134,12 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                     "action": {
                         "type": "string",
                         "enum": ["on", "off", "status", "lock", "unlock"]
+                    },
+                    "sensitivity": {
+                        "type": "number",
+                        "minimum": 0.0,
+                        "maximum": 1.0,
+                        "description": "Optional for action 'on'. 0 is stable and 1 is responsive. Omit it to preserve the project's current setting."
                     }
                 },
                 "required": ["action"]
@@ -817,9 +823,10 @@ fn call_automate(arguments: &serde_json::Value, client: &Client) -> ToolResult {
 
     match action {
         "on" => {
-            let state = ModeState {
-                mode: Mode::On,
-                sensitivity: 0.5,
+            let state = match updated_mode_state(&mode_path, Mode::On, arguments.get("sensitivity"))
+            {
+                Ok(state) => state,
+                Err(error) => return err_result(error),
             };
             if let Err(e) = state.save(&mode_path) {
                 return err_result(format!("failed to save mode: {e}"));
@@ -830,14 +837,16 @@ fn call_automate(arguments: &serde_json::Value, client: &Client) -> ToolResult {
         }
 
         "off" => {
-            let state = ModeState {
-                mode: Mode::Off,
-                sensitivity: 0.5,
+            let state = match updated_mode_state(&mode_path, Mode::Off, None) {
+                Ok(state) => state,
+                Err(error) => return err_result(error),
             };
             if let Err(e) = state.save(&mode_path) {
                 return err_result(format!("failed to save mode: {e}"));
             }
-            ok_result(serde_json::json!({ "mode": "off" }).to_string())
+            ok_result(
+                serde_json::json!({ "mode": "off", "sensitivity": state.sensitivity }).to_string(),
+            )
         }
 
         "status" => {
@@ -881,6 +890,7 @@ fn call_automate(arguments: &serde_json::Value, client: &Client) -> ToolResult {
 
             let text = serde_json::json!({
                 "mode": match mode_state.mode { Mode::On => "on", Mode::Off => "off" },
+                "sensitivity": mode_state.sensitivity,
                 "active": active,
                 "locked": locked,
                 "recent_transitions": recent,
@@ -915,6 +925,32 @@ fn call_automate(arguments: &serde_json::Value, client: &Client) -> ToolResult {
             "unknown action '{other}'; expected: on, off, status, lock, unlock"
         )),
     }
+}
+
+/// Load Automate state and change its mode without discarding sensitivity.
+fn updated_mode_state(
+    mode_path: &std::path::Path,
+    mode: Mode,
+    requested_sensitivity: Option<&serde_json::Value>,
+) -> Result<ModeState, String> {
+    let current = ModeState::load(mode_path).map_err(|e| format!("failed to load mode: {e}"))?;
+    let sensitivity = match requested_sensitivity {
+        Some(value) => value
+            .as_f64()
+            .ok_or_else(|| "sensitivity must be a number from 0.0 through 1.0".to_string())?,
+        None => f64::from(current.sensitivity),
+    };
+
+    if !sensitivity.is_finite() || !(0.0..=1.0).contains(&sensitivity) {
+        return Err(format!(
+            "sensitivity must be a finite number from 0.0 through 1.0, got {sensitivity}"
+        ));
+    }
+
+    Ok(ModeState {
+        mode,
+        sensitivity: sensitivity as f32,
+    })
 }
 
 /// Handle the frameshift_prefs tool call.
@@ -1148,6 +1184,21 @@ mod tests {
     fn tool_definitions_returns_ten() {
         let defs = tool_definitions();
         assert_eq!(defs.len(), 10);
+    }
+
+    /// Automate advertises an optional sensitivity constrained to the public range.
+    #[test]
+    fn tool_definitions_constrain_automate_sensitivity() {
+        let definitions = tool_definitions();
+        let automate = definitions
+            .iter()
+            .find(|definition| definition.name == "frameshift_automate")
+            .expect("tool_definitions must include frameshift_automate");
+        let sensitivity = &automate.input_schema["properties"]["sensitivity"];
+
+        assert_eq!(sensitivity["type"], "number");
+        assert_eq!(sensitivity["minimum"], 0.0);
+        assert_eq!(sensitivity["maximum"], 1.0);
     }
 
     /// frameshift_search is present in tool_definitions with `query` required
@@ -1555,9 +1606,9 @@ mod tests {
         );
     }
 
-    /// Verify that frameshift_automate on/off round-trip persists mode.
+    /// Verify that Automate mode toggles preserve an explicit sensitivity.
     #[test]
-    fn tool_call_automate_on_off_roundtrip() {
+    fn tool_call_automate_on_off_preserves_sensitivity() {
         let tmp = tempfile::tempdir().unwrap();
         let project_root = tmp.path().join("project");
         fs::create_dir_all(&project_root).unwrap();
@@ -1567,7 +1618,11 @@ mod tests {
 
         let on_result = call_tool(
             "frameshift_automate",
-            &serde_json::json!({"project_root": root_str, "action": "on"}),
+            &serde_json::json!({
+                "project_root": root_str,
+                "action": "on",
+                "sensitivity": 0.8
+            }),
             &client,
         );
         assert!(on_result.is_error.is_none());
@@ -1580,13 +1635,15 @@ mod tests {
         assert!(status.is_error.is_none());
         let parsed: serde_json::Value = serde_json::from_str(&status.content[0].text).unwrap();
         assert_eq!(parsed["mode"], "on");
+        assert!((parsed["sensitivity"].as_f64().unwrap() - 0.8).abs() < 1e-6);
 
         // Turn it back off.
-        call_tool(
+        let off_result = call_tool(
             "frameshift_automate",
             &serde_json::json!({"project_root": root_str, "action": "off"}),
             &client,
         );
+        assert!(off_result.is_error.is_none());
         let status2 = call_tool(
             "frameshift_automate",
             &serde_json::json!({"project_root": root_str, "action": "status"}),
@@ -1594,6 +1651,47 @@ mod tests {
         );
         let parsed2: serde_json::Value = serde_json::from_str(&status2.content[0].text).unwrap();
         assert_eq!(parsed2["mode"], "off");
+        assert!((parsed2["sensitivity"].as_f64().unwrap() - 0.8).abs() < 1e-6);
+
+        // Turn it back on without a value and preserve the prior policy again.
+        let on_again = call_tool(
+            "frameshift_automate",
+            &serde_json::json!({"project_root": root_str, "action": "on"}),
+            &client,
+        );
+        assert!(on_again.is_error.is_none());
+        let parsed3: serde_json::Value = serde_json::from_str(&on_again.content[0].text).unwrap();
+        assert_eq!(parsed3["mode"], "on");
+        assert!((parsed3["sensitivity"].as_f64().unwrap() - 0.8).abs() < 1e-6);
+    }
+
+    /// Verify that Automate rejects malformed and out-of-range sensitivities.
+    #[test]
+    fn tool_call_automate_rejects_invalid_sensitivity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+
+        let client = make_client(&tmp.path().join("data"));
+        let root_str = project_root.to_str().unwrap();
+
+        for invalid in [
+            serde_json::json!(-0.1),
+            serde_json::json!(1.1),
+            serde_json::json!("responsive"),
+        ] {
+            let result = call_tool(
+                "frameshift_automate",
+                &serde_json::json!({
+                    "project_root": root_str,
+                    "action": "on",
+                    "sensitivity": invalid
+                }),
+                &client,
+            );
+
+            assert!(result.is_error.is_some());
+        }
     }
 
     /// frameshift_capabilities reports the active persona's manifest and

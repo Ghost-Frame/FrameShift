@@ -22,7 +22,10 @@ pub struct AutomateArgs {
 pub enum AutomateAction {
     /// Enable automate mode for this project (does NOT auto-select a persona).
     On {
-        /// Switching sensitivity from 0.0 (stable) to 1.0 (responsive). Default: 0.5.
+        /// Switching sensitivity from 0.0 (stable) to 1.0 (responsive).
+        ///
+        /// Omit this to preserve the project's current setting, or use 0.5
+        /// when the project has no saved Automate state yet.
         #[arg(long, value_name = "VALUE")]
         sensitivity: Option<f32>,
     },
@@ -49,10 +52,9 @@ pub fn run_automate(client: &Client, args: AutomateArgs) -> Result<(), CliError>
 
     match args.action {
         AutomateAction::On { sensitivity } => {
-            let state = ModeState {
-                mode: Mode::On,
-                sensitivity: sensitivity.unwrap_or(0.5),
-            };
+            let current =
+                ModeState::load(&mode_path).map_err(|e| CliError::Orchestrator(e.to_string()))?;
+            let state = updated_mode_state(current, Mode::On, sensitivity)?;
             state
                 .save(&mode_path)
                 .map_err(|e| CliError::Orchestrator(e.to_string()))?;
@@ -60,10 +62,9 @@ pub fn run_automate(client: &Client, args: AutomateArgs) -> Result<(), CliError>
         }
 
         AutomateAction::Off => {
-            let state = ModeState {
-                mode: Mode::Off,
-                sensitivity: 0.5,
-            };
+            let current =
+                ModeState::load(&mode_path).map_err(|e| CliError::Orchestrator(e.to_string()))?;
+            let state = updated_mode_state(current, Mode::Off, None)?;
             state
                 .save(&mode_path)
                 .map_err(|e| CliError::Orchestrator(e.to_string()))?;
@@ -140,4 +141,66 @@ pub fn run_automate(client: &Client, args: AutomateArgs) -> Result<(), CliError>
     }
 
     Ok(())
+}
+
+/// Change Automate mode while preserving or explicitly replacing sensitivity.
+fn updated_mode_state(
+    current: ModeState,
+    mode: Mode,
+    requested_sensitivity: Option<f32>,
+) -> Result<ModeState, CliError> {
+    let sensitivity = requested_sensitivity.unwrap_or(current.sensitivity);
+    if !sensitivity.is_finite() || !(0.0..=1.0).contains(&sensitivity) {
+        return Err(CliError::Orchestrator(format!(
+            "sensitivity must be a finite number from 0.0 through 1.0, got {sensitivity}"
+        )));
+    }
+
+    Ok(ModeState { mode, sensitivity })
+}
+
+#[cfg(test)]
+/// Unit tests for mode updates and sensitivity validation.
+mod tests {
+    use super::*;
+
+    /// Omitting sensitivity preserves the current project policy.
+    #[test]
+    fn updated_mode_state_preserves_existing_sensitivity() {
+        let current = ModeState {
+            mode: Mode::Off,
+            sensitivity: 0.8,
+        };
+
+        let updated = updated_mode_state(current, Mode::On, None).unwrap();
+
+        assert_eq!(updated.mode, Mode::On);
+        assert!((updated.sensitivity - 0.8).abs() < f32::EPSILON);
+    }
+
+    /// Explicit sensitivity replaces the current project policy.
+    #[test]
+    fn updated_mode_state_accepts_explicit_sensitivity() {
+        let current = ModeState {
+            mode: Mode::Off,
+            sensitivity: 0.2,
+        };
+
+        let updated = updated_mode_state(current, Mode::On, Some(1.0)).unwrap();
+
+        assert!((updated.sensitivity - 1.0).abs() < f32::EPSILON);
+    }
+
+    /// Non-finite and out-of-range sensitivities are rejected.
+    #[test]
+    fn updated_mode_state_rejects_invalid_sensitivity() {
+        for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.1, 1.1] {
+            let current = ModeState {
+                mode: Mode::Off,
+                sensitivity: 0.5,
+            };
+
+            assert!(updated_mode_state(current, Mode::On, Some(invalid)).is_err());
+        }
+    }
 }
