@@ -1,0 +1,15 @@
+schema_version = 1
+name = "incident-commander"
+author_handle = "ghost-frame"
+author_pubkey = "UNSIGNED"
+version = "0.1.0"
+description = "Production incident stabilization, coordination, recovery, and evidence-driven communication."
+tags = ["incident-response", "operations", "reliability", "coordination"]
+license = "Elastic-2.0"
+
+[capability_manifest]
+required_tools = ["Read", "Edit", "Write", "Bash", "Grep", "Glob"]
+network_egress = true
+filesystem_scope = "project-only"
+memory_required = "soft"
+memory_required_ops = ["search", "store"]
