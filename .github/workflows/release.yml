@@ -1,9 +1,8 @@
-# Builds the two end-user binaries on every supported desktop platform and
-# publishes checksummed archives when a semantic version tag is pushed.
-# Tagged macOS builds require APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD,
-# APPLE_KEYCHAIN_PASSWORD, APPLE_ID, APPLE_PASSWORD, and APPLE_TEAM_ID.
-# Tagged Windows builds require WINDOWS_CERTIFICATE and
-# WINDOWS_CERTIFICATE_PASSWORD. Manual dispatches build but never publish.
+# Builds both end-user binaries for the early-access platforms and publishes
+# checksummed archives when a semantic version tag is pushed. Windows artifacts
+# may remain unsigned only while the ALLOW_UNSIGNED_EARLY_ACCESS repository
+# variable is true. macOS is intentionally withheld until Developer ID signing
+# and notarization credentials are available.
 name: Release binaries
 
 on:
@@ -32,14 +31,6 @@ jobs:
             target: x86_64-pc-windows-msvc
             asset: frameshift-windows-x86_64
             windows: true
-          - runner: macos-15-intel
-            target: x86_64-apple-darwin
-            asset: frameshift-macos-x86_64
-            windows: false
-          - runner: macos-15
-            target: aarch64-apple-darwin
-            asset: frameshift-macos-arm64
-            windows: false
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -58,77 +49,18 @@ jobs:
           test "$tag_version" = "$mcp_version"
       - name: Build CLI and MCP server
         run: cargo build --locked --release --package frameshift-cli --package frameshift-mcp --target ${{ matrix.target }}
-      - name: Validate platform signing secrets
-        if: github.ref_type == 'tag'
+      - name: Validate Windows signing secrets
+        if: github.ref_type == 'tag' && runner.os == 'Windows' && vars.ALLOW_UNSIGNED_EARLY_ACCESS != 'true'
         shell: bash
         env:
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_KEYCHAIN_PASSWORD: ${{ secrets.APPLE_KEYCHAIN_PASSWORD }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
           WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
         run: |
           set -euo pipefail
-          if [ "${{ runner.os }}" = "macOS" ]; then
-            test -n "$APPLE_CERTIFICATE"
-            test -n "$APPLE_CERTIFICATE_PASSWORD"
-            test -n "$APPLE_KEYCHAIN_PASSWORD"
-            test -n "$APPLE_ID"
-            test -n "$APPLE_PASSWORD"
-            test -n "$APPLE_TEAM_ID"
-          elif [ "${{ runner.os }}" = "Windows" ]; then
-            test -n "$WINDOWS_CERTIFICATE"
-            test -n "$WINDOWS_CERTIFICATE_PASSWORD"
-          fi
-      - name: Import Apple signing certificate
-        if: github.ref_type == 'tag' && runner.os == 'macOS'
-        shell: bash
-        env:
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_KEYCHAIN_PASSWORD: ${{ secrets.APPLE_KEYCHAIN_PASSWORD }}
-        run: |
-          set -euo pipefail
-          certificate="$RUNNER_TEMP/frameshift-certificate.p12"
-          keychain="$RUNNER_TEMP/frameshift-build.keychain-db"
-          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$certificate"
-          security create-keychain -p "$APPLE_KEYCHAIN_PASSWORD" "$keychain"
-          security unlock-keychain -p "$APPLE_KEYCHAIN_PASSWORD" "$keychain"
-          security set-keychain-settings -t 3600 -u "$keychain"
-          security list-keychains -d user -s "$keychain"
-          security import "$certificate" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$APPLE_KEYCHAIN_PASSWORD" "$keychain"
-          identity="$(security find-identity -v -p codesigning "$keychain" | awk -F'"' '/Developer ID Application/{print $2; exit}')"
-          test -n "$identity"
-          echo "APPLE_SIGNING_IDENTITY=$identity" >> "$GITHUB_ENV"
-      - name: Sign and notarize macOS binaries
-        if: github.ref_type == 'tag' && runner.os == 'macOS'
-        shell: bash
-        env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: |
-          set -euo pipefail
-          binary_dir="target/${{ matrix.target }}/release"
-          codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$binary_dir/frameshift"
-          codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$binary_dir/frameshift-mcp"
-          codesign --verify --strict --verbose=2 "$binary_dir/frameshift"
-          codesign --verify --strict --verbose=2 "$binary_dir/frameshift-mcp"
-          notary_dir="$RUNNER_TEMP/frameshift-notary"
-          mkdir -p "$notary_dir"
-          cp "$binary_dir/frameshift" "$binary_dir/frameshift-mcp" "$notary_dir/"
-          ditto -c -k --keepParent "$notary_dir" "$RUNNER_TEMP/frameshift-notary.zip"
-          xcrun notarytool submit "$RUNNER_TEMP/frameshift-notary.zip" \
-            --apple-id "$APPLE_ID" \
-            --password "$APPLE_PASSWORD" \
-            --team-id "$APPLE_TEAM_ID" \
-            --wait
+          test -n "$WINDOWS_CERTIFICATE"
+          test -n "$WINDOWS_CERTIFICATE_PASSWORD"
       - name: Sign Windows binaries
-        if: github.ref_type == 'tag' && runner.os == 'Windows'
+        if: github.ref_type == 'tag' && runner.os == 'Windows' && vars.ALLOW_UNSIGNED_EARLY_ACCESS != 'true'
         shell: pwsh
         env:
           WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
@@ -201,11 +133,17 @@ jobs:
       - name: Publish immutable release assets
         env:
           GH_TOKEN: ${{ github.token }}
+          EARLY_ACCESS: ${{ vars.ALLOW_UNSIGNED_EARLY_ACCESS }}
         shell: bash
         run: |
+          release_flags=()
+          if [ "$EARLY_ACCESS" = "true" ]; then
+            release_flags+=(--prerelease)
+          fi
           gh release create "$GITHUB_REF_NAME" \
             artifacts/*.tar.gz artifacts/*.zip artifacts/SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
             --generate-notes \
+            "${release_flags[@]}" \
             --title "FrameShift $GITHUB_REF_NAME"

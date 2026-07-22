@@ -8,7 +8,7 @@ A persona engine for AI coding agents. Install behavioral identities as versione
 
 **Status:** Pre-release. The CLI, pack runtime, orchestrator, watch daemon, and marketplace server are implemented. The public registry API is online; the browser marketplace remains behind an access gate while release validation finishes.
 
-**Desktop app:** [download.frameshift.syntheos.dev](https://download.frameshift.syntheos.dev/) -- the easiest way to browse, install, and activate personas without using a terminal.
+**Desktop app:** [download.frameshift.syntheos.dev](https://download.frameshift.syntheos.dev/) -- the easiest way to browse, install, activate, and connect personas without using a terminal. Early-access builds currently support Linux x64 and Windows x64. The Windows installer is not yet Authenticode-signed and may show an unrecognized publisher warning. macOS distribution is withheld until signed and notarized builds are available.
 
 Personas are not instruction lists. They are complete behavioral frames -- identity, rules, skills, operating posture -- that survive long sessions, surprising inputs, and the slow drift that turns careful agents into sloppy ones around turn 200. Same model, different frame.
 
@@ -20,6 +20,7 @@ Personas are not instruction lists. They are complete behavioral frames -- ident
 2. Open the app and choose the project folder where you use an AI coding agent.
 3. Open Marketplace, choose a persona, and select Install.
 4. Return to Personas and activate it for the selected project.
+5. Open Settings, choose your agent, and select Connect. The desktop app installs its bundled CLI and MCP server automatically.
 
 The selected project is always shown in the sidebar. Installing or activating a persona affects that project only, and you can switch projects at any time.
 
@@ -31,8 +32,8 @@ Every release includes both `frameshift`, for people, and `frameshift-mcp`, for 
 | --- | --- |
 | Linux x64 | [frameshift-linux-x86_64.tar.gz](https://github.com/Ghost-Frame/FrameShift/releases/latest/download/frameshift-linux-x86_64.tar.gz) |
 | Windows x64 | [frameshift-windows-x86_64.zip](https://github.com/Ghost-Frame/FrameShift/releases/latest/download/frameshift-windows-x86_64.zip) |
-| macOS Apple Silicon | [frameshift-macos-arm64.tar.gz](https://github.com/Ghost-Frame/FrameShift/releases/latest/download/frameshift-macos-arm64.tar.gz) |
-| macOS Intel | [frameshift-macos-x86_64.tar.gz](https://github.com/Ghost-Frame/FrameShift/releases/latest/download/frameshift-macos-x86_64.tar.gz) |
+
+These early-access Windows command-line archives are also unsigned. Verify the archive against `SHA256SUMS` before extracting it. Persona packs downloaded from the registry are separately signature-verified by FrameShift.
 
 Confirm the installation:
 

@@ -1,0 +1,11 @@
+[Unit]
+Description=Back up FrameShift every six hours
+
+[Timer]
+OnCalendar=*-*-* 00/6:17:00 UTC
+Persistent=true
+RandomizedDelaySec=15m
+Unit=frameshift-backup.service
+
+[Install]
+WantedBy=timers.target
