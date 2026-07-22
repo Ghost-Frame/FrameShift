@@ -831,8 +831,8 @@ impl Client {
     /// Resolves the target's output filename via `RENDER_TARGETS` (e.g. target
     /// `"claude"` maps to `CLAUDE.md`) and reads
     /// `personas/<persona>/rendered/<target>/<file>` from the project's central
-    /// state directory. Defaults to target `"claude"` if an empty string is
-    /// passed (callers should pass `"claude"` explicitly).
+    /// state directory. Defaults to the agent-neutral `"generic"` target if
+    /// an empty string is passed.
     ///
     /// Returns `ClientError::UnknownRenderTarget` when `target` is not in
     /// `RENDER_TARGETS`, and `ClientError::RenderedPersonaNotFound` when the
@@ -844,7 +844,7 @@ impl Client {
         target: &str,
     ) -> Result<String, ClientError> {
         validate_persona_name(persona)?;
-        let effective_target = if target.is_empty() { "claude" } else { target };
+        let effective_target = if target.is_empty() { "generic" } else { target };
 
         let filename = RENDER_TARGETS
             .iter()
@@ -1697,7 +1697,7 @@ fn compose_rendered_content(
     if let Some(infra) = &infra_content {
         composed.push_str(infra);
         composed.push_str("\n\n## Persona Context\n\n");
-        composed.push_str(&format!("Active persona: {}\n", persona_name));
+        composed.push_str(&format!("Active persona: {persona_name}\n"));
         composed.push_str("\n---\n\n");
     }
 
@@ -2196,12 +2196,11 @@ mod tests {
         fs::write(
             pack_dir.join("pack.toml"),
             format!(
-                "schema_version = 1\nname = \"{}\"\nauthor_handle = \"test\"\nauthor_pubkey = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\nversion = \"0.1.0\"\n",
-                name
+                "schema_version = 1\nname = \"{name}\"\nauthor_handle = \"test\"\nauthor_pubkey = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\nversion = \"0.1.0\"\n"
             ),
         )
         .unwrap();
-        fs::write(pack_dir.join("AGENTS.md"), format!("# {}\n\nTest.\n", name)).unwrap();
+        fs::write(pack_dir.join("AGENTS.md"), format!("# {name}\n\nTest.\n")).unwrap();
 
         let project_root = tmp.path().join("project");
         fs::create_dir_all(&project_root).unwrap();

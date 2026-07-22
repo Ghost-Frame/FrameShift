@@ -175,6 +175,7 @@ pub fn error_response(id: Option<serde_json::Value>, code: i32, msg: String) -> 
 }
 
 #[cfg(test)]
+/// Serialization tests for MCP response and protocol payload types.
 mod tests {
     use super::*;
 
@@ -182,7 +183,7 @@ mod tests {
     #[test]
     fn initialize_response_has_server_info() {
         let result = serde_json::json!({
-            "protocolVersion": "2024-11-05",
+            "protocolVersion": "2025-11-25",
             "serverInfo": {
                 "name": "frameshift-mcp",
                 "version": "0.1.0"

@@ -38,6 +38,7 @@ pub struct PolicyWeights {
     pub capability: f32,
 }
 
+/// Supplies balanced default weights for selection scoring.
 impl Default for PolicyWeights {
     /// Returns the default weights: language 0.3, lexical 0.25, intent 0.3, capability 0.15.
     fn default() -> Self {
@@ -337,10 +338,10 @@ pub fn rank_with_embedder(
                 ));
             }
             if intent_score > 0.0 {
-                rationale_parts.push(format!("intent_score={:.2}", intent_score));
+                rationale_parts.push(format!("intent_score={intent_score:.2}"));
             }
             if cap_score > 0.0 {
-                rationale_parts.push(format!("cap_score={:.2}", cap_score));
+                rationale_parts.push(format!("cap_score={cap_score:.2}"));
             }
             if context_score > 0.0 {
                 let hit_signals: Vec<&str> = ctx
@@ -357,10 +358,10 @@ pub fn rank_with_embedder(
                 ));
             }
             if semantic_score > 0.0 {
-                rationale_parts.push(format!("semantic_score={:.2}", semantic_score));
+                rationale_parts.push(format!("semantic_score={semantic_score:.2}"));
             }
             if bias.abs() > f32::EPSILON {
-                rationale_parts.push(format!("pref_bias={:.3}", bias));
+                rationale_parts.push(format!("pref_bias={bias:.3}"));
             }
             let rationale = if rationale_parts.is_empty() {
                 format!("{}: no signal matched", profile.name)
@@ -415,6 +416,7 @@ pub fn rank_with_embedder(
 }
 
 #[cfg(test)]
+/// Persona ranking, confidence, and weighting tests.
 mod tests {
     use super::*;
     use crate::index::{PersonaIndex, PersonaProfile};

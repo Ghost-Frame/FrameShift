@@ -4,8 +4,6 @@
 //! pointing at it, calls the adapter method, and asserts both the result and
 //! the number of HTTP requests received by the mock.
 
-#![cfg(test)]
-
 use std::time::Duration;
 
 use frameshift_memory::{Filters, MemoryAdapter, MemoryError, MemoryId, Metadata};

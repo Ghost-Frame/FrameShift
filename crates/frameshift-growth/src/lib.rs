@@ -174,14 +174,11 @@ pub fn append_with_timestamp(
             })?;
     }
 
-    writeln!(
-        file,
-        "---\n<!-- growth: {} -->\n\n{}\n",
-        timestamp, entry_text
-    )
-    .map_err(|source| GrowthError::Io {
-        path: growth_path,
-        source,
+    writeln!(file, "---\n<!-- growth: {timestamp} -->\n\n{entry_text}\n").map_err(|source| {
+        GrowthError::Io {
+            path: growth_path,
+            source,
+        }
     })?;
 
     Ok(())
@@ -208,10 +205,7 @@ fn format_utc_now() -> String {
     let minutes = (time_secs % 3600) / 60;
     let seconds = time_secs % 60;
     let (year, month, day) = days_to_ymd(days);
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        year, month, day, hours, minutes, seconds
-    )
+    format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}Z")
 }
 
 /// Convert days since Unix epoch to (year, month, day).
@@ -551,10 +545,12 @@ pub fn summarize(
 }
 
 #[cfg(test)]
+/// Growth persistence, migration, validation, and summary tests.
 mod tests {
     use super::*;
 
     #[test]
+    /// Appending creates a new markdown growth file when none exists.
     fn append_creates_file_when_absent() {
         let tmp = tempfile::tempdir().unwrap();
         append_with_timestamp(
@@ -575,6 +571,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    /// New growth files use owner-only permissions on Unix.
     fn append_creates_owner_only_file() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
@@ -637,6 +634,7 @@ mod tests {
     }
 
     #[test]
+    /// Repeated appends preserve every entry in chronological order.
     fn append_accumulates_entries() {
         let tmp = tempfile::tempdir().unwrap();
         append_with_timestamp(
@@ -686,6 +684,7 @@ mod tests {
     }
 
     #[test]
+    /// Persona traversal components are rejected before file access.
     fn append_rejects_traversal_in_persona_name() {
         let tmp = tempfile::tempdir().unwrap();
         let result = append_with_timestamp(
@@ -699,6 +698,7 @@ mod tests {
     }
 
     #[test]
+    /// Project traversal components are rejected before file access.
     fn append_rejects_traversal_in_project_id() {
         let tmp = tempfile::tempdir().unwrap();
         let result = append_with_timestamp(
@@ -712,6 +712,7 @@ mod tests {
     }
 
     #[test]
+    /// Timestamped appends write both the timestamp marker and body.
     fn append_with_timestamp_inserts_header() {
         let tmp = tempfile::tempdir().unwrap();
         append_with_timestamp(
@@ -729,6 +730,7 @@ mod tests {
     }
 
     #[test]
+    /// Empty persona names are rejected.
     fn append_rejects_empty_persona_name() {
         let tmp = tempfile::tempdir().unwrap();
         let result = append_with_timestamp(tmp.path(), "proj", "", "text", "ts");
@@ -736,6 +738,7 @@ mod tests {
     }
 
     #[test]
+    /// UTC timestamps use the fixed RFC 3339-compatible shape.
     fn format_utc_now_produces_valid_timestamp() {
         let ts = format_utc_now();
         assert!(ts.ends_with('Z'));
@@ -743,6 +746,7 @@ mod tests {
     }
 
     #[test]
+    /// Structured appends round-trip through the JSONL file.
     fn append_jsonl_writes_structured_entry() {
         let tmp = tempfile::tempdir().unwrap();
         let entry = GrowthEntry {
@@ -768,6 +772,7 @@ mod tests {
     }
 
     #[test]
+    /// Global structured entries use the global persona path.
     fn append_global_writes_to_global_path() {
         let tmp = tempfile::tempdir().unwrap();
         let entry = GrowthEntry {
@@ -826,6 +831,7 @@ mod tests {
     }
 
     #[test]
+    /// Structured reads return every stored project entry.
     fn read_entries_returns_all_entries() {
         let tmp = tempfile::tempdir().unwrap();
         for i in 0..3 {
@@ -847,6 +853,7 @@ mod tests {
     }
 
     #[test]
+    /// Legacy markdown entries migrate into structured JSONL records.
     fn migrate_md_to_jsonl() {
         let tmp = tempfile::tempdir().unwrap();
         let md_path = tmp.path().join("projects/p1/personas/rust/growth.md");
@@ -863,6 +870,7 @@ mod tests {
     }
 
     #[test]
+    /// Summaries remove near-duplicates and cap the selected entries.
     fn summarize_deduplicates_and_caps() {
         let tmp = tempfile::tempdir().unwrap();
         for i in 0..15 {

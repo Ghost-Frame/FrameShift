@@ -108,7 +108,7 @@ pub fn run_select(client: &Client, args: SelectArgs) -> Result<(), CliError> {
             frameshift_orchestrator::select_rich_with_embedder(&inputs, embedder.as_deref())
                 .map_err(|e| CliError::Orchestrator(e.to_string()))?;
         let json = serde_json::to_string_pretty(&output)?;
-        println!("{}", json);
+        println!("{json}");
         return Ok(());
     }
 

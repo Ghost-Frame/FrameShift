@@ -6,6 +6,16 @@ use frameshift_mcp::protocol::{error_response, success_response, JsonRpcMessage,
 use frameshift_mcp::{prompts, tools};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 
+/// Newest MCP protocol revision implemented by this server.
+const LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
+
+/// Protocol revisions accepted for compatibility with older agent hosts.
+const SUPPORTED_PROTOCOL_VERSIONS: [&str; 3] =
+    [LATEST_PROTOCOL_VERSION, "2025-06-18", "2024-11-05"];
+
+/// Human-readable setup guidance returned to MCP hosts during initialization.
+const SERVER_INSTRUCTIONS: &str = "FrameShift manages project-scoped agent personas. Set FRAMESHIFT_PROJECT_ROOT in this server's environment once, or pass project_root per call. When neither is provided, Claude Code's CLAUDE_PROJECT_DIR is used when available, followed by the server working directory. Set FRAMESHIFT_TARGET to claude, codex, gemini, or generic, or pass target to frameshift_use and active_persona; generic is the default. Start with frameshift_search, install with frameshift_install, choose with select_persona, then activate with frameshift_use.";
+
 /// Main entry point. Initializes tracing, creates the client, then
 /// runs the stdin JSON-RPC read loop writing responses to stdout.
 #[tokio::main]
@@ -174,16 +184,18 @@ fn handle_message(line: &str, client: &Client) -> Option<JsonRpcResponse> {
         "initialize" => {
             // Advertise both tools and prompts; clients use these to decide
             // which surfaces (tools/list, prompts/list) to query and render.
+            let protocol_version = negotiate_protocol_version(msg.params.as_ref());
             let result = serde_json::json!({
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": protocol_version,
                 "serverInfo": {
                     "name": "frameshift-mcp",
-                    "version": "0.9.9"
+                    "version": env!("CARGO_PKG_VERSION")
                 },
                 "capabilities": {
                     "tools": {},
                     "prompts": {}
-                }
+                },
+                "instructions": SERVER_INSTRUCTIONS
             });
             Some(success_response(id, result))
         }
@@ -233,7 +245,20 @@ fn handle_message(line: &str, client: &Client) -> Option<JsonRpcResponse> {
     }
 }
 
+/// Echo a client protocol revision when supported, otherwise select the latest revision.
+fn negotiate_protocol_version(params: Option<&serde_json::Value>) -> &'static str {
+    let requested = params
+        .and_then(|value| value.get("protocolVersion"))
+        .and_then(serde_json::Value::as_str);
+    SUPPORTED_PROTOCOL_VERSIONS
+        .iter()
+        .copied()
+        .find(|supported| Some(*supported) == requested)
+        .unwrap_or(LATEST_PROTOCOL_VERSION)
+}
+
 #[cfg(test)]
+/// JSON-RPC transport and MCP initialization integration tests.
 mod tests {
     use super::*;
     use frameshift_client::{Client, ClientOptions, InstallRequest, InstallSource, PersonaSpec};
@@ -271,6 +296,29 @@ mod tests {
         let response = handle_message(line, &client).expect("should produce a response");
         let serialized = serde_json::to_value(&response).unwrap();
         assert_eq!(serialized["result"]["serverInfo"]["name"], "frameshift-mcp");
+        assert_eq!(
+            serialized["result"]["serverInfo"]["version"],
+            env!("CARGO_PKG_VERSION")
+        );
+        assert_eq!(
+            serialized["result"]["protocolVersion"],
+            LATEST_PROTOCOL_VERSION
+        );
+        assert!(serialized["result"]["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("FRAMESHIFT_PROJECT_ROOT"));
+    }
+
+    /// Initialize echoes an older supported revision for compatible hosts.
+    #[test]
+    fn initialize_negotiates_supported_older_protocol() {
+        let tmp = tempfile::tempdir().unwrap();
+        let client = make_client(tmp.path());
+        let line = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}"#;
+        let response = handle_message(line, &client).expect("should produce a response");
+        let serialized = serde_json::to_value(&response).unwrap();
+        assert_eq!(serialized["result"]["protocolVersion"], "2024-11-05");
     }
 
     /// Verify that an unknown method returns a -32601 error.

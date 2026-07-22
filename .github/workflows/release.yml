@@ -1,0 +1,211 @@
+# Builds the two end-user binaries on every supported desktop platform and
+# publishes checksummed archives when a semantic version tag is pushed.
+# Tagged macOS builds require APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD,
+# APPLE_KEYCHAIN_PASSWORD, APPLE_ID, APPLE_PASSWORD, and APPLE_TEAM_ID.
+# Tagged Windows builds require WINDOWS_CERTIFICATE and
+# WINDOWS_CERTIFICATE_PASSWORD. Manual dispatches build but never publish.
+name: Release binaries
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.asset }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: frameshift-linux-x86_64
+            windows: false
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: frameshift-windows-x86_64
+            windows: true
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            asset: frameshift-macos-x86_64
+            windows: false
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            asset: frameshift-macos-arm64
+            windows: false
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.88.0
+          targets: ${{ matrix.target }}
+      - name: Verify tag matches binary versions
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          cli_version="$(sed -n '/^version = /{s/version = "\([^"]*\)"/\1/p;q;}' crates/frameshift-cli/Cargo.toml)"
+          mcp_version="$(sed -n '/^version = /{s/version = "\([^"]*\)"/\1/p;q;}' crates/frameshift-mcp/Cargo.toml)"
+          test "$tag_version" = "$cli_version"
+          test "$tag_version" = "$mcp_version"
+      - name: Build CLI and MCP server
+        run: cargo build --locked --release --package frameshift-cli --package frameshift-mcp --target ${{ matrix.target }}
+      - name: Validate platform signing secrets
+        if: github.ref_type == 'tag'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_KEYCHAIN_PASSWORD: ${{ secrets.APPLE_KEYCHAIN_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            test -n "$APPLE_CERTIFICATE"
+            test -n "$APPLE_CERTIFICATE_PASSWORD"
+            test -n "$APPLE_KEYCHAIN_PASSWORD"
+            test -n "$APPLE_ID"
+            test -n "$APPLE_PASSWORD"
+            test -n "$APPLE_TEAM_ID"
+          elif [ "${{ runner.os }}" = "Windows" ]; then
+            test -n "$WINDOWS_CERTIFICATE"
+            test -n "$WINDOWS_CERTIFICATE_PASSWORD"
+          fi
+      - name: Import Apple signing certificate
+        if: github.ref_type == 'tag' && runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_KEYCHAIN_PASSWORD: ${{ secrets.APPLE_KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          certificate="$RUNNER_TEMP/frameshift-certificate.p12"
+          keychain="$RUNNER_TEMP/frameshift-build.keychain-db"
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$certificate"
+          security create-keychain -p "$APPLE_KEYCHAIN_PASSWORD" "$keychain"
+          security unlock-keychain -p "$APPLE_KEYCHAIN_PASSWORD" "$keychain"
+          security set-keychain-settings -t 3600 -u "$keychain"
+          security list-keychains -d user -s "$keychain"
+          security import "$certificate" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$APPLE_KEYCHAIN_PASSWORD" "$keychain"
+          identity="$(security find-identity -v -p codesigning "$keychain" | awk -F'"' '/Developer ID Application/{print $2; exit}')"
+          test -n "$identity"
+          echo "APPLE_SIGNING_IDENTITY=$identity" >> "$GITHUB_ENV"
+      - name: Sign and notarize macOS binaries
+        if: github.ref_type == 'tag' && runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          binary_dir="target/${{ matrix.target }}/release"
+          codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$binary_dir/frameshift"
+          codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$binary_dir/frameshift-mcp"
+          codesign --verify --strict --verbose=2 "$binary_dir/frameshift"
+          codesign --verify --strict --verbose=2 "$binary_dir/frameshift-mcp"
+          notary_dir="$RUNNER_TEMP/frameshift-notary"
+          mkdir -p "$notary_dir"
+          cp "$binary_dir/frameshift" "$binary_dir/frameshift-mcp" "$notary_dir/"
+          ditto -c -k --keepParent "$notary_dir" "$RUNNER_TEMP/frameshift-notary.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/frameshift-notary.zip" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+      - name: Sign Windows binaries
+        if: github.ref_type == 'tag' && runner.os == 'Windows'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $certificate = Join-Path $env:RUNNER_TEMP "frameshift-certificate.pfx"
+          [IO.File]::WriteAllBytes($certificate, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+          $signTool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if (-not $signTool) { throw "signtool.exe was not found" }
+          $binaries = @(
+            "target/${{ matrix.target }}/release/frameshift.exe",
+            "target/${{ matrix.target }}/release/frameshift-mcp.exe"
+          )
+          foreach ($binary in $binaries) {
+            & $signTool.FullName sign /f $certificate /p $env:WINDOWS_CERTIFICATE_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $binary
+            if ($LASTEXITCODE -ne 0) { throw "Signing failed for $binary" }
+            & $signTool.FullName verify /pa /v $binary
+            if ($LASTEXITCODE -ne 0) { throw "Signature verification failed for $binary" }
+          }
+      - name: Package Unix archive
+        if: ${{ !matrix.windows }}
+        shell: bash
+        run: |
+          mkdir -p "dist/${{ matrix.asset }}"
+          cp "target/${{ matrix.target }}/release/frameshift" "dist/${{ matrix.asset }}/"
+          cp "target/${{ matrix.target }}/release/frameshift-mcp" "dist/${{ matrix.asset }}/"
+          cp README.md LICENSE "dist/${{ matrix.asset }}/"
+          tar -C dist -czf "dist/${{ matrix.asset }}.tar.gz" "${{ matrix.asset }}"
+          cd dist
+          shasum -a 256 "${{ matrix.asset }}.tar.gz" > "${{ matrix.asset }}.sha256"
+      - name: Package Windows archive
+        if: ${{ matrix.windows }}
+        shell: pwsh
+        run: |
+          $folder = "dist/${{ matrix.asset }}"
+          New-Item -ItemType Directory -Force -Path $folder | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/frameshift.exe" $folder
+          Copy-Item "target/${{ matrix.target }}/release/frameshift-mcp.exe" $folder
+          Copy-Item README.md, LICENSE $folder
+          $archive = "dist/${{ matrix.asset }}.zip"
+          Compress-Archive -Path "$folder/*" -DestinationPath $archive
+          $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          "$hash  ${{ matrix.asset }}.zip" | Set-Content -NoNewline "dist/${{ matrix.asset }}.sha256"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            dist/${{ matrix.asset }}.tar.gz
+            dist/${{ matrix.asset }}.zip
+            dist/${{ matrix.asset }}.sha256
+          if-no-files-found: ignore
+
+  publish:
+    name: Publish GitHub release
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Build combined checksum manifest
+        shell: bash
+        run: cat artifacts/*.sha256 > artifacts/SHA256SUMS
+      - name: Publish immutable release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            artifacts/*.tar.gz artifacts/*.zip artifacts/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --generate-notes \
+            --title "FrameShift $GITHUB_REF_NAME"

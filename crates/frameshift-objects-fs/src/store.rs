@@ -818,8 +818,7 @@ mod tests {
         let result = store.get(&hash).await;
         assert!(
             matches!(result, Err(ObjectStoreError::NotFound { hash: h }) if h == hash),
-            "expected NotFound for symlink at object path, got: {:?}",
-            result
+            "expected NotFound for symlink at object path, got: {result:?}"
         );
     }
 }

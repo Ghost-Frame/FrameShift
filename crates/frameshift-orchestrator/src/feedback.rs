@@ -50,6 +50,7 @@ pub struct Preferences {
     pub bias: BTreeMap<String, f32>,
 }
 
+/// Preference mutation, lookup, decay, and persistence operations.
 impl Preferences {
     /// Create a new empty `Preferences` with no recorded biases.
     pub fn new() -> Self {
@@ -93,7 +94,7 @@ impl Preferences {
 
         if let Some(intent) = intent {
             // Derive the key from the Debug representation, lowercased.
-            let intent_key = format!("{:?}", intent).to_lowercase();
+            let intent_key = format!("{intent:?}").to_lowercase();
             let intent_bias = chosen_entry.by_intent.entry(intent_key).or_insert(0.0);
             *intent_bias = (*intent_bias + BUMP).min(BIAS_MAX);
         }
@@ -146,7 +147,7 @@ impl Preferences {
             if let Some(entry) = self.entries.get(persona) {
                 if !entry.by_intent.is_empty() {
                     // Intent-specific biases exist -- only return one if this intent is tracked.
-                    let intent_key = format!("{:?}", intent).to_lowercase();
+                    let intent_key = format!("{intent:?}").to_lowercase();
                     return entry.by_intent.get(&intent_key).copied().unwrap_or(0.0);
                 }
                 // No per-intent data; fall back to global entry bias.
@@ -210,6 +211,7 @@ impl Preferences {
 }
 
 #[cfg(test)]
+/// Preference scoring and persistence tests.
 mod tests {
     use super::*;
     use tempfile::TempDir;

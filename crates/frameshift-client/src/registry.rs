@@ -188,6 +188,8 @@ pub struct RegistrySearchQuery {
     pub tag: Option<String>,
     /// Maximum number of results to return (server-clamped).
     pub limit: Option<u32>,
+    /// Number of matching results to skip before returning this page.
+    pub offset: Option<u32>,
 }
 
 /// A single search hit: a pack summary paired with its relevance score.
@@ -226,7 +228,7 @@ struct SearchResponseBody {
 
 /// Search the registry's pack catalog (`GET {base}/v1/packs`).
 ///
-/// Applies `q.query`/`q.tag`/`q.limit` as query-string parameters when
+/// Applies `q.query`/`q.tag`/`q.limit`/`q.offset` as query-string parameters when
 /// present; omitted filters are left off the request entirely so the server
 /// applies its own defaults. Returns a structured [`ClientError::RegistryHttp`]
 /// on a network error, non-2xx status, or a response body that does not
@@ -245,6 +247,9 @@ pub fn search_registry(
     }
     if let Some(limit) = q.limit {
         request = request.query("limit", &limit.to_string());
+    }
+    if let Some(offset) = q.offset {
+        request = request.query("offset", &offset.to_string());
     }
 
     let response = request.call().map_err(|err| ClientError::RegistryHttp {
@@ -864,11 +869,13 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
         let handle = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
             let mut request_line = String::new();
             reader.read_line(&mut request_line).unwrap();
+            request_tx.send(request_line).unwrap();
             loop {
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
@@ -887,9 +894,24 @@ mod tests {
         });
 
         let base = format!("http://127.0.0.1:{port}");
-        let results = search_registry(&base, &RegistrySearchQuery::default()).unwrap();
+        let results = search_registry(
+            &base,
+            &RegistrySearchQuery {
+                query: Some("demo pack".to_string()),
+                tag: Some("rust".to_string()),
+                limit: Some(25),
+                offset: Some(50),
+            },
+        )
+        .unwrap();
         handle.join().unwrap();
 
+        let request_line = request_rx.recv().unwrap();
+        assert!(request_line.starts_with("GET /v1/packs?"));
+        assert!(request_line.contains("query=demo+pack"));
+        assert!(request_line.contains("tag=rust"));
+        assert!(request_line.contains("limit=25"));
+        assert!(request_line.contains("offset=50"));
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].pack.name, "demo");
         assert_eq!(results[0].pack.latest_version, Some("1.0.0".to_string()));

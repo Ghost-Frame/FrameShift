@@ -31,9 +31,9 @@ members = [
 
 [workspace.package]
 edition = "2021"
-# diesel 2.3 requires 1.86 and the diesel-async 0.9 transaction API uses async
-# closures (stable since 1.85); 1.86 is the real floor after those bumps.
-rust-version = "1.86"
+# The locked dependency graph includes crates whose published MSRV is 1.88.
+# Keep this value aligned with the pinned CI and release toolchains.
+rust-version = "1.88"
 license = "Elastic-2.0"
 
 [workspace.dependencies]

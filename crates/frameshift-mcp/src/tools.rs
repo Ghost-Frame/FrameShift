@@ -8,6 +8,7 @@ use frameshift_orchestrator::{
 };
 use frameshift_pack::{CapabilityManifest, PackManifest};
 
+use crate::context::{resolve_render_target, validate_absolute_path, with_project_root};
 use crate::protocol::{ToolContent, ToolDef, ToolResult};
 
 /// Return the process-wide semantic embedder, loading the model once on first
@@ -57,10 +58,10 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "spec": {"type": "string"},
-                    "project_root": {"type": "string"},
+                    "project_root": project_root_schema(),
                     "from_path": {"type": "string"}
                 },
-                "required": ["spec", "project_root"]
+                "required": ["spec"]
             }),
         },
         ToolDef {
@@ -70,9 +71,9 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "persona": {"type": "string"},
-                    "project_root": {"type": "string"}
+                    "project_root": project_root_schema()
                 },
-                "required": ["persona", "project_root"]
+                "required": ["persona"]
             }),
         },
         ToolDef {
@@ -81,9 +82,8 @@ pub fn tool_definitions() -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "project_root": {"type": "string"}
-                },
-                "required": ["project_root"]
+                    "project_root": project_root_schema()
+                }
             }),
         },
         ToolDef {
@@ -92,11 +92,11 @@ pub fn tool_definitions() -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "project_root": {"type": "string"},
+                    "project_root": project_root_schema(),
                     "persona": {"type": "string"},
                     "text": {"type": "string"}
                 },
-                "required": ["project_root", "persona", "text"]
+                "required": ["persona", "text"]
             }),
         },
         ToolDef {
@@ -105,11 +105,10 @@ pub fn tool_definitions() -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "project_root": {"type": "string"},
+                    "project_root": project_root_schema(),
                     "task": {"type": "string"},
                     "library": {"type": "string"}
-                },
-                "required": ["project_root"]
+                }
             }),
         },
         ToolDef {
@@ -118,25 +117,32 @@ pub fn tool_definitions() -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "project_root": {"type": "string"},
-                    "persona": {"type": "string"}
+                    "project_root": project_root_schema(),
+                    "persona": {"type": "string"},
+                    "target": render_target_schema()
                 },
-                "required": ["project_root", "persona"]
+                "required": ["persona"]
             }),
         },
         ToolDef {
             name: "frameshift_automate".to_string(),
-            description: "Manage automate-mode state for a project. Actions: on, off, status, lock, unlock.".to_string(),
+            description: "Manage automate-mode state for a project. Actions: on, off, status, lock, unlock. Enabling Automate stores policy only; the connected host or daemon must invoke selection and activation.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "project_root": {"type": "string"},
+                    "project_root": project_root_schema(),
                     "action": {
                         "type": "string",
                         "enum": ["on", "off", "status", "lock", "unlock"]
+                    },
+                    "sensitivity": {
+                        "type": "number",
+                        "minimum": 0.0,
+                        "maximum": 1.0,
+                        "description": "Optional for action 'on'. 0 is stable and 1 is responsive. Omit it to preserve the project's current setting."
                     }
                 },
-                "required": ["project_root", "action"]
+                "required": ["action"]
             }),
         },
         ToolDef {
@@ -145,7 +151,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "project_root": {"type": "string"},
+                    "project_root": project_root_schema(),
                     "persona": {"type": "string"},
                     "tools": {
                         "type": "array",
@@ -168,7 +174,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                         }
                     }
                 },
-                "required": ["project_root"]
+                "required": []
             }),
         },
         ToolDef {
@@ -177,14 +183,14 @@ pub fn tool_definitions() -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "project_root": {"type": "string"},
+                    "project_root": project_root_schema(),
                     "action": {
                         "type": "string",
                         "enum": ["show", "bump", "decay", "reset"]
                     },
                     "persona": {"type": "string"}
                 },
-                "required": ["project_root", "action"]
+                "required": ["action"]
             }),
         },
         ToolDef {
@@ -207,6 +213,23 @@ pub fn tool_definitions() -> Vec<ToolDef> {
             }),
         },
     ]
+}
+
+/// Return the shared schema for the optional project context argument.
+fn project_root_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "string",
+        "description": "Absolute project path. Omit to use FRAMESHIFT_PROJECT_ROOT, Claude Code's CLAUDE_PROJECT_DIR, then the server working directory."
+    })
+}
+
+/// Return the shared schema for an optional agent render target.
+fn render_target_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "string",
+        "enum": ["claude", "codex", "gemini", "generic"],
+        "description": "Agent output target. Omit to use FRAMESHIFT_TARGET, then generic."
+    })
 }
 
 /// Build a successful ToolResult wrapping a single text content block.
@@ -243,15 +266,8 @@ fn err_result(text: String) -> ToolResult {
 /// contain no `..` component: this blocks relative/`..` escapes while still
 /// letting the agent address any real project directory by absolute path.
 fn validate_path_arg(raw: &str) -> Result<std::path::PathBuf, String> {
-    use std::path::Component;
     let path = std::path::PathBuf::from(raw);
-    if !path.is_absolute() {
-        return Err(format!("path must be absolute: {raw:?}"));
-    }
-    if path.components().any(|c| matches!(c, Component::ParentDir)) {
-        return Err(format!("path must not contain '..': {raw:?}"));
-    }
-    Ok(path)
+    validate_absolute_path(&path)
 }
 
 /// Resolve and parse the capability manifest for a persona in a project.
@@ -271,7 +287,7 @@ fn load_capability_manifest(
 ) -> Result<(String, Option<CapabilityManifest>), String> {
     let paths = client
         .project_paths(project_root)
-        .map_err(|e| format!("project_paths failed: {}", e))?;
+        .map_err(|e| format!("project_paths failed: {e}"))?;
 
     let name = match persona {
         Some(p) => p.to_string(),
@@ -310,7 +326,7 @@ fn load_capability_manifest(
         )
     })?;
     let manifest: PackManifest =
-        toml::from_str(&raw).map_err(|e| format!("failed to parse pack manifest: {}", e))?;
+        toml::from_str(&raw).map_err(|e| format!("failed to parse pack manifest: {e}"))?;
 
     Ok((name, manifest.capability_manifest))
 }
@@ -412,7 +428,18 @@ fn call_capabilities(arguments: &serde_json::Value, client: &Client) -> ToolResu
     ok_result(response.to_string())
 }
 
+/// Applies shared project defaults and dispatches one MCP tool invocation.
 pub fn call_tool(name: &str, arguments: &serde_json::Value, client: &Client) -> ToolResult {
+    let resolved_arguments = if project_scoped_tool(name) {
+        match with_project_root(arguments) {
+            Ok(resolved) => resolved,
+            Err(error) => return err_result(error),
+        }
+    } else {
+        arguments.clone()
+    };
+    let arguments = &resolved_arguments;
+
     match name {
         "frameshift_install" => call_install(arguments, client),
         "frameshift_activate" => call_activate(arguments, client),
@@ -424,8 +451,24 @@ pub fn call_tool(name: &str, arguments: &serde_json::Value, client: &Client) -> 
         "frameshift_prefs" => call_prefs(arguments, client),
         "frameshift_capabilities" => call_capabilities(arguments, client),
         "frameshift_search" => call_search(arguments, client),
-        _ => err_result(format!("unknown tool: {}", name)),
+        _ => err_result(format!("unknown tool: {name}")),
     }
+}
+
+/// Return whether a tool operates on project-scoped Frameshift state.
+fn project_scoped_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "frameshift_install"
+            | "frameshift_activate"
+            | "frameshift_list"
+            | "frameshift_grow_append"
+            | "frameshift_select"
+            | "frameshift_use"
+            | "frameshift_automate"
+            | "frameshift_capabilities"
+            | "frameshift_prefs"
+    )
 }
 
 /// Handle the frameshift_install tool call.
@@ -445,7 +488,7 @@ fn call_install(arguments: &serde_json::Value, client: &Client) -> ToolResult {
 
     let spec = match spec_str.parse::<PersonaSpec>() {
         Ok(s) => s,
-        Err(e) => return err_result(format!("invalid spec \"{}\": {}", spec_str, e)),
+        Err(e) => return err_result(format!("invalid spec \"{spec_str}\": {e}")),
     };
 
     let project_root = match validate_path_arg(project_root_str) {
@@ -480,7 +523,7 @@ fn call_install(arguments: &serde_json::Value, client: &Client) -> ToolResult {
             let text = serde_json::json!({"installed": label, "failures": failures}).to_string();
             ok_result(text)
         }
-        Err(e) => err_result(format!("install failed: {}", e)),
+        Err(e) => err_result(format!("install failed: {e}")),
     }
 }
 
@@ -523,7 +566,7 @@ fn call_activate(arguments: &serde_json::Value, client: &Client) -> ToolResult {
             }
             ok_result(response.to_string())
         }
-        Err(e) => err_result(format!("activate failed: {}", e)),
+        Err(e) => err_result(format!("activate failed: {e}")),
     }
 }
 
@@ -554,7 +597,7 @@ fn call_list(arguments: &serde_json::Value, client: &Client) -> ToolResult {
                 serde_json::json!({"personas": report.personas, "failures": failures}).to_string();
             ok_result(text)
         }
-        Err(e) => err_result(format!("list failed: {}", e)),
+        Err(e) => err_result(format!("list failed: {e}")),
     }
 }
 
@@ -589,7 +632,7 @@ fn call_grow_append(arguments: &serde_json::Value, client: &Client) -> ToolResul
 
     let project_id = match client.project_id(&project_root) {
         Ok(id) => id,
-        Err(e) => return err_result(format!("could not determine project_id: {}", e)),
+        Err(e) => return err_result(format!("could not determine project_id: {e}")),
     };
 
     match frameshift_growth::append(client.data_root(), &project_id, persona, text) {
@@ -597,7 +640,7 @@ fn call_grow_append(arguments: &serde_json::Value, client: &Client) -> ToolResul
             let response_text = serde_json::json!({"appended": true}).to_string();
             ok_result(response_text)
         }
-        Err(e) => err_result(format!("grow append failed: {}", e)),
+        Err(e) => err_result(format!("grow append failed: {e}")),
     }
 }
 
@@ -632,7 +675,7 @@ fn call_select(arguments: &serde_json::Value, client: &Client) -> ToolResult {
     // Resolve orchestrator state dir and load preferences.
     let state_dir = match client.orchestrator_state_dir(&project_root) {
         Ok(d) => d,
-        Err(e) => return err_result(format!("could not determine state dir: {}", e)),
+        Err(e) => return err_result(format!("could not determine state dir: {e}")),
     };
     let prefs = Preferences::load(&state_dir.join("automate-prefs.json")).unwrap_or_default();
 
@@ -642,7 +685,7 @@ fn call_select(arguments: &serde_json::Value, client: &Client) -> ToolResult {
     } else {
         match client.installed_persona_source_dirs(&project_root) {
             Ok(dirs) => (dirs, None),
-            Err(e) => return err_result(format!("could not list personas: {}", e)),
+            Err(e) => return err_result(format!("could not list personas: {e}")),
         }
     };
 
@@ -657,7 +700,7 @@ fn call_select(arguments: &serde_json::Value, client: &Client) -> ToolResult {
 
     let ranked = match frameshift_orchestrator::select_with_embedder(&inputs, shared_embedder()) {
         Ok(r) => r,
-        Err(e) => return err_result(format!("selection failed: {}", e)),
+        Err(e) => return err_result(format!("selection failed: {e}")),
     };
 
     let entries: Vec<serde_json::Value> = ranked
@@ -699,17 +742,25 @@ fn call_use(arguments: &serde_json::Value, client: &Client) -> ToolResult {
         Ok(p) => p,
         Err(e) => return err_result(e),
     };
-
-    if let Err(e) = client.activate(&project_root, persona) {
-        return err_result(format!("activate failed: {}", e));
-    }
-
-    let rendered = match client.rendered_persona(&project_root, persona, "claude") {
-        Ok(r) => r,
-        Err(e) => return err_result(format!("render failed: {}", e)),
+    let target = match resolve_render_target(arguments) {
+        Ok(target) => target,
+        Err(error) => return err_result(error),
     };
 
-    let mut result = serde_json::json!({ "persona": persona, "rendered": rendered });
+    if let Err(e) = client.activate(&project_root, persona) {
+        return err_result(format!("activate failed: {e}"));
+    }
+
+    let rendered = match client.rendered_persona(&project_root, persona, &target) {
+        Ok(r) => r,
+        Err(e) => return err_result(format!("render failed: {e}")),
+    };
+
+    let mut result = serde_json::json!({
+        "persona": persona,
+        "target": target,
+        "rendered": rendered
+    });
 
     // Best-effort capability annotation: a manifest read/parse failure here must
     // never fail the activation that already succeeded above -- just log it.
@@ -763,7 +814,7 @@ fn call_automate(arguments: &serde_json::Value, client: &Client) -> ToolResult {
 
     let state_dir = match client.orchestrator_state_dir(&project_root) {
         Ok(d) => d,
-        Err(e) => return err_result(format!("could not determine state dir: {}", e)),
+        Err(e) => return err_result(format!("could not determine state dir: {e}")),
     };
 
     let mode_path = state_dir.join("automate.json");
@@ -772,12 +823,13 @@ fn call_automate(arguments: &serde_json::Value, client: &Client) -> ToolResult {
 
     match action {
         "on" => {
-            let state = ModeState {
-                mode: Mode::On,
-                sensitivity: 0.5,
+            let state = match updated_mode_state(&mode_path, Mode::On, arguments.get("sensitivity"))
+            {
+                Ok(state) => state,
+                Err(error) => return err_result(error),
             };
             if let Err(e) = state.save(&mode_path) {
-                return err_result(format!("failed to save mode: {}", e));
+                return err_result(format!("failed to save mode: {e}"));
             }
             ok_result(
                 serde_json::json!({ "mode": "on", "sensitivity": state.sensitivity }).to_string(),
@@ -785,25 +837,27 @@ fn call_automate(arguments: &serde_json::Value, client: &Client) -> ToolResult {
         }
 
         "off" => {
-            let state = ModeState {
-                mode: Mode::Off,
-                sensitivity: 0.5,
+            let state = match updated_mode_state(&mode_path, Mode::Off, None) {
+                Ok(state) => state,
+                Err(error) => return err_result(error),
             };
             if let Err(e) = state.save(&mode_path) {
-                return err_result(format!("failed to save mode: {}", e));
+                return err_result(format!("failed to save mode: {e}"));
             }
-            ok_result(serde_json::json!({ "mode": "off" }).to_string())
+            ok_result(
+                serde_json::json!({ "mode": "off", "sensitivity": state.sensitivity }).to_string(),
+            )
         }
 
         "status" => {
             let mode_state = match ModeState::load(&mode_path) {
                 Ok(s) => s,
-                Err(e) => return err_result(format!("failed to load mode: {}", e)),
+                Err(e) => return err_result(format!("failed to load mode: {e}")),
             };
 
             let paths = match client.project_paths(&project_root) {
                 Ok(p) => p,
-                Err(e) => return err_result(format!("project_paths failed: {}", e)),
+                Err(e) => return err_result(format!("project_paths failed: {e}")),
             };
             let active = if paths.active_path.exists() {
                 std::fs::read_to_string(&paths.active_path)
@@ -818,7 +872,7 @@ fn call_automate(arguments: &serde_json::Value, client: &Client) -> ToolResult {
 
             let audit = match AuditLog::load(&audit_path) {
                 Ok(a) => a,
-                Err(e) => return err_result(format!("failed to load audit: {}", e)),
+                Err(e) => return err_result(format!("failed to load audit: {e}")),
             };
             let recent: Vec<serde_json::Value> = audit
                 .recent(5)
@@ -836,6 +890,7 @@ fn call_automate(arguments: &serde_json::Value, client: &Client) -> ToolResult {
 
             let text = serde_json::json!({
                 "mode": match mode_state.mode { Mode::On => "on", Mode::Off => "off" },
+                "sensitivity": mode_state.sensitivity,
                 "active": active,
                 "locked": locked,
                 "recent_transitions": recent,
@@ -847,12 +902,12 @@ fn call_automate(arguments: &serde_json::Value, client: &Client) -> ToolResult {
         "lock" => {
             if let Some(parent) = lock_path.parent() {
                 if let Err(e) = std::fs::create_dir_all(parent) {
-                    return err_result(format!("failed to create state dir: {}", e));
+                    return err_result(format!("failed to create state dir: {e}"));
                 }
             }
             let content = serde_json::json!({"locked": true}).to_string();
             if let Err(e) = std::fs::write(&lock_path, content) {
-                return err_result(format!("failed to write lock: {}", e));
+                return err_result(format!("failed to write lock: {e}"));
             }
             ok_result(serde_json::json!({ "locked": true }).to_string())
         }
@@ -860,17 +915,42 @@ fn call_automate(arguments: &serde_json::Value, client: &Client) -> ToolResult {
         "unlock" => {
             if lock_path.exists() {
                 if let Err(e) = std::fs::remove_file(&lock_path) {
-                    return err_result(format!("failed to remove lock: {}", e));
+                    return err_result(format!("failed to remove lock: {e}"));
                 }
             }
             ok_result(serde_json::json!({ "locked": false }).to_string())
         }
 
         other => err_result(format!(
-            "unknown action '{}'; expected: on, off, status, lock, unlock",
-            other
+            "unknown action '{other}'; expected: on, off, status, lock, unlock"
         )),
     }
+}
+
+/// Load Automate state and change its mode without discarding sensitivity.
+fn updated_mode_state(
+    mode_path: &std::path::Path,
+    mode: Mode,
+    requested_sensitivity: Option<&serde_json::Value>,
+) -> Result<ModeState, String> {
+    let current = ModeState::load(mode_path).map_err(|e| format!("failed to load mode: {e}"))?;
+    let sensitivity = match requested_sensitivity {
+        Some(value) => value
+            .as_f64()
+            .ok_or_else(|| "sensitivity must be a number from 0.0 through 1.0".to_string())?,
+        None => f64::from(current.sensitivity),
+    };
+
+    if !sensitivity.is_finite() || !(0.0..=1.0).contains(&sensitivity) {
+        return Err(format!(
+            "sensitivity must be a finite number from 0.0 through 1.0, got {sensitivity}"
+        ));
+    }
+
+    Ok(ModeState {
+        mode,
+        sensitivity: sensitivity as f32,
+    })
 }
 
 /// Handle the frameshift_prefs tool call.
@@ -896,7 +976,7 @@ fn call_prefs(arguments: &serde_json::Value, client: &Client) -> ToolResult {
 
     let state_dir = match client.orchestrator_state_dir(&project_root) {
         Ok(d) => d,
-        Err(e) => return err_result(format!("could not determine state dir: {}", e)),
+        Err(e) => return err_result(format!("could not determine state dir: {e}")),
     };
 
     let prefs_path = state_dir.join("automate-prefs.json");
@@ -917,7 +997,7 @@ fn call_prefs(arguments: &serde_json::Value, client: &Client) -> ToolResult {
             let mut prefs = Preferences::load(&prefs_path).unwrap_or_default();
             prefs.record_override(None, persona);
             if let Err(e) = prefs.save(&prefs_path) {
-                return err_result(format!("failed to save preferences: {}", e));
+                return err_result(format!("failed to save preferences: {e}"));
             }
             let text = serde_json::json!({
                 "persona": persona,
@@ -935,7 +1015,7 @@ fn call_prefs(arguments: &serde_json::Value, client: &Client) -> ToolResult {
             let mut prefs = Preferences::load(&prefs_path).unwrap_or_default();
             prefs.decay(persona);
             if let Err(e) = prefs.save(&prefs_path) {
-                return err_result(format!("failed to save preferences: {}", e));
+                return err_result(format!("failed to save preferences: {e}"));
             }
             let text = serde_json::json!({
                 "persona": persona,
@@ -948,14 +1028,13 @@ fn call_prefs(arguments: &serde_json::Value, client: &Client) -> ToolResult {
         "reset" => {
             let prefs = Preferences::new();
             if let Err(e) = prefs.save(&prefs_path) {
-                return err_result(format!("failed to save preferences: {}", e));
+                return err_result(format!("failed to save preferences: {e}"));
             }
             ok_result(serde_json::json!({ "reset": true }).to_string())
         }
 
         other => err_result(format!(
-            "unknown action '{}'; expected: show, bump, decay, reset",
-            other
+            "unknown action '{other}'; expected: show, bump, decay, reset"
         )),
     }
 }
@@ -1020,6 +1099,7 @@ fn call_search(arguments: &serde_json::Value, client: &Client) -> ToolResult {
         query: Some(query.to_string()),
         tag,
         limit: Some(limit),
+        offset: None,
     };
 
     match client.search_registry(&search_query) {
@@ -1039,11 +1119,12 @@ fn call_search(arguments: &serde_json::Value, client: &Client) -> ToolResult {
                 .collect();
             ok_result(serde_json::json!({ "results": entries }).to_string())
         }
-        Err(e) => err_result(format!("search failed: {}", e)),
+        Err(e) => err_result(format!("search failed: {e}")),
     }
 }
 
 #[cfg(test)]
+/// Unit and integration tests for every published MCP tool.
 mod tests {
     use super::*;
     use frameshift_client::{ClientOptions, InstallRequest, InstallSource, PersonaSpec};
@@ -1062,13 +1143,12 @@ mod tests {
     fn make_pack_dir(dir: &std::path::Path, name: &str, version: &str) {
         fs::create_dir_all(dir).unwrap();
         let manifest = format!(
-            "schema_version = 1\nname = \"{}\"\nversion = \"{}\"\nauthor_handle = \"test\"\nauthor_pubkey = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\n",
-            name, version
+            "schema_version = 1\nname = \"{name}\"\nversion = \"{version}\"\nauthor_handle = \"test\"\nauthor_pubkey = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\n"
         );
         fs::write(dir.join("pack.toml"), manifest).unwrap();
         fs::write(
             dir.join("AGENTS.md"),
-            format!("# {}\n\nTest content.\n", name),
+            format!("# {name}\n\nTest content.\n"),
         )
         .unwrap();
     }
@@ -1079,13 +1159,12 @@ mod tests {
     fn make_pack_dir_with_capabilities(dir: &std::path::Path, name: &str, version: &str) {
         fs::create_dir_all(dir).unwrap();
         let manifest = format!(
-            "schema_version = 1\nname = \"{}\"\nversion = \"{}\"\nauthor_handle = \"test\"\nauthor_pubkey = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\n\n[capability_manifest]\nrequired_tools = [\"Read\", \"Bash\"]\nnetwork_egress = false\n",
-            name, version
+            "schema_version = 1\nname = \"{name}\"\nversion = \"{version}\"\nauthor_handle = \"test\"\nauthor_pubkey = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\n\n[capability_manifest]\nrequired_tools = [\"Read\", \"Bash\"]\nnetwork_egress = false\n"
         );
         fs::write(dir.join("pack.toml"), manifest).unwrap();
         fs::write(
             dir.join("AGENTS.md"),
-            format!("# {}\n\nTest content.\n", name),
+            format!("# {name}\n\nTest content.\n"),
         )
         .unwrap();
     }
@@ -1105,6 +1184,21 @@ mod tests {
     fn tool_definitions_returns_ten() {
         let defs = tool_definitions();
         assert_eq!(defs.len(), 10);
+    }
+
+    /// Automate advertises an optional sensitivity constrained to the public range.
+    #[test]
+    fn tool_definitions_constrain_automate_sensitivity() {
+        let definitions = tool_definitions();
+        let automate = definitions
+            .iter()
+            .find(|definition| definition.name == "frameshift_automate")
+            .expect("tool_definitions must include frameshift_automate");
+        let sensitivity = &automate.input_schema["properties"]["sensitivity"];
+
+        assert_eq!(sensitivity["type"], "number");
+        assert_eq!(sensitivity["minimum"], 0.0);
+        assert_eq!(sensitivity["maximum"], 1.0);
     }
 
     /// frameshift_search is present in tool_definitions with `query` required
@@ -1140,6 +1234,36 @@ mod tests {
         assert!(
             search.input_schema["properties"]["tag"].is_object(),
             "tag must be a declared property"
+        );
+    }
+
+    /// Project-scoped tool schemas expose project_root as an optional default
+    /// and frameshift_use advertises every supported render target.
+    #[test]
+    fn tool_definitions_expose_project_and_target_defaults() {
+        let definitions = tool_definitions();
+        for definition in definitions
+            .iter()
+            .filter(|definition| project_scoped_tool(&definition.name))
+        {
+            let required = definition.input_schema["required"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            assert!(
+                !required.iter().any(|value| value == "project_root"),
+                "{} must allow the server project default",
+                definition.name
+            );
+        }
+
+        let use_tool = definitions
+            .iter()
+            .find(|definition| definition.name == "frameshift_use")
+            .unwrap();
+        assert_eq!(
+            use_tool.input_schema["properties"]["target"]["enum"],
+            serde_json::json!(["claude", "codex", "gemini", "generic"])
         );
     }
 
@@ -1482,9 +1606,9 @@ mod tests {
         );
     }
 
-    /// Verify that frameshift_automate on/off round-trip persists mode.
+    /// Verify that Automate mode toggles preserve an explicit sensitivity.
     #[test]
-    fn tool_call_automate_on_off_roundtrip() {
+    fn tool_call_automate_on_off_preserves_sensitivity() {
         let tmp = tempfile::tempdir().unwrap();
         let project_root = tmp.path().join("project");
         fs::create_dir_all(&project_root).unwrap();
@@ -1494,7 +1618,11 @@ mod tests {
 
         let on_result = call_tool(
             "frameshift_automate",
-            &serde_json::json!({"project_root": root_str, "action": "on"}),
+            &serde_json::json!({
+                "project_root": root_str,
+                "action": "on",
+                "sensitivity": 0.8
+            }),
             &client,
         );
         assert!(on_result.is_error.is_none());
@@ -1507,13 +1635,15 @@ mod tests {
         assert!(status.is_error.is_none());
         let parsed: serde_json::Value = serde_json::from_str(&status.content[0].text).unwrap();
         assert_eq!(parsed["mode"], "on");
+        assert!((parsed["sensitivity"].as_f64().unwrap() - 0.8).abs() < 1e-6);
 
         // Turn it back off.
-        call_tool(
+        let off_result = call_tool(
             "frameshift_automate",
             &serde_json::json!({"project_root": root_str, "action": "off"}),
             &client,
         );
+        assert!(off_result.is_error.is_none());
         let status2 = call_tool(
             "frameshift_automate",
             &serde_json::json!({"project_root": root_str, "action": "status"}),
@@ -1521,6 +1651,47 @@ mod tests {
         );
         let parsed2: serde_json::Value = serde_json::from_str(&status2.content[0].text).unwrap();
         assert_eq!(parsed2["mode"], "off");
+        assert!((parsed2["sensitivity"].as_f64().unwrap() - 0.8).abs() < 1e-6);
+
+        // Turn it back on without a value and preserve the prior policy again.
+        let on_again = call_tool(
+            "frameshift_automate",
+            &serde_json::json!({"project_root": root_str, "action": "on"}),
+            &client,
+        );
+        assert!(on_again.is_error.is_none());
+        let parsed3: serde_json::Value = serde_json::from_str(&on_again.content[0].text).unwrap();
+        assert_eq!(parsed3["mode"], "on");
+        assert!((parsed3["sensitivity"].as_f64().unwrap() - 0.8).abs() < 1e-6);
+    }
+
+    /// Verify that Automate rejects malformed and out-of-range sensitivities.
+    #[test]
+    fn tool_call_automate_rejects_invalid_sensitivity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+
+        let client = make_client(&tmp.path().join("data"));
+        let root_str = project_root.to_str().unwrap();
+
+        for invalid in [
+            serde_json::json!(-0.1),
+            serde_json::json!(1.1),
+            serde_json::json!("responsive"),
+        ] {
+            let result = call_tool(
+                "frameshift_automate",
+                &serde_json::json!({
+                    "project_root": root_str,
+                    "action": "on",
+                    "sensitivity": invalid
+                }),
+                &client,
+            );
+
+            assert!(result.is_error.is_some());
+        }
     }
 
     /// frameshift_capabilities reports the active persona's manifest and
@@ -1648,10 +1819,32 @@ mod tests {
             result.content[0].text
         );
         let parsed: serde_json::Value = serde_json::from_str(&result.content[0].text).unwrap();
+        assert_eq!(parsed["target"], "generic");
         assert_eq!(
             parsed["capabilities"]["required_tools"],
             serde_json::json!(["Read", "Bash"])
         );
+    }
+
+    /// frameshift_use rejects an unknown render target before activation.
+    #[test]
+    fn tool_call_use_rejects_unknown_render_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let client = make_client(&tmp.path().join("data"));
+
+        let result = call_tool(
+            "frameshift_use",
+            &serde_json::json!({
+                "project_root": project_root,
+                "persona": "missing",
+                "target": "unknown-agent"
+            }),
+            &client,
+        );
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content[0].text.contains("invalid render target"));
     }
 
     /// frameshift_search rejects a call with no `query` argument, without
