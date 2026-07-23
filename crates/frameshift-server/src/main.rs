@@ -78,6 +78,15 @@ async fn build_state(config: Arc<ServerConfig>) -> Result<AppState, ServerError>
     let nonce_ttl = config.signed_request_max_skew.saturating_mul(2);
     let auth_nonces = Arc::new(frameshift_server::auth::NonceCache::new(nonce_ttl));
 
+    let account_auth =
+        match frameshift_server::account_auth::OidcVerifier::from_config(&config.oidc) {
+            Ok(verifier) => verifier,
+            Err(error) => {
+                tracing::error!(%error, "OIDC configuration invalid; account routes disabled");
+                None
+            }
+        };
+
     Ok(AppState {
         catalog: Arc::new(catalog),
         objects,
@@ -86,6 +95,7 @@ async fn build_state(config: Arc<ServerConfig>) -> Result<AppState, ServerError>
         config,
         metrics,
         auth_nonces,
+        account_auth,
     })
 }
 
@@ -232,6 +242,7 @@ fn parse_memory_http_auth(raw: &str) -> Result<frameshift_memory_http::HttpAuth,
 }
 
 #[tokio::main]
+/// Resolve configuration, initialize backends, and run the HTTP server.
 async fn main() {
     let config = match ServerConfig::from_env() {
         Ok(c) => Arc::new(c),

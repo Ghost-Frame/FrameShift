@@ -2,7 +2,7 @@
 //!
 //! Every handler returns `Result<T, AppError>`. The [`axum::response::IntoResponse`]
 //! implementation translates each variant into an HTTP status code and a JSON
-//! body `{"error": "..."}`. Internal details are never leaked in 500/502
+//! body `{"error": "..."}`. Internal details are never leaked in 500/502/503
 //! responses -- only the fixed strings `"internal server error"` and
 //! `"upstream backend mismatch"` are emitted.
 //!
@@ -16,6 +16,7 @@
 //! | `CatalogError::BackendError` | `Internal` | 500 |
 //! | `ObjectStoreError::NotFound` (version exists in catalog) | `BadGateway` | 502 |
 //! | Other `ObjectStoreError` | `Internal` | 500 |
+//! | OIDC provider outage | `ServiceUnavailable` | 503 |
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -66,6 +67,12 @@ pub enum AppError {
     #[error("forbidden: {0}")]
     Forbidden(String),
 
+    /// A required external provider is temporarily unavailable.
+    ///
+    /// Maps to `503 Service Unavailable` without exposing upstream details.
+    #[error("service unavailable: {0}")]
+    ServiceUnavailable(String),
+
     /// An unexpected backend failure occurred.
     ///
     /// Maps to `500 Internal Server Error`. The message is NOT included in
@@ -84,6 +91,7 @@ pub enum AppError {
     BadGateway(String),
 }
 
+/// Domain-to-HTTP error conversion helpers.
 impl AppError {
     /// Map a [`CatalogError`] to an [`AppError`].
     ///
@@ -146,12 +154,16 @@ impl AppError {
     }
 }
 
+/// Sanitized HTTP response conversion for all handler failures.
 impl IntoResponse for AppError {
     /// Convert [`AppError`] into an HTTP response.
     ///
     /// - `BadRequest` -> 400 with the message in the body.
     /// - `NotFound` -> 404 with the message in the body.
     /// - `Conflict` -> 409 with the message in the body.
+    /// - `Unauthorized` -> 401 with the message in the body.
+    /// - `Forbidden` -> 403 with the fixed string `"forbidden"` (no details).
+    /// - `ServiceUnavailable` -> 503 with the fixed string `"service unavailable"`.
     /// - `Internal` -> 500 with the fixed string `"internal server error"` (no details).
     /// - `BadGateway` -> 502 with the fixed string `"upstream backend mismatch"` (no details).
     fn into_response(self) -> Response {
@@ -161,6 +173,10 @@ impl IntoResponse for AppError {
             AppError::Conflict(m) => (StatusCode::CONFLICT, m),
             AppError::Unauthorized(m) => (StatusCode::UNAUTHORIZED, m),
             AppError::Forbidden(_) => (StatusCode::FORBIDDEN, "forbidden".to_string()),
+            AppError::ServiceUnavailable(_) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service unavailable".to_string(),
+            ),
             AppError::Internal(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal server error".to_string(),
@@ -175,10 +191,12 @@ impl IntoResponse for AppError {
 }
 
 #[cfg(test)]
+/// Unit tests for status mapping and error-detail redaction.
 mod tests {
     use super::*;
 
     #[test]
+    /// Internal errors never expose their diagnostic message.
     fn internal_error_message_is_fixed() {
         let e = AppError::Internal("super secret db connection string".into());
         let resp = e.into_response();
@@ -186,6 +204,7 @@ mod tests {
     }
 
     #[test]
+    /// Storage mismatch errors retain their fixed public status.
     fn bad_gateway_message_is_fixed() {
         let e = AppError::BadGateway("blob gone".into());
         let resp = e.into_response();
@@ -193,6 +212,7 @@ mod tests {
     }
 
     #[test]
+    /// Catalog backend failures map to opaque internal errors.
     fn catalog_backend_error_maps_to_internal() {
         let inner: Box<dyn std::error::Error + Send + Sync> =
             Box::new(std::io::Error::other("db fail"));
@@ -201,6 +221,7 @@ mod tests {
     }
 
     #[test]
+    /// Missing catalog records preserve the not-found classification.
     fn catalog_not_found_maps_to_not_found() {
         let e = AppError::from_catalog(
             CatalogError::NotFound {
@@ -213,6 +234,7 @@ mod tests {
     }
 
     #[test]
+    /// Missing object blobs map to an upstream storage mismatch.
     fn object_store_not_found_maps_to_bad_gateway() {
         let hash = frameshift_pack::ObjectHash::of(b"test");
         let e = AppError::from_objects(ObjectStoreError::NotFound { hash }, "pack");

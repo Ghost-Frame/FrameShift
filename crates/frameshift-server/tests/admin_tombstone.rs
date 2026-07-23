@@ -57,6 +57,7 @@ fn test_config(admins: Vec<String>) -> Arc<ServerConfig> {
         trust_forwarded_for: false,
         signed_request_max_skew: Duration::from_secs(300),
         admin_pubkeys: admins,
+        oidc: frameshift_server::OidcConfig::disabled(),
         shutdown_grace: Duration::from_secs(1),
         cors_allowed_origins: String::new(),
         download_secret: SecretString::new(String::new()),
@@ -97,6 +98,7 @@ fn mk_state(catalog: MockCatalog, admins: Vec<String>) -> AppState {
         auth_nonces: Arc::new(frameshift_server::auth::NonceCache::new(
             Duration::from_secs(600),
         )),
+        account_auth: None,
     }
 }
 

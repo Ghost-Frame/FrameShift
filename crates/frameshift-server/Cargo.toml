@@ -50,6 +50,8 @@ tower_governor = "0.8"
 # (RUSTSEC-2024-0437); the server only emits the Prometheus text exposition
 # format via TextEncoder, never the protobuf wire format.
 prometheus = { version = "0.13", default-features = false }
+jsonwebtoken = { version = "10.4", default-features = false, features = ["rust_crypto"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [dev-dependencies]
 tokio = { workspace = true }

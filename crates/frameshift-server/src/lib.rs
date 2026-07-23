@@ -35,10 +35,13 @@
 //! - Admin: `POST /v1/admin/packs/{name}/{version}/tombstone`, gated by the
 //!   same signed-request middleware plus an operator-controlled pubkey
 //!   allowlist (`FRAMESHIFT_ADMIN_PUBKEYS`; see [`crate::routes::admin`]).
+//! - OIDC account and publisher-owner APIs under `/v1/account` and
+//!   `/v1/publishers`, mounted only when a valid verifier is configured.
 //! - MCP placeholder: `/mcp/*` returns 501.
 //!
-//! Deferred (M5+): OAuth 2.1, transparency log, and the full MCP surface.
+//! Deferred (M5+): transparency log and the full MCP surface.
 
+pub mod account_auth;
 pub mod auth;
 pub mod config;
 pub mod download;
@@ -52,7 +55,7 @@ pub mod state;
 
 use std::net::SocketAddr;
 
-pub use config::{LogFormat, ServerConfig};
+pub use config::{LogFormat, OidcConfig, ServerConfig};
 pub use error::AppError;
 pub use router::app;
 pub use state::AppState;

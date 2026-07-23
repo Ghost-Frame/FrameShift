@@ -37,6 +37,15 @@
 //! | `TRUST_FORWARDED_FOR` | `false` | Trust `X-Forwarded-For` for rate-limit key extraction; set `true` only behind a trusted proxy |
 //! | `SIGNED_REQUEST_MAX_SKEW_SECS` | `300` | Max allowed clock skew (seconds) between a signed write request's timestamp and server time; also bounds the replay-nonce retention window |
 //! | `FRAMESHIFT_ADMIN_PUBKEYS` | `""` | Comma-separated base64url-no-pad Ed25519 public keys allowed to call `/v1/admin/*` endpoints; empty disables all admin endpoints (404) |
+//! | `OIDC_ENABLED` | `false` | Enable OIDC-backed account routes when the remaining OIDC configuration is valid |
+//! | `OIDC_ISSUER` | `""` | Exact OIDC issuer URL |
+//! | `OIDC_AUDIENCE` | `""` | Required access-token audience |
+//! | `OIDC_JWKS_URL` | `""` | Optional explicit JWKS URL; empty uses OIDC discovery |
+//! | `OIDC_ALLOWED_ALGORITHMS` | `RS256` | Comma-separated asymmetric JWT algorithms |
+//! | `OIDC_JWKS_CACHE_SECS` | `300` | Fresh JWKS cache lifetime |
+//! | `OIDC_JWKS_STALE_SECS` | `900` | Additional stale-key window used only during provider outages |
+//! | `OIDC_CLOCK_SKEW_SECS` | `30` | Token validation clock skew allowance |
+//! | `OIDC_FRESH_AUTH_SECS` | `300` | Maximum `auth_time` age for sensitive key operations |
 //!
 //! Env var names match the struct field names verbatim (figment maps
 //! `download_secret` <-> `DOWNLOAD_SECRET`); shorter aliases would require an
@@ -66,6 +75,47 @@ pub enum LogFormat {
     Json,
     /// Human-readable compact text output.
     Text,
+}
+
+/// OIDC resource-server configuration for account bearer authentication.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OidcConfig {
+    /// Whether authenticated account routes may be mounted.
+    pub enabled: bool,
+    /// Exact issuer expected in discovery metadata and token claims.
+    pub issuer: String,
+    /// Audience required in every accepted access token.
+    pub audience: String,
+    /// Optional operator-pinned JWKS endpoint; empty enables discovery.
+    pub jwks_url: String,
+    /// Explicit allowlist of accepted asymmetric JWT algorithms.
+    pub allowed_algorithms: Vec<String>,
+    /// Duration for which fetched JWKS data is considered fresh.
+    pub jwks_cache_ttl: Duration,
+    /// Additional duration stale keys may be used when refresh fails.
+    pub jwks_stale_ttl: Duration,
+    /// Allowed clock skew for `exp`, `nbf`, and related time claims.
+    pub clock_skew: Duration,
+    /// Maximum age of `auth_time` for security-sensitive operations.
+    pub fresh_auth_max_age: Duration,
+}
+
+/// Constructors for OIDC configuration states.
+impl OidcConfig {
+    /// Return a fully disabled OIDC configuration for tests and local defaults.
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            issuer: String::new(),
+            audience: String::new(),
+            jwks_url: String::new(),
+            allowed_algorithms: vec!["RS256".to_string()],
+            jwks_cache_ttl: Duration::from_secs(300),
+            jwks_stale_ttl: Duration::from_secs(900),
+            clock_skew: Duration::from_secs(30),
+            fresh_auth_max_age: Duration::from_secs(300),
+        }
+    }
 }
 
 /// Full server configuration resolved from environment variables.
@@ -254,6 +304,9 @@ pub struct ServerConfig {
     /// existence is not disclosed).
     pub admin_pubkeys: Vec<String>,
 
+    /// OIDC resource-server settings for account and publisher routes.
+    pub oidc: OidcConfig,
+
     /// Memory backend selector: `"none"` (default), `"http"`, or `"sqlite"`.
     ///
     /// - `"none"` -- no memory adapter; personas that require memory will fail
@@ -378,6 +431,7 @@ impl std::fmt::Debug for ServerConfig {
                 "admin_pubkeys",
                 &format!("[{} key(s)]", self.admin_pubkeys.len()),
             )
+            .field("oidc", &self.oidc)
             .field("memory_backend", &self.memory_backend)
             .field("memory_http_endpoint", &self.memory_http_endpoint)
             .field("memory_http_auth", &"[REDACTED]")
@@ -482,6 +536,25 @@ struct RawConfig {
     /// `FRAMESHIFT_ADMIN_PUBKEYS`.
     admin_pubkeys: String,
 
+    /// Whether OIDC-backed account routes are enabled.
+    oidc_enabled: bool,
+    /// Exact configured OIDC issuer URL.
+    oidc_issuer: String,
+    /// Required access-token audience.
+    oidc_audience: String,
+    /// Optional explicit JWKS endpoint.
+    oidc_jwks_url: String,
+    /// Comma-separated asymmetric JWT algorithm allowlist.
+    oidc_allowed_algorithms: String,
+    /// Fresh JWKS cache lifetime in seconds.
+    oidc_jwks_cache_secs: u64,
+    /// Stale-on-outage JWKS lifetime in seconds.
+    oidc_jwks_stale_secs: u64,
+    /// Token validation clock skew in seconds.
+    oidc_clock_skew_secs: u64,
+    /// Maximum fresh-auth age in seconds.
+    oidc_fresh_auth_secs: u64,
+
     /// Memory backend selector.
     memory_backend: String,
     /// HTTP memory endpoint URL.
@@ -546,6 +619,17 @@ impl RawConfig {
             trust_forwarded_for: self.trust_forwarded_for,
             signed_request_max_skew: Duration::from_secs(self.signed_request_max_skew_secs),
             admin_pubkeys: split_comma_list(&self.admin_pubkeys),
+            oidc: OidcConfig {
+                enabled: self.oidc_enabled,
+                issuer: self.oidc_issuer,
+                audience: self.oidc_audience,
+                jwks_url: self.oidc_jwks_url,
+                allowed_algorithms: split_comma_list(&self.oidc_allowed_algorithms),
+                jwks_cache_ttl: Duration::from_secs(self.oidc_jwks_cache_secs),
+                jwks_stale_ttl: Duration::from_secs(self.oidc_jwks_stale_secs),
+                clock_skew: Duration::from_secs(self.oidc_clock_skew_secs),
+                fresh_auth_max_age: Duration::from_secs(self.oidc_fresh_auth_secs),
+            },
             memory_backend: self.memory_backend,
             memory_http_endpoint: self.memory_http_endpoint,
             memory_http_auth: self.memory_http_auth,
@@ -590,6 +674,15 @@ fn default_raw_config() -> RawConfig {
         trust_forwarded_for: false,
         signed_request_max_skew_secs: 300,
         admin_pubkeys: String::new(),
+        oidc_enabled: false,
+        oidc_issuer: String::new(),
+        oidc_audience: String::new(),
+        oidc_jwks_url: String::new(),
+        oidc_allowed_algorithms: "RS256".to_string(),
+        oidc_jwks_cache_secs: 300,
+        oidc_jwks_stale_secs: 900,
+        oidc_clock_skew_secs: 30,
+        oidc_fresh_auth_secs: 300,
         memory_backend: "none".to_string(),
         memory_http_endpoint: String::new(),
         memory_http_auth: "none".to_string(),
@@ -671,6 +764,7 @@ mod tests {
             trust_forwarded_for: false,
             signed_request_max_skew: Duration::from_secs(300),
             admin_pubkeys: Vec::new(),
+            oidc: OidcConfig::disabled(),
             memory_backend: "none".to_string(),
             memory_http_endpoint: String::new(),
             memory_http_auth: "none".to_string(),
@@ -718,6 +812,7 @@ mod tests {
             trust_forwarded_for: false,
             signed_request_max_skew: Duration::from_secs(300),
             admin_pubkeys: Vec::new(),
+            oidc: OidcConfig::disabled(),
             memory_backend: "none".to_string(),
             memory_http_endpoint: String::new(),
             memory_http_auth: "none".to_string(),
@@ -761,6 +856,7 @@ mod tests {
             trust_forwarded_for: false,
             signed_request_max_skew: Duration::from_secs(300),
             admin_pubkeys: Vec::new(),
+            oidc: OidcConfig::disabled(),
             memory_backend: "none".to_string(),
             memory_http_endpoint: String::new(),
             memory_http_auth: "none".to_string(),
@@ -834,6 +930,7 @@ mod tests {
             trust_forwarded_for: false,
             signed_request_max_skew: Duration::from_secs(300),
             admin_pubkeys: Vec::new(),
+            oidc: OidcConfig::disabled(),
             memory_backend: "none".to_string(),
             memory_http_endpoint: String::new(),
             memory_http_auth: "none".to_string(),

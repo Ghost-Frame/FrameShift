@@ -84,6 +84,7 @@ fn test_config() -> Arc<ServerConfig> {
         trust_forwarded_for: false,
         signed_request_max_skew: Duration::from_secs(300),
         admin_pubkeys: Vec::new(),
+        oidc: frameshift_server::OidcConfig::disabled(),
         memory_backend: "none".to_string(),
         memory_http_endpoint: String::new(),
         memory_http_auth: "none".to_string(),
@@ -107,6 +108,7 @@ fn make_state(catalog: MockCatalog, objects: MockPackStore) -> AppState {
         auth_nonces: Arc::new(frameshift_server::auth::NonceCache::new(
             Duration::from_secs(600),
         )),
+        account_auth: None,
     }
 }
 
@@ -1058,6 +1060,7 @@ fn dl_state_with_rate(catalog: MockCatalog, objects: MockPackStore, rate: u32) -
         trust_forwarded_for: true,
         signed_request_max_skew: Duration::from_secs(300),
         admin_pubkeys: Vec::new(),
+        oidc: frameshift_server::OidcConfig::disabled(),
         memory_backend: "none".to_string(),
         memory_http_endpoint: String::new(),
         memory_http_auth: "none".to_string(),
@@ -1076,6 +1079,7 @@ fn dl_state_with_rate(catalog: MockCatalog, objects: MockPackStore, rate: u32) -
         auth_nonces: Arc::new(frameshift_server::auth::NonceCache::new(
             Duration::from_secs(600),
         )),
+        account_auth: None,
     }
 }
 
