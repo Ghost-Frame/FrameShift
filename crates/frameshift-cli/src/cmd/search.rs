@@ -64,9 +64,11 @@ fn format_owner(hit: &RegistrySearchResult) -> String {
         return format!("@{}", author.handle);
     }
     let prefix: String = hit.pack.current_author.chars().take(12).collect();
-    let suffix = (hit.pack.current_author.chars().count() > 12)
-        .then_some("...")
-        .unwrap_or("");
+    let suffix = if hit.pack.current_author.chars().count() > 12 {
+        "..."
+    } else {
+        ""
+    };
     format!("key:{prefix}{suffix}")
 }
 
