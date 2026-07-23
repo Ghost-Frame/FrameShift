@@ -174,9 +174,11 @@ Every pack has a **canonical hash**: a SHA-256 computed from its files by normal
 
 Signing is Ed25519 over that 32-byte hash; the signature travels alongside the pack, never inside the tarball. On the wire the registry addresses the compressed `.tar.gz` by a second hash (the SHA-256 of the archive bytes), which the client checks on download before it extracts anything.
 
-### Trust: handle-bound keys, no central authority
+### Trust: publisher identity and signed history
 
-There is no central signing authority. An author **claims a handle** (e.g. `ghost-frame`) with a signed request, and the registry binds that handle to the key that signed it, first-claim-wins. Author keys are immutable in the current release: there is no public key-rotation endpoint. At publish, the server checks that the live signer owns the handle and that the pack signature verifies against that registered key. On install from the registry, the client verifies the pack signature against the key in the **registry's record** for that version, not the key embedded in the manifest, so a tampered manifest cannot smuggle in a different key. The client also pins each handle's first observed registry key locally and rejects later key changes. Installing directly from a local path verifies a signature if one is present, and installs unsigned local packs as-is. Registered authors are publicly listable via `GET /v1/authors`.
+There is no central signing authority. Legacy authors **claim a handle** (e.g. `ghost-frame`) with a signed request, and the registry binds that handle to the first key that claimed it. Account-backed publishers instead have a stable publisher UUID, owner memberships, and one or more enrolled signing keys. New publisher writes require both an authenticated owner and a request signed by an active enrolled key. When a publisher and legacy author share a handle, publisher authority takes precedence and failed publisher authentication never falls back to the legacy key.
+
+On registry install, the client verifies the pack signature against the exact key in the registry's version record, not a key embedded in the manifest. It pins legacy installs by handle and key. Once ownership metadata is present, it also pins the stable publisher UUID while retaining the exact signer-key pin. A newly presented publisher key triggers the existing key-change error until the protocol can carry a cryptographic rotation proof. A revoked key remains valid evidence for a historical version but cannot authorize a new publish. With ownership enrichment enabled, missing or mismatched linked ownership data fails closed and never triggers a legacy downgrade. Installing directly from a local path verifies a signature if one is present, and installs unsigned local packs as-is. Registered legacy authors remain publicly listable via `GET /v1/authors`.
 
 ### Downloads
 
@@ -454,6 +456,7 @@ Most variables are read with no prefix (e.g. `BIND_ADDR`, not `FRAMESHIFT_BIND_A
 | `TRUST_FORWARDED_FOR` | `false` | Trust `X-Forwarded-For` for rate-limit key extraction; set `true` only behind a trusted proxy |
 | `SIGNED_REQUEST_MAX_SKEW_SECS` | `300` | Max clock skew (seconds) allowed between a signed write request's timestamp and server time |
 | `FRAMESHIFT_ADMIN_PUBKEYS` | `""` | Comma-separated base64url-no-pad Ed25519 public keys allowed to call `/v1/admin/*` endpoints; empty disables all admin endpoints (404) |
+| `PUBLISHER_OWNERSHIP_READS` | `true` | Add publisher-preferred identity and historical key state to pack responses; set `false` to restore the exact legacy response shape |
 | `MEMORY_BACKEND` | `none` | `none`, `http`, or `sqlite` |
 | `MEMORY_HTTP_ENDPOINT` | `""` | Base URL for the HTTP memory endpoint; used when `MEMORY_BACKEND=http` |
 | `MEMORY_HTTP_AUTH` | `none` | `none` or `bearer:<token>`; used when `MEMORY_BACKEND=http` |

@@ -191,6 +191,30 @@ pub enum ClientError {
         actual: String,
     },
 
+    /// A registry presented a different stable publisher for a trusted handle.
+    #[error(
+        "registry publisher changed for {author} at {registry}: expected {expected}, got {actual}"
+    )]
+    RegistryPublisherChanged {
+        /// Registry base URL whose trust namespace contained the pin.
+        registry: String,
+        /// Publisher handle whose stable identity continuity check failed.
+        author: String,
+        /// Previously trusted publisher UUID.
+        expected: String,
+        /// Newly presented publisher UUID.
+        actual: String,
+    },
+
+    /// A registry returned internally inconsistent ownership metadata.
+    #[error("registry returned invalid ownership metadata for {pack}: {detail}")]
+    RegistryOwnershipInvalid {
+        /// Pack name and version associated with the malformed response.
+        pack: String,
+        /// Bounded explanation of the failed ownership invariant.
+        detail: String,
+    },
+
     #[error("cache entry {hash} is missing at {path}")]
     MissingCacheEntry { hash: String, path: PathBuf },
 

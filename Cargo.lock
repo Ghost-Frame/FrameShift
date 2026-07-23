@@ -1989,6 +1989,7 @@ dependencies = [
  "async-trait",
  "bb8",
  "chrono",
+ "clap",
  "diesel",
  "diesel-async",
  "diesel_migrations",
@@ -1999,6 +2000,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "testcontainers",
  "testcontainers-modules",
  "thiserror 2.0.18",
@@ -2064,6 +2066,7 @@ dependencies = [
  "tracing",
  "ureq 2.12.1",
  "url",
+ "uuid",
  "zeroize",
 ]
 

@@ -33,6 +33,8 @@
 //!   between `Vec<u8>` BYTEA and domain newtypes.
 //! - [`backend`] -- [`PostgresCatalog`] struct and [`CatalogBackend`] impl.
 //! - [`errors`] -- mapping from Diesel/bb8 errors to [`CatalogError`].
+//! - [`ownership_backfill`] -- dry-run-first transactional publisher ownership
+//!   migration driven by a private exact-census manifest.
 //!
 //! ## Migration behaviour
 //!
@@ -44,9 +46,17 @@ pub mod backend;
 pub mod config;
 pub mod errors;
 pub mod models;
+pub mod ownership_backfill;
 pub mod pool;
 pub mod schema;
 
 // Top-level re-exports for the public surface.
 pub use backend::PostgresCatalog;
 pub use config::PostgresCatalogConfig;
+pub use ownership_backfill::{
+    run_ownership_backfill, OwnershipBackfillApplied, OwnershipBackfillCensus,
+    OwnershipBackfillError, OwnershipBackfillManifest, OwnershipBackfillMode,
+    OwnershipBackfillPublisherCensus, OwnershipBackfillReport, OwnershipManifestKey,
+    OwnershipManifestKeyState, OwnershipManifestModerationStatus, OwnershipManifestPack,
+    OwnershipManifestPublisher, OwnershipManifestVersion, OWNERSHIP_BACKFILL_SCHEMA_VERSION,
+};

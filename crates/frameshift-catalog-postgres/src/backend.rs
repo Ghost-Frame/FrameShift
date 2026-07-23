@@ -380,6 +380,18 @@ impl CatalogBackend for PostgresCatalog {
             .into_record()
     }
 
+    /// Retrieve a public publisher profile by its stable internal identifier.
+    async fn get_publisher(&self, id: uuid::Uuid) -> Result<PublisherProfileRecord, CatalogError> {
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        publisher_profiles::table
+            .find(id)
+            .select(PublisherProfileRow::as_select())
+            .first(&mut conn)
+            .await
+            .map_err(|error| map_diesel_error(error, "publisher", id.to_string()))?
+            .into_record()
+    }
+
     /// Update mutable public publisher profile fields.
     async fn update_publisher_profile(
         &self,
@@ -545,6 +557,18 @@ impl CatalogBackend for PostgresCatalog {
             .await
             .map_err(|error| map_diesel_error(error, "publisher_key", publisher_id.to_string()))?;
         rows.into_iter().map(PublisherKeyRow::into_record).collect()
+    }
+
+    /// Retrieve one enrolled publisher key by stable identifier.
+    async fn get_publisher_key(&self, id: uuid::Uuid) -> Result<PublisherKeyRecord, CatalogError> {
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        publisher_keys::table
+            .find(id)
+            .select(PublisherKeyRow::as_select())
+            .first(&mut conn)
+            .await
+            .map_err(|error| map_diesel_error(error, "publisher_key", id.to_string()))?
+            .into_record()
     }
 
     /// Revoke a publisher key while retaining its historical evidence.
@@ -784,8 +808,7 @@ impl CatalogBackend for PostgresCatalog {
     /// Returns an empty `Vec` when `offset` is beyond the total count.
     ///
     /// NOTE: Large offsets cause Postgres to scan and discard many rows.
-    /// A keyset-pagination follow-up (paginate by `created_at` + `pubkey`)
-    /// is tracked as a future improvement.
+    /// Keyset pagination by `created_at` and `pubkey` would avoid that cost.
     #[instrument(skip(self))]
     async fn list_authors(
         &self,
@@ -817,7 +840,7 @@ impl CatalogBackend for PostgresCatalog {
     /// 5. INSERT the new `pack_versions` row; a `UniqueViolation` on
     ///    `(pack_name, version)` maps to `CatalogError::Conflict`.
     /// 6. Record successful publisher-key use inside the same transaction.
-    /// 7. UPDATE `packs.latest_version` using true semver precedence (D8):
+    /// 7. UPDATE `packs.latest_version` using true semver precedence:
     ///    the stored `latest_version` is fetched inside the transaction and
     ///    compared with [`semver_gt`]; the UPDATE only runs when the new
     ///    version has strictly higher precedence.
@@ -912,10 +935,17 @@ impl CatalogBackend for PostgresCatalog {
                 let version = version_clone;
                 let incoming_author = incoming_author_bytes;
                 let incoming_size = incoming_size_bytes;
-                // Serialize registry-wide quota accounting with concurrent
-                // version inserts before reading the aggregate byte total.
+                // Cross the ownership migration boundary before resolving
+                // either namespace. ROW EXCLUSIVE conflicts with backfill's
+                // SHARE ROW EXCLUSIVE lock while remaining compatible with
+                // concurrent publishers. Aggregate quota accounting retains
+                // the stronger self-conflicting lock it already required.
                 if quota.max_total_bytes.is_some() {
                     diesel::sql_query("LOCK TABLE pack_versions IN SHARE ROW EXCLUSIVE MODE")
+                        .execute(conn)
+                        .await?;
+                } else {
+                    diesel::sql_query("LOCK TABLE pack_versions IN ROW EXCLUSIVE MODE")
                         .execute(conn)
                         .await?;
                 }
@@ -986,11 +1016,11 @@ impl CatalogBackend for PostgresCatalog {
                         }
                     }
                 } else {
-                    authors::table
+                    let legacy_handle = authors::table
                         .filter(authors::pubkey.eq(&incoming_author))
                         .for_update()
-                        .select(authors::pubkey)
-                        .first::<Vec<u8>>(conn)
+                        .select(authors::handle)
+                        .first::<String>(conn)
                         .await
                         .map_err(|e| {
                             TxError::Catalog(map_diesel_error(
@@ -999,6 +1029,26 @@ impl CatalogBackend for PostgresCatalog {
                                 hex::encode(&incoming_author),
                             ))
                         })?;
+                    let publisher_exists = publisher_profiles::table
+                        .filter(publisher_profiles::handle.eq(&legacy_handle))
+                        .select(publisher_profiles::id)
+                        .first::<uuid::Uuid>(conn)
+                        .await
+                        .optional()
+                        .map_err(|e| {
+                            TxError::Catalog(map_diesel_error(
+                                e,
+                                "publisher",
+                                legacy_handle.clone(),
+                            ))
+                        })?
+                        .is_some();
+                    if publisher_exists {
+                        return Err(TxError::Catalog(CatalogError::Unauthorized {
+                            kind: "publisher",
+                            key: legacy_handle,
+                        }));
+                    }
                     None
                 };
                 let publisher_key_ids: Vec<Option<uuid::Uuid>> =
@@ -1171,8 +1221,8 @@ impl CatalogBackend for PostgresCatalog {
                         })?;
                 }
 
-                // D8: Update latest_version using true semver precedence.
-                // Read the current stored value (may have changed from the
+                // Update latest_version using true semver precedence. Read the
+                // current stored value (may have changed from the
                 // row we fetched above if this is a first insert), then
                 // compare using semver_gt before issuing the UPDATE.
                 let current_latest: Option<String> = packs::table
@@ -1351,7 +1401,7 @@ impl CatalogBackend for PostgresCatalog {
     /// operates on the `packs` head table, not `pack_versions`.
     ///
     /// NOTE: Large offsets degrade because Postgres must scan and skip rows.
-    /// Keyset pagination is a tracked future improvement.
+    /// Keyset pagination would avoid that scan-and-skip cost.
     #[instrument(skip(self, filters))]
     async fn search_packs(
         &self,
@@ -1519,8 +1569,8 @@ impl CatalogBackend for PostgresCatalog {
     ///    deleted; content-addressed retrieval by hash still works afterwards.
     /// 2. Every remaining version row for the pack is read back and its
     ///    `status` is deserialised. The `Active` versions are compared with
-    ///    [`semver_gt`] (the SAME true-semver-precedence comparator
-    ///    `register_pack_version` uses for D8) to find the newest one.
+    ///    [`semver_gt`] (the same true-semver-precedence comparator used by
+    ///    `register_pack_version`) to find the newest one.
     /// 3. `packs.latest_version` is set to that newest `Active` version, or to
     ///    `NULL` when no `Active` version remains -- this is what makes the
     ///    pack "disappear" from `search_packs` (see its doc for the
@@ -1601,8 +1651,8 @@ impl CatalogBackend for PostgresCatalog {
 
                 // Recompute the head: read back every version's (version, status)
                 // pair, keep the Active ones, and fold to find the newest by
-                // true semver precedence (mirrors D8's `semver_gt` in
-                // `register_pack_version`, not a new comparator).
+                // true semver precedence (reuses `register_pack_version`'s
+                // `semver_gt` rather than defining another comparator).
                 let rows: Vec<(String, serde_json::Value)> = pack_versions::table
                     .filter(pack_versions::pack_name.eq(&pack_name))
                     .select((pack_versions::version, pack_versions::status))
@@ -1780,7 +1830,7 @@ impl CatalogBackend for PostgresCatalog {
     /// ```sql
     /// UPDATE packs SET description = $1, tags = $2 WHERE name = $3
     /// ```
-    /// Same columns the seeder's former raw-SQL workaround wrote directly.
+    /// This is the catalog API for updating the pack metadata columns.
     async fn set_pack_metadata(
         &self,
         name: &str,
@@ -2062,7 +2112,7 @@ impl PostgresCatalog {
         let limit_idx = bind_idx;
         let offset_idx = bind_idx + 1;
 
-        // Include FTS score column for potential future use; discard in PackRow mapping.
+        // The FTS parameter index was embedded in `where_parts` above.
         let _ = fts_param_idx;
 
         let sql = format!(
@@ -2847,7 +2897,7 @@ pub fn semver_gt(a: &str, b: &str) -> bool {
 }
 
 #[cfg(test)]
-/// Unit tests for the semver comparison helper (D8).
+/// Unit tests for the semver comparison helper.
 mod semver_tests {
     use super::semver_gt;
 

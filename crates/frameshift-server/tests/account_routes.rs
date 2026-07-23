@@ -110,6 +110,7 @@ fn test_config() -> Arc<ServerConfig> {
         trust_forwarded_for: false,
         signed_request_max_skew: Duration::from_secs(300),
         admin_pubkeys: Vec::new(),
+        publisher_ownership_reads: true,
         oidc: OidcConfig {
             enabled: true,
             issuer: "https://issuer.frameshift.test".to_string(),

@@ -37,6 +37,7 @@
 //! | `TRUST_FORWARDED_FOR` | `false` | Trust `X-Forwarded-For` for rate-limit key extraction; set `true` only behind a trusted proxy |
 //! | `SIGNED_REQUEST_MAX_SKEW_SECS` | `300` | Max allowed clock skew (seconds) between a signed write request's timestamp and server time; also bounds the replay-nonce retention window |
 //! | `FRAMESHIFT_ADMIN_PUBKEYS` | `""` | Comma-separated base64url-no-pad Ed25519 public keys allowed to call `/v1/admin/*` endpoints; empty disables all admin endpoints (404) |
+//! | `PUBLISHER_OWNERSHIP_READS` | `true` | Add publisher-preferred ownership metadata to pack read responses; false returns the legacy response shape |
 //! | `OIDC_ENABLED` | `false` | Enable OIDC-backed account routes when the remaining OIDC configuration is valid |
 //! | `OIDC_ISSUER` | `""` | Exact OIDC issuer URL |
 //! | `OIDC_AUDIENCE` | `""` | Required access-token audience |
@@ -160,7 +161,7 @@ pub struct ServerConfig {
     /// Maximum number of bytes allowed in a request body.
     ///
     /// Applied globally via [`tower_http::limit::RequestBodyLimitLayer`].
-    /// Publish endpoints in a later milestone will override this per-route.
+    /// Individual routes may apply a tighter per-route limit.
     /// Default: 1 MiB (1 048 576 bytes).
     pub max_request_bytes: usize,
 
@@ -304,6 +305,13 @@ pub struct ServerConfig {
     /// existence is not disclosed).
     pub admin_pubkeys: Vec<String>,
 
+    /// Whether pack reads resolve additive publisher ownership metadata.
+    ///
+    /// Set this to `false` for application rollback to the exact legacy
+    /// response shape while retaining additive database rows and columns.
+    /// Default: `true`.
+    pub publisher_ownership_reads: bool,
+
     /// OIDC resource-server settings for account and publisher routes.
     pub oidc: OidcConfig,
 
@@ -431,6 +439,7 @@ impl std::fmt::Debug for ServerConfig {
                 "admin_pubkeys",
                 &format!("[{} key(s)]", self.admin_pubkeys.len()),
             )
+            .field("publisher_ownership_reads", &self.publisher_ownership_reads)
             .field("oidc", &self.oidc)
             .field("memory_backend", &self.memory_backend)
             .field("memory_http_endpoint", &self.memory_http_endpoint)
@@ -536,6 +545,9 @@ struct RawConfig {
     /// `FRAMESHIFT_ADMIN_PUBKEYS`.
     admin_pubkeys: String,
 
+    /// Whether pack reads add publisher-preferred ownership metadata.
+    publisher_ownership_reads: bool,
+
     /// Whether OIDC-backed account routes are enabled.
     oidc_enabled: bool,
     /// Exact configured OIDC issuer URL.
@@ -619,6 +631,7 @@ impl RawConfig {
             trust_forwarded_for: self.trust_forwarded_for,
             signed_request_max_skew: Duration::from_secs(self.signed_request_max_skew_secs),
             admin_pubkeys: split_comma_list(&self.admin_pubkeys),
+            publisher_ownership_reads: self.publisher_ownership_reads,
             oidc: OidcConfig {
                 enabled: self.oidc_enabled,
                 issuer: self.oidc_issuer,
@@ -674,6 +687,7 @@ fn default_raw_config() -> RawConfig {
         trust_forwarded_for: false,
         signed_request_max_skew_secs: 300,
         admin_pubkeys: String::new(),
+        publisher_ownership_reads: true,
         oidc_enabled: false,
         oidc_issuer: String::new(),
         oidc_audience: String::new(),
@@ -764,6 +778,7 @@ mod tests {
             trust_forwarded_for: false,
             signed_request_max_skew: Duration::from_secs(300),
             admin_pubkeys: Vec::new(),
+            publisher_ownership_reads: true,
             oidc: OidcConfig::disabled(),
             memory_backend: "none".to_string(),
             memory_http_endpoint: String::new(),
@@ -812,6 +827,7 @@ mod tests {
             trust_forwarded_for: false,
             signed_request_max_skew: Duration::from_secs(300),
             admin_pubkeys: Vec::new(),
+            publisher_ownership_reads: true,
             oidc: OidcConfig::disabled(),
             memory_backend: "none".to_string(),
             memory_http_endpoint: String::new(),
@@ -856,6 +872,7 @@ mod tests {
             trust_forwarded_for: false,
             signed_request_max_skew: Duration::from_secs(300),
             admin_pubkeys: Vec::new(),
+            publisher_ownership_reads: true,
             oidc: OidcConfig::disabled(),
             memory_backend: "none".to_string(),
             memory_http_endpoint: String::new(),
@@ -897,6 +914,17 @@ mod tests {
         assert!(cfg.download_key().is_err());
     }
 
+    #[test]
+    /// Publisher ownership enrichment defaults on and remains explicitly reversible.
+    fn publisher_ownership_reads_default_on_and_can_disable() {
+        let raw = default_raw_config();
+        assert!(raw.publisher_ownership_reads);
+
+        let mut raw = default_raw_config();
+        raw.publisher_ownership_reads = false;
+        assert!(!raw.into_server_config().publisher_ownership_reads);
+    }
+
     /// Build a [`ServerConfig`] populated with test-friendly defaults and the
     /// given `download_secret`.
     fn make_test_cfg(secret: &str) -> ServerConfig {
@@ -930,6 +958,7 @@ mod tests {
             trust_forwarded_for: false,
             signed_request_max_skew: Duration::from_secs(300),
             admin_pubkeys: Vec::new(),
+            publisher_ownership_reads: true,
             oidc: OidcConfig::disabled(),
             memory_backend: "none".to_string(),
             memory_http_endpoint: String::new(),

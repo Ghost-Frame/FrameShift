@@ -38,7 +38,10 @@ use secrecy::SecretString;
 use tower::ServiceExt as _;
 
 use frameshift_catalog::identity::Ed25519PublicKey;
-use frameshift_catalog::records::{PackRecord, PackVersionRecord};
+use frameshift_catalog::records::{
+    PackRecord, PackVersionRecord, PublisherKeyRecord, PublisherKeyState,
+    PublisherModerationStatus, PublisherProfileRecord,
+};
 use frameshift_catalog::status::PackStatus;
 use frameshift_objects::ObjectHash;
 
@@ -84,6 +87,7 @@ fn test_config() -> Arc<ServerConfig> {
         trust_forwarded_for: false,
         signed_request_max_skew: Duration::from_secs(300),
         admin_pubkeys: Vec::new(),
+        publisher_ownership_reads: true,
         oidc: frameshift_server::OidcConfig::disabled(),
         memory_backend: "none".to_string(),
         memory_http_endpoint: String::new(),
@@ -294,6 +298,312 @@ fn make_version(
         status: PackStatus::Active,
         size_bytes: 5,
     }
+}
+
+/// Build a public publisher profile fixture with stable timestamps.
+fn make_publisher(id: uuid::Uuid, handle: &str) -> PublisherProfileRecord {
+    let now = chrono::Utc::now();
+    PublisherProfileRecord {
+        id,
+        handle: handle.to_string(),
+        display_name: format!("{handle} display"),
+        biography: None,
+        moderation_status: PublisherModerationStatus::Approved,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+/// Build a publisher signing-key fixture for historical read enrichment.
+fn make_publisher_key(
+    id: uuid::Uuid,
+    publisher_id: uuid::Uuid,
+    public_key: Ed25519PublicKey,
+    state: PublisherKeyState,
+) -> PublisherKeyRecord {
+    PublisherKeyRecord {
+        id,
+        publisher_id,
+        public_key,
+        label: "migration-key".to_string(),
+        state,
+        created_at: chrono::Utc::now(),
+        revoked_at: (state == PublisherKeyState::Revoked).then(chrono::Utc::now),
+        last_used_at: None,
+    }
+}
+
+/// Legacy-owned pack reads expose an author summary while retaining raw key fields.
+#[tokio::test]
+async fn legacy_pack_read_uses_bounded_author_fallback() {
+    let author = Ed25519PublicKey([10u8; 32]);
+    let pack = make_pack("legacy-pack", author);
+    let catalog = MockCatalog::new();
+    {
+        let mut inner = catalog.state.write().unwrap();
+        inner
+            .authors
+            .insert(author.to_string(), make_author(author.0, "legacy-owner"));
+        inner.packs.insert(pack.name.clone(), pack.clone());
+    }
+
+    let response = oneshot_get(
+        make_state(catalog, MockPackStore::new()),
+        "/v1/packs/legacy-pack",
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["legacy_author"]["handle"], "legacy-owner");
+    assert_eq!(body["current_author"], author.to_string());
+    assert!(body.get("publisher").is_none());
+}
+
+/// Publisher-linked pack and version reads expose stable profile and key state.
+#[tokio::test]
+async fn publisher_reads_include_profile_and_historical_key_state() {
+    let author = Ed25519PublicKey([11u8; 32]);
+    let publisher_id = uuid::Uuid::new_v4();
+    let key_id = uuid::Uuid::new_v4();
+    let mut pack = make_pack("publisher-pack", author);
+    pack.publisher_id = Some(publisher_id);
+    let mut version = make_version(
+        "publisher-pack",
+        "1.0.0",
+        ObjectHash::of(b"publisher-pack"),
+        author,
+    );
+    version.publisher_key_id = Some(key_id);
+    let catalog = MockCatalog::new();
+    {
+        let mut inner = catalog.state.write().unwrap();
+        inner
+            .authors
+            .insert(author.to_string(), make_author(author.0, "legacy-shadow"));
+        inner.publishers.insert(
+            publisher_id,
+            make_publisher(publisher_id, "publisher-owner"),
+        );
+        inner.publisher_keys.insert(
+            key_id,
+            make_publisher_key(key_id, publisher_id, author, PublisherKeyState::Revoked),
+        );
+        inner.packs.insert(pack.name.clone(), pack);
+        inner
+            .versions
+            .insert(("publisher-pack".to_string(), "1.0.0".to_string()), version);
+    }
+    let state = make_state(catalog, MockPackStore::new());
+
+    let pack_response = oneshot_get(state.clone(), "/v1/packs/publisher-pack").await;
+    assert_eq!(pack_response.status(), StatusCode::OK);
+    let pack_body = body_json(pack_response).await;
+    assert_eq!(pack_body["publisher"]["id"], publisher_id.to_string());
+    assert_eq!(pack_body["publisher"]["handle"], "publisher-owner");
+    assert!(pack_body.get("legacy_author").is_none());
+
+    let version_response =
+        oneshot_get(state.clone(), "/v1/packs/publisher-pack/versions/1.0.0").await;
+    assert_eq!(version_response.status(), StatusCode::OK);
+    let version_body = body_json(version_response).await;
+    assert_eq!(version_body["publisher"]["id"], publisher_id.to_string());
+    assert_eq!(version_body["publisher_key"]["id"], key_id.to_string());
+    assert_eq!(version_body["publisher_key"]["state"], "revoked");
+    assert_eq!(version_body["author_pubkey"], author.to_string());
+    assert!(version_body.get("legacy_author").is_none());
+
+    let versions_response = oneshot_get(state.clone(), "/v1/packs/publisher-pack/versions").await;
+    assert_eq!(versions_response.status(), StatusCode::OK);
+    let versions_body = body_json(versions_response).await;
+    assert_eq!(
+        versions_body[0]["publisher"]["id"],
+        publisher_id.to_string()
+    );
+    assert_eq!(versions_body[0]["publisher_key"]["id"], key_id.to_string());
+    assert_eq!(versions_body[0]["publisher_key"]["state"], "revoked");
+
+    let search_response = oneshot_get(state, "/v1/packs").await;
+    assert_eq!(search_response.status(), StatusCode::OK);
+    let search_body = body_json(search_response).await;
+    assert_eq!(
+        search_body["results"][0]["publisher"]["handle"],
+        "publisher-owner"
+    );
+    assert_eq!(
+        search_body["results"][0]["pack"]["current_author"],
+        author.to_string()
+    );
+}
+
+/// A linked publisher that cannot be resolved fails closed without legacy fallback.
+#[tokio::test]
+async fn dangling_publisher_link_returns_internal_error() {
+    let author = Ed25519PublicKey([12u8; 32]);
+    let mut pack = make_pack("dangling-owner", author);
+    pack.publisher_id = Some(uuid::Uuid::new_v4());
+    let catalog = MockCatalog::new();
+    {
+        let mut inner = catalog.state.write().unwrap();
+        inner
+            .authors
+            .insert(author.to_string(), make_author(author.0, "legacy-owner"));
+        inner.packs.insert(pack.name.clone(), pack);
+    }
+
+    let response = oneshot_get(
+        make_state(catalog, MockPackStore::new()),
+        "/v1/packs/dangling-owner",
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body_json(response).await["error"], "internal server error");
+}
+
+/// Broken publisher-key links fail closed instead of downgrading to legacy identity.
+#[tokio::test]
+async fn broken_publisher_key_links_return_internal_error() {
+    let signer = Ed25519PublicKey([14_u8; 32]);
+    let other_signer = Ed25519PublicKey([15_u8; 32]);
+    let publisher_id = uuid::Uuid::new_v4();
+    let foreign_publisher_id = uuid::Uuid::new_v4();
+    let missing_key_id = uuid::Uuid::new_v4();
+    let foreign_key_id = uuid::Uuid::new_v4();
+    let mismatched_key_id = uuid::Uuid::new_v4();
+    let orphan_key_id = uuid::Uuid::new_v4();
+    let catalog = MockCatalog::new();
+    {
+        let mut inner = catalog.state.write().unwrap();
+        inner
+            .publishers
+            .insert(publisher_id, make_publisher(publisher_id, "key-owner"));
+        inner.publishers.insert(
+            foreign_publisher_id,
+            make_publisher(foreign_publisher_id, "foreign-owner"),
+        );
+        inner.publisher_keys.insert(
+            foreign_key_id,
+            make_publisher_key(
+                foreign_key_id,
+                foreign_publisher_id,
+                signer,
+                PublisherKeyState::Active,
+            ),
+        );
+        inner.publisher_keys.insert(
+            mismatched_key_id,
+            make_publisher_key(
+                mismatched_key_id,
+                publisher_id,
+                other_signer,
+                PublisherKeyState::Active,
+            ),
+        );
+        inner.publisher_keys.insert(
+            orphan_key_id,
+            make_publisher_key(
+                orphan_key_id,
+                publisher_id,
+                signer,
+                PublisherKeyState::Active,
+            ),
+        );
+        for (name, publisher, key_id) in [
+            ("missing-key", Some(publisher_id), missing_key_id),
+            ("foreign-key", Some(publisher_id), foreign_key_id),
+            ("mismatched-key", Some(publisher_id), mismatched_key_id),
+            ("ownerless-key", None, orphan_key_id),
+        ] {
+            let mut pack = make_pack(name, signer);
+            pack.publisher_id = publisher;
+            let mut version = make_version(name, "1.0.0", ObjectHash::of(name.as_bytes()), signer);
+            version.publisher_key_id = Some(key_id);
+            inner.packs.insert(name.to_string(), pack);
+            inner
+                .versions
+                .insert((name.to_string(), "1.0.0".to_string()), version);
+        }
+    }
+    let state = make_state(catalog, MockPackStore::new());
+
+    for name in [
+        "missing-key",
+        "foreign-key",
+        "mismatched-key",
+        "ownerless-key",
+    ] {
+        let response =
+            oneshot_get(state.clone(), &format!("/v1/packs/{name}/versions/1.0.0")).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "{name} must fail closed"
+        );
+        assert_eq!(body_json(response).await["error"], "internal server error");
+    }
+}
+
+/// Disabling ownership reads reproduces the exact legacy pack and version shapes.
+#[tokio::test]
+async fn ownership_read_switch_restores_legacy_response_shape() {
+    let author = Ed25519PublicKey([13u8; 32]);
+    let mut pack = make_pack("legacy-shape", author);
+    pack.publisher_id = Some(uuid::Uuid::new_v4());
+    let mut version = make_version(
+        "legacy-shape",
+        "1.0.0",
+        ObjectHash::of(b"legacy-shape"),
+        author,
+    );
+    version.publisher_key_id = Some(uuid::Uuid::new_v4());
+    let catalog = MockCatalog::new();
+    {
+        let mut inner = catalog.state.write().unwrap();
+        inner.packs.insert(pack.name.clone(), pack.clone());
+        inner.versions.insert(
+            ("legacy-shape".to_string(), "1.0.0".to_string()),
+            version.clone(),
+        );
+    }
+    let mut state = make_state(catalog, MockPackStore::new());
+    let mut config = (*state.config).clone();
+    config.publisher_ownership_reads = false;
+    state.config = Arc::new(config);
+
+    let pack_response = oneshot_get(state.clone(), "/v1/packs/legacy-shape").await;
+    assert_eq!(pack_response.status(), StatusCode::OK);
+    assert_eq!(
+        body_json(pack_response).await,
+        serde_json::to_value(&pack).unwrap()
+    );
+
+    let version_response =
+        oneshot_get(state.clone(), "/v1/packs/legacy-shape/versions/1.0.0").await;
+    assert_eq!(version_response.status(), StatusCode::OK);
+    assert_eq!(
+        body_json(version_response).await,
+        serde_json::to_value(&version).unwrap()
+    );
+
+    let versions_response = oneshot_get(state.clone(), "/v1/packs/legacy-shape/versions").await;
+    assert_eq!(versions_response.status(), StatusCode::OK);
+    assert_eq!(
+        body_json(versions_response).await,
+        serde_json::json!([version])
+    );
+
+    let search_response = oneshot_get(state, "/v1/packs").await;
+    assert_eq!(search_response.status(), StatusCode::OK);
+    assert_eq!(
+        body_json(search_response).await,
+        serde_json::json!({
+            "results": [{
+                "pack": pack,
+                "score": 1.0
+            }]
+        })
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -889,49 +1199,23 @@ async fn request_id_is_non_empty_uuid() {
 }
 
 // ---------------------------------------------------------------------------
-// AppError::Internal does not leak source details
+// Public error responses do not leak source details
 // ---------------------------------------------------------------------------
 
-/// When the catalog returns `BackendError`, the response body must be the
-/// fixed string "internal server error", not the backend error details.
+/// A missing author returns a structured string error.
 #[tokio::test]
-async fn internal_error_does_not_leak_details_in_body() {
-    // Use the real catalog with no authors: looking up a pack by an existing key
-    // will hit `NotFound`, not `Internal`. Instead inject a bad key via a known
-    // good base64url string for a key that doesn't exist in the catalog.
-    // The mock returns CatalogError::NotFound, not BackendError.
-    // To trigger Internal we need the mock to fail. Use a valid key with no data.
+async fn not_found_response_uses_structured_public_error() {
     let key = Ed25519PublicKey([42u8; 32]);
     let b64 = key.to_string();
 
-    // Empty catalog -> NotFound (404), not Internal.
-    // To test Internal, we need a backend that returns BackendError.
-    // We'll use the error mapping test in error.rs unit tests instead.
-    // For the integration test, verify that 500 body hides details.
-    // Build a catalog whose health() returns an error (simulate Internal).
-    // The healthz handler maps BackendError -> healthy:false, not 500.
-    // The only way to get 500 in the current read-only surface is if a
-    // backend returns BackendError. MockCatalog never returns BackendError
-    // for reads (only NotFound). So we test this via the unit test in error.rs.
-    //
-    // However, we can verify the 404 path shows correct body:
     let state = make_state(MockCatalog::new(), MockPackStore::new());
     let resp = oneshot_get(state, &format!("/v1/authors/{b64}")).await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     let body = body_json(resp).await;
-    // 404 body is allowed to show the resource key; it is not sensitive.
     assert!(body["error"].is_string());
 }
 
-/// `AppError::Internal` body must be exactly "internal server error" (tested
-/// via the download endpoint when both catalog has version but objects fail
-/// in a non-NotFound way).
-///
-/// Note: MockPackStore only returns NotFound (-> 502) for missing keys. There
-/// is no easy way to inject a generic BackendError from the mock without extra
-/// infrastructure. The mapping is tested thoroughly in error.rs unit tests.
-/// This integration test instead verifies that the 502 body does not leak
-/// internal blob details.
+/// A missing pack object returns a fixed gateway error without hash or path details.
 #[tokio::test]
 async fn bad_gateway_body_does_not_leak_hash_or_path() {
     let hash = ObjectHash::of(b"secret bytes");
@@ -966,15 +1250,7 @@ async fn bad_gateway_body_does_not_leak_hash_or_path() {
 // Conflict (409) error mapping
 // ---------------------------------------------------------------------------
 
-/// Inject a Conflict error via MockCatalog's `inject_conflict` flag and verify
-/// the handler returns 409. Since the read endpoints don't trigger Conflict,
-/// we test the error mapping directly via `MockCatalog::register_author` plus
-/// the AppError unit tests for full coverage. The integration test below
-/// exercises the lookup_author path which cannot produce Conflict, so we
-/// verify the conflict mapping via error module unit tests is sufficient.
-///
-/// This test verifies that the mock infrastructure itself works: setting
-/// `inject_conflict = true` and calling `register_author` returns `Conflict`.
+/// The mock conflict switch makes write operations return `Conflict`.
 #[tokio::test]
 async fn mock_catalog_conflict_injection_works() {
     let catalog = MockCatalog::new();
@@ -1060,6 +1336,7 @@ fn dl_state_with_rate(catalog: MockCatalog, objects: MockPackStore, rate: u32) -
         trust_forwarded_for: true,
         signed_request_max_skew: Duration::from_secs(300),
         admin_pubkeys: Vec::new(),
+        publisher_ownership_reads: true,
         oidc: frameshift_server::OidcConfig::disabled(),
         memory_backend: "none".to_string(),
         memory_http_endpoint: String::new(),

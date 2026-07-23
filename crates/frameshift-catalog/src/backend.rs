@@ -122,6 +122,17 @@ pub trait CatalogBackend: Send + Sync {
         handle: &str,
     ) -> Result<PublisherProfileRecord, CatalogError>;
 
+    /// Retrieve a public publisher profile by its stable internal identifier.
+    ///
+    /// The default preserves source compatibility for external backends that
+    /// cannot produce publisher-linked records yet.
+    async fn get_publisher(&self, id: uuid::Uuid) -> Result<PublisherProfileRecord, CatalogError> {
+        Err(CatalogError::NotFound {
+            kind: "publisher",
+            key: id.to_string(),
+        })
+    }
+
     /// Atomically update publisher fields and append an optional audit event.
     async fn update_publisher_profile(
         &self,
@@ -160,6 +171,17 @@ pub trait CatalogBackend: Send + Sync {
         &self,
         publisher_id: uuid::Uuid,
     ) -> Result<Vec<PublisherKeyRecord>, CatalogError>;
+
+    /// Retrieve one enrolled publisher key by its stable identifier.
+    ///
+    /// The default preserves source compatibility for external backends that
+    /// cannot produce publisher-key-linked versions yet.
+    async fn get_publisher_key(&self, id: uuid::Uuid) -> Result<PublisherKeyRecord, CatalogError> {
+        Err(CatalogError::NotFound {
+            kind: "publisher_key",
+            key: id.to_string(),
+        })
+    }
 
     /// Atomically revoke a publisher key and append an optional audit event.
     async fn revoke_publisher_key(

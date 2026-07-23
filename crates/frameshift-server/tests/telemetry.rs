@@ -52,6 +52,7 @@ fn test_config(abuse_rate_per_min: u32, trust_forwarded_for: bool) -> Arc<Server
         trust_forwarded_for,
         signed_request_max_skew: Duration::from_secs(300),
         admin_pubkeys: Vec::new(),
+        publisher_ownership_reads: true,
         oidc: frameshift_server::OidcConfig::disabled(),
         memory_backend: "none".to_string(),
         memory_http_endpoint: String::new(),

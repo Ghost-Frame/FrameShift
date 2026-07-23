@@ -41,7 +41,7 @@ use frameshift_catalog::records::{
     PublisherKeyState, PublisherMembershipRecord, PublisherModerationStatus,
     PublisherProfileRecord, PublisherRole,
 };
-use frameshift_pack::Pack;
+use frameshift_pack::{ObjectHash, Pack};
 
 use frameshift_server::account_auth::{BearerTokenVerifier, OidcAuthError, VerifiedOidcIdentity};
 use frameshift_server::metrics::Metrics;
@@ -110,6 +110,7 @@ fn test_config_with_abuse_rate(
         trust_forwarded_for,
         signed_request_max_skew: Duration::from_secs(300),
         admin_pubkeys: Vec::new(),
+        publisher_ownership_reads: true,
         oidc: frameshift_server::OidcConfig::disabled(),
         shutdown_grace: Duration::from_secs(1),
         cors_allowed_origins: String::new(),
@@ -358,11 +359,8 @@ fn catalog_with_author(signing: &SigningKey, handle: &str) -> (MockCatalog, Ed25
                 oauth_links: vec![],
             },
         );
-        // Pre-populate the parent pack record so downstream `GET /v1/packs/{name}`
-        // succeeds after publish. The MockCatalog does not auto-create parent
-        // records on `register_pack_version`, but the catalog trait requires
-        // real backends to. We seed it manually here so the test exercises the
-        // happy-path GET path.
+        // Pre-populate the parent pack with metadata so the downstream GET
+        // exercises publishing into an existing head record.
         s.packs.insert(
             "demo-pack".to_string(),
             PackRecord {
@@ -578,6 +576,8 @@ async fn publish_happy_path_returns_200_and_pack_is_fetchable() {
     assert_eq!(body["name"], "demo-pack");
     assert_eq!(body["version"], "0.1.0");
     assert_eq!(body["author_handle"], "alice");
+    assert!(body.get("publisher").is_none());
+    assert!(body.get("publisher_key").is_none());
     assert!(
         body["pack_hash"]
             .as_str()
@@ -637,24 +637,32 @@ async fn publisher_active_owner_and_key_can_publish() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["publisher"]["id"], publisher_id.to_string());
+    assert_eq!(body["publisher"]["handle"], "account-publisher");
+    assert_eq!(body["publisher_key"]["id"], key_id.to_string());
+    assert_eq!(body["publisher_key"]["state"], "active");
     let state = catalog.state.read().unwrap();
     assert_eq!(
         state.packs["account-publisher-pack"].publisher_id,
         Some(publisher_id)
     );
+    let version = &state.versions[&("account-publisher-pack".to_string(), "1.0.0".to_string())];
+    assert_eq!(version.publisher_key_id, Some(key_id));
     assert_eq!(
-        state.versions[&("account-publisher-pack".to_string(), "1.0.0".to_string())]
-            .publisher_key_id,
-        Some(key_id)
+        version.author_pubkey,
+        Ed25519PublicKey(signing.verifying_key().to_bytes())
     );
+    assert_eq!(version.signature, prepared.signature);
+    assert_eq!(version.content_hash, ObjectHash::of(&prepared.targz));
     assert!(state.publisher_keys[&key_id].last_used_at.is_some());
 }
 
-/// Publishing fails closed when legacy and account-backed namespaces both contain the handle.
+/// Migrated same-handle identities prefer authenticated publisher authority.
 #[tokio::test]
-async fn ambiguous_publisher_and_legacy_handle_cannot_publish() {
+async fn migrated_same_handle_prefers_authenticated_publisher() {
     let signing = SigningKey::from_bytes(&[72_u8; 32]);
-    let (catalog, _publisher_id, key_id) =
+    let (catalog, publisher_id, key_id) =
         catalog_with_publisher(&signing, "ambiguous-publisher", PublisherKeyState::Active);
     let pubkey = Ed25519PublicKey(signing.verifying_key().to_bytes());
     {
@@ -692,7 +700,65 @@ async fn ambiguous_publisher_and_legacy_handle_cannot_publish() {
         Some("owner-token"),
     )
     .await;
-    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["publisher"]["id"], publisher_id.to_string());
+    assert_eq!(body["publisher_key"]["id"], key_id.to_string());
+    let state = catalog.state.read().unwrap();
+    let version = &state.versions[&("ambiguous-publisher-pack".to_string(), "1.0.0".to_string())];
+    assert_eq!(version.publisher_key_id, Some(key_id));
+    assert_eq!(
+        state.packs["ambiguous-publisher-pack"].publisher_id,
+        Some(publisher_id)
+    );
+    assert!(state.publisher_keys[&key_id].last_used_at.is_some());
+}
+
+/// A publisher cannot claim a colliding legacy handle backed by an unrelated key.
+#[tokio::test]
+async fn migrated_same_handle_rejects_unrelated_legacy_key() {
+    let signing = SigningKey::from_bytes(&[73_u8; 32]);
+    let legacy_signing = SigningKey::from_bytes(&[74_u8; 32]);
+    let (catalog, _publisher_id, key_id) =
+        catalog_with_publisher(&signing, "collision-publisher", PublisherKeyState::Active);
+    let legacy_pubkey = Ed25519PublicKey(legacy_signing.verifying_key().to_bytes());
+    {
+        let mut state = catalog.state.write().unwrap();
+        state
+            .handles
+            .insert("collision-publisher".to_string(), legacy_pubkey);
+        state.authors.insert(
+            legacy_pubkey.to_string(),
+            AuthorRecord {
+                pubkey: legacy_pubkey,
+                handle: "collision-publisher".to_string(),
+                display_name: None,
+                created_at: Utc::now(),
+                oauth_links: vec![],
+            },
+        );
+    }
+    let prepared = prepare_pack(
+        "collision-publisher-pack",
+        "1.0.0",
+        "collision-publisher",
+        &signing,
+    );
+    let response = post_publish_with_bearer(
+        make_state_with_auth(
+            catalog.clone(),
+            MockPackStore::new(),
+            FakeVerifier::owner("owner-token", "publisher-owner"),
+        ),
+        &prepared.targz,
+        &prepared.signature,
+        "collision-publisher",
+        Some(&signing),
+        Some("owner-token"),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     let state = catalog.state.read().unwrap();
     assert!(state.versions.is_empty());
     assert!(state.publisher_keys[&key_id].last_used_at.is_none());
@@ -728,7 +794,7 @@ async fn publisher_revoked_key_cannot_publish() {
 }
 
 // ---------------------------------------------------------------------------
-// description / tags propagation (P0-2 regression test)
+// Description and tags propagation regression
 // ---------------------------------------------------------------------------
 
 /// Publish a pack whose manifest declares `description` and `tags`, then
