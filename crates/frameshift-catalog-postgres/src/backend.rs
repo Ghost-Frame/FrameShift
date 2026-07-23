@@ -76,6 +76,41 @@ struct TotalBytesRow {
     total: i64,
 }
 
+/// Validate and convert a catalog audit record into its insertable row.
+fn new_publisher_audit_row(
+    event: PublisherAuditEventRecord,
+) -> Result<NewPublisherAuditEventRow, CatalogError> {
+    if event.action.trim().is_empty() || !event.metadata.is_object() {
+        return Err(CatalogError::Validation(
+            "audit action must be non-blank and metadata must be an object".to_string(),
+        ));
+    }
+    Ok(NewPublisherAuditEventRow {
+        id: event.id,
+        actor_account_id: event.actor_account_id,
+        publisher_id: event.publisher_id,
+        action: event.action,
+        target_key_id: event.target_key_id,
+        target_version: event.target_version,
+        request_id: event.request_id,
+        created_at: event.created_at,
+        metadata: event.metadata,
+    })
+}
+
+/// Require an optional audit event to describe the publisher being mutated.
+fn validate_audit_publisher(
+    event: Option<&PublisherAuditEventRecord>,
+    publisher_id: uuid::Uuid,
+) -> Result<(), CatalogError> {
+    if event.is_some_and(|event| event.publisher_id != publisher_id) {
+        return Err(CatalogError::InvalidArgument(
+            "audit publisher_id must match the mutated publisher".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Inherent methods on [`PostgresCatalog`]: constructor, pool accessor.
 impl PostgresCatalog {
     /// Create a new [`PostgresCatalog`], open the connection pool, and run
@@ -226,7 +261,9 @@ impl CatalogBackend for PostgresCatalog {
         &self,
         profile: PublisherProfileRecord,
         owner: PublisherMembershipRecord,
+        audit: Option<PublisherAuditEventRecord>,
     ) -> Result<(), CatalogError> {
+        validate_audit_publisher(audit.as_ref(), profile.id)?;
         if profile.id != owner.publisher_id {
             return Err(CatalogError::InvalidArgument(
                 "owner membership publisher_id must match profile id".to_string(),
@@ -254,6 +291,7 @@ impl CatalogBackend for PostgresCatalog {
             created_at: owner.created_at,
             updated_at: owner.updated_at,
         };
+        let audit = audit.map(new_publisher_audit_row).transpose()?;
         let mut conn = self.pool.get().await.map_err(map_pool_error)?;
         use diesel_async::AsyncConnection as _;
         conn.transaction::<(), diesel::result::Error, _>(async move |conn| {
@@ -265,6 +303,12 @@ impl CatalogBackend for PostgresCatalog {
                 .values(new_owner)
                 .execute(conn)
                 .await?;
+            if let Some(audit) = audit {
+                diesel::insert_into(publisher_audit_events::table)
+                    .values(audit)
+                    .execute(conn)
+                    .await?;
+            }
             Ok(())
         })
         .await
@@ -292,19 +336,34 @@ impl CatalogBackend for PostgresCatalog {
         id: uuid::Uuid,
         display_name: &str,
         biography: Option<&str>,
+        audit: Option<PublisherAuditEventRecord>,
     ) -> Result<PublisherProfileRecord, CatalogError> {
+        validate_audit_publisher(audit.as_ref(), id)?;
+        let audit = audit.map(new_publisher_audit_row).transpose()?;
         let mut conn = self.pool.get().await.map_err(map_pool_error)?;
-        diesel::update(publisher_profiles::table.find(id))
-            .set((
-                publisher_profiles::display_name.eq(display_name),
-                publisher_profiles::biography.eq(biography),
-                publisher_profiles::updated_at.eq(Utc::now()),
-            ))
-            .returning(PublisherProfileRow::as_returning())
-            .get_result(&mut conn)
+        use diesel_async::AsyncConnection as _;
+        let row = conn
+            .transaction::<PublisherProfileRow, diesel::result::Error, _>(async move |conn| {
+                let row = diesel::update(publisher_profiles::table.find(id))
+                    .set((
+                        publisher_profiles::display_name.eq(display_name),
+                        publisher_profiles::biography.eq(biography),
+                        publisher_profiles::updated_at.eq(Utc::now()),
+                    ))
+                    .returning(PublisherProfileRow::as_returning())
+                    .get_result(conn)
+                    .await?;
+                if let Some(audit) = audit {
+                    diesel::insert_into(publisher_audit_events::table)
+                        .values(audit)
+                        .execute(conn)
+                        .await?;
+                }
+                Ok(row)
+            })
             .await
-            .map_err(|error| map_diesel_error(error, "publisher", id.to_string()))?
-            .into_record()
+            .map_err(|error| map_diesel_error(error, "publisher", id.to_string()))?;
+        row.into_record()
     }
 
     /// List all memberships held by one account.
@@ -350,13 +409,17 @@ impl CatalogBackend for PostgresCatalog {
     }
 
     /// Enroll a public signing key to a publisher profile.
-    async fn create_publisher_key(&self, record: PublisherKeyRecord) -> Result<(), CatalogError> {
+    async fn create_publisher_key(
+        &self,
+        record: PublisherKeyRecord,
+        audit: Option<PublisherAuditEventRecord>,
+    ) -> Result<(), CatalogError> {
+        validate_audit_publisher(audit.as_ref(), record.publisher_id)?;
         if record.label.trim().is_empty() {
             return Err(CatalogError::Validation(
                 "publisher key label must not be blank".to_string(),
             ));
         }
-        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
         let id = record.id;
         let row = NewPublisherKeyRow {
             id,
@@ -368,11 +431,24 @@ impl CatalogBackend for PostgresCatalog {
             revoked_at: record.revoked_at,
             last_used_at: record.last_used_at,
         };
-        diesel::insert_into(publisher_keys::table)
-            .values(row)
-            .execute(&mut conn)
-            .await
-            .map_err(|error| map_diesel_error(error, "publisher_key", id.to_string()))?;
+        let audit = audit.map(new_publisher_audit_row).transpose()?;
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        use diesel_async::AsyncConnection as _;
+        conn.transaction::<(), diesel::result::Error, _>(async move |conn| {
+            diesel::insert_into(publisher_keys::table)
+                .values(row)
+                .execute(conn)
+                .await?;
+            if let Some(audit) = audit {
+                diesel::insert_into(publisher_audit_events::table)
+                    .values(audit)
+                    .execute(conn)
+                    .await?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|error| map_diesel_error(error, "publisher_key", id.to_string()))?;
         Ok(())
     }
 
@@ -398,7 +474,10 @@ impl CatalogBackend for PostgresCatalog {
         publisher_id: uuid::Uuid,
         key_id: uuid::Uuid,
         revoked_at: chrono::DateTime<Utc>,
+        audit: Option<PublisherAuditEventRecord>,
     ) -> Result<PublisherKeyRecord, CatalogError> {
+        validate_audit_publisher(audit.as_ref(), publisher_id)?;
+        let audit = audit.map(new_publisher_audit_row).transpose()?;
         let mut conn = self.pool.get().await.map_err(map_pool_error)?;
         use diesel_async::AsyncConnection as _;
         let row = conn
@@ -428,14 +507,21 @@ impl CatalogBackend for PostgresCatalog {
                 if active_count <= 1 {
                     return Err(diesel::result::Error::RollbackTransaction);
                 }
-                diesel::update(publisher_keys::table.find(key_id))
+                let updated = diesel::update(publisher_keys::table.find(key_id))
                     .set((
                         publisher_keys::state.eq("revoked"),
                         publisher_keys::revoked_at.eq(Some(revoked_at)),
                     ))
                     .returning(PublisherKeyRow::as_returning())
                     .get_result(conn)
-                    .await
+                    .await?;
+                if let Some(audit) = audit {
+                    diesel::insert_into(publisher_audit_events::table)
+                        .values(audit)
+                        .execute(conn)
+                        .await?;
+                }
+                Ok(updated)
             })
             .await
             .map_err(|error| match error {
@@ -452,24 +538,9 @@ impl CatalogBackend for PostgresCatalog {
         &self,
         event: PublisherAuditEventRecord,
     ) -> Result<(), CatalogError> {
-        if event.action.trim().is_empty() || !event.metadata.is_object() {
-            return Err(CatalogError::Validation(
-                "audit action must be non-blank and metadata must be an object".to_string(),
-            ));
-        }
         let mut conn = self.pool.get().await.map_err(map_pool_error)?;
         let id = event.id;
-        let row = NewPublisherAuditEventRow {
-            id,
-            actor_account_id: event.actor_account_id,
-            publisher_id: event.publisher_id,
-            action: event.action,
-            target_key_id: event.target_key_id,
-            target_version: event.target_version,
-            request_id: event.request_id,
-            created_at: event.created_at,
-            metadata: event.metadata,
-        };
+        let row = new_publisher_audit_row(event)?;
         diesel::insert_into(publisher_audit_events::table)
             .values(row)
             .execute(&mut conn)

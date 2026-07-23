@@ -108,11 +108,12 @@ pub trait CatalogBackend: Send + Sync {
         display_name: Option<&str>,
     ) -> Result<AccountRecord, CatalogError>;
 
-    /// Atomically create a publisher profile and its first owner membership.
+    /// Atomically create a publisher, its first owner, and an optional audit event.
     async fn create_publisher(
         &self,
         profile: PublisherProfileRecord,
         owner: PublisherMembershipRecord,
+        audit: Option<PublisherAuditEventRecord>,
     ) -> Result<(), CatalogError>;
 
     /// Retrieve a public publisher profile by its normalized handle.
@@ -121,12 +122,13 @@ pub trait CatalogBackend: Send + Sync {
         handle: &str,
     ) -> Result<PublisherProfileRecord, CatalogError>;
 
-    /// Update mutable publisher profile fields without changing its handle.
+    /// Atomically update publisher fields and append an optional audit event.
     async fn update_publisher_profile(
         &self,
         id: uuid::Uuid,
         display_name: &str,
         biography: Option<&str>,
+        audit: Option<PublisherAuditEventRecord>,
     ) -> Result<PublisherProfileRecord, CatalogError>;
 
     /// List all memberships held by one account in stable creation order.
@@ -142,8 +144,12 @@ pub trait CatalogBackend: Send + Sync {
         publisher_id: uuid::Uuid,
     ) -> Result<PublisherMembershipRecord, CatalogError>;
 
-    /// Enroll a public signing key to a publisher profile.
-    async fn create_publisher_key(&self, record: PublisherKeyRecord) -> Result<(), CatalogError>;
+    /// Atomically enroll a publisher key and append an optional audit event.
+    async fn create_publisher_key(
+        &self,
+        record: PublisherKeyRecord,
+        audit: Option<PublisherAuditEventRecord>,
+    ) -> Result<(), CatalogError>;
 
     /// List a publisher's enrolled public keys in stable creation order.
     async fn list_publisher_keys(
@@ -151,12 +157,13 @@ pub trait CatalogBackend: Send + Sync {
         publisher_id: uuid::Uuid,
     ) -> Result<Vec<PublisherKeyRecord>, CatalogError>;
 
-    /// Revoke a publisher key while retaining its historical public evidence.
+    /// Atomically revoke a publisher key and append an optional audit event.
     async fn revoke_publisher_key(
         &self,
         publisher_id: uuid::Uuid,
         key_id: uuid::Uuid,
         revoked_at: DateTime<Utc>,
+        audit: Option<PublisherAuditEventRecord>,
     ) -> Result<PublisherKeyRecord, CatalogError>;
 
     /// Append an immutable, sanitized publisher audit event.

@@ -193,7 +193,7 @@ async fn publisher_membership_key_and_audit_lifecycle() {
         updated_at: now,
     };
     catalog
-        .create_publisher(profile.clone(), membership.clone())
+        .create_publisher(profile.clone(), membership.clone(), None)
         .await
         .expect("create publisher failed");
     let found_profile = catalog
@@ -225,11 +225,11 @@ async fn publisher_membership_key_and_audit_lifecycle() {
         last_used_at: None,
     };
     catalog
-        .create_publisher_key(first_key.clone())
+        .create_publisher_key(first_key.clone(), None)
         .await
         .expect("create first key failed");
     let last_key_error = catalog
-        .revoke_publisher_key(publisher_id, first_key.id, chrono::Utc::now())
+        .revoke_publisher_key(publisher_id, first_key.id, chrono::Utc::now(), None)
         .await
         .expect_err("last active key revocation must fail");
     assert!(matches!(last_key_error, CatalogError::Validation(_)));
@@ -245,12 +245,12 @@ async fn publisher_membership_key_and_audit_lifecycle() {
         last_used_at: None,
     };
     catalog
-        .create_publisher_key(second_key.clone())
+        .create_publisher_key(second_key.clone(), None)
         .await
         .expect("create second key failed");
     let (first_result, second_result) = tokio::join!(
-        catalog.revoke_publisher_key(publisher_id, first_key.id, chrono::Utc::now()),
-        catalog.revoke_publisher_key(publisher_id, second_key.id, chrono::Utc::now()),
+        catalog.revoke_publisher_key(publisher_id, first_key.id, chrono::Utc::now(), None),
+        catalog.revoke_publisher_key(publisher_id, second_key.id, chrono::Utc::now(), None),
     );
     assert!(matches!(
         (&first_result, &second_result),
@@ -274,9 +274,10 @@ async fn publisher_membership_key_and_audit_lifecycle() {
         1
     );
 
+    let audit_id = uuid::Uuid::new_v4();
     catalog
         .append_publisher_audit_event(PublisherAuditEventRecord {
-            id: uuid::Uuid::new_v4(),
+            id: audit_id,
             actor_account_id: Some(account.id),
             publisher_id,
             action: "publisher.key.revoked".to_string(),
@@ -288,6 +289,46 @@ async fn publisher_membership_key_and_audit_lifecycle() {
         })
         .await
         .expect("append audit event failed");
+
+    let rollback_publisher_id = uuid::Uuid::new_v4();
+    let rollback_profile = PublisherProfileRecord {
+        id: rollback_publisher_id,
+        handle: "atomic-rollback".to_string(),
+        display_name: "Atomic Rollback".to_string(),
+        biography: None,
+        moderation_status: PublisherModerationStatus::Pending,
+        created_at: now,
+        updated_at: now,
+    };
+    let rollback_membership = PublisherMembershipRecord {
+        account_id: account.id,
+        publisher_id: rollback_publisher_id,
+        role: PublisherRole::Owner,
+        state: MembershipState::Active,
+        created_at: now,
+        updated_at: now,
+    };
+    let duplicate_audit = PublisherAuditEventRecord {
+        id: audit_id,
+        actor_account_id: Some(account.id),
+        publisher_id: rollback_publisher_id,
+        action: "publisher.created".to_string(),
+        target_key_id: None,
+        target_version: None,
+        request_id: Some(uuid::Uuid::new_v4()),
+        created_at: chrono::Utc::now(),
+        metadata: serde_json::json!({}),
+    };
+    let error = catalog
+        .create_publisher(rollback_profile, rollback_membership, Some(duplicate_audit))
+        .await
+        .expect_err("duplicate audit identifier must roll back publisher creation");
+    assert!(matches!(error, CatalogError::Conflict { .. }));
+    let lookup_error = catalog
+        .get_publisher_by_handle("atomic-rollback")
+        .await
+        .expect_err("publisher row must not survive a failed atomic audit insert");
+    assert!(matches!(lookup_error, CatalogError::NotFound { .. }));
 }
 
 /// Register an author and look them up by pubkey.

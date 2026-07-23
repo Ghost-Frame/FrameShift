@@ -121,6 +121,27 @@ impl Default for MockCatalog {
     }
 }
 
+/// Validate optional audit records before applying an in-memory mutation.
+fn validate_audit(
+    event: Option<&PublisherAuditEventRecord>,
+    publisher_id: Option<uuid::Uuid>,
+) -> Result<(), CatalogError> {
+    if event.is_some_and(|event| event.action.trim().is_empty() || !event.metadata.is_object()) {
+        return Err(CatalogError::Validation(
+            "audit action must be non-blank and metadata must be an object".to_string(),
+        ));
+    }
+    if event
+        .zip(publisher_id)
+        .is_some_and(|(event, publisher_id)| event.publisher_id != publisher_id)
+    {
+        return Err(CatalogError::InvalidArgument(
+            "audit publisher_id must match the mutated publisher".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 #[async_trait]
 /// In-memory implementation of every catalog operation used by server tests.
 impl CatalogBackend for MockCatalog {
@@ -216,7 +237,9 @@ impl CatalogBackend for MockCatalog {
         &self,
         profile: PublisherProfileRecord,
         owner: PublisherMembershipRecord,
+        audit: Option<PublisherAuditEventRecord>,
     ) -> Result<(), CatalogError> {
+        validate_audit(audit.as_ref(), Some(profile.id))?;
         let mut state = self
             .state
             .write()
@@ -241,6 +264,9 @@ impl CatalogBackend for MockCatalog {
             .publisher_memberships
             .insert((owner.account_id, owner.publisher_id), owner);
         state.publishers.insert(profile.id, profile);
+        if let Some(audit) = audit {
+            state.publisher_audit_events.push(audit);
+        }
         Ok(())
     }
 
@@ -276,7 +302,9 @@ impl CatalogBackend for MockCatalog {
         id: uuid::Uuid,
         display_name: &str,
         biography: Option<&str>,
+        audit: Option<PublisherAuditEventRecord>,
     ) -> Result<PublisherProfileRecord, CatalogError> {
+        validate_audit(audit.as_ref(), Some(id))?;
         let mut state = self
             .state
             .write()
@@ -291,7 +319,11 @@ impl CatalogBackend for MockCatalog {
         publisher.display_name = display_name.to_string();
         publisher.biography = biography.map(str::to_string);
         publisher.updated_at = Utc::now();
-        Ok(publisher.clone())
+        let updated = publisher.clone();
+        if let Some(audit) = audit {
+            state.publisher_audit_events.push(audit);
+        }
+        Ok(updated)
     }
 
     /// List all memberships held by one account.
@@ -334,7 +366,12 @@ impl CatalogBackend for MockCatalog {
     }
 
     /// Enroll a public signing key while enforcing global key uniqueness.
-    async fn create_publisher_key(&self, record: PublisherKeyRecord) -> Result<(), CatalogError> {
+    async fn create_publisher_key(
+        &self,
+        record: PublisherKeyRecord,
+        audit: Option<PublisherAuditEventRecord>,
+    ) -> Result<(), CatalogError> {
+        validate_audit(audit.as_ref(), Some(record.publisher_id))?;
         let mut state = self
             .state
             .write()
@@ -351,6 +388,9 @@ impl CatalogBackend for MockCatalog {
             });
         }
         state.publisher_keys.insert(record.id, record);
+        if let Some(audit) = audit {
+            state.publisher_audit_events.push(audit);
+        }
         Ok(())
     }
 
@@ -379,7 +419,9 @@ impl CatalogBackend for MockCatalog {
         publisher_id: uuid::Uuid,
         key_id: uuid::Uuid,
         revoked_at: DateTime<Utc>,
+        audit: Option<PublisherAuditEventRecord>,
     ) -> Result<PublisherKeyRecord, CatalogError> {
+        validate_audit(audit.as_ref(), Some(publisher_id))?;
         let mut state = self
             .state
             .write()
@@ -414,7 +456,11 @@ impl CatalogBackend for MockCatalog {
         }
         key.state = PublisherKeyState::Revoked;
         key.revoked_at = Some(revoked_at);
-        Ok(key.clone())
+        let updated = key.clone();
+        if let Some(audit) = audit {
+            state.publisher_audit_events.push(audit);
+        }
+        Ok(updated)
     }
 
     /// Append an immutable publisher audit event.
@@ -422,6 +468,7 @@ impl CatalogBackend for MockCatalog {
         &self,
         event: PublisherAuditEventRecord,
     ) -> Result<(), CatalogError> {
+        validate_audit(Some(&event), None)?;
         let mut state = self
             .state
             .write()

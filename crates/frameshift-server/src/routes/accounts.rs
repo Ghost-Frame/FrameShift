@@ -22,6 +22,15 @@ use crate::error::AppError;
 use crate::middleware::account::AuthenticatedAccount;
 use crate::state::AppState;
 
+/// Maximum accepted account email length in Unicode scalar values.
+const MAX_EMAIL_CHARS: usize = 320;
+/// Maximum accepted account or publisher display-name length.
+const MAX_DISPLAY_NAME_CHARS: usize = 100;
+/// Maximum accepted public publisher biography length.
+const MAX_BIOGRAPHY_CHARS: usize = 2_000;
+/// Maximum accepted publisher key label length.
+const MAX_KEY_LABEL_CHARS: usize = 100;
+
 /// Public OIDC bootstrap metadata returned to clients.
 #[derive(Debug, Serialize)]
 pub struct AuthConfigResponse {
@@ -183,6 +192,13 @@ async fn update_account(
     Extension(auth): Extension<AuthenticatedAccount>,
     Json(request): Json<UpdateAccountRequest>,
 ) -> Result<Json<AccountRecord>, AppError> {
+    validate_optional_text(request.email.as_deref(), MAX_EMAIL_CHARS, "email", true)?;
+    validate_optional_text(
+        request.display_name.as_deref(),
+        MAX_DISPLAY_NAME_CHARS,
+        "display name",
+        true,
+    )?;
     let email = request.email.as_deref().or(auth.account.email.as_deref());
     let display_name = request
         .display_name
@@ -203,6 +219,18 @@ async fn create_publisher(
     headers: HeaderMap,
     Json(request): Json<CreatePublisherRequest>,
 ) -> Result<Json<PublisherProfileRecord>, AppError> {
+    validate_publisher_handle(&request.handle)?;
+    validate_required_text(
+        &request.display_name,
+        MAX_DISPLAY_NAME_CHARS,
+        "display name",
+    )?;
+    validate_optional_text(
+        request.biography.as_deref(),
+        MAX_BIOGRAPHY_CHARS,
+        "biography",
+        false,
+    )?;
     let now = Utc::now();
     let profile = PublisherProfileRecord {
         id: Uuid::new_v4(),
@@ -221,20 +249,18 @@ async fn create_publisher(
         created_at: now,
         updated_at: now,
     };
-    state
-        .catalog
-        .create_publisher(profile.clone(), owner)
-        .await
-        .map_err(|error| AppError::from_catalog(error, "publisher"))?;
-    append_audit(
-        &state,
+    let audit = publisher_audit(
         &auth,
         profile.id,
         "publisher.created",
         None,
         request_id(&headers),
-    )
-    .await?;
+    );
+    state
+        .catalog
+        .create_publisher(profile.clone(), owner, Some(audit))
+        .await
+        .map_err(|error| AppError::from_catalog(error, "publisher"))?;
     Ok(Json(profile))
 }
 
@@ -259,6 +285,18 @@ async fn update_publisher(
     headers: HeaderMap,
     Json(request): Json<UpdatePublisherRequest>,
 ) -> Result<Json<PublisherProfileRecord>, AppError> {
+    require_fresh_auth(&state, &auth)?;
+    validate_required_text(
+        &request.display_name,
+        MAX_DISPLAY_NAME_CHARS,
+        "display name",
+    )?;
+    validate_optional_text(
+        request.biography.as_deref(),
+        MAX_BIOGRAPHY_CHARS,
+        "biography",
+        false,
+    )?;
     let profile = require_owner(&state, &auth, &handle).await?;
     let biography = if request.clear_biography {
         None
@@ -268,20 +306,18 @@ async fn update_publisher(
             .as_deref()
             .or(profile.biography.as_deref())
     };
-    let updated = state
-        .catalog
-        .update_publisher_profile(profile.id, &request.display_name, biography)
-        .await
-        .map_err(|error| AppError::from_catalog(error, "publisher"))?;
-    append_audit(
-        &state,
+    let audit = publisher_audit(
         &auth,
         profile.id,
         "publisher.updated",
         None,
         request_id(&headers),
-    )
-    .await?;
+    );
+    let updated = state
+        .catalog
+        .update_publisher_profile(profile.id, &request.display_name, biography, Some(audit))
+        .await
+        .map_err(|error| AppError::from_catalog(error, "publisher"))?;
     Ok(Json(updated))
 }
 
@@ -309,6 +345,7 @@ async fn enroll_publisher_key(
     Json(request): Json<EnrollPublisherKeyRequest>,
 ) -> Result<Json<PublisherKeyRecord>, AppError> {
     require_fresh_auth(&state, &auth)?;
+    validate_required_text(&request.label, MAX_KEY_LABEL_CHARS, "key label")?;
     let profile = require_owner(&state, &auth, &handle).await?;
     let public_key = Ed25519PublicKey::from_str(&request.public_key)
         .map_err(|_| AppError::BadRequest("invalid publisher public key".to_string()))?;
@@ -328,20 +365,18 @@ async fn enroll_publisher_key(
         revoked_at: None,
         last_used_at: None,
     };
-    state
-        .catalog
-        .create_publisher_key(record.clone())
-        .await
-        .map_err(|error| AppError::from_catalog(error, "publisher key"))?;
-    append_audit(
-        &state,
+    let audit = publisher_audit(
         &auth,
         profile.id,
         "publisher.key.enrolled",
         Some(record.id),
         request_id(&headers),
-    )
-    .await?;
+    );
+    state
+        .catalog
+        .create_publisher_key(record.clone(), Some(audit))
+        .await
+        .map_err(|error| AppError::from_catalog(error, "publisher key"))?;
     Ok(Json(record))
 }
 
@@ -354,20 +389,18 @@ async fn revoke_publisher_key(
 ) -> Result<Json<PublisherKeyRecord>, AppError> {
     require_fresh_auth(&state, &auth)?;
     let profile = require_owner(&state, &auth, &handle).await?;
-    let record = state
-        .catalog
-        .revoke_publisher_key(profile.id, key_id, Utc::now())
-        .await
-        .map_err(|error| AppError::from_catalog(error, "publisher key"))?;
-    append_audit(
-        &state,
+    let audit = publisher_audit(
         &auth,
         profile.id,
         "publisher.key.revoked",
-        Some(record.id),
+        Some(key_id),
         request_id(&headers),
-    )
-    .await?;
+    );
+    let record = state
+        .catalog
+        .revoke_publisher_key(profile.id, key_id, Utc::now(), Some(audit))
+        .await
+        .map_err(|error| AppError::from_catalog(error, "publisher key"))?;
     Ok(Json(record))
 }
 
@@ -454,28 +487,68 @@ fn request_id(headers: &HeaderMap) -> Option<Uuid> {
         .and_then(|value| Uuid::parse_str(value).ok())
 }
 
-/// Append one sanitized account-driven publisher audit event.
-async fn append_audit(
-    state: &AppState,
+/// Build one sanitized account-driven publisher audit event.
+fn publisher_audit(
     auth: &AuthenticatedAccount,
     publisher_id: Uuid,
     action: &str,
     target_key_id: Option<Uuid>,
     request_id: Option<Uuid>,
+) -> PublisherAuditEventRecord {
+    PublisherAuditEventRecord {
+        id: Uuid::new_v4(),
+        actor_account_id: Some(auth.account.id),
+        publisher_id,
+        action: action.to_string(),
+        target_key_id,
+        target_version: None,
+        request_id,
+        created_at: Utc::now(),
+        metadata: serde_json::json!({}),
+    }
+}
+
+/// Validate a required bounded user-facing text field.
+fn validate_required_text(value: &str, max_chars: usize, field: &str) -> Result<(), AppError> {
+    if value.trim().is_empty() || value.chars().count() > max_chars {
+        return Err(AppError::BadRequest(format!(
+            "{field} must contain 1 to {max_chars} characters"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate an optional bounded user-facing text field.
+fn validate_optional_text(
+    value: Option<&str>,
+    max_chars: usize,
+    field: &str,
+    reject_blank: bool,
 ) -> Result<(), AppError> {
-    state
-        .catalog
-        .append_publisher_audit_event(PublisherAuditEventRecord {
-            id: Uuid::new_v4(),
-            actor_account_id: Some(auth.account.id),
-            publisher_id,
-            action: action.to_string(),
-            target_key_id,
-            target_version: None,
-            request_id,
-            created_at: Utc::now(),
-            metadata: serde_json::json!({}),
-        })
-        .await
-        .map_err(|error| AppError::from_catalog(error, "publisher audit"))
+    if let Some(value) = value {
+        if value.chars().count() > max_chars || (reject_blank && value.trim().is_empty()) {
+            return Err(AppError::BadRequest(format!(
+                "{field} must contain at most {max_chars} characters"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Validate the normalized public publisher-handle contract before persistence.
+fn validate_publisher_handle(handle: &str) -> Result<(), AppError> {
+    let bytes = handle.as_bytes();
+    let valid_edge = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+    let valid_body = |byte: u8| valid_edge(byte) || matches!(byte, b'_' | b'-');
+    if !(3..=64).contains(&bytes.len())
+        || !bytes.first().copied().is_some_and(valid_edge)
+        || !bytes.last().copied().is_some_and(valid_edge)
+        || !bytes.iter().copied().all(valid_body)
+    {
+        return Err(AppError::BadRequest(
+            "publisher handle must be 3 to 64 lowercase ASCII letters, digits, underscores, or hyphens with alphanumeric edges"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }

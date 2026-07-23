@@ -221,6 +221,16 @@ async fn account_and_publisher_security_workflow_is_enforced() {
     let account_json = response_json(account).await;
     let account_id = account_json["account"]["id"].as_str().unwrap();
 
+    let oversized_account = send(
+        state.clone(),
+        Method::PATCH,
+        "/v1/account",
+        Some("owner"),
+        Some(json!({"display_name": "x".repeat(101)})),
+    )
+    .await;
+    assert_eq!(oversized_account.status(), StatusCode::BAD_REQUEST);
+
     let created = send(
         state.clone(),
         Method::POST,
@@ -256,6 +266,16 @@ async fn account_and_publisher_security_workflow_is_enforced() {
     )
     .await;
     assert_eq!(cross_account.status(), StatusCode::FORBIDDEN);
+
+    let stale_profile_update = send(
+        state.clone(),
+        Method::PATCH,
+        "/v1/publishers/gatekeeper",
+        Some("stale"),
+        Some(json!({"display_name": "Too Old"})),
+    )
+    .await;
+    assert_eq!(stale_profile_update.status(), StatusCode::FORBIDDEN);
 
     let stale = send(
         state.clone(),
