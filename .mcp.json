@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "agent-forge": {
+      "type": "stdio",
+      "command": "agent-forge-mcp",
+      "args": [],
+      "env": {}
+    }
+  }
+}
