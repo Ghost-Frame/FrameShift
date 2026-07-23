@@ -536,7 +536,7 @@ async fn ownership_backfill_validates_phase3_legacy_handle_when_present() {
         .await
         .expect("register Phase 3 pack failed");
     let author_error = catalog
-        .get_author_by_handle(handle)
+        .lookup_author_by_handle(handle)
         .await
         .expect_err("Phase 3 fixture must not have a legacy author");
     assert!(matches!(
