@@ -9,6 +9,162 @@ use chrono::{DateTime, Utc};
 use crate::identity::Ed25519PublicKey;
 use crate::status::PackStatus;
 use frameshift_pack::ObjectHash;
+use uuid::Uuid;
+
+/// Lifecycle state for an OIDC-backed FrameShift account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountStatus {
+    /// The account may authenticate and perform authorized operations.
+    Active,
+    /// The account is temporarily denied access by an operator action.
+    Suspended,
+    /// The account is permanently disabled while its audit history is retained.
+    Disabled,
+}
+
+/// A user account identified by an exact OIDC issuer and subject pair.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AccountRecord {
+    /// Internal stable account identifier.
+    pub id: Uuid,
+    /// Canonical OIDC issuer URL from the validated token.
+    pub issuer: String,
+    /// Issuer-scoped OIDC subject identifier from the validated token.
+    pub subject: String,
+    /// Optional email claim retained only as mutable profile metadata.
+    pub email: Option<String>,
+    /// Optional user-selected display name.
+    pub display_name: Option<String>,
+    /// Current account lifecycle state.
+    pub status: AccountStatus,
+    /// UTC timestamp when the account was created.
+    pub created_at: DateTime<Utc>,
+    /// UTC timestamp of the most recent account update.
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Moderation state for a public publisher profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublisherModerationStatus {
+    /// The profile exists but public publication still requires review.
+    Pending,
+    /// The profile is approved for the configured publication policy.
+    Approved,
+    /// The profile is temporarily prevented from publishing.
+    Suspended,
+    /// The profile was rejected but remains available to the audit trail.
+    Rejected,
+}
+
+/// Public identity and moderation state for an artifact publisher.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PublisherProfileRecord {
+    /// Internal stable publisher identifier.
+    pub id: Uuid,
+    /// Unique lowercase public handle.
+    pub handle: String,
+    /// Public publisher display name.
+    pub display_name: String,
+    /// Optional bounded public biography.
+    pub biography: Option<String>,
+    /// Current moderation state.
+    pub moderation_status: PublisherModerationStatus,
+    /// UTC timestamp when the profile was created.
+    pub created_at: DateTime<Utc>,
+    /// UTC timestamp of the most recent profile update.
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Authorization role assigned through a publisher membership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublisherRole {
+    /// Full publisher ownership authority.
+    Owner,
+}
+
+/// Lifecycle state for a publisher membership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MembershipState {
+    /// The account currently holds the membership role.
+    Active,
+    /// The membership has been revoked but remains auditable.
+    Revoked,
+}
+
+/// An account's role within one publisher profile.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PublisherMembershipRecord {
+    /// Account holding the membership.
+    pub account_id: Uuid,
+    /// Publisher to which the membership grants access.
+    pub publisher_id: Uuid,
+    /// Authorization role held by the account.
+    pub role: PublisherRole,
+    /// Current membership lifecycle state.
+    pub state: MembershipState,
+    /// UTC timestamp when the membership was created.
+    pub created_at: DateTime<Utc>,
+    /// UTC timestamp of the most recent membership update.
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Lifecycle state for an enrolled publisher signing key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublisherKeyState {
+    /// The key may authorize new publisher writes.
+    Active,
+    /// The key may verify historical evidence but cannot authorize new writes.
+    Revoked,
+}
+
+/// A public Ed25519 key enrolled to a publisher profile.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PublisherKeyRecord {
+    /// Internal stable key identifier.
+    pub id: Uuid,
+    /// Publisher that owns the key.
+    pub publisher_id: Uuid,
+    /// Raw public key used to verify proof-of-possession and signed requests.
+    pub public_key: Ed25519PublicKey,
+    /// User-visible device or purpose label.
+    pub label: String,
+    /// Current key lifecycle state.
+    pub state: PublisherKeyState,
+    /// UTC timestamp when the key was enrolled.
+    pub created_at: DateTime<Utc>,
+    /// UTC timestamp when the key was revoked, when applicable.
+    pub revoked_at: Option<DateTime<Utc>>,
+    /// UTC timestamp of the most recent successful use, when known.
+    pub last_used_at: Option<DateTime<Utc>>,
+}
+
+/// Immutable audit event for security-sensitive publisher operations.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PublisherAuditEventRecord {
+    /// Internal stable audit event identifier.
+    pub id: Uuid,
+    /// Account responsible for the action, when an account initiated it.
+    pub actor_account_id: Option<Uuid>,
+    /// Publisher affected by the action.
+    pub publisher_id: Uuid,
+    /// Stable action name suitable for filtering.
+    pub action: String,
+    /// Optional publisher key affected by the action.
+    pub target_key_id: Option<Uuid>,
+    /// Optional pack version affected by the action.
+    pub target_version: Option<String>,
+    /// Request correlation identifier from the HTTP boundary.
+    pub request_id: Option<Uuid>,
+    /// UTC timestamp when the event was recorded.
+    pub created_at: DateTime<Utc>,
+    /// Sanitized structured metadata that must not contain credentials.
+    pub metadata: serde_json::Value,
+}
 
 /// A registered marketplace author.
 ///
@@ -105,6 +261,11 @@ pub struct PackRecord {
     /// May differ from the original creator if ownership was transferred.
     pub current_author: Ed25519PublicKey,
 
+    /// Optional publisher profile that owns the pack after identity backfill.
+    ///
+    /// `None` preserves the legacy author-key ownership path during migration.
+    pub publisher_id: Option<Uuid>,
+
     /// Tags associated with this pack for search and discovery.
     ///
     /// Example: `["roleplay", "assistant", "creative"]`.
@@ -182,6 +343,11 @@ pub struct PackVersionRecord {
 
     /// The Ed25519 public key of the author who published this version.
     pub author_pubkey: Ed25519PublicKey,
+
+    /// Optional enrolled publisher key associated with this version.
+    ///
+    /// Historical `author_pubkey` bytes remain immutable even when this link is set.
+    pub publisher_key_id: Option<Uuid>,
 
     /// The content hash of the previous version in this pack's history chain.
     ///

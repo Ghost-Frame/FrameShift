@@ -173,6 +173,7 @@ fn prepare_signed_fixture(name: &str, version: &str, signing: &SigningKey) -> Fi
         content_hash,
         signature,
         author_pubkey: Ed25519PublicKey(signing.verifying_key().to_bytes()),
+        publisher_key_id: None,
         parent_hash: None,
         capability_manifest_json: "{}".to_string(),
         schema_version: 1,
@@ -212,6 +213,7 @@ struct EnvGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
 }
 
+/// Creates scoped registry URL overrides for integration tests.
 impl EnvGuard {
     /// Set `FRAMESHIFT_REGISTRY_URL` to `value`, remembering the original
     /// value (if any) for restoration on drop.
@@ -227,6 +229,7 @@ impl EnvGuard {
     }
 }
 
+/// Restores the registry URL when a scoped override leaves scope.
 impl Drop for EnvGuard {
     /// Restore `FRAMESHIFT_REGISTRY_URL` to its pre-guard state.
     fn drop(&mut self) {

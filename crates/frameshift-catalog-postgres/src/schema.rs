@@ -20,6 +20,112 @@
 #![allow(dead_code)]
 
 diesel::table! {
+    /// OIDC-backed FrameShift accounts keyed by an internal UUID.
+    accounts (id) {
+        /// Internal stable account identifier.
+        id -> Uuid,
+        /// Canonical OIDC issuer URL.
+        issuer -> Text,
+        /// Issuer-scoped OIDC subject.
+        subject -> Text,
+        /// Optional profile email.
+        email -> Nullable<Text>,
+        /// Optional account display name.
+        display_name -> Nullable<Text>,
+        /// Account lifecycle state.
+        status -> Text,
+        /// Account creation timestamp.
+        created_at -> Timestamptz,
+        /// Most recent account update timestamp.
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    /// Public artifact publisher profiles.
+    publisher_profiles (id) {
+        /// Internal stable publisher identifier.
+        id -> Uuid,
+        /// Unique normalized public handle.
+        handle -> Text,
+        /// Public display name.
+        display_name -> Text,
+        /// Optional public biography.
+        biography -> Nullable<Text>,
+        /// Publisher moderation state.
+        moderation_status -> Text,
+        /// Profile creation timestamp.
+        created_at -> Timestamptz,
+        /// Most recent profile update timestamp.
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    /// Account roles within publisher profiles.
+    publisher_memberships (account_id, publisher_id) {
+        /// Account holding the role.
+        account_id -> Uuid,
+        /// Publisher receiving the member.
+        publisher_id -> Uuid,
+        /// Authorization role.
+        role -> Text,
+        /// Membership lifecycle state.
+        state -> Text,
+        /// Membership creation timestamp.
+        created_at -> Timestamptz,
+        /// Most recent membership update timestamp.
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    /// Public Ed25519 keys enrolled to publishers.
+    publisher_keys (id) {
+        /// Internal stable key identifier.
+        id -> Uuid,
+        /// Publisher owning the key.
+        publisher_id -> Uuid,
+        /// Raw 32-byte Ed25519 public key.
+        public_key -> Binary,
+        /// User-visible key label.
+        label -> Text,
+        /// Key lifecycle state.
+        state -> Text,
+        /// Key enrollment timestamp.
+        created_at -> Timestamptz,
+        /// Key revocation timestamp.
+        revoked_at -> Nullable<Timestamptz>,
+        /// Most recent successful use timestamp.
+        last_used_at -> Nullable<Timestamptz>,
+    }
+}
+
+diesel::table! {
+    /// Immutable audit events for publisher security operations.
+    publisher_audit_events (id) {
+        /// Internal stable event identifier.
+        id -> Uuid,
+        /// Optional account responsible for the event.
+        actor_account_id -> Nullable<Uuid>,
+        /// Publisher affected by the event.
+        publisher_id -> Uuid,
+        /// Stable action name.
+        action -> Text,
+        /// Optional affected publisher key.
+        target_key_id -> Nullable<Uuid>,
+        /// Optional affected pack version.
+        target_version -> Nullable<Text>,
+        /// Optional request correlation identifier.
+        request_id -> Nullable<Uuid>,
+        /// Event timestamp.
+        created_at -> Timestamptz,
+        /// Sanitized structured metadata.
+        metadata -> Jsonb,
+    }
+}
+
+diesel::table! {
     /// The `authors` table stores one row per registered Ed25519 keypair.
     ///
     /// Primary key: `pubkey` (raw 32-byte BYTEA).
@@ -60,6 +166,8 @@ diesel::table! {
         name -> Text,
         /// Raw 32-byte Ed25519 pubkey of the current pack owner.
         current_author -> Binary,
+        /// Nullable publisher owner during the compatibility migration.
+        publisher_id -> Nullable<Uuid>,
         /// Tag array for search and discovery.
         tags -> Array<Text>,
         /// Short human-readable description.
@@ -91,6 +199,8 @@ diesel::table! {
         signature -> Binary,
         /// Raw 32-byte Ed25519 pubkey of the publishing author.
         author_pubkey -> Binary,
+        /// Nullable enrolled publisher key during the compatibility migration.
+        publisher_key_id -> Nullable<Uuid>,
         /// Raw 32-byte SHA-256 hash of the previous version; NULL for first version.
         parent_hash -> Nullable<Binary>,
         /// JSON capability manifest (schema defined by pack runtime).
@@ -142,12 +252,25 @@ diesel::table! {
 
 // Allow Diesel join inference between packs and authors.
 diesel::joinable!(packs -> authors (current_author));
+// Allow Diesel join inference between packs and publisher profiles.
+diesel::joinable!(packs -> publisher_profiles (publisher_id));
 // Allow Diesel join inference between pack_versions and packs.
 diesel::joinable!(pack_versions -> packs (pack_name));
 // Allow Diesel join inference between pack_versions and authors via author_pubkey.
 diesel::joinable!(pack_versions -> authors (author_pubkey));
+// Allow Diesel join inference between pack versions and publisher keys.
+diesel::joinable!(pack_versions -> publisher_keys (publisher_key_id));
 // Allow Diesel join inference between handles and authors.
 diesel::joinable!(handles -> authors (pubkey));
+// Allow Diesel join inference for publisher memberships.
+diesel::joinable!(publisher_memberships -> accounts (account_id));
+diesel::joinable!(publisher_memberships -> publisher_profiles (publisher_id));
+// Allow Diesel join inference for publisher keys.
+diesel::joinable!(publisher_keys -> publisher_profiles (publisher_id));
+// Allow Diesel join inference for audit events.
+diesel::joinable!(publisher_audit_events -> accounts (actor_account_id));
+diesel::joinable!(publisher_audit_events -> publisher_profiles (publisher_id));
+diesel::joinable!(publisher_audit_events -> publisher_keys (target_key_id));
 
 diesel::allow_tables_to_appear_in_same_query!(
     authors,
@@ -156,4 +279,9 @@ diesel::allow_tables_to_appear_in_same_query!(
     handles,
     pack_downloads,
     signed_request_nonces,
+    accounts,
+    publisher_profiles,
+    publisher_memberships,
+    publisher_keys,
+    publisher_audit_events,
 );

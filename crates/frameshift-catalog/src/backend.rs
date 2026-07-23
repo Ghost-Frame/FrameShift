@@ -12,7 +12,10 @@ use frameshift_pack::ObjectHash;
 use crate::error::{CatalogError, HealthStatus};
 use crate::filters::{PackSearchFilters, PackSearchResult};
 use crate::identity::Ed25519PublicKey;
-use crate::records::{AuthorRecord, PackRecord, PackVersionRecord};
+use crate::records::{
+    AccountRecord, AuthorRecord, PackRecord, PackVersionRecord, PublisherAuditEventRecord,
+    PublisherKeyRecord, PublisherMembershipRecord, PublisherProfileRecord,
+};
 use crate::status::TombstoneRecord;
 
 /// Optional per-author limits applied atomically during pack registration.
@@ -78,6 +81,97 @@ impl PublishQuota {
 /// `Box<dyn CatalogBackend>` or `Arc<dyn CatalogBackend>` for dynamic dispatch.
 #[async_trait]
 pub trait CatalogBackend: Send + Sync {
+    /// Create an OIDC-backed account with a unique `(issuer, subject)` identity.
+    ///
+    /// # Errors
+    ///
+    /// - `CatalogError::Conflict` when the account ID or identity pair exists.
+    /// - `CatalogError::Validation` when issuer or subject is empty.
+    /// - `CatalogError::BackendError` for unexpected backend failures.
+    async fn create_account(&self, record: AccountRecord) -> Result<(), CatalogError>;
+
+    /// Retrieve an account by its internal identifier.
+    async fn get_account(&self, id: uuid::Uuid) -> Result<AccountRecord, CatalogError>;
+
+    /// Retrieve an account by its exact OIDC issuer and subject pair.
+    async fn get_account_by_subject(
+        &self,
+        issuer: &str,
+        subject: &str,
+    ) -> Result<AccountRecord, CatalogError>;
+
+    /// Update mutable account profile fields without changing OIDC identity.
+    async fn update_account_profile(
+        &self,
+        id: uuid::Uuid,
+        email: Option<&str>,
+        display_name: Option<&str>,
+    ) -> Result<AccountRecord, CatalogError>;
+
+    /// Atomically create a publisher, its first owner, and an optional audit event.
+    async fn create_publisher(
+        &self,
+        profile: PublisherProfileRecord,
+        owner: PublisherMembershipRecord,
+        audit: Option<PublisherAuditEventRecord>,
+    ) -> Result<(), CatalogError>;
+
+    /// Retrieve a public publisher profile by its normalized handle.
+    async fn get_publisher_by_handle(
+        &self,
+        handle: &str,
+    ) -> Result<PublisherProfileRecord, CatalogError>;
+
+    /// Atomically update publisher fields and append an optional audit event.
+    async fn update_publisher_profile(
+        &self,
+        id: uuid::Uuid,
+        display_name: &str,
+        biography: Option<&str>,
+        audit: Option<PublisherAuditEventRecord>,
+    ) -> Result<PublisherProfileRecord, CatalogError>;
+
+    /// List all memberships held by one account in stable creation order.
+    async fn list_account_memberships(
+        &self,
+        account_id: uuid::Uuid,
+    ) -> Result<Vec<PublisherMembershipRecord>, CatalogError>;
+
+    /// Retrieve the membership joining one account and publisher.
+    async fn get_publisher_membership(
+        &self,
+        account_id: uuid::Uuid,
+        publisher_id: uuid::Uuid,
+    ) -> Result<PublisherMembershipRecord, CatalogError>;
+
+    /// Atomically enroll a publisher key and append an optional audit event.
+    async fn create_publisher_key(
+        &self,
+        record: PublisherKeyRecord,
+        audit: Option<PublisherAuditEventRecord>,
+    ) -> Result<(), CatalogError>;
+
+    /// List a publisher's enrolled public keys in stable creation order.
+    async fn list_publisher_keys(
+        &self,
+        publisher_id: uuid::Uuid,
+    ) -> Result<Vec<PublisherKeyRecord>, CatalogError>;
+
+    /// Atomically revoke a publisher key and append an optional audit event.
+    async fn revoke_publisher_key(
+        &self,
+        publisher_id: uuid::Uuid,
+        key_id: uuid::Uuid,
+        revoked_at: DateTime<Utc>,
+        audit: Option<PublisherAuditEventRecord>,
+    ) -> Result<PublisherKeyRecord, CatalogError>;
+
+    /// Append an immutable, sanitized publisher audit event.
+    async fn append_publisher_audit_event(
+        &self,
+        event: PublisherAuditEventRecord,
+    ) -> Result<(), CatalogError>;
+
     /// Register a new author or confirm that an identical author already exists.
     ///
     /// Idempotent for an identical `(pubkey, handle)` pair. Returns

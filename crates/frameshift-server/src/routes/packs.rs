@@ -504,6 +504,7 @@ pub async fn publish_pack(
         content_hash,
         signature: signature_bytes.clone(),
         author_pubkey: pubkey,
+        publisher_key_id: None,
         parent_hash,
         capability_manifest_json,
         schema_version: manifest.schema_version,
@@ -643,15 +644,17 @@ fn map_object_put_error(err: ObjectStoreError) -> AppError {
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```
+/// use frameshift_server::routes::packs::validate_pack_name;
+///
 /// // valid names
-/// validate_pack_name("my-persona").is_ok();
-/// validate_pack_name("MyPersona_v2").is_ok();
+/// assert!(validate_pack_name("my-persona").is_ok());
+/// assert!(validate_pack_name("MyPersona_v2").is_ok());
 ///
 /// // invalid names
-/// validate_pack_name("../etc/passwd").is_err();
-/// validate_pack_name("a/b").is_err();
-/// validate_pack_name("").is_err();
+/// assert!(validate_pack_name("../etc/passwd").is_err());
+/// assert!(validate_pack_name("a/b").is_err());
+/// assert!(validate_pack_name("").is_err());
 /// ```
 pub fn validate_pack_name(name: &str) -> Result<(), AppError> {
     if name.is_empty() {

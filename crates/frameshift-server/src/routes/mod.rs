@@ -12,6 +12,7 @@
 //! - [`admin`] -- `POST /v1/admin/packs/{name}/{version}/tombstone` and other
 //!   allowlist-gated operator endpoints.
 
+pub mod accounts;
 pub mod admin;
 pub mod authors;
 pub mod downloads;

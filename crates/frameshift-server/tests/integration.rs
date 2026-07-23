@@ -84,6 +84,7 @@ fn test_config() -> Arc<ServerConfig> {
         trust_forwarded_for: false,
         signed_request_max_skew: Duration::from_secs(300),
         admin_pubkeys: Vec::new(),
+        oidc: frameshift_server::OidcConfig::disabled(),
         memory_backend: "none".to_string(),
         memory_http_endpoint: String::new(),
         memory_http_auth: "none".to_string(),
@@ -107,6 +108,7 @@ fn make_state(catalog: MockCatalog, objects: MockPackStore) -> AppState {
         auth_nonces: Arc::new(frameshift_server::auth::NonceCache::new(
             Duration::from_secs(600),
         )),
+        account_auth: None,
     }
 }
 
@@ -259,6 +261,7 @@ fn make_pack(name: &str, author: Ed25519PublicKey) -> PackRecord {
     PackRecord {
         name: name.to_string(),
         current_author: author,
+        publisher_id: None,
         tags: vec![],
         description: "test pack".to_string(),
         created_at: Utc::now(),
@@ -282,6 +285,7 @@ fn make_version(
         content_hash: hash,
         signature: vec![0u8; 64],
         author_pubkey: author,
+        publisher_key_id: None,
         parent_hash: None,
         capability_manifest_json: "{}".to_string(),
         schema_version: 1,
@@ -1056,6 +1060,7 @@ fn dl_state_with_rate(catalog: MockCatalog, objects: MockPackStore, rate: u32) -
         trust_forwarded_for: true,
         signed_request_max_skew: Duration::from_secs(300),
         admin_pubkeys: Vec::new(),
+        oidc: frameshift_server::OidcConfig::disabled(),
         memory_backend: "none".to_string(),
         memory_http_endpoint: String::new(),
         memory_http_auth: "none".to_string(),
@@ -1074,6 +1079,7 @@ fn dl_state_with_rate(catalog: MockCatalog, objects: MockPackStore, rate: u32) -
         auth_nonces: Arc::new(frameshift_server::auth::NonceCache::new(
             Duration::from_secs(600),
         )),
+        account_auth: None,
     }
 }
 

@@ -10,6 +10,7 @@ use frameshift_catalog::CatalogBackend;
 use frameshift_memory::MemoryAdapter;
 use frameshift_objects::PackStore;
 
+use crate::account_auth::BearerTokenVerifier;
 use crate::auth::NonceCache;
 use crate::config::ServerConfig;
 use crate::metrics::Metrics;
@@ -19,12 +20,6 @@ use crate::metrics::Metrics;
 /// Holds `Arc`-wrapped references to all backend services so that handlers can
 /// access them via [`axum::extract::State<AppState>`] without any allocation
 /// per request.
-///
-/// # Extension points
-///
-/// Follow-up milestones will add fields here:
-/// - `transparency_log: Option<Arc<dyn TransparencyLog>>` for append-only audit.
-/// - `oauth: Option<Arc<OAuthConfig>>` for OAuth 2.1 endpoints.
 ///
 /// Because `AppState` is `Clone` (cheap Arc clone), adding new `Arc`-wrapped
 /// fields is non-breaking.
@@ -74,4 +69,9 @@ pub struct AppState {
     /// to reject replays within the timestamp-skew window. Shared via `Arc`;
     /// the catalog provides the authoritative cross-instance nonce claim.
     pub auth_nonces: Arc<NonceCache>,
+
+    /// Optional OIDC bearer verifier for account and publisher routes.
+    ///
+    /// `None` keeps all authenticated account routes unmounted.
+    pub account_auth: Option<Arc<dyn BearerTokenVerifier>>,
 }

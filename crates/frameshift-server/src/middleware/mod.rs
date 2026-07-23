@@ -21,6 +21,7 @@
 //! the mutating endpoints, where it buffers and verifies the Ed25519
 //! signed-request envelope.
 
+pub mod account;
 pub mod auth;
 pub mod metrics;
 pub mod request_id;

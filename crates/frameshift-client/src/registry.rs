@@ -831,6 +831,7 @@ mod tests {
         frameshift_catalog::PackRecord {
             name: name.to_string(),
             current_author: frameshift_catalog::Ed25519PublicKey([7u8; 32]),
+            publisher_id: None,
             tags: vec!["demo".to_string()],
             description: "a demo pack".to_string(),
             created_at: chrono::Utc::now(),
@@ -1147,6 +1148,7 @@ mod tests {
             content_hash,
             signature: signature.clone(),
             author_pubkey,
+            publisher_key_id: None,
             parent_hash: None,
             capability_manifest_json: "{}".to_string(),
             schema_version: 1,

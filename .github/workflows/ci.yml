@@ -91,9 +91,11 @@ jobs:
       - run: cargo test --locked --workspace
 
   # The Docker-gated Postgres integration tests. testcontainers starts its own
-  # postgres container against the runner's Docker daemon (no service block or
-  # DATABASE_URL needed); migrations run inside PostgresCatalog::new(). Scoped to
-  # the one crate that owns these tests so --include-ignored stays narrow.
+  # postgres containers against the runner's Docker daemon (no service block or
+  # DATABASE_URL needed); migrations run inside PostgresCatalog::new(). Pre-pull
+  # the shared image once so parallel tests cannot race while populating Docker's
+  # cold image cache. Scoped to the one crate that owns these tests so
+  # --include-ignored stays narrow.
   test-postgres:
     name: Test (Postgres integration)
     runs-on: ubuntu-latest
@@ -105,6 +107,8 @@ jobs:
       - name: Install libpq
         run: sudo apt-get update -q && sudo apt-get install -y libpq-dev
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Pre-pull Postgres image
+        run: docker pull postgres:11-alpine
       - run: cargo test --locked -p frameshift-catalog-postgres -- --include-ignored
 
   # Supply-chain advisory scan against the RustSec database. Now blocking: the

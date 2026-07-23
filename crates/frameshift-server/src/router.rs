@@ -32,6 +32,9 @@
 //! The `download-url` mint endpoint uses its configured per-IP rate limit.
 //! Signed writes and anonymous telemetry use a separate abuse rate to bound
 //! nonce-cache and log-amplification pressure before handler work.
+//! Account and publisher-owner routes carry a separate OIDC bearer layer when
+//! the verifier is configured; public auth metadata and publisher reads remain
+//! available without bearer credentials.
 //!
 //! The mutating endpoints -- `POST /v1/packs`, `POST /v1/authors`, and
 //! `POST /v1/admin/packs/{name}/{version}/tombstone` -- carry the Ed25519
@@ -57,10 +60,12 @@ use tower_http::request_id::{PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::set_header::SetResponseHeaderLayer;
 
 use crate::mcp::mcp_router;
+use crate::middleware::account::require_account;
 use crate::middleware::auth::require_signed_request;
 use crate::middleware::metrics::MetricsLayer;
 use crate::middleware::request_id::RequestIdGenerator;
 use crate::middleware::tracing::make_trace_layer;
+use crate::routes::accounts::{account_write_router, auth_config_router, publisher_read_router};
 use crate::routes::admin::admin_router;
 use crate::routes::authors::{authors_router, authors_write_router};
 use crate::routes::downloads::{dl_router, pack_download_url_router};
@@ -83,6 +88,9 @@ use crate::state::AppState;
 ///     /packs    -- pack read endpoints + POST publish (signed-request)
 ///     /authors  -- GET list (paginated) + lookup; POST register (signed-request)
 ///     /handles  -- handle lookup
+///     /auth/config -- public OIDC capability metadata
+///     /account  -- OIDC-authenticated account profile and memberships
+///     /publishers -- public profiles plus OIDC-authenticated owner operations
 ///     /telemetry -- POST /selection opt-in selection telemetry sink
 ///     /memory   -- GET /health read-only memory backend health
 ///     /admin    -- POST /packs/{name}/{version}/tombstone (signed + allowlist)
@@ -138,13 +146,20 @@ pub fn app(state: AppState) -> Router {
     let telemetry =
         apply_ip_rate_limit(telemetry_router(), &state, state.config.abuse_rate_per_min);
 
-    let v1 = Router::new()
+    let mut v1 = Router::new()
         .nest("/packs", packs)
         .nest("/authors", authors)
         .nest("/handles", handles_router())
+        .nest("/auth", auth_config_router())
+        .nest("/publishers", publisher_read_router())
         .nest("/telemetry", telemetry)
         .nest("/memory", memory_router())
         .nest("/admin", admin);
+
+    if state.account_auth.is_some() {
+        let account_layer = axum::middleware::from_fn_with_state(state.clone(), require_account);
+        v1 = v1.merge(account_write_router().route_layer(account_layer));
+    }
 
     let x_request_id = axum::http::HeaderName::from_static("x-request-id");
 

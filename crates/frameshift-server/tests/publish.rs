@@ -65,6 +65,7 @@ fn test_config_with_abuse_rate(
         trust_forwarded_for,
         signed_request_max_skew: Duration::from_secs(300),
         admin_pubkeys: Vec::new(),
+        oidc: frameshift_server::OidcConfig::disabled(),
         shutdown_grace: Duration::from_secs(1),
         cors_allowed_origins: String::new(),
         download_secret: SecretString::new(String::new()),
@@ -115,6 +116,7 @@ fn make_state_with_config(
         auth_nonces: Arc::new(frameshift_server::auth::NonceCache::new(
             Duration::from_secs(600),
         )),
+        account_auth: None,
     }
 }
 
@@ -273,6 +275,7 @@ fn catalog_with_author(signing: &SigningKey, handle: &str) -> (MockCatalog, Ed25
             PackRecord {
                 name: "demo-pack".to_string(),
                 current_author: pubkey,
+                publisher_id: None,
                 tags: vec![],
                 description: "test".to_string(),
                 created_at: Utc::now(),
