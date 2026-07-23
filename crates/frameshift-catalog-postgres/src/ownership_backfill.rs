@@ -673,7 +673,7 @@ fn validate_handle(handle: &str) -> Result<(), OwnershipBackfillError> {
 
 /// Require timestamps that Postgres can round-trip without precision loss.
 fn validate_timestamp(kind: &str, timestamp: DateTime<Utc>) -> Result<(), OwnershipBackfillError> {
-    if timestamp.nanosecond() % 1_000 != 0 {
+    if !timestamp.nanosecond().is_multiple_of(1_000) {
         return Err(manifest_error(format!(
             "{kind} must use microsecond precision or coarser"
         )));
