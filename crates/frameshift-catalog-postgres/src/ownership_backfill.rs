@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Timelike as _, Utc};
-use diesel::prelude::*;
+use diesel::{ExpressionMethods as _, QueryDsl as _, Queryable, Selectable, SelectableHelper as _};
 use diesel_async::{AsyncPgConnection, RunQueryDsl as _};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
