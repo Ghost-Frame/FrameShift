@@ -27,9 +27,14 @@ frameshift-vault = { path = "../frameshift-vault" }
 # local backend; kept here (rather than pushed out to every caller) so the
 # CLI, daemon, and MCP server share one passphrase-to-`VaultData` path.
 frameshift-vault-local = { path = "../frameshift-vault-local" }
+age.workspace = true
 base64.workspace = true
 ed25519-dalek.workspace = true
+# Serializes cross-process publisher-key inventory mutations.
+fs2.workspace = true
 hex.workspace = true
+# Native Keychain, Credential Manager, and Secret Service storage for publisher seeds.
+keyring.workspace = true
 # Wraps the vault passphrase so it is never accidentally `Debug`-printed or
 # logged; matches how frameshift-vault-local's own recipients are typed.
 secrecy.workspace = true
@@ -42,9 +47,11 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 thiserror.workspace = true
 toml.workspace = true
 tracing.workspace = true
+zeroize.workspace = true
 # Blocking HTTP client -- matches the sync `install` fn signature; avoids pulling tokio into this crate.
 # The `json` feature provides `Response::into_json` for deserializing version records.
 ureq = { version = "2", features = ["json"] }
+url.workspace = true
 # Tar/gzip extraction for registry pack archives.
 tar = "0.4"
 flate2 = "1"

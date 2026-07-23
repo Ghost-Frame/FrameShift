@@ -97,6 +97,63 @@ pub enum ClientError {
         detail: String,
     },
 
+    /// The metadata-only publisher-key inventory failed schema or integrity validation.
+    #[error("publisher key inventory at {path} is invalid: {detail}")]
+    InvalidPublisherKeyInventory {
+        /// Path to the rejected inventory.
+        path: PathBuf,
+        /// Description of the violated inventory invariant.
+        detail: String,
+    },
+
+    /// No publisher key matched the requested local identifier.
+    #[error("publisher key {key_id:?} was not found")]
+    PublisherKeyNotFound {
+        /// Requested stable local key identifier.
+        key_id: String,
+    },
+
+    /// Publisher private material was missing, malformed, or mismatched.
+    #[error("publisher key {key_id:?} secret is unavailable: {detail}")]
+    PublisherKeySecret {
+        /// Stable local identifier of the affected key.
+        key_id: String,
+        /// Sanitized failure detail that never contains the private seed.
+        detail: String,
+    },
+
+    /// The native credential store failed and no encrypted fallback was supplied.
+    #[error(
+        "native publisher key storage is unavailable: {detail}; provide an encrypted fallback passphrase"
+    )]
+    PublisherKeychainUnavailable {
+        /// Sanitized platform credential-store failure.
+        detail: String,
+    },
+
+    /// An age-backed publisher key cannot be opened without its passphrase.
+    #[error("publisher key {key_id:?} requires the encrypted fallback passphrase")]
+    PublisherKeyPassphraseRequired {
+        /// Stable local identifier of the encrypted key.
+        key_id: String,
+    },
+
+    /// Recovery-package encryption, decryption, or validation failed.
+    #[error("publisher key recovery operation at {path} failed: {detail}")]
+    PublisherKeyRecovery {
+        /// Recovery-package or encrypted-seed path involved in the failure.
+        path: PathBuf,
+        /// Sanitized failure detail that never contains a passphrase or seed.
+        detail: String,
+    },
+
+    /// A publisher-key label was empty or exceeded the supported bound.
+    #[error("publisher key label must contain 1 to {max_chars} characters")]
+    InvalidPublisherKeyLabel {
+        /// Maximum accepted Unicode scalar count.
+        max_chars: usize,
+    },
+
     /// Failed to serialize a JSON request body for a registry call.
     #[error("failed to serialize request JSON: {0}")]
     JsonSerialize(String),

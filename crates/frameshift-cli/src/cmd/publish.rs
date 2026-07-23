@@ -11,6 +11,7 @@ use clap::Args;
 use frameshift_client::{Client, ClientError};
 use frameshift_source::render::{render_to_markdown, RenderTarget};
 
+use crate::cmd::keys::{access_token_from_env, with_key_passphrase};
 use crate::util::{load_persona_by_name, validate_server_url, CliError};
 
 /// Default pack version when a persona source declares none.
@@ -94,11 +95,20 @@ pub fn run_publish(args: PublishArgs) -> Result<(), CliError> {
     // Synthesize a pack.toml so the directory loads as a Pack. The author
     // pubkey is the managed signing key's public key (hex), matching the
     // frameshift-seed convention.
-    let author_pubkey_hex = client.author_pubkey_hex()?;
+    let access_token = access_token_from_env()?;
+    let (signing_key, _) =
+        with_key_passphrase(|passphrase| client.author_signing_key_with_passphrase(passphrase))?;
+    let author_pubkey_hex = frameshift_client::identity::public_key_hex(&signing_key);
     write_pack_toml(&out_dir, &pack_name, &version, handle, &author_pubkey_hex)?;
 
     // Pack, sign, and upload.
-    match client.publish_pack_dir(server, &out_dir, handle) {
+    match client.publish_pack_dir_with_signing_key_and_auth(
+        server,
+        &out_dir,
+        handle,
+        &signing_key,
+        access_token.as_ref(),
+    ) {
         Ok(outcome) => {
             println!(
                 "uploaded {} v{} as {} (pack_hash {})",
@@ -110,9 +120,10 @@ pub fn run_publish(args: PublishArgs) -> Result<(), CliError> {
         // machine's key. Point the user at `frameshift register`.
         Err(ClientError::RegistryRejected { status: 401, .. }) => Err(CliError::Publish(format!(
             "registry rejected the upload (HTTP 401). Register this machine's key first: \
-             frameshift register --server {server} --handle {handle}"
+             frameshift register --server {server} --handle {handle}; account-owned publishers \
+             must also set FRAMESHIFT_ACCESS_TOKEN"
         ))),
-        Err(e) => Err(CliError::Client(e)),
+        Err(error) => Err(CliError::Client(error)),
     }
 }
 

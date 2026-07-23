@@ -8,6 +8,7 @@ pub mod config;
 pub mod diff;
 pub mod feedback;
 pub mod grow;
+pub mod keys;
 pub mod migrate;
 pub mod prefs;
 pub mod publish;

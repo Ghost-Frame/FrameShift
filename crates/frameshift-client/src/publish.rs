@@ -8,11 +8,8 @@
 //!
 //! # Author key
 //!
-//! The author's Ed25519 signing key is a managed file in the central data root
-//! ([`load_or_create_signing_key`]): a raw 32-byte seed at
-//! `identity/ed25519-signing-key.bin`, `0o600`, created on first use. This
-//! mirrors the proven `frameshift-seed` key handling; the age vault schema
-//! cannot hold a private signing key, so a dedicated file is used instead.
+//! The caller supplies an Ed25519 signing key loaded through the versioned
+//! publisher-key inventory. This module never reads or persists private seeds.
 //!
 //! # Publish flow
 //!
@@ -20,7 +17,7 @@
 //! 2. Sign the pack's canonical hash -> the 64-byte `signature` field.
 //! 3. Pack the directory into a gzipped tar (excluding `signature.sig`).
 //! 4. Build a `multipart/form-data` body (`pack`, `signature`, `author_handle`).
-//! 5. Sign the request envelope over `POST /v1/packs` + the body hash.
+//! 5. Sign the request envelope over `POST` + the resolved endpoint path + body hash.
 //! 6. `POST` and parse the [`PublishOutcome`].
 
 use std::fs;
@@ -32,10 +29,12 @@ use base64::Engine as _;
 use ed25519_dalek::{Signer as _, SigningKey};
 use frameshift_pack::Pack;
 use rand_core::{OsRng, RngCore as _};
+use secrecy::SecretString;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::error::ClientError;
+use crate::identity::public_key_b64;
 
 /// Domain-separation prefix for the signed-request envelope.
 ///
@@ -43,9 +42,6 @@ use crate::error::ClientError;
 /// signature (over the canonical hash) carries no such prefix, so a captured
 /// pack signature can never be replayed as a request signature and vice versa.
 const SIGNING_DOMAIN: &str = "frameshift-signed-request/v1";
-
-/// Relative path of the managed author signing key within the central data root.
-const SIGNING_KEY_REL: &str = "identity/ed25519-signing-key.bin";
 
 /// Outcome of a successful publish, deserialized from the server's
 /// `PublishResponse` JSON body.
@@ -61,134 +57,10 @@ pub struct PublishOutcome {
     pub author_handle: String,
 }
 
-/// Load the author's Ed25519 signing key from the central data root, creating
-/// and persisting a fresh key (`0o600`) on first use.
-///
-/// The key is a raw 32-byte seed. A file of any other length is a hard error
-/// rather than a silently regenerated key, so a corrupt or truncated key never
-/// masquerades as a new identity.
-pub fn load_or_create_signing_key(data_root: &Path) -> Result<SigningKey, ClientError> {
-    let path = data_root.join(SIGNING_KEY_REL);
-    match fs::symlink_metadata(&path) {
-        Ok(_) => return load_existing_signing_key(&path),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(source) => {
-            return Err(ClientError::Io {
-                path: path.clone(),
-                source,
-            });
-        }
-    }
-
-    // First use: generate and persist atomically. `create_new` fails if the
-    // file already exists, which closes the check-then-write race -- two
-    // concurrent first-use callers can no longer each write a different key and
-    // let "last write win" (which would silently change the author identity).
-    // On Unix the 0o600 mode is applied at open() time, so the secret seed is
-    // never world-readable even for an instant. If another process wins the
-    // race (AlreadyExists), we load and use the key it persisted.
-    let key = SigningKey::generate(&mut OsRng);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|source| ClientError::Io {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-    }
-
-    let mut open_opts = fs::OpenOptions::new();
-    open_opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        open_opts.mode(0o600);
-    }
-
-    match open_opts.open(&path) {
-        Ok(mut file) => {
-            use std::io::Write as _;
-            file.write_all(&key.to_bytes())
-                .map_err(|source| ClientError::Io {
-                    path: path.clone(),
-                    source,
-                })?;
-            Ok(key)
-        }
-        // Another process created the key between our `exists` check and here;
-        // adopt the winner's key so the author identity stays stable.
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => load_existing_signing_key(&path),
-        Err(source) => Err(ClientError::Io {
-            path: path.clone(),
-            source,
-        }),
-    }
-}
-
-/// Load a regular signing-key file without following symlinks.
-fn load_existing_signing_key(path: &Path) -> Result<SigningKey, ClientError> {
-    let metadata = fs::symlink_metadata(path).map_err(|source| ClientError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    if !metadata.file_type().is_file() {
-        return Err(ClientError::InvalidSigningKey {
-            path: path.to_path_buf(),
-            detail: "key path is not a regular file".to_string(),
-        });
-    }
-    let mut options = fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    let file = options.open(path).map_err(|source| ClientError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        file.set_permissions(fs::Permissions::from_mode(0o600))
-            .map_err(|source| ClientError::Io {
-                path: path.to_path_buf(),
-                source,
-            })?;
-    }
-    use std::io::Read as _;
-    let mut bytes = Vec::with_capacity(33);
-    file.take(33)
-        .read_to_end(&mut bytes)
-        .map_err(|source| ClientError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    let seed: [u8; 32] =
-        bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| ClientError::InvalidSigningKey {
-                path: path.to_path_buf(),
-                detail: format!("expected 32-byte seed, found {} bytes", bytes.len()),
-            })?;
-    Ok(SigningKey::from_bytes(&seed))
-}
-
-/// The base64url-no-pad public key string for a signing key, matching the
-/// `Ed25519PublicKey` wire encoding the server registers and looks up.
-pub fn public_key_b64(key: &SigningKey) -> String {
-    URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes())
-}
-
-/// The lowercase-hex public key string used in synthesized `pack.toml`
-/// manifests (informational; the catalog binds handles to typed keys).
-pub fn public_key_hex(key: &SigningKey) -> String {
-    hex::encode(key.verifying_key().to_bytes())
-}
-
 /// Register the managed author key under `handle` at the registry.
 ///
-/// Sends a signed `POST /v1/authors` with a JSON body `{handle, display_name?}`.
+/// Sends a signed author-registration `POST` with a JSON body
+/// `{handle, display_name?}`.
 /// The server takes the public key from the verified request signer, so this
 /// claims `handle` for the local managed key. A `409` means the handle is taken
 /// by another key (or this key already owns a different handle).
@@ -205,17 +77,16 @@ pub fn register_author(
     let body =
         serde_json::to_vec(&body_value).map_err(|e| ClientError::JsonSerialize(e.to_string()))?;
 
-    let base = server_url.trim_end_matches('/');
-    let url = format!("{base}/v1/authors");
-    let headers = signed_headers(key, "POST", "/v1/authors", &body);
+    let url = crate::publisher::registry_endpoint_url(server_url, &["v1", "authors"])?;
+    let headers = signed_headers(key, "POST", url.path(), &body);
 
     let mut req = crate::registry::http_agent()
-        .post(&url)
+        .post(url.as_str())
         .set("Content-Type", "application/json");
     for header in &headers {
         req = req.set(header.name, &header.value);
     }
-    send_signed(req, &url, &body).map(|_| ())
+    send_signed(req, url.as_str(), &body).map(|_| ())
 }
 
 /// Pack, sign, and upload `pack_dir` to the registry under `author_handle`.
@@ -227,6 +98,7 @@ pub fn publish_pack_dir(
     key: &SigningKey,
     pack_dir: &Path,
     author_handle: &str,
+    access_token: Option<&SecretString>,
 ) -> Result<PublishOutcome, ClientError> {
     // Load the pack and sign its canonical hash. We sign the hash directly
     // rather than via Pack::sign so the on-disk pack directory is not mutated
@@ -249,20 +121,22 @@ pub fn publish_pack_dir(
 
     // Assemble the multipart body and sign the request over it.
     let (boundary, body) = build_publish_multipart(&pack_targz, &signature, author_handle);
-    let base = server_url.trim_end_matches('/');
-    let url = format!("{base}/v1/packs");
-    let headers = signed_headers(key, "POST", "/v1/packs", &body);
+    let url = crate::publisher::registry_endpoint_url(server_url, &["v1", "packs"])?;
+    let headers = signed_headers(key, "POST", url.path(), &body);
     let content_type = format!("multipart/form-data; boundary={boundary}");
 
     let mut req = crate::registry::http_agent()
-        .post(&url)
+        .post(url.as_str())
         .set("Content-Type", &content_type);
     for header in &headers {
         req = req.set(header.name, &header.value);
     }
-    let response = send_signed(req, &url, &body)?;
+    if let Some(access_token) = access_token {
+        req = crate::publisher::with_bearer(req, access_token);
+    }
+    let response = send_signed(req, url.as_str(), &body)?;
 
-    crate::registry::response_json_bounded::<PublishOutcome>(response, &url)
+    crate::registry::response_json_bounded::<PublishOutcome>(response, url.as_str())
 }
 
 /// Send a prepared signed request body, mapping non-2xx statuses to
@@ -466,23 +340,6 @@ mod tests {
         SigningKey::from_bytes(&[7u8; 32])
     }
 
-    /// load_or_create persists a 32-byte key and reloads it identically.
-    #[test]
-    fn signing_key_load_or_create_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
-        let first = load_or_create_signing_key(dir.path()).unwrap();
-        let key_path = dir.path().join(SIGNING_KEY_REL);
-        assert!(key_path.is_file(), "key file must be created");
-        assert_eq!(fs::read(&key_path).unwrap().len(), 32, "raw 32-byte seed");
-
-        let second = load_or_create_signing_key(dir.path()).unwrap();
-        assert_eq!(
-            first.to_bytes(),
-            second.to_bytes(),
-            "reload must return the same key"
-        );
-    }
-
     /// A pack still carrying the local-unsigned author_pubkey sentinel must be
     /// refused before signing or any network activity, with a typed error.
     #[test]
@@ -499,42 +356,12 @@ mod tests {
 
         // Unroutable URL: if the guard is missing, the failure mode would be a
         // network error instead of the typed rejection this asserts on.
-        let err = publish_pack_dir("http://127.0.0.1:1", &test_key(), &pack_dir, "local")
+        let err = publish_pack_dir("http://127.0.0.1:1", &test_key(), &pack_dir, "local", None)
             .expect_err("sentinel pack must not publish");
         assert!(
             matches!(err, ClientError::PublishLocalUnsigned { ref name } if name == "legacy"),
             "expected PublishLocalUnsigned, got: {err:?}"
         );
-    }
-
-    /// A corrupt (wrong-length) key file is an error, not a silent regeneration.
-    #[test]
-    fn signing_key_wrong_length_is_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let key_path = dir.path().join(SIGNING_KEY_REL);
-        fs::create_dir_all(key_path.parent().unwrap()).unwrap();
-        fs::write(&key_path, b"too short").unwrap();
-
-        let err = load_or_create_signing_key(dir.path()).unwrap_err();
-        assert!(matches!(err, ClientError::InvalidSigningKey { .. }));
-    }
-
-    /// Existing signing-key symlinks are rejected rather than followed.
-    #[cfg(unix)]
-    #[test]
-    fn signing_key_symlink_is_rejected() {
-        use std::os::unix::fs::symlink;
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("target-key");
-        fs::write(&target, [9u8; 32]).unwrap();
-        let key_path = dir.path().join(SIGNING_KEY_REL);
-        fs::create_dir_all(key_path.parent().unwrap()).unwrap();
-        symlink(&target, &key_path).unwrap();
-
-        assert!(matches!(
-            load_or_create_signing_key(dir.path()),
-            Err(ClientError::InvalidSigningKey { .. })
-        ));
     }
 
     /// The signed-request envelope reproduces the exact server signing string and
@@ -655,8 +482,13 @@ mod tests {
             let timestamp = hdr.get("x-frameshift-timestamp").unwrap();
             let nonce = hdr.get("x-frameshift-nonce").unwrap();
             let body_hex = hex::encode(Sha256::digest(&body));
+            let request_path = request_line
+                .split_whitespace()
+                .nth(1)
+                .expect("request line must include a path");
+            assert_eq!(request_path, "/registry/v1/packs");
             let message =
-                format!("{SIGNING_DOMAIN}\nPOST\n/v1/packs\n{body_hex}\n{timestamp}\n{nonce}");
+                format!("{SIGNING_DOMAIN}\nPOST\n{request_path}\n{body_hex}\n{timestamp}\n{nonce}");
             let pk_bytes: [u8; 32] = URL_SAFE_NO_PAD
                 .decode(hdr.get("x-frameshift-pubkey").unwrap())
                 .unwrap()
@@ -691,8 +523,8 @@ mod tests {
             (envelope_ok, fields_ok)
         });
 
-        let url = format!("http://127.0.0.1:{port}");
-        let outcome = publish_pack_dir(&url, &key, pack.path(), "alice").unwrap();
+        let url = format!("http://127.0.0.1:{port}/registry");
+        let outcome = publish_pack_dir(&url, &key, pack.path(), "alice", None).unwrap();
         assert_eq!(outcome.name, "demo");
         assert_eq!(outcome.version, "0.1.0");
         assert_eq!(outcome.author_handle, "alice");

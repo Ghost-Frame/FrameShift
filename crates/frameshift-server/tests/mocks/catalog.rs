@@ -251,6 +251,11 @@ impl CatalogBackend for MockCatalog {
         }
         if state.publishers.contains_key(&profile.id)
             || state.publisher_handles.contains_key(&profile.handle)
+            || state.handles.contains_key(&profile.handle)
+            || state
+                .authors
+                .values()
+                .any(|author| author.handle == profile.handle)
         {
             return Err(CatalogError::Conflict {
                 kind: "publisher",
@@ -365,33 +370,43 @@ impl CatalogBackend for MockCatalog {
             })
     }
 
-    /// Enroll a public signing key while enforcing global key uniqueness.
+    /// Enroll a public signing key idempotently while enforcing global uniqueness.
     async fn create_publisher_key(
         &self,
         record: PublisherKeyRecord,
         audit: Option<PublisherAuditEventRecord>,
-    ) -> Result<(), CatalogError> {
+    ) -> Result<PublisherKeyRecord, CatalogError> {
         validate_audit(audit.as_ref(), Some(record.publisher_id))?;
         let mut state = self
             .state
             .write()
             .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
-        if state.publisher_keys.contains_key(&record.id)
-            || state
-                .publisher_keys
-                .values()
-                .any(|existing| existing.public_key == record.public_key)
+        if let Some(existing) = state
+            .publisher_keys
+            .values()
+            .find(|existing| existing.public_key == record.public_key)
         {
+            if existing.publisher_id == record.publisher_id
+                && existing.state == PublisherKeyState::Active
+            {
+                return Ok(existing.clone());
+            }
             return Err(CatalogError::Conflict {
                 kind: "publisher_key",
                 key: record.public_key.to_string(),
             });
         }
-        state.publisher_keys.insert(record.id, record);
+        if state.publisher_keys.contains_key(&record.id) {
+            return Err(CatalogError::Conflict {
+                kind: "publisher_key",
+                key: record.id.to_string(),
+            });
+        }
+        state.publisher_keys.insert(record.id, record.clone());
         if let Some(audit) = audit {
             state.publisher_audit_events.push(audit);
         }
-        Ok(())
+        Ok(record)
     }
 
     /// List a publisher's enrolled public keys.
@@ -488,6 +503,12 @@ impl CatalogBackend for MockCatalog {
             .state
             .write()
             .map_err(|e| CatalogError::BackendError(e.to_string().into()))?;
+        if state.publisher_handles.contains_key(&record.handle) {
+            return Err(CatalogError::Conflict {
+                kind: "author",
+                key: record.handle,
+            });
+        }
         if state.inject_conflict {
             state.inject_conflict = false;
             return Err(CatalogError::Conflict {
@@ -585,10 +606,60 @@ impl CatalogBackend for MockCatalog {
             .state
             .write()
             .map_err(|e| CatalogError::BackendError(e.to_string().into()))?;
+        let publisher_id = match record.publisher_key_id {
+            Some(key_id) => {
+                let key = state.publisher_keys.get(&key_id).ok_or_else(|| {
+                    CatalogError::Unauthorized {
+                        kind: "publisher_key",
+                        key: key_id.to_string(),
+                    }
+                })?;
+                if key.state != PublisherKeyState::Active || key.public_key != record.author_pubkey
+                {
+                    return Err(CatalogError::Unauthorized {
+                        kind: "publisher_key",
+                        key: key_id.to_string(),
+                    });
+                }
+                Some(key.publisher_id)
+            }
+            None => None,
+        };
+        if let Some(pack) = state.packs.get(&record.pack_name) {
+            let ownership_matches = match (pack.publisher_id, publisher_id) {
+                (Some(existing), Some(incoming)) => existing == incoming,
+                (None, None) => pack.current_author == record.author_pubkey,
+                _ => false,
+            };
+            if !ownership_matches {
+                return Err(CatalogError::Unauthorized {
+                    kind: "pack",
+                    key: record.pack_name.clone(),
+                });
+            }
+        }
+        let publisher_key_ids: Vec<_> = publisher_id
+            .map(|publisher_id| {
+                state
+                    .publisher_keys
+                    .values()
+                    .filter(|key| key.publisher_id == publisher_id)
+                    .map(|key| key.id)
+                    .collect()
+            })
+            .unwrap_or_default();
         let existing: Vec<&PackVersionRecord> = state
             .versions
             .values()
-            .filter(|version| version.author_pubkey == record.author_pubkey)
+            .filter(|version| {
+                if publisher_id.is_some() {
+                    version
+                        .publisher_key_id
+                        .is_some_and(|key_id| publisher_key_ids.contains(&key_id))
+                } else {
+                    version.author_pubkey == record.author_pubkey
+                }
+            })
             .collect();
         let next_versions = existing.len() as u64 + 1;
         let next_bytes = existing
@@ -625,7 +696,43 @@ impl CatalogBackend for MockCatalog {
             ));
         }
         let k = (record.pack_name.clone(), record.version.clone());
+        if state.versions.contains_key(&k) {
+            return Err(CatalogError::Conflict {
+                kind: "pack_version",
+                key: format!("{}@{}", record.pack_name, record.version),
+            });
+        }
+        let pack_name = record.pack_name.clone();
+        let version = record.version.clone();
+        let author_pubkey = record.author_pubkey;
+        let publisher_key_id = record.publisher_key_id;
         state.versions.insert(k, record);
+        let pack = state
+            .packs
+            .entry(pack_name.clone())
+            .or_insert_with(|| PackRecord {
+                name: pack_name,
+                current_author: author_pubkey,
+                publisher_id,
+                tags: Vec::new(),
+                description: String::new(),
+                created_at: Utc::now(),
+                latest_version: None,
+                total_downloads: 0,
+                extends: None,
+            });
+        if pack
+            .latest_version
+            .as_deref()
+            .is_none_or(|current| semver_gt(&version, current))
+        {
+            pack.latest_version = Some(version);
+        }
+        if let Some(key_id) = publisher_key_id {
+            if let Some(key) = state.publisher_keys.get_mut(&key_id) {
+                key.last_used_at = Some(Utc::now());
+            }
+        }
         Ok(())
     }
 
@@ -845,6 +952,12 @@ impl CatalogBackend for MockCatalog {
             .state
             .write()
             .map_err(|e| CatalogError::BackendError(e.to_string().into()))?;
+        if state.publisher_handles.contains_key(handle) {
+            return Err(CatalogError::Conflict {
+                kind: "handle",
+                key: handle.to_string(),
+            });
+        }
         state.handles.insert(handle.to_string(), pubkey);
         Ok(())
     }

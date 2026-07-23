@@ -30,15 +30,24 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use frameshift_catalog::filters::{PackSearchFilters, SortMode};
 use frameshift_catalog::records::PackVersionRecord;
 use frameshift_catalog::status::PackStatus;
-use frameshift_catalog::CatalogError;
 use frameshift_catalog::Ed25519PublicKey;
+use frameshift_catalog::{CatalogError, MembershipState, PublisherKeyState, PublisherRole};
 use frameshift_objects::{ObjectHash, ObjectStoreError};
 use frameshift_pack::Pack;
 use serde::{Deserialize, Serialize};
 
 use crate::auth::VerifiedSigner;
 use crate::error::AppError;
+use crate::middleware::account::AuthenticatedAccount;
 use crate::state::AppState;
+
+/// Resolved signing authority for one legacy author or account-backed publisher.
+struct PublishAuthority {
+    /// Public key used to verify both request and pack signatures.
+    pubkey: Ed25519PublicKey,
+    /// Enrolled key identifier for account-backed publisher history.
+    publisher_key_id: Option<uuid::Uuid>,
+}
 
 /// Build the packs **read** sub-router, mounted at `/v1/packs`.
 ///
@@ -293,20 +302,19 @@ fn find_pack_root(extract_dir: &std::path::Path) -> Result<std::path::PathBuf, A
 /// - `pack`: the pack contents as a gzipped tar archive.
 /// - `signature`: the raw 64-byte Ed25519 signature over the canonical pack
 ///   hash (the same value returned by [`frameshift_pack::Pack::canonical_hash`]).
-/// - `author_handle`: the handle of the publishing author. Used to look up the
-///   registered Ed25519 public key in the catalog; the signature is verified
-///   against that key.
+/// - `author_handle`: the legacy author or account-backed publisher handle.
 ///
 /// # Authentication
 ///
 /// The mutating route carries the signed-request layer
 /// ([`crate::middleware::auth::require_signed_request`]), so by the time this
 /// handler runs a [`VerifiedSigner`] extension is present, proving the live
-/// request was signed by some Ed25519 key. This handler additionally enforces
-/// **authorization**: the verified signer MUST be the key currently registered
-/// for `author_handle`, and the pack's own content signature MUST verify
-/// against that same key. A live request signed by a different key than the
-/// handle's owner is rejected as `401`.
+/// request was signed by some Ed25519 key. Legacy handles require the verified
+/// signer to remain their registered author key. Account-backed publisher
+/// handles additionally require a validated bearer account with an active
+/// owner membership, and the request signer must be an active enrolled key for
+/// that publisher. The pack content signature is verified against the same
+/// request signer in both modes.
 ///
 /// # Response
 ///
@@ -319,14 +327,16 @@ fn find_pack_root(extract_dir: &std::path::Path) -> Result<std::path::PathBuf, A
 ///   does not match the supplied `author_handle`, or the manifest carries the
 ///   `local-unsigned` author_pubkey sentinel (reserved for unsigned local
 ///   packs, never publishable).
-/// - `401 Unauthorized` -- author handle not registered, the verified request
-///   signer is not the handle's owner, or the pack content signature does not
-///   verify against the registered key.
+/// - `401 Unauthorized` -- author handle not registered, account bearer is
+///   absent or invalid for an account-backed publisher, request signer is not
+///   authorized, or the pack content signature does not verify.
+/// - `403 Forbidden` -- bearer account lacks an active owner membership.
 /// - `409 Conflict` -- `(name, version)` already published.
 /// - `500 Internal Server Error` -- catalog or object store backend failure.
 pub async fn publish_pack(
     State(state): State<AppState>,
     Extension(signer): Extension<VerifiedSigner>,
+    authenticated: Option<Extension<AuthenticatedAccount>>,
     multipart: Multipart,
 ) -> Result<Response, AppError> {
     if state.config.publisher_pubkeys.is_empty() {
@@ -359,33 +369,14 @@ pub async fn publish_pack(
         .map_err(|_| AppError::BadRequest("signature must be 64 bytes".to_string()))?;
     let signature = Signature::from_bytes(&sig_arr);
 
-    // Look up the author's registered Ed25519 pubkey via the handle. A missing
-    // handle is an authentication failure (401), not a 404, because the caller
-    // is asserting authority they do not actually hold.
-    let pubkey = match state.catalog.get_handle_pubkey(&author_handle).await {
-        Ok(k) => k,
-        Err(CatalogError::NotFound { .. }) => {
-            // Log the handle internally but return a fixed message so the
-            // response cannot be used to enumerate which handles are registered.
-            tracing::warn!(handle = %author_handle, "publish attempt for unregistered author handle");
-            return Err(AppError::Unauthorized("authentication failed".to_string()));
-        }
-        Err(e) => return Err(AppError::from_catalog(e, "handle")),
-    };
-
-    // Authorization: the live, signed request MUST come from the key that owns
-    // this handle. The signed-request middleware proved the caller controls
-    // `signer.pubkey`; here we bind that identity to the claimed handle so a
-    // caller cannot publish under a handle they do not control. The message is
-    // the same opaque "authentication failed" returned elsewhere.
-    if signer.pubkey != pubkey {
-        tracing::warn!(
-            handle = %author_handle,
-            signer = %signer.pubkey,
-            "publish attempt where request signer is not the handle owner"
-        );
-        return Err(AppError::Unauthorized("authentication failed".to_string()));
-    }
+    let authority = resolve_publish_authority(
+        &state,
+        &author_handle,
+        signer.pubkey,
+        authenticated.as_ref().map(|extension| &extension.0),
+    )
+    .await?;
+    let pubkey = authority.pubkey;
 
     let verifying_key = VerifyingKey::from_bytes(&pubkey.0)
         .map_err(|e| AppError::Internal(format!("invalid registered pubkey: {e}")))?;
@@ -504,7 +495,7 @@ pub async fn publish_pack(
         content_hash,
         signature: signature_bytes.clone(),
         author_pubkey: pubkey,
-        publisher_key_id: None,
+        publisher_key_id: authority.publisher_key_id,
         parent_hash,
         capability_manifest_json,
         schema_version: manifest.schema_version,
@@ -618,6 +609,87 @@ pub async fn publish_pack(
         author_handle,
     };
     Ok((StatusCode::OK, Json(response)).into_response())
+}
+
+/// Resolve legacy handle ownership or require an active account-backed publisher authority.
+async fn resolve_publish_authority(
+    state: &AppState,
+    author_handle: &str,
+    signer_pubkey: Ed25519PublicKey,
+    authenticated: Option<&AuthenticatedAccount>,
+) -> Result<PublishAuthority, AppError> {
+    let publisher = match state.catalog.get_publisher_by_handle(author_handle).await {
+        Ok(profile) => Some(profile),
+        Err(CatalogError::NotFound { .. }) => None,
+        Err(error) => return Err(AppError::from_catalog(error, "publisher")),
+    };
+    let legacy_pubkey = match state.catalog.get_handle_pubkey(author_handle).await {
+        Ok(pubkey) => Some(pubkey),
+        Err(CatalogError::NotFound { .. }) => None,
+        Err(error) => return Err(AppError::from_catalog(error, "handle")),
+    };
+
+    match (publisher, legacy_pubkey) {
+        (Some(_), Some(_)) => Err(AppError::Conflict(format!(
+            "publisher and legacy author both claim handle {author_handle}"
+        ))),
+        (Some(profile), None) => {
+            let authenticated = authenticated
+                .ok_or_else(|| AppError::Unauthorized("authentication failed".to_string()))?;
+            let membership = state
+                .catalog
+                .get_publisher_membership(authenticated.account.id, profile.id)
+                .await
+                .map_err(|error| match error {
+                    CatalogError::NotFound { .. } => {
+                        AppError::Forbidden("active publisher ownership required".to_string())
+                    }
+                    other => AppError::from_catalog(other, "publisher membership"),
+                })?;
+            if membership.role != PublisherRole::Owner
+                || membership.state != MembershipState::Active
+            {
+                return Err(AppError::Forbidden(
+                    "active publisher ownership required".to_string(),
+                ));
+            }
+            let key = state
+                .catalog
+                .list_publisher_keys(profile.id)
+                .await
+                .map_err(|error| AppError::from_catalog(error, "publisher key"))?
+                .into_iter()
+                .find(|key| {
+                    key.public_key == signer_pubkey && key.state == PublisherKeyState::Active
+                })
+                .ok_or_else(|| AppError::Unauthorized("authentication failed".to_string()))?;
+            Ok(PublishAuthority {
+                pubkey: signer_pubkey,
+                publisher_key_id: Some(key.id),
+            })
+        }
+        (None, Some(pubkey)) => {
+            if signer_pubkey != pubkey {
+                tracing::warn!(
+                    handle = %author_handle,
+                    signer = %signer_pubkey,
+                    "publish attempt where request signer is not the handle owner"
+                );
+                return Err(AppError::Unauthorized("authentication failed".to_string()));
+            }
+            Ok(PublishAuthority {
+                pubkey,
+                publisher_key_id: None,
+            })
+        }
+        (None, None) => {
+            tracing::warn!(
+                handle = %author_handle,
+                "publish attempt for unregistered author handle"
+            );
+            Err(AppError::Unauthorized("authentication failed".to_string()))
+        }
+    }
 }
 
 /// Map an [`ObjectStoreError`] from a publish-time `put` into the appropriate

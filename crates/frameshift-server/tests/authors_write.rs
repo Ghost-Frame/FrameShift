@@ -12,11 +12,12 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use chrono::Utc;
 use ed25519_dalek::SigningKey;
 use secrecy::SecretString;
 use tower::ServiceExt as _;
 
-use frameshift_catalog::identity::Ed25519PublicKey;
+use frameshift_catalog::{Ed25519PublicKey, PublisherModerationStatus, PublisherProfileRecord};
 
 use frameshift_server::metrics::Metrics;
 use frameshift_server::{app, AppState, LogFormat, ServerConfig};
@@ -220,6 +221,43 @@ async fn register_handle_owned_only_in_handles_table_returns_409() {
         Some(owner_pubkey),
         "attacker must not overwrite the existing handle owner"
     );
+}
+
+/// Legacy registration cannot claim an account-backed publisher handle.
+#[tokio::test]
+async fn register_publisher_handle_returns_409() {
+    let signing = SigningKey::from_bytes(&[42_u8; 32]);
+    let catalog = MockCatalog::new();
+    let publisher_id = uuid::Uuid::new_v4();
+    let now = Utc::now();
+    {
+        let mut state = catalog.state.write().unwrap();
+        state
+            .publisher_handles
+            .insert("publisher-owned".to_string(), publisher_id);
+        state.publishers.insert(
+            publisher_id,
+            PublisherProfileRecord {
+                id: publisher_id,
+                handle: "publisher-owned".to_string(),
+                display_name: "Publisher Owned".to_string(),
+                biography: None,
+                moderation_status: PublisherModerationStatus::Approved,
+                created_at: now,
+                updated_at: now,
+            },
+        );
+    }
+
+    let response = post_signed_json(
+        mk_state(catalog.clone()),
+        "/v1/authors",
+        serde_json::json!({ "handle": "publisher-owned" }),
+        Some(&signing),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(catalog.state.read().unwrap().authors.is_empty());
 }
 
 // ---------------------------------------------------------------------------

@@ -27,24 +27,51 @@ pub async fn require_account(
     mut request: Request,
     next: Next,
 ) -> Result<Response, AppError> {
+    let authenticated = authenticate_account(&state, request.headers()).await?;
+    request.extensions_mut().insert(authenticated);
+    Ok(next.run(request).await)
+}
+
+/// Authenticate a bearer token when one is present and otherwise continue anonymously.
+pub async fn resolve_optional_account(
+    State(state): State<AppState>,
+    mut request: Request,
+    next: Next,
+) -> Result<Response, AppError> {
+    let has_bearer = request
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("Bearer "));
+    if has_bearer {
+        let authenticated = authenticate_account(&state, request.headers()).await?;
+        request.extensions_mut().insert(authenticated);
+    }
+    Ok(next.run(request).await)
+}
+
+/// Validate the request bearer token and resolve its active durable account.
+async fn authenticate_account(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+) -> Result<AuthenticatedAccount, AppError> {
     let verifier = state
         .account_auth
         .as_ref()
         .ok_or_else(|| AppError::NotFound("account routes are disabled".to_string()))?;
-    let token = extract_bearer(request.headers())?;
+    let token = extract_bearer(headers)?;
     let identity = verifier.verify(token).await.map_err(map_auth_error)?;
-    let account = resolve_account(&state, &identity).await?;
+    let account = resolve_account(state, &identity).await?;
     match account.status {
         AccountStatus::Active => {}
         AccountStatus::Suspended | AccountStatus::Disabled => {
             return Err(AppError::Forbidden("account is not active".to_string()));
         }
     }
-    request.extensions_mut().insert(AuthenticatedAccount {
+    Ok(AuthenticatedAccount {
         account,
         auth_time: identity.auth_time,
-    });
-    Ok(next.run(request).await)
+    })
 }
 
 /// Parse one strict `Authorization: Bearer <token>` header.

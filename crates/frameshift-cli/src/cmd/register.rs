@@ -5,8 +5,9 @@
 //! `frameshift publish --server`, which signs uploads with the same key.
 
 use clap::Args;
-use frameshift_client::Client;
+use frameshift_client::{identity, Client};
 
+use crate::cmd::keys::with_key_passphrase;
 use crate::util::{validate_server_url, CliError};
 
 /// Arguments for the `register` subcommand.
@@ -33,10 +34,19 @@ pub fn run_register(args: RegisterArgs) -> Result<(), CliError> {
     validate_server_url(&args.server)?;
     let client = Client::with_default_data_root()?;
 
-    // Resolve the public key first so the success line can echo it even though
-    // the server derives the key from the request signature itself.
-    let pubkey = client.author_pubkey_b64()?;
-    client.register_author(&args.server, &args.handle, args.display_name.as_deref())?;
+    // Resolve and register inside one passphrase-aware operation so an
+    // encrypted fallback key never needs to leak through command arguments.
+    let (pubkey, _) = with_key_passphrase(|passphrase| {
+        let key = client.author_signing_key_with_passphrase(passphrase)?;
+        let pubkey = identity::public_key_b64(&key);
+        client.register_author_with_signing_key(
+            &args.server,
+            &args.handle,
+            args.display_name.as_deref(),
+            &key,
+        )?;
+        Ok(pubkey)
+    })?;
 
     println!(
         "registered handle '{}' -> {} at {}",

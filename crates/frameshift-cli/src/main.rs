@@ -20,6 +20,7 @@ use cmd::config::ConfigArgs;
 use cmd::diff::DiffArgs;
 use cmd::feedback::FeedbackArgs;
 use cmd::grow::GrowArgs;
+use cmd::keys::KeysArgs;
 use cmd::migrate::MigrateArgs;
 use cmd::prefs::PrefsArgs;
 use cmd::publish::PublishArgs;
@@ -115,6 +116,9 @@ enum Command {
 
     /// Register this machine's author key under a handle at the registry.
     Register(RegisterArgs),
+
+    /// Manage local and account-enrolled publisher keys.
+    Keys(KeysArgs),
 
     /// Search the registry's pack catalog.
     Search(SearchArgs),
@@ -473,6 +477,7 @@ fn run() -> Result<(), RunError> {
         Command::Verify(args) => cmd::verify::run_verify(args).map_err(RunError::from),
         Command::Publish(args) => cmd::publish::run_publish(args).map_err(RunError::from),
         Command::Register(args) => cmd::register::run_register(args).map_err(RunError::from),
+        Command::Keys(args) => cmd::keys::run_keys(args).map_err(RunError::from),
         Command::Search(args) => cmd::search::run_search(args).map_err(RunError::from),
 
         // ------------------------------------------------------------------
