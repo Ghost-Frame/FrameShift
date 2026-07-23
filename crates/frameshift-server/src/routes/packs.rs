@@ -1,7 +1,8 @@
 //! Pack read endpoints under `/v1/packs`.
 //!
-//! All endpoints are anonymous (no authentication required at this milestone).
-//! Write and publish endpoints are deferred to a follow-up milestone.
+//! The read router is anonymous. This module also exports the authenticated
+//! [`publish_pack`] handler, which the application router mounts separately with
+//! signed-request middleware.
 //!
 //! # Endpoints
 //!
@@ -28,13 +29,17 @@ use axum::{Extension, Json, Router};
 use chrono::Utc;
 use ed25519_dalek::{Signature, VerifyingKey};
 use frameshift_catalog::filters::{PackSearchFilters, SortMode};
-use frameshift_catalog::records::PackVersionRecord;
+use frameshift_catalog::records::{
+    PackRecord, PackVersionRecord, PublisherKeyRecord, PublisherProfileRecord,
+};
 use frameshift_catalog::status::PackStatus;
 use frameshift_catalog::Ed25519PublicKey;
 use frameshift_catalog::{CatalogError, MembershipState, PublisherKeyState, PublisherRole};
 use frameshift_objects::{ObjectHash, ObjectStoreError};
 use frameshift_pack::Pack;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use uuid::Uuid;
 
 use crate::auth::VerifiedSigner;
 use crate::error::AppError;
@@ -46,7 +51,265 @@ struct PublishAuthority {
     /// Public key used to verify both request and pack signatures.
     pubkey: Ed25519PublicKey,
     /// Enrolled key identifier for account-backed publisher history.
-    publisher_key_id: Option<uuid::Uuid>,
+    publisher_key_id: Option<Uuid>,
+    /// Public publisher identity returned for account-backed publication.
+    publisher: Option<PublisherSummary>,
+    /// Enrolled key state returned for account-backed publication.
+    publisher_key: Option<PublisherKeySummary>,
+}
+
+/// Stable public publisher identity attached additively to pack responses.
+#[derive(Clone, Debug, Serialize)]
+pub struct PublisherSummary {
+    /// Stable publisher identifier.
+    pub id: Uuid,
+    /// Unique public publisher handle.
+    pub handle: String,
+    /// Public publisher display name.
+    pub display_name: String,
+}
+
+/// Legacy author identity attached while compatibility fallback remains enabled.
+#[derive(Clone, Debug, Serialize)]
+pub struct LegacyAuthorSummary {
+    /// Unique legacy author handle.
+    pub handle: String,
+    /// Optional legacy author display name.
+    pub display_name: Option<String>,
+}
+
+/// Public state for the exact publisher key that signed a pack version.
+#[derive(Clone, Debug, Serialize)]
+pub struct PublisherKeySummary {
+    /// Stable publisher key identifier.
+    pub id: Uuid,
+    /// Current lifecycle state of the historical signing key.
+    pub state: PublisherKeyState,
+}
+
+/// Additive ownership response for one pack record.
+#[derive(Debug, Serialize)]
+pub struct PackResponse {
+    /// Existing pack fields retained at their original JSON locations.
+    #[serde(flatten)]
+    pub pack: PackRecord,
+    /// Preferred publisher identity when the pack has a linked owner.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub publisher: Option<PublisherSummary>,
+    /// Legacy author fallback when no publisher link exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub legacy_author: Option<LegacyAuthorSummary>,
+}
+
+/// Additive ownership response for one search result.
+#[derive(Debug, Serialize)]
+pub struct PackSearchResponse {
+    /// Existing search result fields retained at their original JSON locations.
+    #[serde(flatten)]
+    pub result: frameshift_catalog::PackSearchResult,
+    /// Preferred publisher identity when the pack has a linked owner.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub publisher: Option<PublisherSummary>,
+    /// Legacy author fallback when no publisher link exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub legacy_author: Option<LegacyAuthorSummary>,
+}
+
+/// Additive ownership response for one immutable pack version.
+#[derive(Debug, Serialize)]
+pub struct PackVersionResponse {
+    /// Existing version fields retained at their original JSON locations.
+    #[serde(flatten)]
+    pub version: PackVersionRecord,
+    /// Current publisher identity for the parent pack, when linked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub publisher: Option<PublisherSummary>,
+    /// Legacy signer identity when the version lacks a publisher key link.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub legacy_author: Option<LegacyAuthorSummary>,
+    /// Exact historical publisher key state when the version is linked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub publisher_key: Option<PublisherKeySummary>,
+}
+
+/// Request-local ownership lookup cache used to avoid repeated catalog reads.
+struct OwnershipResolver<'a> {
+    /// Shared server state containing the catalog backend.
+    state: &'a AppState,
+    /// Publisher summaries already resolved by stable identifier.
+    publishers: HashMap<Uuid, PublisherSummary>,
+    /// Legacy author summaries already resolved by signer key.
+    legacy_authors: HashMap<Ed25519PublicKey, Option<LegacyAuthorSummary>>,
+    /// Publisher keys already loaded by stable identifier.
+    publisher_keys: HashMap<Uuid, PublisherKeyRecord>,
+}
+
+/// Ownership enrichment helpers that enforce publisher links fail closed.
+impl<'a> OwnershipResolver<'a> {
+    /// Create an empty request-local resolver.
+    fn new(state: &'a AppState) -> Self {
+        Self {
+            state,
+            publishers: HashMap::new(),
+            legacy_authors: HashMap::new(),
+            publisher_keys: HashMap::new(),
+        }
+    }
+
+    /// Resolve a linked publisher or report an internal consistency failure.
+    async fn publisher(&mut self, id: Uuid) -> Result<PublisherSummary, AppError> {
+        if let Some(summary) = self.publishers.get(&id) {
+            return Ok(summary.clone());
+        }
+        let profile = self
+            .state
+            .catalog
+            .get_publisher(id)
+            .await
+            .map_err(|error| linked_catalog_error(error, "publisher", format!("publisher {id}")))?;
+        let summary = publisher_summary(&profile);
+        self.publishers.insert(id, summary.clone());
+        Ok(summary)
+    }
+
+    /// Resolve a legacy signer when one exists without failing on absence.
+    async fn legacy_author(
+        &mut self,
+        pubkey: Ed25519PublicKey,
+    ) -> Result<Option<LegacyAuthorSummary>, AppError> {
+        if let Some(summary) = self.legacy_authors.get(&pubkey) {
+            return Ok(summary.clone());
+        }
+        let summary = match self.state.catalog.lookup_author(&pubkey).await {
+            Ok(author) => Some(LegacyAuthorSummary {
+                handle: author.handle,
+                display_name: author.display_name,
+            }),
+            Err(CatalogError::NotFound { .. }) => None,
+            Err(error) => return Err(AppError::from_catalog(error, "author")),
+        };
+        self.legacy_authors.insert(pubkey, summary.clone());
+        Ok(summary)
+    }
+
+    /// Resolve and validate the exact publisher key linked to a version.
+    async fn publisher_key(
+        &mut self,
+        publisher_id: Uuid,
+        version: &PackVersionRecord,
+    ) -> Result<PublisherKeySummary, AppError> {
+        let key_id = version.publisher_key_id.ok_or_else(|| {
+            AppError::Internal("publisher key resolution requires a linked key".to_string())
+        })?;
+        if !self.publisher_keys.contains_key(&key_id) {
+            let key = self
+                .state
+                .catalog
+                .get_publisher_key(key_id)
+                .await
+                .map_err(|error| {
+                    linked_catalog_error(error, "publisher key", format!("publisher key {key_id}"))
+                })?;
+            self.publisher_keys.insert(key.id, key);
+        }
+        let key = self.publisher_keys.get(&key_id).ok_or_else(|| {
+            AppError::Internal(format!(
+                "version {}@{} links missing publisher key {key_id}",
+                version.pack_name, version.version
+            ))
+        })?;
+        if key.publisher_id != publisher_id || key.public_key != version.author_pubkey {
+            return Err(AppError::Internal(format!(
+                "version {}@{} publisher key evidence does not match its owner or signer",
+                version.pack_name, version.version
+            )));
+        }
+        Ok(PublisherKeySummary {
+            id: key.id,
+            state: key.state,
+        })
+    }
+
+    /// Enrich one pack while allowing legacy fallback only when no publisher is linked.
+    async fn pack_response(&mut self, pack: PackRecord) -> Result<PackResponse, AppError> {
+        let (publisher, legacy_author) = match pack.publisher_id {
+            Some(id) => (Some(self.publisher(id).await?), None),
+            None => (None, self.legacy_author(pack.current_author).await?),
+        };
+        Ok(PackResponse {
+            pack,
+            publisher,
+            legacy_author,
+        })
+    }
+
+    /// Enrich one search result while retaining its original score and pack fields.
+    async fn search_response(
+        &mut self,
+        result: frameshift_catalog::PackSearchResult,
+    ) -> Result<PackSearchResponse, AppError> {
+        let (publisher, legacy_author) = match result.pack.publisher_id {
+            Some(id) => (Some(self.publisher(id).await?), None),
+            None => (None, self.legacy_author(result.pack.current_author).await?),
+        };
+        Ok(PackSearchResponse {
+            result,
+            publisher,
+            legacy_author,
+        })
+    }
+
+    /// Enrich one version with parent ownership and exact signing-key evidence.
+    async fn version_response(
+        &mut self,
+        pack: &PackRecord,
+        version: PackVersionRecord,
+    ) -> Result<PackVersionResponse, AppError> {
+        let publisher = match pack.publisher_id {
+            Some(id) => Some(self.publisher(id).await?),
+            None => None,
+        };
+        let (legacy_author, publisher_key) = match version.publisher_key_id {
+            Some(_) => {
+                let publisher_id = pack.publisher_id.ok_or_else(|| {
+                    AppError::Internal(format!(
+                        "version {}@{} links a publisher key without a publisher owner",
+                        version.pack_name, version.version
+                    ))
+                })?;
+                (
+                    None,
+                    Some(self.publisher_key(publisher_id, &version).await?),
+                )
+            }
+            None => (self.legacy_author(version.author_pubkey).await?, None),
+        };
+        Ok(PackVersionResponse {
+            version,
+            publisher,
+            legacy_author,
+            publisher_key,
+        })
+    }
+}
+
+/// Build the public subset of one publisher profile.
+fn publisher_summary(profile: &PublisherProfileRecord) -> PublisherSummary {
+    PublisherSummary {
+        id: profile.id,
+        handle: profile.handle.clone(),
+        display_name: profile.display_name.clone(),
+    }
+}
+
+/// Convert a missing linked record into an internal consistency failure.
+fn linked_catalog_error(error: CatalogError, kind: &str, link: String) -> AppError {
+    match error {
+        CatalogError::NotFound { .. } => {
+            AppError::Internal(format!("{kind} link is dangling: {link}"))
+        }
+        other => AppError::from_catalog(other, "ownership"),
+    }
 }
 
 /// Build the packs **read** sub-router, mounted at `/v1/packs`.
@@ -84,6 +347,12 @@ pub struct PublishResponse {
     pub version: String,
     /// The handle of the author who published the pack.
     pub author_handle: String,
+    /// Account-backed publisher identity when this was a publisher write.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub publisher: Option<PublisherSummary>,
+    /// Exact enrolled key used for an account-backed publisher write.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub publisher_key: Option<PublisherKeySummary>,
 }
 
 /// Maximum decoded size of an uploaded pack archive (16 MiB).
@@ -607,6 +876,8 @@ pub async fn publish_pack(
         name: manifest.name,
         version: manifest.version,
         author_handle,
+        publisher: authority.publisher,
+        publisher_key: authority.publisher_key,
     };
     Ok((StatusCode::OK, Json(response)).into_response())
 }
@@ -618,57 +889,28 @@ async fn resolve_publish_authority(
     signer_pubkey: Ed25519PublicKey,
     authenticated: Option<&AuthenticatedAccount>,
 ) -> Result<PublishAuthority, AppError> {
-    let publisher = match state.catalog.get_publisher_by_handle(author_handle).await {
-        Ok(profile) => Some(profile),
-        Err(CatalogError::NotFound { .. }) => None,
-        Err(error) => return Err(AppError::from_catalog(error, "publisher")),
-    };
-    let legacy_pubkey = match state.catalog.get_handle_pubkey(author_handle).await {
-        Ok(pubkey) => Some(pubkey),
-        Err(CatalogError::NotFound { .. }) => None,
-        Err(error) => return Err(AppError::from_catalog(error, "handle")),
-    };
-
-    match (publisher, legacy_pubkey) {
-        (Some(_), Some(_)) => Err(AppError::Conflict(format!(
-            "publisher and legacy author both claim handle {author_handle}"
-        ))),
-        (Some(profile), None) => {
-            let authenticated = authenticated
-                .ok_or_else(|| AppError::Unauthorized("authentication failed".to_string()))?;
-            let membership = state
-                .catalog
-                .get_publisher_membership(authenticated.account.id, profile.id)
-                .await
-                .map_err(|error| match error {
-                    CatalogError::NotFound { .. } => {
-                        AppError::Forbidden("active publisher ownership required".to_string())
-                    }
-                    other => AppError::from_catalog(other, "publisher membership"),
-                })?;
-            if membership.role != PublisherRole::Owner
-                || membership.state != MembershipState::Active
-            {
-                return Err(AppError::Forbidden(
-                    "active publisher ownership required".to_string(),
-                ));
-            }
-            let key = state
-                .catalog
-                .list_publisher_keys(profile.id)
-                .await
-                .map_err(|error| AppError::from_catalog(error, "publisher key"))?
-                .into_iter()
-                .find(|key| {
-                    key.public_key == signer_pubkey && key.state == PublisherKeyState::Active
-                })
-                .ok_or_else(|| AppError::Unauthorized("authentication failed".to_string()))?;
-            Ok(PublishAuthority {
-                pubkey: signer_pubkey,
-                publisher_key_id: Some(key.id),
-            })
+    match state.catalog.get_publisher_by_handle(author_handle).await {
+        Ok(profile) => {
+            let legacy_pubkey = match state.catalog.get_handle_pubkey(author_handle).await {
+                Ok(pubkey) => Some(pubkey),
+                Err(CatalogError::NotFound { .. }) => None,
+                Err(error) => return Err(AppError::from_catalog(error, "handle")),
+            };
+            return resolve_account_publisher_authority(
+                state,
+                profile,
+                signer_pubkey,
+                authenticated,
+                legacy_pubkey,
+            )
+            .await;
         }
-        (None, Some(pubkey)) => {
+        Err(CatalogError::NotFound { .. }) => {}
+        Err(error) => return Err(AppError::from_catalog(error, "publisher")),
+    }
+
+    match state.catalog.get_handle_pubkey(author_handle).await {
+        Ok(pubkey) => {
             if signer_pubkey != pubkey {
                 tracing::warn!(
                     handle = %author_handle,
@@ -680,16 +922,72 @@ async fn resolve_publish_authority(
             Ok(PublishAuthority {
                 pubkey,
                 publisher_key_id: None,
+                publisher: None,
+                publisher_key: None,
             })
         }
-        (None, None) => {
+        Err(CatalogError::NotFound { .. }) => {
             tracing::warn!(
                 handle = %author_handle,
                 "publish attempt for unregistered author handle"
             );
             Err(AppError::Unauthorized("authentication failed".to_string()))
         }
+        Err(error) => Err(AppError::from_catalog(error, "handle")),
     }
+}
+
+/// Require active account ownership and an active enrolled key for one publisher.
+async fn resolve_account_publisher_authority(
+    state: &AppState,
+    profile: PublisherProfileRecord,
+    signer_pubkey: Ed25519PublicKey,
+    authenticated: Option<&AuthenticatedAccount>,
+    legacy_pubkey: Option<Ed25519PublicKey>,
+) -> Result<PublishAuthority, AppError> {
+    let authenticated =
+        authenticated.ok_or_else(|| AppError::Unauthorized("authentication failed".to_string()))?;
+    let membership = state
+        .catalog
+        .get_publisher_membership(authenticated.account.id, profile.id)
+        .await
+        .map_err(|error| match error {
+            CatalogError::NotFound { .. } => {
+                AppError::Forbidden("active publisher ownership required".to_string())
+            }
+            other => AppError::from_catalog(other, "publisher membership"),
+        })?;
+    if membership.role != PublisherRole::Owner || membership.state != MembershipState::Active {
+        return Err(AppError::Forbidden(
+            "active publisher ownership required".to_string(),
+        ));
+    }
+    let keys = state
+        .catalog
+        .list_publisher_keys(profile.id)
+        .await
+        .map_err(|error| AppError::from_catalog(error, "publisher key"))?;
+    if legacy_pubkey
+        .is_some_and(|legacy_pubkey| !keys.iter().any(|key| key.public_key == legacy_pubkey))
+    {
+        return Err(AppError::Internal(format!(
+            "publisher {} conflicts with an unrelated legacy handle key",
+            profile.id
+        )));
+    }
+    let key = keys
+        .into_iter()
+        .find(|key| key.public_key == signer_pubkey && key.state == PublisherKeyState::Active)
+        .ok_or_else(|| AppError::Unauthorized("authentication failed".to_string()))?;
+    Ok(PublishAuthority {
+        pubkey: signer_pubkey,
+        publisher_key_id: Some(key.id),
+        publisher: Some(publisher_summary(&profile)),
+        publisher_key: Some(PublisherKeySummary {
+            id: key.id,
+            state: key.state,
+        }),
+    })
 }
 
 /// Map an [`ObjectStoreError`] from a publish-time `put` into the appropriate
@@ -825,7 +1123,7 @@ pub struct SearchQuery {
 #[derive(Debug, Serialize)]
 pub struct SearchResponse {
     /// The matching pack records with relevance scores.
-    pub results: Vec<frameshift_catalog::PackSearchResult>,
+    pub results: Vec<PackSearchResponse>,
 }
 
 /// `GET /v1/packs?query=&tag=&author=&sort=&limit=&offset=`
@@ -894,11 +1192,28 @@ pub async fn search_packs(
         offset: q.offset.unwrap_or(0),
     };
 
-    let results = state
+    let raw_results = state
         .catalog
         .search_packs(&filters)
         .await
         .map_err(|e| AppError::from_catalog(e, "pack"))?;
+    let results = if state.config.publisher_ownership_reads {
+        let mut resolver = OwnershipResolver::new(&state);
+        let mut enriched = Vec::with_capacity(raw_results.len());
+        for result in raw_results {
+            enriched.push(resolver.search_response(result).await?);
+        }
+        enriched
+    } else {
+        raw_results
+            .into_iter()
+            .map(|result| PackSearchResponse {
+                result,
+                publisher: None,
+                legacy_author: None,
+            })
+            .collect()
+    };
 
     // Increment the search counter after a successful catalog call.
     state.metrics.searches_total.inc();
@@ -923,11 +1238,13 @@ pub async fn search_packs(
 ///
 /// # Response
 ///
-/// `200 OK` with body `PackRecord` serialized as JSON.
+/// `200 OK` with a flattened [`PackResponse`]. Ownership fields are omitted when
+/// read enrichment is disabled.
 ///
 /// # Backend calls
 ///
-/// - `catalog.get_pack(name)` -- single catalog read.
+/// - `catalog.get_pack(name)` -- loads the pack.
+/// - Ownership profile or legacy author lookup when read enrichment is enabled.
 ///
 /// # Errors
 ///
@@ -939,14 +1256,23 @@ pub async fn search_packs(
 pub async fn get_pack(
     State(state): State<AppState>,
     Path(name): Path<String>,
-) -> Result<Json<frameshift_catalog::PackRecord>, AppError> {
+) -> Result<Json<PackResponse>, AppError> {
     validate_pack_name(&name)?;
     let pack = state
         .catalog
         .get_pack(&name)
         .await
         .map_err(|e| AppError::from_catalog(e, "pack"))?;
-    Ok(Json(pack))
+    let response = if state.config.publisher_ownership_reads {
+        OwnershipResolver::new(&state).pack_response(pack).await?
+    } else {
+        PackResponse {
+            pack,
+            publisher: None,
+            legacy_author: None,
+        }
+    };
+    Ok(Json(response))
 }
 
 /// Query parameters accepted by `GET /v1/packs/{name}/versions`.
@@ -983,12 +1309,13 @@ pub struct VersionsQuery {
 ///
 /// # Response
 ///
-/// `200 OK` with body `[PackVersionRecord, ...]`, containing at most `limit`
-/// records starting at `offset`.
+/// `200 OK` with a JSON array of [`PackVersionResponse`] values, containing at
+/// most `limit` records starting at `offset`.
 ///
 /// # Backend calls
 ///
-/// - `catalog.list_pack_versions(name)` -- single catalog read.
+/// - `catalog.list_pack_versions(name)` -- loads the page source.
+/// - Parent pack and ownership lookups when read enrichment is enabled.
 ///
 /// # Errors
 ///
@@ -1019,6 +1346,24 @@ pub async fn list_pack_versions(
         .skip(offset)
         .take(clamped as usize)
         .collect();
+    let page = if state.config.publisher_ownership_reads {
+        let pack = load_version_parent(&state, &name).await?;
+        let mut resolver = OwnershipResolver::new(&state);
+        let mut enriched = Vec::with_capacity(page.len());
+        for version in page {
+            enriched.push(resolver.version_response(&pack, version).await?);
+        }
+        enriched
+    } else {
+        page.into_iter()
+            .map(|version| PackVersionResponse {
+                version,
+                publisher: None,
+                legacy_author: None,
+                publisher_key: None,
+            })
+            .collect()
+    };
 
     let body = Json(page);
 
@@ -1040,11 +1385,13 @@ pub async fn list_pack_versions(
 ///
 /// # Response
 ///
-/// `200 OK` with body `PackVersionRecord` serialized as JSON.
+/// `200 OK` with a flattened [`PackVersionResponse`]. Ownership fields are
+/// omitted when read enrichment is disabled.
 ///
 /// # Backend calls
 ///
-/// - `catalog.get_pack_version(name, version)` -- single catalog read.
+/// - `catalog.get_pack_version(name, version)` -- loads the version.
+/// - Parent pack and ownership lookups when read enrichment is enabled.
 ///
 /// # Errors
 ///
@@ -1054,7 +1401,7 @@ pub async fn list_pack_versions(
 pub async fn get_pack_version(
     State(state): State<AppState>,
     Path((name, version)): Path<(String, String)>,
-) -> Result<Json<frameshift_catalog::PackVersionRecord>, AppError> {
+) -> Result<Json<PackVersionResponse>, AppError> {
     validate_pack_name(&name)?;
     validate_pack_version(&version)?;
     let record = state
@@ -1062,7 +1409,29 @@ pub async fn get_pack_version(
         .get_pack_version(&name, &version)
         .await
         .map_err(|e| AppError::from_catalog(e, "pack_version"))?;
-    Ok(Json(record))
+    let response = if state.config.publisher_ownership_reads {
+        let pack = load_version_parent(&state, &name).await?;
+        OwnershipResolver::new(&state)
+            .version_response(&pack, record)
+            .await?
+    } else {
+        PackVersionResponse {
+            version: record,
+            publisher: None,
+            legacy_author: None,
+            publisher_key: None,
+        }
+    };
+    Ok(Json(response))
+}
+
+/// Load a version's parent pack and fail closed when the relationship is broken.
+async fn load_version_parent(state: &AppState, name: &str) -> Result<PackRecord, AppError> {
+    state
+        .catalog
+        .get_pack(name)
+        .await
+        .map_err(|error| linked_catalog_error(error, "pack", format!("version parent {name}")))
 }
 
 /// `GET /v1/packs/{name}/versions/{version}/pack`

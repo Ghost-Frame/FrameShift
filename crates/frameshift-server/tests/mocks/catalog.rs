@@ -301,6 +301,22 @@ impl CatalogBackend for MockCatalog {
             })
     }
 
+    /// Retrieve a publisher profile by its stable internal identifier.
+    async fn get_publisher(&self, id: uuid::Uuid) -> Result<PublisherProfileRecord, CatalogError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        state
+            .publishers
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| CatalogError::NotFound {
+                kind: "publisher",
+                key: id.to_string(),
+            })
+    }
+
     /// Update mutable publisher profile fields.
     async fn update_publisher_profile(
         &self,
@@ -426,6 +442,22 @@ impl CatalogBackend for MockCatalog {
             .collect();
         records.sort_by_key(|record| record.created_at);
         Ok(records)
+    }
+
+    /// Retrieve one enrolled publisher key by stable identifier.
+    async fn get_publisher_key(&self, id: uuid::Uuid) -> Result<PublisherKeyRecord, CatalogError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        state
+            .publisher_keys
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| CatalogError::NotFound {
+                kind: "publisher_key",
+                key: id.to_string(),
+            })
     }
 
     /// Revoke a key unless it is the publisher's last active key.
@@ -625,6 +657,22 @@ impl CatalogBackend for MockCatalog {
             }
             None => None,
         };
+        if publisher_id.is_none() {
+            let legacy_author = state
+                .authors
+                .values()
+                .find(|author| author.pubkey == record.author_pubkey)
+                .ok_or_else(|| CatalogError::NotFound {
+                    kind: "author",
+                    key: record.author_pubkey.to_string(),
+                })?;
+            if state.publisher_handles.contains_key(&legacy_author.handle) {
+                return Err(CatalogError::Unauthorized {
+                    kind: "publisher",
+                    key: legacy_author.handle.clone(),
+                });
+            }
+        }
         if let Some(pack) = state.packs.get(&record.pack_name) {
             let ownership_matches = match (pack.publisher_id, publisher_id) {
                 (Some(existing), Some(incoming)) => existing == incoming,

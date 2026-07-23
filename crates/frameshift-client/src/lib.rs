@@ -34,7 +34,10 @@ pub use model::{
 };
 pub use publish::PublishOutcome;
 pub use publisher::{EnrolledPublisherKey, EnrolledPublisherKeyState};
-pub use registry::{RegistryPackSummary, RegistrySearchQuery, RegistrySearchResult};
+pub use registry::{
+    RegistryLegacyAuthorSummary, RegistryPackSummary, RegistryPublisherKeySummary,
+    RegistryPublisherSummary, RegistrySearchQuery, RegistrySearchResult, RegistryVersionDetails,
+};
 pub use selection::{
     SelectionEvent, SelectionTelemetry, SELECTION_HISTORY_FILENAME, TELEMETRY_URL_ENV,
 };
@@ -405,6 +408,15 @@ impl Client {
     /// expand a version-less spec before installing from the registry.
     pub fn resolve_latest_version(&self, name: &str) -> Result<String, ClientError> {
         registry::resolve_latest_version(name)
+    }
+
+    /// Fetch ownership and signing-key status for one immutable registry version.
+    pub fn registry_version_details(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> Result<RegistryVersionDetails, ClientError> {
+        registry::registry_version_details(&registry::registry_base_url(), name, version)
     }
 
     /// Resolve the project id for `project_root`.

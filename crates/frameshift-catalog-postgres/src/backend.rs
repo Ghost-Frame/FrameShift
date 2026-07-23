@@ -380,6 +380,18 @@ impl CatalogBackend for PostgresCatalog {
             .into_record()
     }
 
+    /// Retrieve a public publisher profile by its stable internal identifier.
+    async fn get_publisher(&self, id: uuid::Uuid) -> Result<PublisherProfileRecord, CatalogError> {
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        publisher_profiles::table
+            .find(id)
+            .select(PublisherProfileRow::as_select())
+            .first(&mut conn)
+            .await
+            .map_err(|error| map_diesel_error(error, "publisher", id.to_string()))?
+            .into_record()
+    }
+
     /// Update mutable public publisher profile fields.
     async fn update_publisher_profile(
         &self,
@@ -545,6 +557,18 @@ impl CatalogBackend for PostgresCatalog {
             .await
             .map_err(|error| map_diesel_error(error, "publisher_key", publisher_id.to_string()))?;
         rows.into_iter().map(PublisherKeyRow::into_record).collect()
+    }
+
+    /// Retrieve one enrolled publisher key by stable identifier.
+    async fn get_publisher_key(&self, id: uuid::Uuid) -> Result<PublisherKeyRecord, CatalogError> {
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        publisher_keys::table
+            .find(id)
+            .select(PublisherKeyRow::as_select())
+            .first(&mut conn)
+            .await
+            .map_err(|error| map_diesel_error(error, "publisher_key", id.to_string()))?
+            .into_record()
     }
 
     /// Revoke a publisher key while retaining its historical evidence.
@@ -912,10 +936,17 @@ impl CatalogBackend for PostgresCatalog {
                 let version = version_clone;
                 let incoming_author = incoming_author_bytes;
                 let incoming_size = incoming_size_bytes;
-                // Serialize registry-wide quota accounting with concurrent
-                // version inserts before reading the aggregate byte total.
+                // Cross the ownership migration boundary before resolving
+                // either namespace. ROW EXCLUSIVE conflicts with backfill's
+                // SHARE ROW EXCLUSIVE lock while remaining compatible with
+                // concurrent publishers. Aggregate quota accounting retains
+                // the stronger self-conflicting lock it already required.
                 if quota.max_total_bytes.is_some() {
                     diesel::sql_query("LOCK TABLE pack_versions IN SHARE ROW EXCLUSIVE MODE")
+                        .execute(conn)
+                        .await?;
+                } else {
+                    diesel::sql_query("LOCK TABLE pack_versions IN ROW EXCLUSIVE MODE")
                         .execute(conn)
                         .await?;
                 }
@@ -986,11 +1017,11 @@ impl CatalogBackend for PostgresCatalog {
                         }
                     }
                 } else {
-                    authors::table
+                    let legacy_handle = authors::table
                         .filter(authors::pubkey.eq(&incoming_author))
                         .for_update()
-                        .select(authors::pubkey)
-                        .first::<Vec<u8>>(conn)
+                        .select(authors::handle)
+                        .first::<String>(conn)
                         .await
                         .map_err(|e| {
                             TxError::Catalog(map_diesel_error(
@@ -999,6 +1030,26 @@ impl CatalogBackend for PostgresCatalog {
                                 hex::encode(&incoming_author),
                             ))
                         })?;
+                    let publisher_exists = publisher_profiles::table
+                        .filter(publisher_profiles::handle.eq(&legacy_handle))
+                        .select(publisher_profiles::id)
+                        .first::<uuid::Uuid>(conn)
+                        .await
+                        .optional()
+                        .map_err(|e| {
+                            TxError::Catalog(map_diesel_error(
+                                e,
+                                "publisher",
+                                legacy_handle.clone(),
+                            ))
+                        })?
+                        .is_some();
+                    if publisher_exists {
+                        return Err(TxError::Catalog(CatalogError::Unauthorized {
+                            kind: "publisher",
+                            key: legacy_handle,
+                        }));
+                    }
                     None
                 };
                 let publisher_key_ids: Vec<Option<uuid::Uuid>> =

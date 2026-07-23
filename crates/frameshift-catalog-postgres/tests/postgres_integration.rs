@@ -14,6 +14,8 @@
 
 use std::time::Duration;
 
+use diesel::QueryDsl as _;
+use diesel_async::{RunQueryDsl as _, SimpleAsyncConnection as _};
 use frameshift_catalog::{
     AccountRecord, AccountStatus, AuthorRecord, CatalogBackend, CatalogError, Ed25519PublicKey,
     MembershipState, ObjectHash, PackSearchFilters, PackStatus, PackVersionRecord, PublishQuota,
@@ -21,8 +23,15 @@ use frameshift_catalog::{
     PublisherModerationStatus, PublisherProfileRecord, PublisherRole, SortMode, TombstoneReason,
     TombstoneRecord,
 };
-use frameshift_catalog_postgres::{PostgresCatalog, PostgresCatalogConfig};
+use frameshift_catalog_postgres::schema::publisher_audit_events;
+use frameshift_catalog_postgres::{
+    OwnershipBackfillApplied, OwnershipBackfillManifest, OwnershipBackfillMode,
+    OwnershipManifestKey, OwnershipManifestKeyState, OwnershipManifestModerationStatus,
+    OwnershipManifestPack, OwnershipManifestPublisher, OwnershipManifestVersion, PostgresCatalog,
+    PostgresCatalogConfig, OWNERSHIP_BACKFILL_SCHEMA_VERSION,
+};
 use secrecy::SecretString;
+use sha2::{Digest as _, Sha256};
 
 /// Construct a [`PostgresCatalog`] pointing at a fresh `testcontainers`-managed
 /// Postgres instance.
@@ -178,7 +187,766 @@ async fn create_test_publisher(
     (publisher_id, key)
 }
 
+/// Return a stable microsecond-safe timestamp for ownership migration manifests.
+fn ownership_manifest_time() -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp(1_750_000_000, 0)
+        .expect("ownership manifest timestamp must be valid")
+}
+
+/// Serialize a manifest and compute the confirmation for its exact bytes.
+fn ownership_manifest_input(manifest: &OwnershipBackfillManifest) -> (Vec<u8>, String) {
+    let bytes = serde_json::to_vec(manifest).expect("ownership manifest must serialize");
+    let digest = hex::encode(Sha256::digest(&bytes));
+    (bytes, digest)
+}
+
+/// Build a complete ownership manifest for one legacy pack version.
+fn ownership_manifest_for_legacy_pack(
+    account_id: uuid::Uuid,
+    publisher_id: uuid::Uuid,
+    key_id: uuid::Uuid,
+    audit_event_id: uuid::Uuid,
+    handle: &str,
+    pack_name: &str,
+    version: &PackVersionRecord,
+) -> OwnershipBackfillManifest {
+    let timestamp = ownership_manifest_time();
+    OwnershipBackfillManifest {
+        schema_version: OWNERSHIP_BACKFILL_SCHEMA_VERSION,
+        expected_pack_count: 1,
+        expected_version_count: 1,
+        publishers: vec![OwnershipManifestPublisher {
+            id: publisher_id,
+            handle: handle.to_string(),
+            owner_account_id: account_id,
+            display_name: format!("{handle} publisher"),
+            biography: Some("Migrated legacy publisher".to_string()),
+            moderation_status: OwnershipManifestModerationStatus::Approved,
+            created_at: timestamp,
+            audit_event_id,
+            audit_created_at: timestamp,
+            keys: vec![OwnershipManifestKey {
+                id: key_id,
+                public_key: hex::encode(version.author_pubkey.0),
+                label: "legacy signing key".to_string(),
+                state: OwnershipManifestKeyState::Active,
+                created_at: timestamp,
+                revoked_at: None,
+            }],
+        }],
+        packs: vec![OwnershipManifestPack {
+            name: pack_name.to_string(),
+            publisher_id,
+            expected_current_author: hex::encode(version.author_pubkey.0),
+        }],
+        versions: vec![OwnershipManifestVersion {
+            pack_name: pack_name.to_string(),
+            version: version.version.clone(),
+            publisher_key_id: key_id,
+            expected_author_pubkey: hex::encode(version.author_pubkey.0),
+            expected_content_hash: hex::encode(version.content_hash.as_bytes()),
+        }],
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
+
+/// An exactly empty catalog supports dry-run and apply with a zero census.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn ownership_backfill_accepts_empty_catalog() {
+    let (catalog, _container) = setup_catalog().await;
+    let manifest = OwnershipBackfillManifest {
+        schema_version: OWNERSHIP_BACKFILL_SCHEMA_VERSION,
+        expected_pack_count: 0,
+        expected_version_count: 0,
+        publishers: vec![],
+        packs: vec![],
+        versions: vec![],
+    };
+    let (manifest_bytes, digest) = ownership_manifest_input(&manifest);
+
+    let dry_run = catalog
+        .run_ownership_backfill(&manifest_bytes, None, OwnershipBackfillMode::DryRun)
+        .await
+        .expect("empty dry-run must succeed");
+    assert_eq!(dry_run.census.catalog_packs, 0);
+    assert_eq!(dry_run.census.catalog_versions, 0);
+    assert_eq!(dry_run.applied.packs, 0);
+    assert_eq!(dry_run.applied.versions, 0);
+
+    let applied = catalog
+        .run_ownership_backfill(&manifest_bytes, Some(&digest), OwnershipBackfillMode::Apply)
+        .await
+        .expect("empty apply must succeed");
+    assert_eq!(applied.census, dry_run.census);
+    assert_eq!(applied.applied, dry_run.applied);
+}
+
+/// Populated backfill preserves signer evidence and is idempotent.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn ownership_backfill_preserves_evidence_and_is_idempotent() {
+    let (catalog, _container) = setup_catalog().await;
+    let handle = "legacy-migrated";
+    let pack_name = "ownership-migrated-pack";
+    let author = make_author(72, handle);
+    catalog
+        .register_author(author.clone())
+        .await
+        .expect("register legacy author failed");
+    let mut version = make_version(pack_name, "1.0.0", 72, 73);
+    let parent_hash = make_hash(71);
+    version.parent_hash = Some(parent_hash);
+    catalog
+        .register_pack_version(version.clone())
+        .await
+        .expect("register legacy pack failed");
+    let account = make_account(uuid::Uuid::from_u128(10_001), "ownership-owner");
+    catalog
+        .create_account(account.clone())
+        .await
+        .expect("create ownership account failed");
+    let publisher_id = uuid::Uuid::from_u128(10_002);
+    let key_id = uuid::Uuid::from_u128(10_003);
+    let manifest = ownership_manifest_for_legacy_pack(
+        account.id,
+        publisher_id,
+        key_id,
+        uuid::Uuid::from_u128(10_004),
+        handle,
+        pack_name,
+        &version,
+    );
+    let mut unrelated_key_manifest = manifest.clone();
+    unrelated_key_manifest.publishers[0]
+        .keys
+        .push(OwnershipManifestKey {
+            id: uuid::Uuid::from_u128(10_005),
+            public_key: hex::encode([99_u8; 32]),
+            label: "unrelated bootstrap key".to_string(),
+            state: OwnershipManifestKeyState::Active,
+            created_at: ownership_manifest_time(),
+            revoked_at: None,
+        });
+    let (unrelated_key_bytes, _) = ownership_manifest_input(&unrelated_key_manifest);
+    let unrelated_key_error = catalog
+        .run_ownership_backfill(&unrelated_key_bytes, None, OwnershipBackfillMode::DryRun)
+        .await
+        .expect_err("backfill must not create an unrelated publisher key");
+    assert!(unrelated_key_error
+        .to_string()
+        .contains("new publisher key"));
+    let (manifest_bytes, digest) = ownership_manifest_input(&manifest);
+
+    let dry_run = catalog
+        .run_ownership_backfill(&manifest_bytes, None, OwnershipBackfillMode::DryRun)
+        .await
+        .expect("ownership dry-run failed");
+    assert_eq!(dry_run.census.publisher_profiles_to_create, 1);
+    assert_eq!(dry_run.census.publisher_keys_to_create, 1);
+    assert_eq!(dry_run.census.packs_to_update, 1);
+    assert_eq!(dry_run.census.versions_to_update, 1);
+    assert_eq!(dry_run.census.publishers.len(), 1);
+    assert_eq!(dry_run.census.publishers[0].publisher_id, publisher_id);
+    assert_eq!(dry_run.census.publishers[0].handle, handle);
+    assert_eq!(dry_run.census.publishers[0].manifest_keys, 1);
+    assert_eq!(dry_run.census.publishers[0].mapped_packs, 1);
+    assert_eq!(dry_run.census.publishers[0].mapped_versions, 1);
+    assert_eq!(dry_run.census.publishers[0].packs_to_update, 1);
+    assert_eq!(dry_run.census.publishers[0].versions_to_update, 1);
+    let before_pack = catalog
+        .get_pack(pack_name)
+        .await
+        .expect("get legacy pack before apply failed");
+    assert_eq!(before_pack.publisher_id, None);
+
+    let first_apply = catalog
+        .run_ownership_backfill(&manifest_bytes, Some(&digest), OwnershipBackfillMode::Apply)
+        .await
+        .expect("ownership apply failed");
+    assert_eq!(first_apply.applied.publisher_profiles, 1);
+    assert_eq!(first_apply.applied.owner_memberships, 1);
+    assert_eq!(first_apply.applied.publisher_keys, 1);
+    assert_eq!(first_apply.applied.audit_events, 1);
+    assert_eq!(first_apply.applied.packs, 1);
+    assert_eq!(first_apply.applied.versions, 1);
+
+    let migrated_pack = catalog
+        .get_pack(pack_name)
+        .await
+        .expect("get migrated pack failed");
+    let migrated_version = catalog
+        .get_pack_version(pack_name, "1.0.0")
+        .await
+        .expect("get migrated version failed");
+    assert_eq!(migrated_pack.publisher_id, Some(publisher_id));
+    assert_eq!(migrated_pack.current_author, author.pubkey);
+    assert_eq!(migrated_version.publisher_key_id, Some(key_id));
+    assert_eq!(migrated_version.author_pubkey, version.author_pubkey);
+    assert_eq!(migrated_version.content_hash, version.content_hash);
+    assert_eq!(migrated_version.signature, version.signature);
+    assert_eq!(migrated_version.parent_hash, Some(parent_hash));
+    let membership = catalog
+        .get_publisher_membership(account.id, publisher_id)
+        .await
+        .expect("get migrated owner membership failed");
+    assert_eq!(membership.created_at, ownership_manifest_time());
+    let mut audit_connection = catalog
+        .pool()
+        .get()
+        .await
+        .expect("ownership audit verification connection failed");
+    let audit = publisher_audit_events::table
+        .find(uuid::Uuid::from_u128(10_004))
+        .select((
+            publisher_audit_events::actor_account_id,
+            publisher_audit_events::publisher_id,
+            publisher_audit_events::action,
+        ))
+        .first::<(Option<uuid::Uuid>, uuid::Uuid, String)>(&mut audit_connection)
+        .await
+        .expect("ownership audit row must exist");
+    assert_eq!(audit.0, None);
+    assert_eq!(audit.1, publisher_id);
+    assert_eq!(audit.2, "publisher.ownership_backfilled");
+    drop(audit_connection);
+
+    let stale_legacy_version = make_version(pack_name, "1.1.0", 72, 76);
+    let stale_error = catalog
+        .register_pack_version(stale_legacy_version)
+        .await
+        .expect_err("migrated handle must reject stale legacy authority");
+    assert!(matches!(
+        stale_error,
+        CatalogError::Unauthorized {
+            kind: "publisher",
+            ..
+        }
+    ));
+    let absent_version = catalog
+        .get_pack_version(pack_name, "1.1.0")
+        .await
+        .expect_err("rejected stale legacy version must remain absent");
+    assert!(matches!(
+        absent_version,
+        CatalogError::NotFound {
+            kind: "pack_version",
+            ..
+        }
+    ));
+
+    let second_apply = catalog
+        .run_ownership_backfill(&manifest_bytes, Some(&digest), OwnershipBackfillMode::Apply)
+        .await
+        .expect("idempotent ownership apply failed");
+    assert_eq!(second_apply.census.publisher_profiles_existing, 1);
+    assert_eq!(second_apply.census.owner_memberships_existing, 1);
+    assert_eq!(second_apply.census.publisher_keys_existing, 1);
+    assert_eq!(second_apply.census.audit_events_existing, 1);
+    assert_eq!(second_apply.census.packs_already_linked, 1);
+    assert_eq!(second_apply.census.versions_already_linked, 1);
+    assert_eq!(second_apply.applied.publisher_profiles, 0);
+    assert_eq!(second_apply.applied.owner_memberships, 0);
+    assert_eq!(second_apply.applied.publisher_keys, 0);
+    assert_eq!(second_apply.applied.audit_events, 0);
+    assert_eq!(second_apply.applied.packs, 0);
+    assert_eq!(second_apply.applied.versions, 0);
+
+    let post_apply_dry_run = catalog
+        .run_ownership_backfill(&manifest_bytes, None, OwnershipBackfillMode::DryRun)
+        .await
+        .expect("post-apply ownership dry-run failed");
+    assert_eq!(post_apply_dry_run.census, second_apply.census);
+    assert_eq!(post_apply_dry_run.applied, second_apply.applied);
+}
+
+/// Linked Phase 3 rows allow no legacy author but reject one with a foreign key.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn ownership_backfill_validates_phase3_legacy_handle_when_present() {
+    let (catalog, _container) = setup_catalog().await;
+    let handle = "phase3-publisher";
+    let pack_name = "phase3-owned-pack";
+    let timestamp = ownership_manifest_time();
+    let account = make_account(uuid::Uuid::from_u128(10_101), "phase3-owner");
+    let publisher_id = uuid::Uuid::from_u128(10_102);
+    let key_id = uuid::Uuid::from_u128(10_103);
+    let audit_id = uuid::Uuid::from_u128(10_104);
+    let unused_key_id = uuid::Uuid::from_u128(10_105);
+    catalog
+        .create_account(account.clone())
+        .await
+        .expect("create Phase 3 account failed");
+    catalog
+        .create_publisher(
+            PublisherProfileRecord {
+                id: publisher_id,
+                handle: handle.to_string(),
+                display_name: "Phase 3 publisher".to_string(),
+                biography: Some("Account-backed publisher".to_string()),
+                moderation_status: PublisherModerationStatus::Approved,
+                created_at: timestamp,
+                updated_at: timestamp,
+            },
+            PublisherMembershipRecord {
+                account_id: account.id,
+                publisher_id,
+                role: PublisherRole::Owner,
+                state: MembershipState::Active,
+                created_at: timestamp,
+                updated_at: timestamp,
+            },
+            None,
+        )
+        .await
+        .expect("create Phase 3 publisher failed");
+    let key = PublisherKeyRecord {
+        id: key_id,
+        publisher_id,
+        public_key: make_pubkey(84),
+        label: "Phase 3 signing key".to_string(),
+        state: PublisherKeyState::Active,
+        created_at: timestamp,
+        revoked_at: None,
+        last_used_at: None,
+    };
+    catalog
+        .create_publisher_key(key.clone(), None)
+        .await
+        .expect("create Phase 3 key failed");
+    let unused_key = PublisherKeyRecord {
+        id: unused_key_id,
+        publisher_id,
+        public_key: make_pubkey(86),
+        label: "Unused Phase 3 rotation key".to_string(),
+        state: PublisherKeyState::Active,
+        created_at: timestamp,
+        revoked_at: None,
+        last_used_at: None,
+    };
+    catalog
+        .create_publisher_key(unused_key.clone(), None)
+        .await
+        .expect("create unused Phase 3 key failed");
+    let mut version = make_version(pack_name, "1.0.0", 84, 85);
+    version.publisher_key_id = Some(key_id);
+    catalog
+        .register_pack_version(version.clone())
+        .await
+        .expect("register Phase 3 pack failed");
+    let author_error = catalog
+        .get_author_by_handle(handle)
+        .await
+        .expect_err("Phase 3 fixture must not have a legacy author");
+    assert!(matches!(
+        author_error,
+        CatalogError::NotFound { kind: "author", .. }
+    ));
+
+    let manifest = OwnershipBackfillManifest {
+        schema_version: OWNERSHIP_BACKFILL_SCHEMA_VERSION,
+        expected_pack_count: 1,
+        expected_version_count: 1,
+        publishers: vec![OwnershipManifestPublisher {
+            id: publisher_id,
+            handle: handle.to_string(),
+            owner_account_id: account.id,
+            display_name: "Phase 3 publisher".to_string(),
+            biography: Some("Account-backed publisher".to_string()),
+            moderation_status: OwnershipManifestModerationStatus::Approved,
+            created_at: timestamp,
+            audit_event_id: audit_id,
+            audit_created_at: timestamp,
+            keys: vec![
+                OwnershipManifestKey {
+                    id: key_id,
+                    public_key: hex::encode(key.public_key.0),
+                    label: key.label.clone(),
+                    state: OwnershipManifestKeyState::Active,
+                    created_at: timestamp,
+                    revoked_at: None,
+                },
+                OwnershipManifestKey {
+                    id: unused_key_id,
+                    public_key: hex::encode(unused_key.public_key.0),
+                    label: unused_key.label.clone(),
+                    state: OwnershipManifestKeyState::Active,
+                    created_at: timestamp,
+                    revoked_at: None,
+                },
+            ],
+        }],
+        packs: vec![OwnershipManifestPack {
+            name: pack_name.to_string(),
+            publisher_id,
+            expected_current_author: hex::encode(version.author_pubkey.0),
+        }],
+        versions: vec![OwnershipManifestVersion {
+            pack_name: pack_name.to_string(),
+            version: version.version.clone(),
+            publisher_key_id: key_id,
+            expected_author_pubkey: hex::encode(version.author_pubkey.0),
+            expected_content_hash: hex::encode(version.content_hash.as_bytes()),
+        }],
+    };
+    let (manifest_bytes, digest) = ownership_manifest_input(&manifest);
+
+    let dry_run = catalog
+        .run_ownership_backfill(&manifest_bytes, None, OwnershipBackfillMode::DryRun)
+        .await
+        .expect("Phase 3 dry-run failed");
+    assert_eq!(dry_run.census.publisher_profiles_existing, 1);
+    assert_eq!(dry_run.census.owner_memberships_existing, 1);
+    assert_eq!(dry_run.census.publisher_keys_existing, 2);
+    assert_eq!(dry_run.census.publishers[0].manifest_keys, 2);
+    assert_eq!(dry_run.census.audit_events_to_create, 1);
+    assert_eq!(dry_run.census.packs_already_linked, 1);
+    assert_eq!(dry_run.census.versions_already_linked, 1);
+
+    let first_apply = catalog
+        .run_ownership_backfill(&manifest_bytes, Some(&digest), OwnershipBackfillMode::Apply)
+        .await
+        .expect("Phase 3 apply failed");
+    assert_eq!(first_apply.applied.audit_events, 1);
+    assert_eq!(first_apply.applied.publisher_profiles, 0);
+    assert_eq!(first_apply.applied.owner_memberships, 0);
+    assert_eq!(first_apply.applied.publisher_keys, 0);
+    assert_eq!(first_apply.applied.packs, 0);
+    assert_eq!(first_apply.applied.versions, 0);
+
+    let second_apply = catalog
+        .run_ownership_backfill(&manifest_bytes, Some(&digest), OwnershipBackfillMode::Apply)
+        .await
+        .expect("idempotent Phase 3 apply failed");
+    assert_eq!(second_apply.census.audit_events_existing, 1);
+    assert_eq!(second_apply.applied.audit_events, 0);
+    assert_eq!(second_apply.applied, OwnershipBackfillApplied::default());
+
+    let mut connection = catalog
+        .pool()
+        .get()
+        .await
+        .expect("foreign legacy author fixture connection failed");
+    connection
+        .batch_execute(
+            "INSERT INTO authors (pubkey, handle, display_name, oauth_links) \
+             VALUES (decode(repeat('57', 32), 'hex'), 'phase3-publisher', NULL, '[]'::jsonb)",
+        )
+        .await
+        .expect("insert foreign same-handle legacy author failed");
+    drop(connection);
+
+    let ambiguity = catalog
+        .run_ownership_backfill(&manifest_bytes, None, OwnershipBackfillMode::DryRun)
+        .await
+        .expect_err("foreign same-handle legacy author must fail closed");
+    assert!(ambiguity
+        .to_string()
+        .contains("legacy author handle phase3-publisher has an unmapped or foreign key"));
+}
+
+/// A database failure after bootstrap inserts rolls back every mutation.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn ownership_backfill_apply_failure_rolls_back_everything() {
+    let (catalog, _container) = setup_catalog().await;
+    let handle = "legacy-rollback";
+    let pack_name = "ownership-rollback-pack";
+    catalog
+        .register_author(make_author(74, handle))
+        .await
+        .expect("register rollback author failed");
+    let version = make_version(pack_name, "1.0.0", 74, 75);
+    catalog
+        .register_pack_version(version.clone())
+        .await
+        .expect("register rollback pack failed");
+    let account = make_account(uuid::Uuid::from_u128(11_001), "ownership-rollback-owner");
+    catalog
+        .create_account(account.clone())
+        .await
+        .expect("create rollback account failed");
+    let publisher_id = uuid::Uuid::from_u128(11_002);
+    let manifest = ownership_manifest_for_legacy_pack(
+        account.id,
+        publisher_id,
+        uuid::Uuid::from_u128(11_003),
+        uuid::Uuid::from_u128(11_004),
+        handle,
+        pack_name,
+        &version,
+    );
+    let (manifest_bytes, digest) = ownership_manifest_input(&manifest);
+    let mut connection = catalog
+        .pool()
+        .get()
+        .await
+        .expect("rollback trigger connection failed");
+    connection
+        .batch_execute(
+            "CREATE FUNCTION reject_ownership_version_link() RETURNS trigger \
+             LANGUAGE plpgsql AS $$ BEGIN \
+             RAISE EXCEPTION 'injected ownership backfill failure'; \
+             END $$; \
+             CREATE TRIGGER reject_ownership_version_link \
+             BEFORE UPDATE OF publisher_key_id ON pack_versions \
+             FOR EACH ROW EXECUTE FUNCTION reject_ownership_version_link();",
+        )
+        .await
+        .expect("create rollback trigger failed");
+    drop(connection);
+
+    let error = catalog
+        .run_ownership_backfill(&manifest_bytes, Some(&digest), OwnershipBackfillMode::Apply)
+        .await
+        .expect_err("injected version-link failure must fail apply");
+    assert!(error.to_string().contains("database operation failed"));
+
+    let pack = catalog
+        .get_pack(pack_name)
+        .await
+        .expect("get rollback pack failed");
+    let stored_version = catalog
+        .get_pack_version(pack_name, "1.0.0")
+        .await
+        .expect("get rollback version failed");
+    assert_eq!(pack.publisher_id, None);
+    assert_eq!(stored_version.publisher_key_id, None);
+    assert_eq!(stored_version.author_pubkey, version.author_pubkey);
+    assert_eq!(stored_version.content_hash, version.content_hash);
+    let publisher_error = catalog
+        .get_publisher_by_handle(handle)
+        .await
+        .expect_err("failed migration must not create publisher");
+    assert!(matches!(
+        publisher_error,
+        CatalogError::NotFound {
+            kind: "publisher",
+            ..
+        }
+    ));
+    let membership_error = catalog
+        .get_publisher_membership(account.id, publisher_id)
+        .await
+        .expect_err("failed migration must not create membership");
+    assert!(matches!(
+        membership_error,
+        CatalogError::NotFound {
+            kind: "publisher_membership",
+            ..
+        }
+    ));
+    let key_error = catalog
+        .get_publisher_key(uuid::Uuid::from_u128(11_003))
+        .await
+        .expect_err("failed migration must not create key");
+    assert!(matches!(
+        key_error,
+        CatalogError::NotFound {
+            kind: "publisher_key",
+            ..
+        }
+    ));
+    let mut connection = catalog
+        .pool()
+        .get()
+        .await
+        .expect("audit verification connection failed");
+    let audit_count = publisher_audit_events::table
+        .count()
+        .get_result::<i64>(&mut connection)
+        .await
+        .expect("count ownership audit rows failed");
+    assert_eq!(audit_count, 0);
+}
+
+/// Equal row counts cannot hide a substituted pack/version identity.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn ownership_backfill_rejects_exact_count_identity_substitution() {
+    let (catalog, _container) = setup_catalog().await;
+    let handle = "legacy-census";
+    let pack_name = "ownership-census-pack";
+    catalog
+        .register_author(make_author(77, handle))
+        .await
+        .expect("register census author failed");
+    let version = make_version(pack_name, "1.0.0", 77, 78);
+    catalog
+        .register_pack_version(version.clone())
+        .await
+        .expect("register census pack failed");
+    let account = make_account(uuid::Uuid::from_u128(12_001), "ownership-census-owner");
+    catalog
+        .create_account(account.clone())
+        .await
+        .expect("create census account failed");
+    let empty_manifest = OwnershipBackfillManifest {
+        schema_version: OWNERSHIP_BACKFILL_SCHEMA_VERSION,
+        expected_pack_count: 0,
+        expected_version_count: 0,
+        publishers: vec![],
+        packs: vec![],
+        versions: vec![],
+    };
+    let (empty_manifest_bytes, _) = ownership_manifest_input(&empty_manifest);
+    let count_error = catalog
+        .run_ownership_backfill(&empty_manifest_bytes, None, OwnershipBackfillMode::DryRun)
+        .await
+        .expect_err("live catalog count mismatch must fail");
+    assert!(count_error.to_string().contains("catalog has 1 packs"));
+
+    let mut manifest = ownership_manifest_for_legacy_pack(
+        account.id,
+        uuid::Uuid::from_u128(12_002),
+        uuid::Uuid::from_u128(12_003),
+        uuid::Uuid::from_u128(12_004),
+        handle,
+        pack_name,
+        &version,
+    );
+    manifest.packs[0].name = "substituted-pack".to_string();
+    manifest.versions[0].pack_name = "substituted-pack".to_string();
+    let (manifest_bytes, _) = ownership_manifest_input(&manifest);
+
+    let error = catalog
+        .run_ownership_backfill(&manifest_bytes, None, OwnershipBackfillMode::DryRun)
+        .await
+        .expect_err("equal-count identity substitution must fail");
+    assert!(error.to_string().contains(pack_name));
+
+    let stored_pack = catalog
+        .get_pack(pack_name)
+        .await
+        .expect("get census pack failed");
+    let stored_version = catalog
+        .get_pack_version(pack_name, "1.0.0")
+        .await
+        .expect("get census version failed");
+    assert_eq!(stored_pack.publisher_id, None);
+    assert_eq!(stored_version.publisher_key_id, None);
+}
+
+/// Backfill cannot transfer another legacy handle's signed rows into a publisher.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn ownership_backfill_rejects_cross_handle_key_transfer() {
+    let (catalog, _container) = setup_catalog().await;
+    let alice_handle = "legacy-alice";
+    let bob_handle = "legacy-bob";
+    let alice_pack = "ownership-alice-pack";
+    let bob_pack = "ownership-bob-pack";
+    catalog
+        .register_author(make_author(80, alice_handle))
+        .await
+        .expect("register Alice author failed");
+    catalog
+        .register_author(make_author(81, bob_handle))
+        .await
+        .expect("register Bob author failed");
+    let alice_version = make_version(alice_pack, "1.0.0", 80, 82);
+    let bob_version = make_version(bob_pack, "1.0.0", 81, 83);
+    catalog
+        .register_pack_version(alice_version.clone())
+        .await
+        .expect("register Alice pack failed");
+    catalog
+        .register_pack_version(bob_version.clone())
+        .await
+        .expect("register Bob pack failed");
+    let account = make_account(uuid::Uuid::from_u128(13_001), "ownership-alice-owner");
+    catalog
+        .create_account(account.clone())
+        .await
+        .expect("create Alice ownership account failed");
+
+    let publisher_id = uuid::Uuid::from_u128(13_002);
+    let alice_key_id = uuid::Uuid::from_u128(13_003);
+    let bob_key_id = uuid::Uuid::from_u128(13_004);
+    let timestamp = ownership_manifest_time();
+    let manifest = OwnershipBackfillManifest {
+        schema_version: OWNERSHIP_BACKFILL_SCHEMA_VERSION,
+        expected_pack_count: 2,
+        expected_version_count: 2,
+        publishers: vec![OwnershipManifestPublisher {
+            id: publisher_id,
+            handle: alice_handle.to_string(),
+            owner_account_id: account.id,
+            display_name: "Alice publisher".to_string(),
+            biography: None,
+            moderation_status: OwnershipManifestModerationStatus::Approved,
+            created_at: timestamp,
+            audit_event_id: uuid::Uuid::from_u128(13_005),
+            audit_created_at: timestamp,
+            keys: vec![
+                OwnershipManifestKey {
+                    id: alice_key_id,
+                    public_key: hex::encode(alice_version.author_pubkey.0),
+                    label: "Alice legacy key".to_string(),
+                    state: OwnershipManifestKeyState::Active,
+                    created_at: timestamp,
+                    revoked_at: None,
+                },
+                OwnershipManifestKey {
+                    id: bob_key_id,
+                    public_key: hex::encode(bob_version.author_pubkey.0),
+                    label: "Bob legacy key".to_string(),
+                    state: OwnershipManifestKeyState::Active,
+                    created_at: timestamp,
+                    revoked_at: None,
+                },
+            ],
+        }],
+        packs: vec![
+            OwnershipManifestPack {
+                name: alice_pack.to_string(),
+                publisher_id,
+                expected_current_author: hex::encode(alice_version.author_pubkey.0),
+            },
+            OwnershipManifestPack {
+                name: bob_pack.to_string(),
+                publisher_id,
+                expected_current_author: hex::encode(bob_version.author_pubkey.0),
+            },
+        ],
+        versions: vec![
+            OwnershipManifestVersion {
+                pack_name: alice_pack.to_string(),
+                version: alice_version.version.clone(),
+                publisher_key_id: alice_key_id,
+                expected_author_pubkey: hex::encode(alice_version.author_pubkey.0),
+                expected_content_hash: hex::encode(alice_version.content_hash.as_bytes()),
+            },
+            OwnershipManifestVersion {
+                pack_name: bob_pack.to_string(),
+                version: bob_version.version.clone(),
+                publisher_key_id: bob_key_id,
+                expected_author_pubkey: hex::encode(bob_version.author_pubkey.0),
+                expected_content_hash: hex::encode(bob_version.content_hash.as_bytes()),
+            },
+        ],
+    };
+    let (manifest_bytes, _) = ownership_manifest_input(&manifest);
+
+    let error = catalog
+        .run_ownership_backfill(&manifest_bytes, None, OwnershipBackfillMode::DryRun)
+        .await
+        .expect_err("cross-handle ownership transfer must fail");
+    assert!(error
+        .to_string()
+        .contains("belongs to legacy author handle legacy-bob, not legacy-alice"));
+    let alice_stored = catalog
+        .get_pack(alice_pack)
+        .await
+        .expect("get Alice pack after rejection failed");
+    let bob_stored = catalog
+        .get_pack(bob_pack)
+        .await
+        .expect("get Bob pack after rejection failed");
+    assert_eq!(alice_stored.publisher_id, None);
+    assert_eq!(bob_stored.publisher_id, None);
+}
 
 /// Account identities are unique by exact issuer and subject and remain provider-neutral.
 #[tokio::test]

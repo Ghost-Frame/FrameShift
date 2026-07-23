@@ -16,6 +16,7 @@
 //! 8. Cache the extracted pack directory under `cache/<pack_canonical_hash>`.
 //! 9. Return the [`LockedPersona`] for the caller to commit to the lockfile.
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::VerifyingKey;
 use flate2::read::GzDecoder;
 use frameshift_pack::{ObjectHash, Pack};
@@ -30,6 +31,7 @@ use tracing::debug;
 
 use crate::error::ClientError;
 use crate::model::{LockedPersona, PersonaSpec, ProjectPaths};
+use crate::publisher::EnrolledPublisherKeyState;
 
 /// Environment variable that overrides the registry base URL.
 ///
@@ -76,6 +78,10 @@ const MAX_TRUST_PIN_BYTES: u64 = 1024;
 /// server additions will not break older clients.
 #[derive(Debug, Deserialize)]
 struct VersionRecord {
+    /// Pack name echoed by the immutable catalog record.
+    pack_name: String,
+    /// Exact published version echoed by the immutable catalog record.
+    version: String,
     /// SHA-256 hash of the raw `.tar.gz` archive bytes (hex string, 64 chars).
     content_hash: ObjectHash,
     /// Ed25519 signature over the canonical pack hash (base64url no-pad).
@@ -85,6 +91,18 @@ struct VersionRecord {
     signature: Vec<u8>,
     /// Ed25519 public key of the author who published this version (base64url no-pad).
     author_pubkey: AuthorPubkeyField,
+    /// Stable publisher-key link retained in the base catalog record.
+    #[serde(default)]
+    publisher_key_id: Option<String>,
+    /// Publisher identity attached by ownership-aware registries.
+    #[serde(default)]
+    publisher: Option<RegistryPublisherSummary>,
+    /// Legacy identity attached when the version has no publisher-key link.
+    #[serde(default)]
+    legacy_author: Option<RegistryLegacyAuthorSummary>,
+    /// Exact enrolled key and lifecycle state attached by ownership-aware registries.
+    #[serde(default)]
+    publisher_key: Option<RegistryPublisherKeySummary>,
 }
 
 /// Wrapper that deserializes either a base64url string or a raw `[u8; 32]` JSON array.
@@ -200,6 +218,79 @@ pub struct RegistrySearchResult {
     /// Backend-assigned relevance score (higher is more relevant; not
     /// comparable across backends).
     pub score: f32,
+    /// Preferred publisher identity when the registry has linked ownership.
+    #[serde(default)]
+    pub publisher: Option<RegistryPublisherSummary>,
+    /// Legacy author identity when publisher ownership has not been linked.
+    #[serde(default)]
+    pub legacy_author: Option<RegistryLegacyAuthorSummary>,
+}
+
+/// Public publisher identity returned additively by ownership-aware registries.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct RegistryPublisherSummary {
+    /// Stable publisher identifier serialized as a UUID string.
+    pub id: String,
+    /// Unique public publisher handle.
+    pub handle: String,
+    /// Public publisher display name.
+    pub display_name: String,
+}
+
+/// Legacy author identity returned during the compatibility window.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct RegistryLegacyAuthorSummary {
+    /// Unique legacy author handle.
+    pub handle: String,
+    /// Optional legacy author display name.
+    pub display_name: Option<String>,
+}
+
+/// Public state for the exact publisher key linked to a historical version.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct RegistryPublisherKeySummary {
+    /// Stable publisher-key identifier serialized as a UUID string.
+    pub id: String,
+    /// Current lifecycle state of the historical signing key.
+    pub state: EnrolledPublisherKeyState,
+}
+
+/// Ownership and verification details for one immutable registry version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistryVersionDetails {
+    /// Exact pack name returned by the registry.
+    pub pack_name: String,
+    /// Exact version returned by the registry.
+    pub version: String,
+    /// Immutable archive SHA-256 encoded as lowercase hexadecimal.
+    pub content_hash: String,
+    /// Historical Ed25519 signer encoded as base64url without padding.
+    pub author_pubkey: String,
+    /// Stable publisher-key link retained in the base record.
+    pub publisher_key_id: Option<String>,
+    /// Current publisher identity when ownership is linked.
+    pub publisher: Option<RegistryPublisherSummary>,
+    /// Legacy identity when no publisher key is linked.
+    pub legacy_author: Option<RegistryLegacyAuthorSummary>,
+    /// Exact historical publisher key and its current lifecycle state.
+    pub publisher_key: Option<RegistryPublisherKeySummary>,
+}
+
+/// Conversion helpers for public immutable version details.
+impl RegistryVersionDetails {
+    /// Convert the private install wire record into a stable public view.
+    fn from_record(record: &VersionRecord) -> Self {
+        Self {
+            pack_name: record.pack_name.clone(),
+            version: record.version.clone(),
+            content_hash: record.content_hash.to_hex(),
+            author_pubkey: URL_SAFE_NO_PAD.encode(record.author_pubkey.0),
+            publisher_key_id: record.publisher_key_id.clone(),
+            publisher: record.publisher.clone(),
+            legacy_author: record.legacy_author.clone(),
+            publisher_key: record.publisher_key.clone(),
+        }
+    }
 }
 
 /// Client-side subset of the server's `PackRecord`, containing only the
@@ -208,6 +299,8 @@ pub struct RegistrySearchResult {
 pub struct RegistryPackSummary {
     /// The pack's unique name.
     pub name: String,
+    /// Legacy-compatible raw owner key retained for verification and fallback display.
+    pub current_author: String,
     /// Short human-readable description of the pack.
     pub description: String,
     /// Tags associated with the pack for search/discovery.
@@ -302,6 +395,18 @@ pub fn resolve_latest_version(name: &str) -> Result<String, ClientError> {
         .ok_or_else(|| ClientError::NoPublishedVersion(name.to_string()))
 }
 
+/// Fetch ownership and verification details for one immutable registry version.
+pub fn registry_version_details(
+    base: &str,
+    name: &str,
+    version: &str,
+) -> Result<RegistryVersionDetails, ClientError> {
+    let url = format!("{base}/v1/packs/{name}/versions/{version}");
+    let record: VersionRecord = ureq_get_json(&url)?;
+    validate_version_identity(&record, name, version)?;
+    Ok(RegistryVersionDetails::from_record(&record))
+}
+
 /// Fetch a pack from the registry, verify it, cache it, and return the [`LockedPersona`].
 ///
 /// This is the top-level entry point for [`crate::InstallSource::Registry`].
@@ -317,6 +422,7 @@ pub fn fetch_and_install(
     let record_url = format!("{base}/v1/packs/{name}/versions/{version}");
     debug!(url = %record_url, "fetching pack version record from registry");
     let record: VersionRecord = ureq_get_json(&record_url)?;
+    validate_version_identity(&record, name, version)?;
 
     // Step 2: fetch the raw archive bytes.
     let archive_url = format!("{base}/v1/packs/{name}/versions/{version}/pack");
@@ -372,13 +478,14 @@ pub fn fetch_and_install(
     debug!("pack signature verified against registry pubkey");
 
     // Cryptographic validity is not enough when the registry supplies both
-    // the signature and key. Pin the first verified key and reject later
-    // substitutions for the same registry and author.
-    check_or_create_author_pin(
+    // the signature and key. All responses retain exact key TOFU, while
+    // ownership-aware responses additionally pin the stable publisher UUID.
+    check_or_create_registry_trust(
         paths,
         &base,
         &pack.manifest().author_handle,
         &record.author_pubkey.0,
+        &record,
     )?;
 
     // Step 8: cache the extracted pack directory.
@@ -387,6 +494,118 @@ pub fn fetch_and_install(
     crate::ensure_cached_pack(&pack_root, &cache_path)?;
 
     Ok(crate::locked_persona_from_pack(&pack))
+}
+
+/// Require the immutable record identity to match the requested resource.
+fn validate_version_identity(
+    record: &VersionRecord,
+    expected_name: &str,
+    expected_version: &str,
+) -> Result<(), ClientError> {
+    if record.pack_name != expected_name || record.version != expected_version {
+        return Err(ClientError::RegistryOwnershipInvalid {
+            pack: format!("{expected_name}@{expected_version}"),
+            detail: "version record identity does not match the requested resource".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Apply exact signer-key TOFU and additive publisher identity continuity.
+fn check_or_create_registry_trust(
+    paths: &ProjectPaths,
+    registry: &str,
+    author: &str,
+    pubkey: &[u8; 32],
+    record: &VersionRecord,
+) -> Result<(), ClientError> {
+    let pack = format!("{}@{}", record.pack_name, record.version);
+    match (
+        &record.publisher,
+        &record.publisher_key,
+        record.publisher_key_id.as_deref(),
+    ) {
+        (None, None, _) => {
+            if record
+                .legacy_author
+                .as_ref()
+                .is_some_and(|legacy| legacy.handle != author)
+            {
+                return Err(ClientError::RegistryOwnershipInvalid {
+                    pack,
+                    detail: "legacy author handle does not match the signed pack manifest"
+                        .to_string(),
+                });
+            }
+            check_or_create_author_pin(paths, registry, author, pubkey)
+        }
+        (Some(publisher), None, None) => {
+            let legacy_author = record.legacy_author.as_ref().ok_or_else(|| {
+                ClientError::RegistryOwnershipInvalid {
+                    pack: pack.clone(),
+                    detail: "historical unlinked version has no legacy author metadata".to_string(),
+                }
+            })?;
+            if publisher.handle != author || legacy_author.handle != author {
+                return Err(ClientError::RegistryOwnershipInvalid {
+                    pack,
+                    detail:
+                        "publisher and legacy author handles must match the signed pack manifest"
+                            .to_string(),
+                });
+            }
+            check_or_create_author_pin(paths, registry, author, pubkey)
+        }
+        (Some(publisher), Some(publisher_key), Some(linked_key_id)) => {
+            if record.legacy_author.is_some() {
+                return Err(ClientError::RegistryOwnershipInvalid {
+                    pack,
+                    detail: "publisher and legacy author metadata cannot coexist".to_string(),
+                });
+            }
+            if publisher.handle != author {
+                return Err(ClientError::RegistryOwnershipInvalid {
+                    pack,
+                    detail: "publisher handle does not match the signed pack manifest".to_string(),
+                });
+            }
+            let publisher_id = publisher.id.parse::<uuid::Uuid>().map_err(|_| {
+                ClientError::RegistryOwnershipInvalid {
+                    pack: pack.clone(),
+                    detail: "publisher identifier is not a UUID".to_string(),
+                }
+            })?;
+            let summarized_key_id = publisher_key.id.parse::<uuid::Uuid>().map_err(|_| {
+                ClientError::RegistryOwnershipInvalid {
+                    pack: pack.clone(),
+                    detail: "publisher key identifier is not a UUID".to_string(),
+                }
+            })?;
+            let linked_key_id = linked_key_id.parse::<uuid::Uuid>().map_err(|_| {
+                ClientError::RegistryOwnershipInvalid {
+                    pack: pack.clone(),
+                    detail: "catalog publisher key link is not a UUID".to_string(),
+                }
+            })?;
+            if linked_key_id != summarized_key_id {
+                return Err(ClientError::RegistryOwnershipInvalid {
+                    pack,
+                    detail: "publisher key summary does not match the catalog key link".to_string(),
+                });
+            }
+            check_or_create_publisher_pin(
+                paths,
+                registry,
+                author,
+                &publisher_id.to_string(),
+                pubkey,
+            )
+        }
+        _ => Err(ClientError::RegistryOwnershipInvalid {
+            pack,
+            detail: "publisher ownership metadata is internally inconsistent".to_string(),
+        }),
+    }
 }
 
 /// Verify or atomically establish an author key continuity pin.
@@ -481,6 +700,118 @@ fn verify_author_pin(
             author: author.to_string(),
             expected: expected.to_string(),
             actual: presented.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Verify or atomically establish stable publisher identity continuity.
+fn check_or_create_publisher_pin(
+    paths: &ProjectPaths,
+    registry: &str,
+    author: &str,
+    publisher_id: &str,
+    presented_pubkey: &[u8; 32],
+) -> Result<(), ClientError> {
+    // Publisher identity is additive trust context, not a replacement for the
+    // exact signer pin. Until the wire protocol carries an old-key-signed
+    // rotation proof, a newly presented key must retain the existing warning.
+    check_or_create_author_pin(paths, registry, author, presented_pubkey)?;
+
+    let data_root = paths.cache_dir.parent().unwrap_or(&paths.cache_dir);
+    let namespace = ObjectHash::of(format!("{registry}\0{author}").as_bytes()).to_hex();
+    let pin_dir = data_root.join("trust").join("registry-publishers");
+    std::fs::create_dir_all(&pin_dir).map_err(|source| ClientError::Io {
+        path: pin_dir.clone(),
+        source,
+    })?;
+    set_private_dir_permissions(&pin_dir)?;
+
+    let pin_path = pin_dir.join(format!("{namespace}.pin"));
+    match std::fs::symlink_metadata(&pin_path) {
+        Ok(_) => return verify_publisher_pin(&pin_path, registry, author, publisher_id),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(ClientError::Io {
+                path: pin_path,
+                source,
+            });
+        }
+    }
+
+    let contents = format!("frameshift-publisher-v1\n{registry}\n{author}\n{publisher_id}\n");
+    match create_private_file(&pin_path) {
+        Ok(mut file) => file
+            .write_all(contents.as_bytes())
+            .map_err(|source| ClientError::Io {
+                path: pin_path,
+                source,
+            }),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            verify_publisher_pin(&pin_path, registry, author, publisher_id)
+        }
+        Err(source) => Err(ClientError::Io {
+            path: pin_path,
+            source,
+        }),
+    }
+}
+
+/// Compare an existing bounded publisher pin with the presented identity.
+fn verify_publisher_pin(
+    pin_path: &Path,
+    registry: &str,
+    author: &str,
+    presented_publisher_id: &str,
+) -> Result<(), ClientError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(pin_path).map_err(|source| ClientError::Io {
+        path: pin_path.to_path_buf(),
+        source,
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|source| ClientError::Io {
+                path: pin_path.to_path_buf(),
+                source,
+            })?;
+    }
+    let mut raw = String::new();
+    LimitedReader::new(file, MAX_TRUST_PIN_BYTES)
+        .read_to_string(&mut raw)
+        .map_err(|source| ClientError::Io {
+            path: pin_path.to_path_buf(),
+            source,
+        })?;
+    let mut lines = raw.lines();
+    let valid_header = lines.next() == Some("frameshift-publisher-v1");
+    let stored_registry = lines.next();
+    let stored_author = lines.next();
+    let stored_publisher_id = lines.next();
+    if !valid_header || stored_registry != Some(registry) || stored_author != Some(author) {
+        return Err(ClientError::Io {
+            path: pin_path.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "registry publisher trust pin is malformed",
+            ),
+        });
+    }
+    let expected = stored_publisher_id.unwrap_or_default();
+    if expected != presented_publisher_id {
+        return Err(ClientError::RegistryPublisherChanged {
+            registry: registry.to_string(),
+            author: author.to_string(),
+            expected: expected.to_string(),
+            actual: presented_publisher_id.to_string(),
         });
     }
     Ok(())
@@ -822,6 +1153,195 @@ mod tests {
         ));
     }
 
+    /// Build one ownership-aware version record for trust continuity tests.
+    fn ownership_version_record(
+        publisher_id: &str,
+        key_id: &str,
+        key_state: EnrolledPublisherKeyState,
+        pubkey: [u8; 32],
+    ) -> VersionRecord {
+        VersionRecord {
+            pack_name: "demo".to_string(),
+            version: "1.0.0".to_string(),
+            content_hash: ObjectHash::of(b"test"),
+            signature: vec![0_u8; 64],
+            author_pubkey: AuthorPubkeyField(pubkey),
+            publisher_key_id: Some(key_id.to_string()),
+            publisher: Some(RegistryPublisherSummary {
+                id: publisher_id.to_string(),
+                handle: "alice".to_string(),
+                display_name: "Alice".to_string(),
+            }),
+            legacy_author: None,
+            publisher_key: Some(RegistryPublisherKeySummary {
+                id: key_id.to_string(),
+                state: key_state,
+            }),
+        }
+    }
+
+    /// A publisher UUID cannot silently authorize an unproven signing-key rotation.
+    #[test]
+    fn publisher_pin_rejects_unproven_key_rotation() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = trust_test_paths(temp.path());
+        let publisher_id = "4a128e72-cc91-4721-b452-943ce736799b";
+        let first = ownership_version_record(
+            publisher_id,
+            "cc56ea2b-991d-46eb-a94f-936a9b071a4a",
+            EnrolledPublisherKeyState::Revoked,
+            [7_u8; 32],
+        );
+        check_or_create_registry_trust(
+            &paths,
+            "https://registry.example",
+            "alice",
+            &[7_u8; 32],
+            &first,
+        )
+        .expect("legacy-to-publisher transition must succeed");
+
+        let rotated = ownership_version_record(
+            publisher_id,
+            "1e41ae38-9a5e-4623-8fcc-8f705928dacf",
+            EnrolledPublisherKeyState::Active,
+            [8_u8; 32],
+        );
+        let rotation = check_or_create_registry_trust(
+            &paths,
+            "https://registry.example",
+            "alice",
+            &[8_u8; 32],
+            &rotated,
+        )
+        .expect_err("publisher UUID alone must not authorize a new signer");
+        assert!(matches!(
+            rotation,
+            ClientError::RegistryAuthorKeyChanged { .. }
+        ));
+
+        let legacy_only = VersionRecord {
+            publisher: None,
+            publisher_key: None,
+            publisher_key_id: None,
+            ..first
+        };
+        check_or_create_registry_trust(
+            &paths,
+            "https://registry.example",
+            "alice",
+            &[7_u8; 32],
+            &legacy_only,
+        )
+        .expect("legacy response with the pinned signer must retain continuity");
+    }
+
+    /// A linked pack may retain exact legacy trust for an unlinked historical version.
+    #[test]
+    fn publisher_with_legacy_historical_version_uses_author_key_pin() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = trust_test_paths(temp.path());
+        let mut historical = ownership_version_record(
+            "4a128e72-cc91-4721-b452-943ce736799b",
+            "cc56ea2b-991d-46eb-a94f-936a9b071a4a",
+            EnrolledPublisherKeyState::Active,
+            [7_u8; 32],
+        );
+        historical.publisher_key_id = None;
+        historical.publisher_key = None;
+        historical.legacy_author = Some(RegistryLegacyAuthorSummary {
+            handle: "alice".to_string(),
+            display_name: Some("Alice".to_string()),
+        });
+
+        check_or_create_registry_trust(
+            &paths,
+            "https://registry.example",
+            "alice",
+            &[7_u8; 32],
+            &historical,
+        )
+        .expect("historical unlinked version must retain legacy key continuity");
+        let error = check_or_create_registry_trust(
+            &paths,
+            "https://registry.example",
+            "alice",
+            &[8_u8; 32],
+            &historical,
+        )
+        .expect_err("historical signer substitution must fail");
+        assert!(matches!(
+            error,
+            ClientError::RegistryAuthorKeyChanged { .. }
+        ));
+    }
+
+    /// A trusted handle cannot silently move to another publisher UUID.
+    #[test]
+    fn publisher_pin_rejects_identity_substitution() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = trust_test_paths(temp.path());
+        let first = ownership_version_record(
+            "4a128e72-cc91-4721-b452-943ce736799b",
+            "cc56ea2b-991d-46eb-a94f-936a9b071a4a",
+            EnrolledPublisherKeyState::Active,
+            [7_u8; 32],
+        );
+        check_or_create_registry_trust(
+            &paths,
+            "https://registry.example",
+            "alice",
+            &[7_u8; 32],
+            &first,
+        )
+        .expect("first publisher pin must succeed");
+
+        let substituted = ownership_version_record(
+            "6199b23b-906f-4689-a840-664a184c5f75",
+            "1e41ae38-9a5e-4623-8fcc-8f705928dacf",
+            EnrolledPublisherKeyState::Active,
+            [8_u8; 32],
+        );
+        let error = check_or_create_registry_trust(
+            &paths,
+            "https://registry.example",
+            "alice",
+            &[8_u8; 32],
+            &substituted,
+        )
+        .expect_err("publisher substitution must fail");
+        assert!(matches!(
+            error,
+            ClientError::RegistryPublisherChanged { .. }
+        ));
+    }
+
+    /// Publisher summaries must agree with the base catalog key link.
+    #[test]
+    fn publisher_key_summary_mismatch_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = trust_test_paths(temp.path());
+        let mut record = ownership_version_record(
+            "4a128e72-cc91-4721-b452-943ce736799b",
+            "cc56ea2b-991d-46eb-a94f-936a9b071a4a",
+            EnrolledPublisherKeyState::Active,
+            [7_u8; 32],
+        );
+        record.publisher_key_id = Some("1e41ae38-9a5e-4623-8fcc-8f705928dacf".to_string());
+        let error = check_or_create_registry_trust(
+            &paths,
+            "https://registry.example",
+            "alice",
+            &[7_u8; 32],
+            &record,
+        )
+        .expect_err("key-link mismatch must fail");
+        assert!(matches!(
+            error,
+            ClientError::RegistryOwnershipInvalid { .. }
+        ));
+    }
+
     /// Build a real `frameshift_catalog::PackRecord` fixture for serde-pin tests.
     fn sample_pack_record(
         name: &str,
@@ -857,6 +1377,39 @@ mod tests {
         assert_eq!(hit.pack.name, "demo");
         assert_eq!(hit.pack.latest_version, Some("2.0.0".to_string()));
         assert_eq!(hit.pack.total_downloads, 42);
+        assert_eq!(
+            hit.pack.current_author,
+            frameshift_catalog::Ed25519PublicKey([7u8; 32]).to_string()
+        );
+        assert!(hit.publisher.is_none());
+        assert!(hit.legacy_author.is_none());
+    }
+
+    /// Ownership additions deserialize without changing the legacy pack subset.
+    #[test]
+    fn search_response_body_accepts_additive_ownership_fields() {
+        let pack = sample_pack_record("owned-demo", Some("3.0.0"), 7);
+        let server_result = frameshift_catalog::PackSearchResult { pack, score: 0.8 };
+        let value = serde_json::json!({
+            "results": [{
+                "pack": server_result.pack,
+                "score": server_result.score,
+                "publisher": {
+                    "id": "4a128e72-cc91-4721-b452-943ce736799b",
+                    "handle": "owned",
+                    "display_name": "Owned Publisher"
+                },
+                "future_addition": true
+            }]
+        });
+
+        let body: SearchResponseBody = serde_json::from_value(value).unwrap();
+        let hit = &body.results[0];
+        let publisher = hit.publisher.as_ref().expect("publisher summary");
+        assert_eq!(publisher.handle, "owned");
+        assert_eq!(publisher.display_name, "Owned Publisher");
+        assert_eq!(publisher.id, "4a128e72-cc91-4721-b452-943ce736799b");
+        assert!(hit.legacy_author.is_none());
     }
 
     /// search_registry performs a real HTTP round-trip against a one-shot TCP
@@ -1128,11 +1681,11 @@ mod tests {
     }
 
     /// The client's private `VersionRecord` deserializes the exact JSON shape
-    /// produced by serializing a real server-side `PackVersionRecord`, and the
-    /// three fields `fetch_and_install` relies on (`content_hash`, `signature`,
-    /// `author_pubkey`) round-trip correctly. `VersionRecord` is private to
-    /// this module, so this pin must live here rather than in the
-    /// `tests/registry_install.rs` integration test.
+    /// produced by serializing a real server-side `PackVersionRecord` with
+    /// additive publisher fields, and the
+    /// install verification and ownership fields round-trip correctly.
+    /// `VersionRecord` is private to this module, so this pin must live here
+    /// rather than in the `tests/registry_install.rs` integration test.
     #[test]
     fn version_record_matches_catalog_wire_shape() {
         use ed25519_dalek::Signer as _;
@@ -1141,6 +1694,8 @@ mod tests {
         let signature = signing.sign(content_hash.as_bytes()).to_bytes().to_vec();
         let author_pubkey =
             frameshift_catalog::Ed25519PublicKey(signing.verifying_key().to_bytes());
+        let publisher_key_id =
+            uuid::Uuid::parse_str("cc56ea2b-991d-46eb-a94f-936a9b071a4a").unwrap();
 
         let server_record = frameshift_catalog::PackVersionRecord {
             pack_name: "demo".to_string(),
@@ -1148,7 +1703,7 @@ mod tests {
             content_hash,
             signature: signature.clone(),
             author_pubkey,
-            publisher_key_id: None,
+            publisher_key_id: Some(publisher_key_id),
             parent_hash: None,
             capability_manifest_json: "{}".to_string(),
             schema_version: 1,
@@ -1158,12 +1713,53 @@ mod tests {
             size_bytes: 123,
         };
 
-        let value = serde_json::to_value(&server_record).unwrap();
+        let mut value = serde_json::to_value(&server_record).unwrap();
+        let object = value.as_object_mut().expect("version object");
+        object.insert(
+            "publisher".to_string(),
+            serde_json::json!({
+                "id": "4a128e72-cc91-4721-b452-943ce736799b",
+                "handle": "owned",
+                "display_name": "Owned Publisher"
+            }),
+        );
+        object.insert(
+            "publisher_key".to_string(),
+            serde_json::json!({
+                "id": "cc56ea2b-991d-46eb-a94f-936a9b071a4a",
+                "state": "revoked"
+            }),
+        );
         let client_record: VersionRecord = serde_json::from_value(value).unwrap();
 
         assert_eq!(client_record.content_hash, content_hash);
         assert_eq!(client_record.signature, signature);
         assert_eq!(client_record.author_pubkey.0, author_pubkey.0);
+        assert_eq!(
+            client_record.publisher_key_id.as_deref(),
+            Some("cc56ea2b-991d-46eb-a94f-936a9b071a4a")
+        );
+        assert_eq!(
+            client_record
+                .publisher
+                .as_ref()
+                .expect("publisher summary")
+                .handle,
+            "owned"
+        );
+        assert_eq!(
+            client_record
+                .publisher_key
+                .as_ref()
+                .expect("publisher key summary")
+                .state,
+            EnrolledPublisherKeyState::Revoked
+        );
+        let details = RegistryVersionDetails::from_record(&client_record);
+        assert_eq!(
+            details.publisher_key.expect("public key status").state,
+            EnrolledPublisherKeyState::Revoked
+        );
     }
 
     /// A hash-mismatch is detected before any extraction is attempted.

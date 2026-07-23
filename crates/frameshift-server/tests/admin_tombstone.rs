@@ -57,6 +57,7 @@ fn test_config(admins: Vec<String>) -> Arc<ServerConfig> {
         trust_forwarded_for: false,
         signed_request_max_skew: Duration::from_secs(300),
         admin_pubkeys: admins,
+        publisher_ownership_reads: true,
         oidc: frameshift_server::OidcConfig::disabled(),
         shutdown_grace: Duration::from_secs(1),
         cors_allowed_origins: String::new(),
