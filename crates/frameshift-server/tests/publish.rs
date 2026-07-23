@@ -19,10 +19,12 @@
 
 mod mocks;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use chrono::Utc;
@@ -34,14 +36,57 @@ use secrecy::SecretString;
 use tower::ServiceExt as _;
 
 use frameshift_catalog::identity::Ed25519PublicKey;
-use frameshift_catalog::records::{AuthorRecord, PackRecord};
+use frameshift_catalog::records::{
+    AccountRecord, AccountStatus, AuthorRecord, MembershipState, PackRecord, PublisherKeyRecord,
+    PublisherKeyState, PublisherMembershipRecord, PublisherModerationStatus,
+    PublisherProfileRecord, PublisherRole,
+};
 use frameshift_pack::Pack;
 
+use frameshift_server::account_auth::{BearerTokenVerifier, OidcAuthError, VerifiedOidcIdentity};
 use frameshift_server::metrics::Metrics;
-use frameshift_server::{app, AppState, LogFormat, ServerConfig};
+use frameshift_server::{app, AppState, LogFormat, OidcConfig, ServerConfig};
 
 use mocks::catalog::MockCatalog;
 use mocks::objects::MockPackStore;
+
+/// Deterministic bearer verifier for publisher publication tests.
+#[derive(Clone)]
+struct FakeVerifier {
+    /// Opaque bearer tokens mapped to verified OIDC identities.
+    identities: Arc<RwLock<HashMap<String, VerifiedOidcIdentity>>>,
+}
+
+/// Constructors for the publication bearer verifier.
+impl FakeVerifier {
+    /// Create a verifier that accepts one owner token.
+    fn owner(token: &str, subject: &str) -> Self {
+        let identity = VerifiedOidcIdentity {
+            issuer: "https://issuer.frameshift.test".to_string(),
+            subject: subject.to_string(),
+            email: None,
+            display_name: None,
+            auth_time: Some(u64::try_from(Utc::now().timestamp()).unwrap()),
+        };
+        Self {
+            identities: Arc::new(RwLock::new(HashMap::from([(token.to_string(), identity)]))),
+        }
+    }
+}
+
+/// Resolve only explicitly configured bearer tokens.
+#[async_trait]
+impl BearerTokenVerifier for FakeVerifier {
+    /// Return the configured identity or an opaque invalid-token error.
+    async fn verify(&self, token: &str) -> Result<VerifiedOidcIdentity, OidcAuthError> {
+        self.identities
+            .read()
+            .unwrap()
+            .get(token)
+            .cloned()
+            .ok_or(OidcAuthError::InvalidToken)
+    }
+}
 
 /// Minimal [`ServerConfig`] for tests. Body limit is large enough to fit a
 /// realistic pack upload.
@@ -118,6 +163,31 @@ fn make_state_with_config(
         )),
         account_auth: None,
     }
+}
+
+/// Build publisher-enabled application state with a deterministic bearer verifier.
+fn make_state_with_auth(
+    catalog: MockCatalog,
+    objects: MockPackStore,
+    verifier: FakeVerifier,
+) -> AppState {
+    let mut state = make_state(catalog, objects);
+    state.config = Arc::new(ServerConfig {
+        oidc: OidcConfig {
+            enabled: true,
+            issuer: "https://issuer.frameshift.test".to_string(),
+            audience: "frameshift-api".to_string(),
+            jwks_url: "https://issuer.frameshift.test/jwks".to_string(),
+            allowed_algorithms: vec!["EdDSA".to_string()],
+            jwks_cache_ttl: Duration::from_secs(300),
+            jwks_stale_ttl: Duration::from_secs(900),
+            clock_skew: Duration::from_secs(30),
+            fresh_auth_max_age: Duration::from_secs(300),
+        },
+        ..(*state.config).clone()
+    });
+    state.account_auth = Some(Arc::new(verifier));
+    state
 }
 
 /// Write a minimal valid pack directory at `dir` with the given name/version
@@ -226,6 +296,26 @@ async fn post_publish(
     author_handle: &str,
     request_key: Option<&SigningKey>,
 ) -> axum::http::Response<Body> {
+    post_publish_with_bearer(
+        state,
+        pack_bytes,
+        signature,
+        author_handle,
+        request_key,
+        None,
+    )
+    .await
+}
+
+/// Issue a signed pack publication with an optional OIDC bearer credential.
+async fn post_publish_with_bearer(
+    state: AppState,
+    pack_bytes: &[u8],
+    signature: &[u8],
+    author_handle: &str,
+    request_key: Option<&SigningKey>,
+    bearer: Option<&str>,
+) -> axum::http::Response<Body> {
     let boundary = "frameshifttestboundary";
     let body = build_multipart(boundary, pack_bytes, signature, author_handle);
     let mut req = Request::builder().method("POST").uri("/v1/packs").header(
@@ -236,6 +326,9 @@ async fn post_publish(
         for h in mocks::signing::signed_headers(key, "POST", "/v1/packs", &body) {
             req = req.header(h.name, h.value);
         }
+    }
+    if let Some(token) = bearer {
+        req = req.header("authorization", format!("Bearer {token}"));
     }
     let req = req.body(Body::from(body)).unwrap();
     app(state).oneshot(req).await.unwrap()
@@ -286,6 +379,90 @@ fn catalog_with_author(signing: &SigningKey, handle: &str) -> (MockCatalog, Ed25
         );
     }
     (catalog, pubkey)
+}
+
+/// Seed an account-backed publisher with the requested primary signing-key state.
+fn catalog_with_publisher(
+    signing: &SigningKey,
+    handle: &str,
+    key_state: PublisherKeyState,
+) -> (MockCatalog, uuid::Uuid, uuid::Uuid) {
+    let catalog = MockCatalog::new();
+    let now = Utc::now();
+    let account_id = uuid::Uuid::new_v4();
+    let publisher_id = uuid::Uuid::new_v4();
+    let key_id = uuid::Uuid::new_v4();
+    let account = AccountRecord {
+        id: account_id,
+        issuer: "https://issuer.frameshift.test".to_string(),
+        subject: "publisher-owner".to_string(),
+        email: None,
+        display_name: None,
+        status: AccountStatus::Active,
+        created_at: now,
+        updated_at: now,
+    };
+    let mut state = catalog.state.write().unwrap();
+    state.account_subjects.insert(
+        (account.issuer.clone(), account.subject.clone()),
+        account.id,
+    );
+    state.accounts.insert(account.id, account);
+    state.publishers.insert(
+        publisher_id,
+        PublisherProfileRecord {
+            id: publisher_id,
+            handle: handle.to_string(),
+            display_name: "Publisher Owner".to_string(),
+            biography: None,
+            moderation_status: PublisherModerationStatus::Approved,
+            created_at: now,
+            updated_at: now,
+        },
+    );
+    state
+        .publisher_handles
+        .insert(handle.to_string(), publisher_id);
+    state.publisher_memberships.insert(
+        (account_id, publisher_id),
+        PublisherMembershipRecord {
+            account_id,
+            publisher_id,
+            role: PublisherRole::Owner,
+            state: MembershipState::Active,
+            created_at: now,
+            updated_at: now,
+        },
+    );
+    state.publisher_keys.insert(
+        key_id,
+        PublisherKeyRecord {
+            id: key_id,
+            publisher_id,
+            public_key: Ed25519PublicKey(signing.verifying_key().to_bytes()),
+            label: "primary".to_string(),
+            state: key_state,
+            created_at: now,
+            revoked_at: (key_state == PublisherKeyState::Revoked).then_some(now),
+            last_used_at: None,
+        },
+    );
+    let backup_key_id = uuid::Uuid::new_v4();
+    state.publisher_keys.insert(
+        backup_key_id,
+        PublisherKeyRecord {
+            id: backup_key_id,
+            publisher_id,
+            public_key: Ed25519PublicKey([250_u8; 32]),
+            label: "backup".to_string(),
+            state: PublisherKeyState::Active,
+            created_at: now,
+            revoked_at: None,
+            last_used_at: None,
+        },
+    );
+    drop(state);
+    (catalog, publisher_id, key_id)
 }
 
 /// Build a fully prepared pack: extract dir, tar.gz bytes, canonical hash,
@@ -424,6 +601,130 @@ async fn publish_happy_path_returns_200_and_pack_is_fetchable() {
     assert_eq!(resp2.status(), StatusCode::OK);
     let archive_bytes = resp2.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(archive_bytes.as_ref(), prepared.targz.as_slice());
+}
+
+/// Account-backed publication requires bearer ownership and persists publisher identity links.
+#[tokio::test]
+async fn publisher_active_owner_and_key_can_publish() {
+    let signing = SigningKey::from_bytes(&[70_u8; 32]);
+    let (catalog, publisher_id, key_id) =
+        catalog_with_publisher(&signing, "account-publisher", PublisherKeyState::Active);
+    let prepared = prepare_pack(
+        "account-publisher-pack",
+        "1.0.0",
+        "account-publisher",
+        &signing,
+    );
+    let verifier = FakeVerifier::owner("owner-token", "publisher-owner");
+
+    let missing_bearer = post_publish(
+        make_state_with_auth(catalog.clone(), MockPackStore::new(), verifier.clone()),
+        &prepared.targz,
+        &prepared.signature,
+        "account-publisher",
+        Some(&signing),
+    )
+    .await;
+    assert_eq!(missing_bearer.status(), StatusCode::UNAUTHORIZED);
+
+    let response = post_publish_with_bearer(
+        make_state_with_auth(catalog.clone(), MockPackStore::new(), verifier),
+        &prepared.targz,
+        &prepared.signature,
+        "account-publisher",
+        Some(&signing),
+        Some("owner-token"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let state = catalog.state.read().unwrap();
+    assert_eq!(
+        state.packs["account-publisher-pack"].publisher_id,
+        Some(publisher_id)
+    );
+    assert_eq!(
+        state.versions[&("account-publisher-pack".to_string(), "1.0.0".to_string())]
+            .publisher_key_id,
+        Some(key_id)
+    );
+    assert!(state.publisher_keys[&key_id].last_used_at.is_some());
+}
+
+/// Publishing fails closed when legacy and account-backed namespaces both contain the handle.
+#[tokio::test]
+async fn ambiguous_publisher_and_legacy_handle_cannot_publish() {
+    let signing = SigningKey::from_bytes(&[72_u8; 32]);
+    let (catalog, _publisher_id, key_id) =
+        catalog_with_publisher(&signing, "ambiguous-publisher", PublisherKeyState::Active);
+    let pubkey = Ed25519PublicKey(signing.verifying_key().to_bytes());
+    {
+        let mut state = catalog.state.write().unwrap();
+        state
+            .handles
+            .insert("ambiguous-publisher".to_string(), pubkey);
+        state.authors.insert(
+            pubkey.to_string(),
+            AuthorRecord {
+                pubkey,
+                handle: "ambiguous-publisher".to_string(),
+                display_name: None,
+                created_at: Utc::now(),
+                oauth_links: vec![],
+            },
+        );
+    }
+    let prepared = prepare_pack(
+        "ambiguous-publisher-pack",
+        "1.0.0",
+        "ambiguous-publisher",
+        &signing,
+    );
+    let response = post_publish_with_bearer(
+        make_state_with_auth(
+            catalog.clone(),
+            MockPackStore::new(),
+            FakeVerifier::owner("owner-token", "publisher-owner"),
+        ),
+        &prepared.targz,
+        &prepared.signature,
+        "ambiguous-publisher",
+        Some(&signing),
+        Some("owner-token"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let state = catalog.state.read().unwrap();
+    assert!(state.versions.is_empty());
+    assert!(state.publisher_keys[&key_id].last_used_at.is_none());
+}
+
+/// A revoked enrolled key cannot authorize a new account-backed publication.
+#[tokio::test]
+async fn publisher_revoked_key_cannot_publish() {
+    let signing = SigningKey::from_bytes(&[71_u8; 32]);
+    let (catalog, _publisher_id, _key_id) =
+        catalog_with_publisher(&signing, "revoked-publisher", PublisherKeyState::Revoked);
+    let prepared = prepare_pack(
+        "revoked-publisher-pack",
+        "1.0.0",
+        "revoked-publisher",
+        &signing,
+    );
+    let response = post_publish_with_bearer(
+        make_state_with_auth(
+            catalog.clone(),
+            MockPackStore::new(),
+            FakeVerifier::owner("owner-token", "publisher-owner"),
+        ),
+        &prepared.targz,
+        &prepared.signature,
+        "revoked-publisher",
+        Some(&signing),
+        Some("owner-token"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(catalog.state.read().unwrap().versions.is_empty());
 }
 
 // ---------------------------------------------------------------------------

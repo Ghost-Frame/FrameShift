@@ -185,6 +185,45 @@ async fn disabled_auth_never_mounts_protected_routes() {
     assert_eq!(account.status(), StatusCode::NOT_FOUND);
 }
 
+/// Publisher creation cannot claim a handle already held by the legacy namespace.
+#[tokio::test]
+async fn publisher_creation_rejects_legacy_handle() {
+    let now = u64::try_from(Utc::now().timestamp()).unwrap();
+    let verifier = FakeVerifier::new();
+    verifier.allow("owner", "namespace-owner", now);
+    let catalog = MockCatalog::new();
+    catalog
+        .state
+        .write()
+        .unwrap()
+        .handles
+        .insert("legacy-owned".to_string(), Ed25519PublicKey([83_u8; 32]));
+    let state = test_state(catalog.clone(), Some(verifier));
+
+    let provisioned = send(
+        state.clone(),
+        Method::GET,
+        "/v1/account",
+        Some("owner"),
+        None,
+    )
+    .await;
+    assert_eq!(provisioned.status(), StatusCode::OK);
+    let response = send(
+        state,
+        Method::POST,
+        "/v1/publishers",
+        Some("owner"),
+        Some(json!({
+            "handle": "legacy-owned",
+            "display_name": "Legacy Owned"
+        })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(catalog.state.read().unwrap().publishers.is_empty());
+}
+
 /// Account JIT provisioning, publisher ownership, key proof, and suspension are enforced.
 #[tokio::test]
 async fn account_and_publisher_security_workflow_is_enforced() {
@@ -307,21 +346,34 @@ async fn account_and_publisher_security_workflow_is_enforced() {
     let proof_signature =
         URL_SAFE_NO_PAD.encode(signing_key.sign(challenge_text.as_bytes()).to_bytes());
 
+    let enrollment_body = json!({
+        "public_key": public_key,
+        "label": "primary",
+        "proof_signature": proof_signature
+    });
     let enrolled = send(
         state.clone(),
         Method::POST,
         "/v1/publishers/gatekeeper/keys",
         Some("owner"),
-        Some(json!({
-            "public_key": public_key,
-            "label": "primary",
-            "proof_signature": proof_signature
-        })),
+        Some(enrollment_body.clone()),
     )
     .await;
     assert_eq!(enrolled.status(), StatusCode::OK);
     let enrolled = response_json(enrolled).await;
     let key_id = enrolled["id"].as_str().unwrap();
+
+    let retried = send(
+        state.clone(),
+        Method::POST,
+        "/v1/publishers/gatekeeper/keys",
+        Some("owner"),
+        Some(enrollment_body),
+    )
+    .await;
+    assert_eq!(retried.status(), StatusCode::OK);
+    let retried = response_json(retried).await;
+    assert_eq!(retried["id"].as_str(), Some(key_id));
 
     let last_key = send(
         state.clone(),

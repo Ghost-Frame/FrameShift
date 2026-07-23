@@ -145,11 +145,15 @@ pub trait CatalogBackend: Send + Sync {
     ) -> Result<PublisherMembershipRecord, CatalogError>;
 
     /// Atomically enroll a publisher key and append an optional audit event.
+    ///
+    /// Repeating enrollment for the same active public key and publisher is
+    /// idempotent: the original record is returned and no duplicate audit event
+    /// is written. Reuse across publishers or after revocation is a conflict.
     async fn create_publisher_key(
         &self,
         record: PublisherKeyRecord,
         audit: Option<PublisherAuditEventRecord>,
-    ) -> Result<(), CatalogError>;
+    ) -> Result<PublisherKeyRecord, CatalogError>;
 
     /// List a publisher's enrolled public keys in stable creation order.
     async fn list_publisher_keys(
@@ -241,6 +245,12 @@ pub trait CatalogBackend: Send + Sync {
     /// `record.signature` MUST be exactly 64 bytes; any other length returns
     /// `CatalogError::InvalidArgument`.
     ///
+    /// When `record.publisher_key_id` is present, the backend MUST atomically
+    /// verify that the referenced key is active, belongs to the same publisher
+    /// as the pack head, and equals `record.author_pubkey`. The first version
+    /// persists that key's publisher on the parent pack. A revoked key remains
+    /// valid historical evidence but MUST NOT authorize a new version.
+    ///
     /// # Errors
     ///
     /// - `CatalogError::Conflict` -- `(pack_name, version)` already registered.
@@ -259,7 +269,7 @@ pub trait CatalogBackend: Send + Sync {
             .await
     }
 
-    /// Register a version while atomically enforcing per-author storage limits.
+    /// Register a version while atomically enforcing author or publisher storage limits.
     async fn register_pack_version_with_quota(
         &self,
         record: PackVersionRecord,

@@ -125,6 +125,59 @@ fn make_account(id: uuid::Uuid, subject: &str) -> AccountRecord {
     }
 }
 
+/// Create one approved publisher with an active deterministic signing key.
+async fn create_test_publisher(
+    catalog: &PostgresCatalog,
+    handle: &str,
+    key_seed: u8,
+) -> (uuid::Uuid, PublisherKeyRecord) {
+    let account = make_account(uuid::Uuid::new_v4(), &format!("{handle}-account"));
+    catalog
+        .create_account(account.clone())
+        .await
+        .expect("create publisher test account failed");
+    let publisher_id = uuid::Uuid::new_v4();
+    let now = chrono::Utc::now();
+    catalog
+        .create_publisher(
+            PublisherProfileRecord {
+                id: publisher_id,
+                handle: handle.to_string(),
+                display_name: handle.to_string(),
+                biography: None,
+                moderation_status: PublisherModerationStatus::Approved,
+                created_at: now,
+                updated_at: now,
+            },
+            PublisherMembershipRecord {
+                account_id: account.id,
+                publisher_id,
+                role: PublisherRole::Owner,
+                state: MembershipState::Active,
+                created_at: now,
+                updated_at: now,
+            },
+            None,
+        )
+        .await
+        .expect("create test publisher failed");
+    let key = PublisherKeyRecord {
+        id: uuid::Uuid::new_v4(),
+        publisher_id,
+        public_key: make_pubkey(key_seed),
+        label: format!("{handle} key"),
+        state: PublisherKeyState::Active,
+        created_at: now,
+        revoked_at: None,
+        last_used_at: None,
+    };
+    catalog
+        .create_publisher_key(key.clone(), None)
+        .await
+        .expect("create test publisher key failed");
+    (publisher_id, key)
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 /// Account identities are unique by exact issuer and subject and remain provider-neutral.
@@ -228,6 +281,18 @@ async fn publisher_membership_key_and_audit_lifecycle() {
         .create_publisher_key(first_key.clone(), None)
         .await
         .expect("create first key failed");
+    let mut retry = first_key.clone();
+    retry.id = uuid::Uuid::new_v4();
+    let retried = catalog
+        .create_publisher_key(retry, None)
+        .await
+        .expect("same publisher key enrollment must be idempotent");
+    assert_eq!(retried.id, first_key.id);
+    let keys_after_retry = catalog
+        .list_publisher_keys(publisher_id)
+        .await
+        .expect("list keys after idempotent retry failed");
+    assert_eq!(keys_after_retry, vec![first_key.clone()]);
     let last_key_error = catalog
         .revoke_publisher_key(publisher_id, first_key.id, chrono::Utc::now(), None)
         .await
@@ -329,6 +394,218 @@ async fn publisher_membership_key_and_audit_lifecycle() {
         .await
         .expect_err("publisher row must not survive a failed atomic audit insert");
     assert!(matches!(lookup_error, CatalogError::NotFound { .. }));
+}
+
+/// Publisher writes persist identity links and reject revoked keys without hiding history.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn publisher_pack_registration_enforces_active_key_state() {
+    let (catalog, _container) = setup_catalog().await;
+    let account = make_account(uuid::Uuid::new_v4(), "pack-publisher-owner");
+    catalog
+        .create_account(account.clone())
+        .await
+        .expect("create account failed");
+    let publisher_id = uuid::Uuid::new_v4();
+    let now = chrono::Utc::now();
+    catalog
+        .create_publisher(
+            PublisherProfileRecord {
+                id: publisher_id,
+                handle: "pack-publisher".to_string(),
+                display_name: "Pack Publisher".to_string(),
+                biography: None,
+                moderation_status: PublisherModerationStatus::Approved,
+                created_at: now,
+                updated_at: now,
+            },
+            PublisherMembershipRecord {
+                account_id: account.id,
+                publisher_id,
+                role: PublisherRole::Owner,
+                state: MembershipState::Active,
+                created_at: now,
+                updated_at: now,
+            },
+            None,
+        )
+        .await
+        .expect("create publisher failed");
+    let publishing_key = PublisherKeyRecord {
+        id: uuid::Uuid::new_v4(),
+        publisher_id,
+        public_key: make_pubkey(92),
+        label: "publishing key".to_string(),
+        state: PublisherKeyState::Active,
+        created_at: now,
+        revoked_at: None,
+        last_used_at: None,
+    };
+    let backup_key = PublisherKeyRecord {
+        id: uuid::Uuid::new_v4(),
+        publisher_id,
+        public_key: make_pubkey(93),
+        label: "backup key".to_string(),
+        state: PublisherKeyState::Active,
+        created_at: now,
+        revoked_at: None,
+        last_used_at: None,
+    };
+    catalog
+        .create_publisher_key(publishing_key.clone(), None)
+        .await
+        .expect("create publishing key failed");
+    catalog
+        .create_publisher_key(backup_key, None)
+        .await
+        .expect("create backup key failed");
+
+    let mut first = make_version("publisher-owned-pack", "1.0.0", 92, 92);
+    first.publisher_key_id = Some(publishing_key.id);
+    catalog
+        .register_pack_version(first.clone())
+        .await
+        .expect("active publisher key must register a version");
+    let pack = catalog
+        .get_pack(&first.pack_name)
+        .await
+        .expect("publisher-owned pack must be readable");
+    assert_eq!(pack.publisher_id, Some(publisher_id));
+    let stored_first = catalog
+        .get_pack_version(&first.pack_name, &first.version)
+        .await
+        .expect("publisher version must be readable");
+    assert_eq!(stored_first.publisher_key_id, Some(publishing_key.id));
+    let used_at = catalog
+        .list_publisher_keys(publisher_id)
+        .await
+        .expect("list publisher keys after publish failed")
+        .into_iter()
+        .find(|key| key.id == publishing_key.id)
+        .and_then(|key| key.last_used_at)
+        .expect("successful publish must update key last_used_at");
+    let duplicate_error = catalog
+        .register_pack_version(first.clone())
+        .await
+        .expect_err("duplicate version must fail");
+    assert!(matches!(duplicate_error, CatalogError::Conflict { .. }));
+    let after_duplicate = catalog
+        .list_publisher_keys(publisher_id)
+        .await
+        .expect("list publisher keys after duplicate failed")
+        .into_iter()
+        .find(|key| key.id == publishing_key.id)
+        .and_then(|key| key.last_used_at)
+        .expect("successful key use timestamp must remain present");
+    assert_eq!(after_duplicate, used_at);
+
+    catalog
+        .revoke_publisher_key(publisher_id, publishing_key.id, chrono::Utc::now(), None)
+        .await
+        .expect("publishing key revocation failed");
+    let historical = catalog
+        .get_pack_version(&first.pack_name, &first.version)
+        .await
+        .expect("revocation must not hide historical versions");
+    assert_eq!(historical.publisher_key_id, Some(publishing_key.id));
+
+    let mut rejected = make_version("publisher-owned-pack", "1.1.0", 92, 94);
+    rejected.publisher_key_id = Some(publishing_key.id);
+    let error = catalog
+        .register_pack_version(rejected)
+        .await
+        .expect_err("revoked publisher key must not register a new version");
+    assert!(matches!(
+        error,
+        CatalogError::Unauthorized {
+            kind: "publisher_key",
+            ..
+        }
+    ));
+}
+
+/// Concurrent first publishers cannot both add versions beneath one pack head.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn concurrent_first_publish_enforces_winning_owner() {
+    let (catalog, _container) = setup_catalog().await;
+    let (first_publisher_id, first_key) = create_test_publisher(&catalog, "first-racer", 101).await;
+    let (second_publisher_id, second_key) =
+        create_test_publisher(&catalog, "second-racer", 102).await;
+    let mut first = make_version("contended-pack", "1.0.0", 101, 101);
+    first.publisher_key_id = Some(first_key.id);
+    let mut second = make_version("contended-pack", "2.0.0", 102, 102);
+    second.publisher_key_id = Some(second_key.id);
+
+    let (first_result, second_result) = tokio::join!(
+        catalog.register_pack_version(first),
+        catalog.register_pack_version(second)
+    );
+    let winner = match (first_result, second_result) {
+        (Ok(()), Err(CatalogError::Unauthorized { kind: "pack", .. })) => first_publisher_id,
+        (Err(CatalogError::Unauthorized { kind: "pack", .. }), Ok(())) => second_publisher_id,
+        (first, second) => panic!("expected one winning owner, got {first:?} and {second:?}"),
+    };
+    let pack = catalog
+        .get_pack("contended-pack")
+        .await
+        .expect("winning pack head must exist");
+    assert_eq!(pack.publisher_id, Some(winner));
+    let versions = catalog
+        .list_pack_versions("contended-pack")
+        .await
+        .expect("winning pack versions must be readable");
+    assert_eq!(versions.len(), 1);
+}
+
+/// Concurrent legacy and publisher claims leave exactly one namespace owner.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn publisher_and_legacy_handle_namespaces_are_disjoint() {
+    let (catalog, _container) = setup_catalog().await;
+    let account = make_account(uuid::Uuid::new_v4(), "namespace-racer-account");
+    catalog
+        .create_account(account.clone())
+        .await
+        .expect("create namespace test account failed");
+    let publisher_id = uuid::Uuid::new_v4();
+    let now = chrono::Utc::now();
+    let profile = PublisherProfileRecord {
+        id: publisher_id,
+        handle: "namespace-racer".to_string(),
+        display_name: "Namespace Racer".to_string(),
+        biography: None,
+        moderation_status: PublisherModerationStatus::Approved,
+        created_at: now,
+        updated_at: now,
+    };
+    let membership = PublisherMembershipRecord {
+        account_id: account.id,
+        publisher_id,
+        role: PublisherRole::Owner,
+        state: MembershipState::Active,
+        created_at: now,
+        updated_at: now,
+    };
+    let author = make_author(103, "namespace-racer");
+
+    let (publisher_result, author_result) = tokio::join!(
+        catalog.create_publisher(profile, membership, None),
+        catalog.register_author(author.clone())
+    );
+    match (&publisher_result, &author_result) {
+        (Ok(()), Err(CatalogError::Conflict { .. }))
+        | (Err(CatalogError::Conflict { .. }), Ok(())) => {}
+        _ => panic!(
+            "expected one namespace winner and one conflict, got {publisher_result:?} and {author_result:?}"
+        ),
+    }
+    let publisher_exists = catalog
+        .get_publisher_by_handle("namespace-racer")
+        .await
+        .is_ok();
+    let author_exists = catalog.lookup_author(&author.pubkey).await.is_ok();
+    assert_ne!(publisher_exists, author_exists);
 }
 
 /// Register an author and look them up by pubkey.

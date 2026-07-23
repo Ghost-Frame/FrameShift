@@ -60,7 +60,7 @@ use tower_http::request_id::{PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::set_header::SetResponseHeaderLayer;
 
 use crate::mcp::mcp_router;
-use crate::middleware::account::require_account;
+use crate::middleware::account::{require_account, resolve_optional_account};
 use crate::middleware::auth::require_signed_request;
 use crate::middleware::metrics::MetricsLayer;
 use crate::middleware::request_id::RequestIdGenerator;
@@ -127,6 +127,13 @@ pub fn app(state: AppState) -> Router {
     let publish = Router::new()
         .route("/", post(publish_pack))
         .route_layer(signed.clone());
+    let publish = if state.account_auth.is_some() {
+        let optional_account =
+            axum::middleware::from_fn_with_state(state.clone(), resolve_optional_account);
+        publish.route_layer(optional_account)
+    } else {
+        publish
+    };
     let publish = apply_ip_rate_limit(publish, &state, state.config.abuse_rate_per_min);
     let mint_router = build_mint_router(&state);
     let packs = packs_router()

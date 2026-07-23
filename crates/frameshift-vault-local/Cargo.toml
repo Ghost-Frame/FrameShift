@@ -8,7 +8,7 @@ description = "Local age-encrypted file backend for frameshift-vault"
 
 [dependencies]
 frameshift-vault = { path = "../frameshift-vault" }
-age = { version = "0.10", features = [] }
+age.workspace = true
 secrecy = { workspace = true }
 thiserror = { workspace = true }
 tempfile = { workspace = true }

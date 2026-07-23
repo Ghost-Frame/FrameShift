@@ -372,12 +372,12 @@ async fn enroll_publisher_key(
         Some(record.id),
         request_id(&headers),
     );
-    state
+    let enrolled = state
         .catalog
-        .create_publisher_key(record.clone(), Some(audit))
+        .create_publisher_key(record, Some(audit))
         .await
         .map_err(|error| AppError::from_catalog(error, "publisher key"))?;
-    Ok(Json(record))
+    Ok(Json(enrolled))
 }
 
 /// Revoke a non-last publisher key after fresh account authentication.

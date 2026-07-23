@@ -1,9 +1,13 @@
 /// Cache-backed resolver for `extends`/`mixin` persona specs at render time.
 mod compose_support;
 mod error;
+/// Versioned local publisher-key metadata and secret storage.
+pub mod identity;
 mod model;
 /// Registry publish implementation: pack, sign, and HTTP upload.
 mod publish;
+/// Bearer-authenticated publisher profile and key operations.
+mod publisher;
 /// Registry install implementation: HTTP fetch, extraction, and verification.
 mod registry;
 /// Persona-selection history (local JSONL) and opt-in telemetry.
@@ -19,12 +23,17 @@ pub use frameshift_conformance::CrossVersionDecision;
 /// direct `frameshift-vault` dependency just to name `VaultData`/`VaultError`
 /// in a provider function's signature.
 pub use frameshift_vault::{VaultData, VaultError};
+pub use identity::{
+    LocalPublisherKeyState, PublisherKeyInitialization, PublisherKeyInventory,
+    PublisherKeyMetadata, PublisherKeyStore, PublisherSecretBackend,
+};
 pub use model::{
     ActivePersonaState, ClientOptions, GcReport, InstallReport, InstallRequest, InstallSource,
     LockedPersona, Lockfile, MaterializeFailure, MemoryConfig, MemoryRequirementStatus,
     PersonaSpec, ProjectConfig, ProjectPaths, SyncReport, SCHEMA_VERSION,
 };
 pub use publish::PublishOutcome;
+pub use publisher::{EnrolledPublisherKey, EnrolledPublisherKeyState};
 pub use registry::{RegistryPackSummary, RegistrySearchQuery, RegistrySearchResult};
 pub use selection::{
     SelectionEvent, SelectionTelemetry, SELECTION_HISTORY_FILENAME, TELEMETRY_URL_ENV,
@@ -224,22 +233,35 @@ impl Client {
         &self.data_root
     }
 
-    /// Load (or create on first use) the managed author Ed25519 signing key from
-    /// the central data root. See [`publish::load_or_create_signing_key`].
+    /// Return the local publisher-key inventory manager.
+    pub fn publisher_key_store(&self) -> PublisherKeyStore {
+        PublisherKeyStore::new(&self.data_root)
+    }
+
+    /// Load the selected publisher Ed25519 signing key from secure storage.
     pub fn author_signing_key(&self) -> Result<ed25519_dalek::SigningKey, ClientError> {
-        publish::load_or_create_signing_key(&self.data_root)
+        self.author_signing_key_with_passphrase(None)
+    }
+
+    /// Load the selected publisher key with an optional encrypted-fallback passphrase.
+    pub fn author_signing_key_with_passphrase(
+        &self,
+        fallback_passphrase: Option<&SecretString>,
+    ) -> Result<ed25519_dalek::SigningKey, ClientError> {
+        self.publisher_key_store()
+            .load_selected_key(fallback_passphrase)
     }
 
     /// The base64url-no-pad public key string for the managed author key -- the
     /// value the registry registers a handle against.
     pub fn author_pubkey_b64(&self) -> Result<String, ClientError> {
-        Ok(publish::public_key_b64(&self.author_signing_key()?))
+        Ok(identity::public_key_b64(&self.author_signing_key()?))
     }
 
     /// The lowercase-hex public key string for the managed author key, used to
     /// fill the `author_pubkey` field of a synthesized `pack.toml`.
     pub fn author_pubkey_hex(&self) -> Result<String, ClientError> {
-        Ok(publish::public_key_hex(&self.author_signing_key()?))
+        Ok(identity::public_key_hex(&self.author_signing_key()?))
     }
 
     /// Register the managed author key under `handle` at `server_url`
@@ -251,8 +273,72 @@ impl Client {
         handle: &str,
         display_name: Option<&str>,
     ) -> Result<(), ClientError> {
-        let key = self.author_signing_key()?;
-        publish::register_author(server_url, &key, handle, display_name)
+        self.register_author_with_passphrase(server_url, handle, display_name, None)
+    }
+
+    /// Register the selected legacy author key with encrypted-fallback support.
+    pub fn register_author_with_passphrase(
+        &self,
+        server_url: &str,
+        handle: &str,
+        display_name: Option<&str>,
+        fallback_passphrase: Option<&SecretString>,
+    ) -> Result<(), ClientError> {
+        let key = self.author_signing_key_with_passphrase(fallback_passphrase)?;
+        self.register_author_with_signing_key(server_url, handle, display_name, &key)
+    }
+
+    /// Register a handle using one already verified signing-key snapshot.
+    pub fn register_author_with_signing_key(
+        &self,
+        server_url: &str,
+        handle: &str,
+        display_name: Option<&str>,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> Result<(), ClientError> {
+        publish::register_author(server_url, signing_key, handle, display_name)
+    }
+
+    /// Enroll one local publisher key after account authorization and proof of possession.
+    pub fn enroll_publisher_key(
+        &self,
+        server_url: &str,
+        publisher_handle: &str,
+        local_key_id: &str,
+        access_token: &SecretString,
+        fallback_passphrase: Option<&SecretString>,
+    ) -> Result<EnrolledPublisherKey, ClientError> {
+        let (metadata, signing_key) = self
+            .publisher_key_store()
+            .load_active_key(local_key_id, fallback_passphrase)?;
+        publisher::enroll_publisher_key(
+            server_url,
+            publisher_handle,
+            access_token,
+            &signing_key,
+            &metadata.label,
+        )
+    }
+
+    /// List public publisher-key records visible to the authenticated owner.
+    pub fn list_publisher_keys(
+        &self,
+        server_url: &str,
+        publisher_handle: &str,
+        access_token: &SecretString,
+    ) -> Result<Vec<EnrolledPublisherKey>, ClientError> {
+        publisher::list_publisher_keys(server_url, publisher_handle, access_token)
+    }
+
+    /// Revoke one server-assigned publisher key after fresh account authentication.
+    pub fn revoke_publisher_key(
+        &self,
+        server_url: &str,
+        publisher_handle: &str,
+        remote_key_id: &str,
+        access_token: &SecretString,
+    ) -> Result<EnrolledPublisherKey, ClientError> {
+        publisher::revoke_publisher_key(server_url, publisher_handle, remote_key_id, access_token)
     }
 
     /// Pack, sign, and upload the pack directory at `pack_dir` to `server_url`
@@ -264,8 +350,44 @@ impl Client {
         pack_dir: &Path,
         author_handle: &str,
     ) -> Result<PublishOutcome, ClientError> {
-        let key = self.author_signing_key()?;
-        publish::publish_pack_dir(server_url, &key, pack_dir, author_handle)
+        self.publish_pack_dir_with_auth(server_url, pack_dir, author_handle, None, None)
+    }
+
+    /// Publish using the selected key plus optional encrypted storage and account auth.
+    pub fn publish_pack_dir_with_auth(
+        &self,
+        server_url: &str,
+        pack_dir: &Path,
+        author_handle: &str,
+        fallback_passphrase: Option<&SecretString>,
+        access_token: Option<&SecretString>,
+    ) -> Result<PublishOutcome, ClientError> {
+        let key = self.author_signing_key_with_passphrase(fallback_passphrase)?;
+        self.publish_pack_dir_with_signing_key_and_auth(
+            server_url,
+            pack_dir,
+            author_handle,
+            &key,
+            access_token,
+        )
+    }
+
+    /// Publish using one verified signing-key snapshot plus optional account auth.
+    pub fn publish_pack_dir_with_signing_key_and_auth(
+        &self,
+        server_url: &str,
+        pack_dir: &Path,
+        author_handle: &str,
+        signing_key: &ed25519_dalek::SigningKey,
+        access_token: Option<&SecretString>,
+    ) -> Result<PublishOutcome, ClientError> {
+        publish::publish_pack_dir(
+            server_url,
+            signing_key,
+            pack_dir,
+            author_handle,
+            access_token,
+        )
     }
 
     /// Search the registry's pack catalog (`GET /v1/packs`) with optional

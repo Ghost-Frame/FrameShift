@@ -76,6 +76,22 @@ struct TotalBytesRow {
     total: i64,
 }
 
+/// Transaction error preserving catalog policy failures across Diesel rollbacks.
+enum CatalogTransactionError {
+    /// A domain-level catalog failure that must be returned unchanged.
+    Catalog(CatalogError),
+    /// A raw Diesel failure that must be mapped after the transaction ends.
+    Diesel(diesel::result::Error),
+}
+
+/// Convert raw Diesel failures into the shared transaction error wrapper.
+impl From<diesel::result::Error> for CatalogTransactionError {
+    /// Preserve the Diesel error until the caller can attach resource context.
+    fn from(error: diesel::result::Error) -> Self {
+        Self::Diesel(error)
+    }
+}
+
 /// Validate and convert a catalog audit record into its insertable row.
 fn new_publisher_audit_row(
     event: PublisherAuditEventRecord,
@@ -274,6 +290,7 @@ impl CatalogBackend for PostgresCatalog {
                 "initial owner membership must be active".to_string(),
             ));
         }
+        let profile_handle = profile.handle.clone();
         let new_profile = NewPublisherProfileRow {
             id: profile.id,
             handle: profile.handle.clone(),
@@ -294,25 +311,58 @@ impl CatalogBackend for PostgresCatalog {
         let audit = audit.map(new_publisher_audit_row).transpose()?;
         let mut conn = self.pool.get().await.map_err(map_pool_error)?;
         use diesel_async::AsyncConnection as _;
-        conn.transaction::<(), diesel::result::Error, _>(async move |conn| {
-            diesel::insert_into(publisher_profiles::table)
-                .values(new_profile)
+        let tx_result = conn
+            .transaction::<(), CatalogTransactionError, _>(async move |conn| {
+                // All namespace writers take this lock in the same order so a
+                // legacy author and publisher cannot concurrently claim one handle.
+                diesel::sql_query(
+                    "LOCK TABLE authors, handles, publisher_profiles \
+                     IN SHARE ROW EXCLUSIVE MODE",
+                )
                 .execute(conn)
                 .await?;
-            diesel::insert_into(publisher_memberships::table)
-                .values(new_owner)
-                .execute(conn)
-                .await?;
-            if let Some(audit) = audit {
-                diesel::insert_into(publisher_audit_events::table)
-                    .values(audit)
+                let legacy_author_exists = authors::table
+                    .filter(authors::handle.eq(&profile_handle))
+                    .select(authors::pubkey)
+                    .first::<Vec<u8>>(conn)
+                    .await
+                    .optional()?;
+                let legacy_handle_exists = handles::table
+                    .filter(handles::handle.eq(&profile_handle))
+                    .select(handles::pubkey)
+                    .first::<Vec<u8>>(conn)
+                    .await
+                    .optional()?;
+                if legacy_author_exists.is_some() || legacy_handle_exists.is_some() {
+                    return Err(CatalogTransactionError::Catalog(CatalogError::Conflict {
+                        kind: "publisher",
+                        key: profile_handle.clone(),
+                    }));
+                }
+                diesel::insert_into(publisher_profiles::table)
+                    .values(new_profile)
                     .execute(conn)
                     .await?;
+                diesel::insert_into(publisher_memberships::table)
+                    .values(new_owner)
+                    .execute(conn)
+                    .await?;
+                if let Some(audit) = audit {
+                    diesel::insert_into(publisher_audit_events::table)
+                        .values(audit)
+                        .execute(conn)
+                        .await?;
+                }
+                Ok(())
+            })
+            .await;
+        match tx_result {
+            Ok(()) => Ok(()),
+            Err(CatalogTransactionError::Catalog(error)) => Err(error),
+            Err(CatalogTransactionError::Diesel(error)) => {
+                Err(map_diesel_error(error, "publisher", profile.handle))
             }
-            Ok(())
-        })
-        .await
-        .map_err(|error| map_diesel_error(error, "publisher", profile.handle))
+        }
     }
 
     /// Retrieve a public publisher profile by normalized handle.
@@ -408,12 +458,12 @@ impl CatalogBackend for PostgresCatalog {
             .into_record()
     }
 
-    /// Enroll a public signing key to a publisher profile.
+    /// Enroll a public signing key to a publisher profile idempotently.
     async fn create_publisher_key(
         &self,
         record: PublisherKeyRecord,
         audit: Option<PublisherAuditEventRecord>,
-    ) -> Result<(), CatalogError> {
+    ) -> Result<PublisherKeyRecord, CatalogError> {
         validate_audit_publisher(audit.as_ref(), record.publisher_id)?;
         if record.label.trim().is_empty() {
             return Err(CatalogError::Validation(
@@ -421,10 +471,13 @@ impl CatalogBackend for PostgresCatalog {
             ));
         }
         let id = record.id;
+        let publisher_id = record.publisher_id;
+        let public_key = record.public_key.0.to_vec();
+        let public_key_display = record.public_key.to_string();
         let row = NewPublisherKeyRow {
             id,
-            publisher_id: record.publisher_id,
-            public_key: record.public_key.0.to_vec(),
+            publisher_id,
+            public_key: public_key.clone(),
             label: record.label,
             state: encode_text_enum(record.state)?,
             created_at: record.created_at,
@@ -434,22 +487,48 @@ impl CatalogBackend for PostgresCatalog {
         let audit = audit.map(new_publisher_audit_row).transpose()?;
         let mut conn = self.pool.get().await.map_err(map_pool_error)?;
         use diesel_async::AsyncConnection as _;
-        conn.transaction::<(), diesel::result::Error, _>(async move |conn| {
-            diesel::insert_into(publisher_keys::table)
-                .values(row)
-                .execute(conn)
-                .await?;
-            if let Some(audit) = audit {
-                diesel::insert_into(publisher_audit_events::table)
-                    .values(audit)
-                    .execute(conn)
+        let tx_result = conn
+            .transaction::<PublisherKeyRow, CatalogTransactionError, _>(async move |conn| {
+                let inserted = diesel::insert_into(publisher_keys::table)
+                    .values(row)
+                    .on_conflict(publisher_keys::public_key)
+                    .do_nothing()
+                    .returning(PublisherKeyRow::as_returning())
+                    .get_result(conn)
+                    .await
+                    .optional()?;
+                if let Some(inserted) = inserted {
+                    if let Some(audit) = audit {
+                        diesel::insert_into(publisher_audit_events::table)
+                            .values(audit)
+                            .execute(conn)
+                            .await?;
+                    }
+                    return Ok(inserted);
+                }
+
+                let existing = publisher_keys::table
+                    .filter(publisher_keys::public_key.eq(public_key))
+                    .for_update()
+                    .select(PublisherKeyRow::as_select())
+                    .first(conn)
                     .await?;
+                if existing.publisher_id != publisher_id || existing.state != "active" {
+                    return Err(CatalogTransactionError::Catalog(CatalogError::Conflict {
+                        kind: "publisher_key",
+                        key: public_key_display,
+                    }));
+                }
+                Ok(existing)
+            })
+            .await;
+        match tx_result {
+            Ok(row) => row.into_record(),
+            Err(CatalogTransactionError::Catalog(error)) => Err(error),
+            Err(CatalogTransactionError::Diesel(error)) => {
+                Err(map_diesel_error(error, "publisher_key", id.to_string()))
             }
-            Ok(())
-        })
-        .await
-        .map_err(|error| map_diesel_error(error, "publisher_key", id.to_string()))?;
-        Ok(())
+        }
     }
 
     /// List a publisher's enrolled public keys.
@@ -585,52 +664,76 @@ impl CatalogBackend for PostgresCatalog {
             oauth_links: oauth_json,
         };
 
-        // Attempt insert; ON CONFLICT DO NOTHING means no error on duplicate.
-        diesel::insert_into(authors::table)
-            .values(&new_row)
-            .on_conflict_do_nothing()
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| map_diesel_error(e, "author", record.handle.clone()))?;
+        let handle = record.handle.clone();
+        let pubkey = record.pubkey;
+        use diesel_async::AsyncConnection as _;
+        let tx_result = conn
+            .transaction::<(), CatalogTransactionError, _>(async move |conn| {
+                diesel::sql_query(
+                    "LOCK TABLE authors, handles, publisher_profiles \
+                     IN SHARE ROW EXCLUSIVE MODE",
+                )
+                .execute(conn)
+                .await?;
+                let publisher_exists = publisher_profiles::table
+                    .filter(publisher_profiles::handle.eq(&handle))
+                    .select(publisher_profiles::id)
+                    .first::<uuid::Uuid>(conn)
+                    .await
+                    .optional()?;
+                if publisher_exists.is_some() {
+                    return Err(CatalogTransactionError::Catalog(CatalogError::Conflict {
+                        kind: "author",
+                        key: handle.clone(),
+                    }));
+                }
 
-        // Reconcile the requested (pubkey, handle) against the stored rows using
-        // optional() so an absent row is None rather than a spurious NotFound.
-        // Re-registering an existing pubkey under a NEW handle leaves no row at
-        // that handle, which previously surfaced as NotFound from the read-back
-        // instead of the correct conflict below.
+                // Attempt insert; ON CONFLICT DO NOTHING means no error on duplicate.
+                diesel::insert_into(authors::table)
+                    .values(&new_row)
+                    .on_conflict_do_nothing()
+                    .execute(conn)
+                    .await?;
 
-        // If the requested handle is held by a different pubkey, it is taken.
-        let by_handle: Option<AuthorRow> = authors::table
-            .filter(authors::handle.eq(&record.handle))
-            .select(AuthorRow::as_select())
-            .first(&mut *conn)
-            .await
-            .optional()
-            .map_err(|e| map_diesel_error(e, "author", record.handle.clone()))?;
-        if let Some(existing) = by_handle {
-            if existing.pubkey != record.pubkey.0.to_vec() {
-                let owner = vec_to_pubkey(existing.pubkey)?;
-                return Err(CatalogError::HandleTaken { owner });
+                // Reconcile the requested identity against the stored rows after
+                // the conflict-resolving insert while namespace writers remain locked.
+                let by_handle: Option<AuthorRow> = authors::table
+                    .filter(authors::handle.eq(&handle))
+                    .select(AuthorRow::as_select())
+                    .first(conn)
+                    .await
+                    .optional()?;
+                if let Some(existing) = by_handle {
+                    if existing.pubkey != pubkey.0.to_vec() {
+                        let owner = vec_to_pubkey(existing.pubkey)
+                            .map_err(CatalogTransactionError::Catalog)?;
+                        return Err(CatalogTransactionError::Catalog(
+                            CatalogError::HandleTaken { owner },
+                        ));
+                    }
+                }
+
+                let by_pubkey: Option<AuthorRow> = authors::table
+                    .filter(authors::pubkey.eq(pubkey.0.to_vec()))
+                    .select(AuthorRow::as_select())
+                    .first(conn)
+                    .await
+                    .optional()?;
+                if by_pubkey.is_some_and(|existing| existing.handle != handle) {
+                    return Err(CatalogTransactionError::Catalog(CatalogError::Conflict {
+                        kind: "author",
+                        key: pubkey.to_string(),
+                    }));
+                }
+                Ok(())
+            })
+            .await;
+        match tx_result {
+            Ok(()) => Ok(()),
+            Err(CatalogTransactionError::Catalog(error)) => Err(error),
+            Err(CatalogTransactionError::Diesel(error)) => {
+                Err(map_diesel_error(error, "author", record.handle))
             }
-        }
-
-        // A pubkey already bound to a DIFFERENT handle cannot silently re-handle
-        // itself through registration; that is a conflict. The same handle is the
-        // idempotent success case, and no row means the insert above established
-        // the requested (pubkey, handle) for the first time.
-        let by_pubkey: Option<AuthorRow> = authors::table
-            .filter(authors::pubkey.eq(record.pubkey.0.to_vec()))
-            .select(AuthorRow::as_select())
-            .first(&mut *conn)
-            .await
-            .optional()
-            .map_err(|e| map_diesel_error(e, "author", record.pubkey.to_string()))?;
-        match by_pubkey {
-            Some(existing) if existing.handle != record.handle => Err(CatalogError::Conflict {
-                kind: "author",
-                key: record.pubkey.to_string(),
-            }),
-            _ => Ok(()),
         }
     }
 
@@ -705,14 +808,16 @@ impl CatalogBackend for PostgresCatalog {
     ///
     /// Executed inside a single transaction:
     /// 1. Validate `signature` length is exactly 64 bytes.
-    /// 2. If the pack head already exists, verify that the publishing author
-    ///    matches the stored `current_author`; mismatches return
-    ///    `CatalogError::Unauthorized` (D5: co-publish / name-squat guard).
+    /// 2. Lock and validate either the legacy author or active enrolled
+    ///    publisher key, serializing publisher writes with key revocation.
     /// 3. Upsert the parent `packs` row (INSERT ... ON CONFLICT DO NOTHING) to
     ///    ensure the head record exists.
-    /// 4. INSERT the new `pack_versions` row; a `UniqueViolation` on
+    /// 4. Re-read and lock the stored pack head, then verify that its legacy
+    ///    author or publisher identity matches the incoming authority.
+    /// 5. INSERT the new `pack_versions` row; a `UniqueViolation` on
     ///    `(pack_name, version)` maps to `CatalogError::Conflict`.
-    /// 5. UPDATE `packs.latest_version` using true semver precedence (D8):
+    /// 6. Record successful publisher-key use inside the same transaction.
+    /// 7. UPDATE `packs.latest_version` using true semver precedence (D8):
     ///    the stored `latest_version` is fetched inside the transaction and
     ///    compared with [`semver_gt`]; the UPDATE only runs when the new
     ///    version has strictly higher precedence.
@@ -739,16 +844,6 @@ impl CatalogBackend for PostgresCatalog {
 
         let status_json = serde_json::to_value(&record.status)
             .map_err(|e| CatalogError::BackendError(Box::new(e)))?;
-
-        let new_pack = NewPackRow {
-            name: record.pack_name.clone(),
-            current_author: record.author_pubkey.0.to_vec(),
-            publisher_id: None,
-            tags: vec![],
-            description: String::new(),
-            latest_version: Some(record.version.clone()),
-            extends: None,
-        };
 
         let schema_version_i32 = i32::try_from(record.schema_version).map_err(|_| {
             CatalogError::InvalidArgument(format!(
@@ -781,6 +876,7 @@ impl CatalogBackend for PostgresCatalog {
         let version_clone = record.version.clone();
         // Capture the incoming author bytes for the ownership check inside the tx.
         let incoming_author_bytes = record.author_pubkey.0.to_vec();
+        let incoming_publisher_key_id = record.publisher_key_id;
         let incoming_size_bytes = record.size_bytes;
 
         // `diesel_async::AsyncConnection::transaction` requires
@@ -810,7 +906,7 @@ impl CatalogBackend for PostgresCatalog {
                 // diesel-async 0.9 takes an `AsyncFnOnce`, so the old
                 // `|conn| Box::pin(async move { .. })` wrapper is gone -- the body
                 // is now the async closure directly. `new_pack` and `new_version`
-                // are captured by move under their own names; the comparison values
+                // are captured by move under their own names; comparison values
                 // are rebound (by move, no clone) to the short names used below.
                 let pack_name = pack_name_clone;
                 let version = version_clone;
@@ -823,37 +919,147 @@ impl CatalogBackend for PostgresCatalog {
                         .execute(conn)
                         .await?;
                 }
-                // Serialize quota accounting for this author so concurrent
-                // publishes cannot both observe the same pre-insert usage.
-                let _locked_author: Vec<u8> = authors::table
-                    .filter(authors::pubkey.eq(&incoming_author))
-                    .for_update()
-                    .select(authors::pubkey)
-                    .first(conn)
-                    .await
-                    .map_err(|e| {
-                        TxError::Catalog(map_diesel_error(
-                            e,
-                            "author",
-                            hex::encode(&incoming_author),
-                        ))
-                    })?;
-                let version_count: i64 = pack_versions::table
-                    .filter(pack_versions::author_pubkey.eq(&incoming_author))
-                    .count()
-                    .get_result(conn)
-                    .await
-                    .map_err(|e| {
-                        TxError::Catalog(map_diesel_error(e, "pack_version", pack_name.clone()))
-                    })?;
-                let stored_sizes: Vec<i64> = pack_versions::table
-                    .filter(pack_versions::author_pubkey.eq(&incoming_author))
-                    .select(pack_versions::size_bytes)
-                    .load(conn)
-                    .await
-                    .map_err(|e| {
-                        TxError::Catalog(map_diesel_error(e, "pack_version", pack_name.clone()))
-                    })?;
+                // Lock and validate the authoritative write identity before any
+                // quota reads. Publisher profiles serialize quota accounting,
+                // and their key rows serialize publication with revocation;
+                // legacy authors retain their existing key lock.
+                let incoming_publisher_id = if let Some(key_id) = incoming_publisher_key_id {
+                    let publisher_id = publisher_keys::table
+                        .find(key_id)
+                        .select(publisher_keys::publisher_id)
+                        .first::<uuid::Uuid>(conn)
+                        .await
+                        .optional()
+                        .map_err(|e| {
+                            TxError::Catalog(map_diesel_error(
+                                e,
+                                "publisher_key",
+                                key_id.to_string(),
+                            ))
+                        })?
+                        .ok_or_else(|| {
+                            TxError::Catalog(CatalogError::Unauthorized {
+                                kind: "publisher_key",
+                                key: key_id.to_string(),
+                            })
+                        })?;
+                    publisher_profiles::table
+                        .find(publisher_id)
+                        .for_update()
+                        .select(publisher_profiles::id)
+                        .first::<uuid::Uuid>(conn)
+                        .await
+                        .map_err(|e| {
+                            TxError::Catalog(map_diesel_error(
+                                e,
+                                "publisher",
+                                publisher_id.to_string(),
+                            ))
+                        })?;
+                    let key = publisher_keys::table
+                        .find(key_id)
+                        .for_update()
+                        .select(PublisherKeyRow::as_select())
+                        .first(conn)
+                        .await
+                        .optional()
+                        .map_err(|e| {
+                            TxError::Catalog(map_diesel_error(
+                                e,
+                                "publisher_key",
+                                key_id.to_string(),
+                            ))
+                        })?;
+                    match key {
+                        Some(key)
+                            if key.publisher_id == publisher_id
+                                && key.state == "active"
+                                && key.public_key == incoming_author =>
+                        {
+                            Some(publisher_id)
+                        }
+                        _ => {
+                            return Err(TxError::Catalog(CatalogError::Unauthorized {
+                                kind: "publisher_key",
+                                key: key_id.to_string(),
+                            }));
+                        }
+                    }
+                } else {
+                    authors::table
+                        .filter(authors::pubkey.eq(&incoming_author))
+                        .for_update()
+                        .select(authors::pubkey)
+                        .first::<Vec<u8>>(conn)
+                        .await
+                        .map_err(|e| {
+                            TxError::Catalog(map_diesel_error(
+                                e,
+                                "author",
+                                hex::encode(&incoming_author),
+                            ))
+                        })?;
+                    None
+                };
+                let publisher_key_ids: Vec<Option<uuid::Uuid>> =
+                    if let Some(publisher_id) = incoming_publisher_id {
+                        publisher_keys::table
+                            .filter(publisher_keys::publisher_id.eq(publisher_id))
+                            .select(publisher_keys::id)
+                            .load::<uuid::Uuid>(conn)
+                            .await
+                            .map_err(|e| {
+                                TxError::Catalog(map_diesel_error(
+                                    e,
+                                    "publisher_key",
+                                    publisher_id.to_string(),
+                                ))
+                            })?
+                            .into_iter()
+                            .map(Some)
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                let (version_count, stored_sizes): (i64, Vec<i64>) = if incoming_publisher_id
+                    .is_some()
+                {
+                    let count = pack_versions::table
+                        .filter(pack_versions::publisher_key_id.eq_any(&publisher_key_ids))
+                        .count()
+                        .get_result(conn)
+                        .await
+                        .map_err(|e| {
+                            TxError::Catalog(map_diesel_error(e, "pack_version", pack_name.clone()))
+                        })?;
+                    let sizes = pack_versions::table
+                        .filter(pack_versions::publisher_key_id.eq_any(&publisher_key_ids))
+                        .select(pack_versions::size_bytes)
+                        .load(conn)
+                        .await
+                        .map_err(|e| {
+                            TxError::Catalog(map_diesel_error(e, "pack_version", pack_name.clone()))
+                        })?;
+                    (count, sizes)
+                } else {
+                    let count = pack_versions::table
+                        .filter(pack_versions::author_pubkey.eq(&incoming_author))
+                        .count()
+                        .get_result(conn)
+                        .await
+                        .map_err(|e| {
+                            TxError::Catalog(map_diesel_error(e, "pack_version", pack_name.clone()))
+                        })?;
+                    let sizes = pack_versions::table
+                        .filter(pack_versions::author_pubkey.eq(&incoming_author))
+                        .select(pack_versions::size_bytes)
+                        .load(conn)
+                        .await
+                        .map_err(|e| {
+                            TxError::Catalog(map_diesel_error(e, "pack_version", pack_name.clone()))
+                        })?;
+                    (count, sizes)
+                };
                 let next_versions = u64::try_from(version_count)
                     .unwrap_or(u64::MAX)
                     .saturating_add(1);
@@ -891,30 +1097,16 @@ impl CatalogBackend for PostgresCatalog {
                         )));
                     }
                 }
-                // D5: If the pack head already exists, verify the publishing
-                // author matches the stored current_author. First-publish
-                // (no existing row) is always allowed.
-                let existing_pack: Option<PackRow> = packs::table
-                    .filter(packs::name.eq(&pack_name))
-                    .select(PackRow::as_select())
-                    .first(conn)
-                    .await
-                    .optional()
-                    .map_err(|e| {
-                        TxError::Catalog(map_diesel_error(e, "pack", pack_name.clone()))
-                    })?;
-
-                if let Some(ref existing) = existing_pack {
-                    // Pack already exists -- check ownership.
-                    if existing.current_author != incoming_author {
-                        return Err(TxError::Catalog(CatalogError::Unauthorized {
-                            kind: "pack",
-                            key: pack_name.clone(),
-                        }));
-                    }
-                }
-
                 // Upsert the parent pack row; do nothing if it already exists.
+                let new_pack = NewPackRow {
+                    name: pack_name.clone(),
+                    current_author: incoming_author.clone(),
+                    publisher_id: incoming_publisher_id,
+                    tags: vec![],
+                    description: String::new(),
+                    latest_version: Some(version.clone()),
+                    extends: None,
+                };
                 diesel::insert_into(packs::table)
                     .values(&new_pack)
                     .on_conflict(packs::name)
@@ -924,6 +1116,30 @@ impl CatalogBackend for PostgresCatalog {
                     .map_err(|e| {
                         TxError::Catalog(map_diesel_error(e, "pack", pack_name.clone()))
                     })?;
+
+                // The conflict-resolving insert above may have waited for a
+                // concurrent first publisher. Authorize against the actual
+                // winning row while holding its lock before inserting a version.
+                let stored_pack: PackRow = packs::table
+                    .filter(packs::name.eq(&pack_name))
+                    .for_update()
+                    .select(PackRow::as_select())
+                    .first(conn)
+                    .await
+                    .map_err(|e| {
+                        TxError::Catalog(map_diesel_error(e, "pack", pack_name.clone()))
+                    })?;
+                let ownership_matches = match (stored_pack.publisher_id, incoming_publisher_id) {
+                    (Some(existing), Some(incoming)) => existing == incoming,
+                    (None, None) => stored_pack.current_author == incoming_author,
+                    _ => false,
+                };
+                if !ownership_matches {
+                    return Err(TxError::Catalog(CatalogError::Unauthorized {
+                        kind: "pack",
+                        key: pack_name.clone(),
+                    }));
+                }
 
                 // Insert the version row.
                 diesel::insert_into(pack_versions::table)
@@ -937,6 +1153,23 @@ impl CatalogBackend for PostgresCatalog {
                             format!("{pack_name}@{version}"),
                         ))
                     })?;
+
+                // Only a committed version counts as key use. Keeping this
+                // update after the insert also leaves conflicts and rollbacks
+                // with their previous last_used_at value.
+                if let Some(key_id) = incoming_publisher_key_id {
+                    diesel::update(publisher_keys::table.find(key_id))
+                        .set(publisher_keys::last_used_at.eq(Some(Utc::now())))
+                        .execute(conn)
+                        .await
+                        .map_err(|e| {
+                            TxError::Catalog(map_diesel_error(
+                                e,
+                                "publisher_key",
+                                key_id.to_string(),
+                            ))
+                        })?;
+                }
 
                 // D8: Update latest_version using true semver precedence.
                 // Read the current stored value (may have changed from the
@@ -1462,19 +1695,48 @@ impl CatalogBackend for PostgresCatalog {
             pubkey: pubkey.0.to_vec(),
         };
 
-        diesel::insert_into(handles::table)
-            .values(&new_row)
-            .on_conflict(handles::handle)
-            .do_update()
-            .set((
-                handles::pubkey.eq(pubkey.0.to_vec()),
-                handles::updated_at.eq(Utc::now()),
-            ))
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| map_diesel_error(e, "handle", handle.to_string()))?;
-
-        Ok(())
+        let handle_key = handle.to_string();
+        use diesel_async::AsyncConnection as _;
+        let tx_result = conn
+            .transaction::<(), CatalogTransactionError, _>(async move |conn| {
+                diesel::sql_query(
+                    "LOCK TABLE authors, handles, publisher_profiles \
+                     IN SHARE ROW EXCLUSIVE MODE",
+                )
+                .execute(conn)
+                .await?;
+                let publisher_exists = publisher_profiles::table
+                    .filter(publisher_profiles::handle.eq(&handle_key))
+                    .select(publisher_profiles::id)
+                    .first::<uuid::Uuid>(conn)
+                    .await
+                    .optional()?;
+                if publisher_exists.is_some() {
+                    return Err(CatalogTransactionError::Catalog(CatalogError::Conflict {
+                        kind: "handle",
+                        key: handle_key.clone(),
+                    }));
+                }
+                diesel::insert_into(handles::table)
+                    .values(&new_row)
+                    .on_conflict(handles::handle)
+                    .do_update()
+                    .set((
+                        handles::pubkey.eq(pubkey.0.to_vec()),
+                        handles::updated_at.eq(Utc::now()),
+                    ))
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            })
+            .await;
+        match tx_result {
+            Ok(()) => Ok(()),
+            Err(CatalogTransactionError::Catalog(error)) => Err(error),
+            Err(CatalogTransactionError::Diesel(error)) => {
+                Err(map_diesel_error(error, "handle", handle.to_string()))
+            }
+        }
     }
 
     /// Set the `extends` field on the pack head record.

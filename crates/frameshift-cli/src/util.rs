@@ -96,6 +96,10 @@ pub enum CliError {
     #[error("{0}")]
     Publish(String),
 
+    /// Publisher-key lifecycle or secret-input policy error.
+    #[error("{0}")]
+    Keys(String),
+
     /// `frameshift config` error: unknown key or a value that fails to parse
     /// for the requested key's type.
     #[error("{0}")]
@@ -123,19 +127,27 @@ impl From<frameshift_vault::VaultError> for CliError {
     }
 }
 
-/// Validate that a registry server URL uses an `http`/`https` scheme.
-///
-/// The URL is handed to the HTTP client as-is; rejecting other schemes here
-/// (e.g. `file://`) keeps a typo or injected value from reaching the client
-/// with surprising behavior.
+/// Validate that a registry URL is credential-free HTTP(S) with a host.
 pub fn validate_server_url(url: &str) -> Result<(), CliError> {
-    if url.starts_with("https://") || url.starts_with("http://") {
-        Ok(())
-    } else {
-        Err(CliError::Publish(format!(
-            "--server must be an http(s) URL, got: {url:?}"
-        )))
+    let parsed = url::Url::parse(url).map_err(|_| {
+        CliError::Publish("--server must be a valid http(s) URL with a host".to_string())
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err(CliError::Publish(
+            "--server must be a valid http(s) URL with a host".to_string(),
+        ));
     }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(CliError::Publish(
+            "--server URL must not contain userinfo credentials".to_string(),
+        ));
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(CliError::Publish(
+            "--server URL must not contain a query or fragment".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Validate that `name` is safe to use as a single directory component.
@@ -323,6 +335,22 @@ pub fn write_persona_by_name(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Server URL validation rejects credentials without reflecting them.
+    #[test]
+    fn server_url_rejects_embedded_credentials_without_leaking_them() {
+        let error = validate_server_url("https://user:secret@registry.example").unwrap_err();
+        let rendered = error.to_string();
+        assert!(!rendered.contains("user:secret"));
+        assert!(!rendered.contains("secret"));
+    }
+
+    /// Server URL validation rejects query data without reflecting it.
+    #[test]
+    fn server_url_rejects_query_data_without_leaking_it() {
+        let error = validate_server_url("https://registry.example?token=secret").unwrap_err();
+        assert!(!error.to_string().contains("secret"));
+    }
 
     // -----------------------------------------------------------------------
     // validate_persona_name
