@@ -15,8 +15,11 @@
 use std::time::Duration;
 
 use frameshift_catalog::{
-    AuthorRecord, CatalogBackend, CatalogError, Ed25519PublicKey, ObjectHash, PackSearchFilters,
-    PackStatus, PackVersionRecord, PublishQuota, SortMode, TombstoneReason, TombstoneRecord,
+    AccountRecord, AccountStatus, AuthorRecord, CatalogBackend, CatalogError, Ed25519PublicKey,
+    MembershipState, ObjectHash, PackSearchFilters, PackStatus, PackVersionRecord, PublishQuota,
+    PublisherAuditEventRecord, PublisherKeyRecord, PublisherKeyState, PublisherMembershipRecord,
+    PublisherModerationStatus, PublisherProfileRecord, PublisherRole, SortMode, TombstoneReason,
+    TombstoneRecord,
 };
 use frameshift_catalog_postgres::{PostgresCatalog, PostgresCatalogConfig};
 use secrecy::SecretString;
@@ -96,6 +99,7 @@ fn make_version(
         content_hash: make_hash(hash_seed),
         signature: vec![0x42_u8; 64],
         author_pubkey: make_pubkey(author_seed),
+        publisher_key_id: None,
         parent_hash: None,
         capability_manifest_json: r#"{"permissions":[]}"#.to_string(),
         schema_version: 1,
@@ -106,7 +110,185 @@ fn make_version(
     }
 }
 
+/// Build a minimal active OIDC account for repository tests.
+fn make_account(id: uuid::Uuid, subject: &str) -> AccountRecord {
+    let now = chrono::Utc::now();
+    AccountRecord {
+        id,
+        issuer: "https://issuer.example".to_string(),
+        subject: subject.to_string(),
+        email: Some(format!("{subject}@example.test")),
+        display_name: Some(subject.to_string()),
+        status: AccountStatus::Active,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
+
+/// Account identities are unique by exact issuer and subject and remain provider-neutral.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn account_identity_roundtrip_and_duplicate_rejection() {
+    let (catalog, _container) = setup_catalog().await;
+    let account = make_account(uuid::Uuid::new_v4(), "account-subject");
+    catalog
+        .create_account(account.clone())
+        .await
+        .expect("create account failed");
+
+    let found = catalog
+        .get_account_by_subject(&account.issuer, &account.subject)
+        .await
+        .expect("lookup by subject failed");
+    assert_eq!(found.id, account.id);
+    assert_eq!(found.issuer, account.issuer);
+    assert_eq!(found.subject, account.subject);
+    assert_eq!(found.email, account.email);
+    assert_eq!(found.display_name, account.display_name);
+    assert_eq!(found.status, account.status);
+
+    let duplicate = make_account(uuid::Uuid::new_v4(), &account.subject);
+    let error = catalog
+        .create_account(duplicate)
+        .await
+        .expect_err("duplicate identity must fail");
+    assert!(matches!(
+        error,
+        CatalogError::Conflict {
+            kind: "account",
+            ..
+        }
+    ));
+}
+
+/// Publisher creation atomically establishes ownership and key revocation keeps one active key.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn publisher_membership_key_and_audit_lifecycle() {
+    let (catalog, _container) = setup_catalog().await;
+    let account = make_account(uuid::Uuid::new_v4(), "publisher-owner");
+    catalog
+        .create_account(account.clone())
+        .await
+        .expect("create account failed");
+    let publisher_id = uuid::Uuid::new_v4();
+    let now = chrono::Utc::now();
+    let profile = PublisherProfileRecord {
+        id: publisher_id,
+        handle: "publisher-owner".to_string(),
+        display_name: "Publisher Owner".to_string(),
+        biography: None,
+        moderation_status: PublisherModerationStatus::Pending,
+        created_at: now,
+        updated_at: now,
+    };
+    let membership = PublisherMembershipRecord {
+        account_id: account.id,
+        publisher_id,
+        role: PublisherRole::Owner,
+        state: MembershipState::Active,
+        created_at: now,
+        updated_at: now,
+    };
+    catalog
+        .create_publisher(profile.clone(), membership.clone())
+        .await
+        .expect("create publisher failed");
+    let found_profile = catalog
+        .get_publisher_by_handle(&profile.handle)
+        .await
+        .expect("publisher lookup failed");
+    assert_eq!(found_profile.id, profile.id);
+    assert_eq!(found_profile.handle, profile.handle);
+    assert_eq!(found_profile.display_name, profile.display_name);
+    assert_eq!(found_profile.biography, profile.biography);
+    assert_eq!(found_profile.moderation_status, profile.moderation_status);
+    let found_membership = catalog
+        .get_publisher_membership(account.id, publisher_id)
+        .await
+        .expect("membership lookup failed");
+    assert_eq!(found_membership.account_id, membership.account_id);
+    assert_eq!(found_membership.publisher_id, membership.publisher_id);
+    assert_eq!(found_membership.role, membership.role);
+    assert_eq!(found_membership.state, membership.state);
+
+    let first_key = PublisherKeyRecord {
+        id: uuid::Uuid::new_v4(),
+        publisher_id,
+        public_key: make_pubkey(90),
+        label: "first device".to_string(),
+        state: PublisherKeyState::Active,
+        created_at: now,
+        revoked_at: None,
+        last_used_at: None,
+    };
+    catalog
+        .create_publisher_key(first_key.clone())
+        .await
+        .expect("create first key failed");
+    let last_key_error = catalog
+        .revoke_publisher_key(publisher_id, first_key.id, chrono::Utc::now())
+        .await
+        .expect_err("last active key revocation must fail");
+    assert!(matches!(last_key_error, CatalogError::Validation(_)));
+
+    let second_key = PublisherKeyRecord {
+        id: uuid::Uuid::new_v4(),
+        publisher_id,
+        public_key: make_pubkey(91),
+        label: "second device".to_string(),
+        state: PublisherKeyState::Active,
+        created_at: chrono::Utc::now(),
+        revoked_at: None,
+        last_used_at: None,
+    };
+    catalog
+        .create_publisher_key(second_key.clone())
+        .await
+        .expect("create second key failed");
+    let (first_result, second_result) = tokio::join!(
+        catalog.revoke_publisher_key(publisher_id, first_key.id, chrono::Utc::now()),
+        catalog.revoke_publisher_key(publisher_id, second_key.id, chrono::Utc::now()),
+    );
+    assert!(matches!(
+        (&first_result, &second_result),
+        (Ok(_), Err(CatalogError::Validation(_))) | (Err(CatalogError::Validation(_)), Ok(_))
+    ));
+    let revoked = first_result
+        .as_ref()
+        .ok()
+        .or_else(|| second_result.as_ref().ok())
+        .expect("one concurrent revocation must succeed");
+    assert_eq!(revoked.state, PublisherKeyState::Revoked);
+    assert!(revoked.revoked_at.is_some());
+    let keys = catalog
+        .list_publisher_keys(publisher_id)
+        .await
+        .expect("list keys after concurrent revocation failed");
+    assert_eq!(
+        keys.iter()
+            .filter(|key| key.state == PublisherKeyState::Active)
+            .count(),
+        1
+    );
+
+    catalog
+        .append_publisher_audit_event(PublisherAuditEventRecord {
+            id: uuid::Uuid::new_v4(),
+            actor_account_id: Some(account.id),
+            publisher_id,
+            action: "publisher.key.revoked".to_string(),
+            target_key_id: Some(revoked.id),
+            target_version: None,
+            request_id: Some(uuid::Uuid::new_v4()),
+            created_at: chrono::Utc::now(),
+            metadata: serde_json::json!({"reason": "test"}),
+        })
+        .await
+        .expect("append audit event failed");
+}
 
 /// Register an author and look them up by pubkey.
 #[tokio::test]

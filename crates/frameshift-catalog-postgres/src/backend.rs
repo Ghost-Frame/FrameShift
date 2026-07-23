@@ -24,20 +24,24 @@ use diesel_migrations::{embed_migrations, EmbeddedMigrations, MigrationHarness a
 use tracing::{debug, error, instrument};
 
 use frameshift_catalog::{
-    AuthorRecord, CatalogBackend, CatalogError, Ed25519PublicKey, HealthStatus, PackRecord,
-    PackSearchFilters, PackSearchResult, PackVersionRecord, PublishQuota, SortMode,
-    TombstoneRecord,
+    AccountRecord, AuthorRecord, CatalogBackend, CatalogError, Ed25519PublicKey, HealthStatus,
+    MembershipState, PackRecord, PackSearchFilters, PackSearchResult, PackVersionRecord,
+    PublishQuota, PublisherAuditEventRecord, PublisherKeyRecord, PublisherMembershipRecord,
+    PublisherProfileRecord, SortMode, TombstoneRecord,
 };
 
 use crate::config::PostgresCatalogConfig;
 use crate::errors::{map_diesel_error, map_migration_error, map_pool_error};
 use crate::models::{
-    vec_to_pubkey, AuthorRow, HandleRow, NewAuthorRow, NewHandleRow, NewPackDownloadRow,
-    NewPackRow, NewPackVersionRow, PackRow, PackVersionRow,
+    encode_text_enum, vec_to_pubkey, AccountRow, AuthorRow, HandleRow, NewAccountRow, NewAuthorRow,
+    NewHandleRow, NewPackDownloadRow, NewPackRow, NewPackVersionRow, NewPublisherAuditEventRow,
+    NewPublisherKeyRow, NewPublisherMembershipRow, NewPublisherProfileRow, PackRow, PackVersionRow,
+    PublisherKeyRow, PublisherMembershipRow, PublisherProfileRow,
 };
 use crate::pool::{build_pool, PgPool};
 use crate::schema::{
-    authors, handles, pack_downloads, pack_versions, packs, signed_request_nonces,
+    accounts, authors, handles, pack_downloads, pack_versions, packs, publisher_audit_events,
+    publisher_keys, publisher_memberships, publisher_profiles, signed_request_nonces,
 };
 
 /// Embedded migration files compiled into the binary at build time.
@@ -134,12 +138,346 @@ impl PostgresCatalog {
     }
 }
 
-/// PostgreSQL implementation of all 15 [`CatalogBackend`] trait methods.
+/// PostgreSQL implementation of the [`CatalogBackend`] trait.
 ///
 /// Each method checks out a connection from the pool, executes the relevant
 /// Diesel DSL or raw SQL query, and maps driver errors to [`CatalogError`].
 #[async_trait]
 impl CatalogBackend for PostgresCatalog {
+    /// Create an OIDC-backed account with a unique identity pair.
+    #[instrument(skip(self, record), fields(account_id = %record.id, issuer = %record.issuer))]
+    async fn create_account(&self, record: AccountRecord) -> Result<(), CatalogError> {
+        if record.issuer.trim().is_empty() || record.subject.trim().is_empty() {
+            return Err(CatalogError::Validation(
+                "account issuer and subject must not be blank".to_string(),
+            ));
+        }
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        let row = NewAccountRow {
+            id: record.id,
+            issuer: record.issuer.clone(),
+            subject: record.subject,
+            email: record.email,
+            display_name: record.display_name,
+            status: encode_text_enum(record.status)?,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+        };
+        diesel::insert_into(accounts::table)
+            .values(row)
+            .execute(&mut conn)
+            .await
+            .map_err(|error| map_diesel_error(error, "account", record.issuer))?;
+        Ok(())
+    }
+
+    /// Retrieve an account by its internal identifier.
+    async fn get_account(&self, id: uuid::Uuid) -> Result<AccountRecord, CatalogError> {
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        accounts::table
+            .find(id)
+            .select(AccountRow::as_select())
+            .first(&mut conn)
+            .await
+            .map_err(|error| map_diesel_error(error, "account", id.to_string()))?
+            .into_record()
+    }
+
+    /// Retrieve an account by its exact OIDC issuer and subject pair.
+    async fn get_account_by_subject(
+        &self,
+        issuer: &str,
+        subject: &str,
+    ) -> Result<AccountRecord, CatalogError> {
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        accounts::table
+            .filter(accounts::issuer.eq(issuer))
+            .filter(accounts::subject.eq(subject))
+            .select(AccountRow::as_select())
+            .first(&mut conn)
+            .await
+            .map_err(|error| map_diesel_error(error, "account", format!("{issuer}#{subject}")))?
+            .into_record()
+    }
+
+    /// Update mutable account profile fields without changing OIDC identity.
+    async fn update_account_profile(
+        &self,
+        id: uuid::Uuid,
+        email: Option<&str>,
+        display_name: Option<&str>,
+    ) -> Result<AccountRecord, CatalogError> {
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        diesel::update(accounts::table.find(id))
+            .set((
+                accounts::email.eq(email),
+                accounts::display_name.eq(display_name),
+                accounts::updated_at.eq(Utc::now()),
+            ))
+            .returning(AccountRow::as_returning())
+            .get_result(&mut conn)
+            .await
+            .map_err(|error| map_diesel_error(error, "account", id.to_string()))?
+            .into_record()
+    }
+
+    /// Atomically create a publisher profile and its first owner membership.
+    async fn create_publisher(
+        &self,
+        profile: PublisherProfileRecord,
+        owner: PublisherMembershipRecord,
+    ) -> Result<(), CatalogError> {
+        if profile.id != owner.publisher_id {
+            return Err(CatalogError::InvalidArgument(
+                "owner membership publisher_id must match profile id".to_string(),
+            ));
+        }
+        if owner.state != MembershipState::Active {
+            return Err(CatalogError::InvalidArgument(
+                "initial owner membership must be active".to_string(),
+            ));
+        }
+        let new_profile = NewPublisherProfileRow {
+            id: profile.id,
+            handle: profile.handle.clone(),
+            display_name: profile.display_name,
+            biography: profile.biography,
+            moderation_status: encode_text_enum(profile.moderation_status)?,
+            created_at: profile.created_at,
+            updated_at: profile.updated_at,
+        };
+        let new_owner = NewPublisherMembershipRow {
+            account_id: owner.account_id,
+            publisher_id: owner.publisher_id,
+            role: encode_text_enum(owner.role)?,
+            state: encode_text_enum(owner.state)?,
+            created_at: owner.created_at,
+            updated_at: owner.updated_at,
+        };
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        use diesel_async::AsyncConnection as _;
+        conn.transaction::<(), diesel::result::Error, _>(async move |conn| {
+            diesel::insert_into(publisher_profiles::table)
+                .values(new_profile)
+                .execute(conn)
+                .await?;
+            diesel::insert_into(publisher_memberships::table)
+                .values(new_owner)
+                .execute(conn)
+                .await?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| map_diesel_error(error, "publisher", profile.handle))
+    }
+
+    /// Retrieve a public publisher profile by normalized handle.
+    async fn get_publisher_by_handle(
+        &self,
+        handle: &str,
+    ) -> Result<PublisherProfileRecord, CatalogError> {
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        publisher_profiles::table
+            .filter(publisher_profiles::handle.eq(handle))
+            .select(PublisherProfileRow::as_select())
+            .first(&mut conn)
+            .await
+            .map_err(|error| map_diesel_error(error, "publisher", handle.to_string()))?
+            .into_record()
+    }
+
+    /// Update mutable public publisher profile fields.
+    async fn update_publisher_profile(
+        &self,
+        id: uuid::Uuid,
+        display_name: &str,
+        biography: Option<&str>,
+    ) -> Result<PublisherProfileRecord, CatalogError> {
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        diesel::update(publisher_profiles::table.find(id))
+            .set((
+                publisher_profiles::display_name.eq(display_name),
+                publisher_profiles::biography.eq(biography),
+                publisher_profiles::updated_at.eq(Utc::now()),
+            ))
+            .returning(PublisherProfileRow::as_returning())
+            .get_result(&mut conn)
+            .await
+            .map_err(|error| map_diesel_error(error, "publisher", id.to_string()))?
+            .into_record()
+    }
+
+    /// List all memberships held by one account.
+    async fn list_account_memberships(
+        &self,
+        account_id: uuid::Uuid,
+    ) -> Result<Vec<PublisherMembershipRecord>, CatalogError> {
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        let rows = publisher_memberships::table
+            .filter(publisher_memberships::account_id.eq(account_id))
+            .order(publisher_memberships::created_at.asc())
+            .select(PublisherMembershipRow::as_select())
+            .load(&mut conn)
+            .await
+            .map_err(|error| {
+                map_diesel_error(error, "publisher_membership", account_id.to_string())
+            })?;
+        rows.into_iter()
+            .map(PublisherMembershipRow::into_record)
+            .collect()
+    }
+
+    /// Retrieve one account-to-publisher membership.
+    async fn get_publisher_membership(
+        &self,
+        account_id: uuid::Uuid,
+        publisher_id: uuid::Uuid,
+    ) -> Result<PublisherMembershipRecord, CatalogError> {
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        publisher_memberships::table
+            .find((account_id, publisher_id))
+            .select(PublisherMembershipRow::as_select())
+            .first(&mut conn)
+            .await
+            .map_err(|error| {
+                map_diesel_error(
+                    error,
+                    "publisher_membership",
+                    format!("{account_id}:{publisher_id}"),
+                )
+            })?
+            .into_record()
+    }
+
+    /// Enroll a public signing key to a publisher profile.
+    async fn create_publisher_key(&self, record: PublisherKeyRecord) -> Result<(), CatalogError> {
+        if record.label.trim().is_empty() {
+            return Err(CatalogError::Validation(
+                "publisher key label must not be blank".to_string(),
+            ));
+        }
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        let id = record.id;
+        let row = NewPublisherKeyRow {
+            id,
+            publisher_id: record.publisher_id,
+            public_key: record.public_key.0.to_vec(),
+            label: record.label,
+            state: encode_text_enum(record.state)?,
+            created_at: record.created_at,
+            revoked_at: record.revoked_at,
+            last_used_at: record.last_used_at,
+        };
+        diesel::insert_into(publisher_keys::table)
+            .values(row)
+            .execute(&mut conn)
+            .await
+            .map_err(|error| map_diesel_error(error, "publisher_key", id.to_string()))?;
+        Ok(())
+    }
+
+    /// List a publisher's enrolled public keys.
+    async fn list_publisher_keys(
+        &self,
+        publisher_id: uuid::Uuid,
+    ) -> Result<Vec<PublisherKeyRecord>, CatalogError> {
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        let rows = publisher_keys::table
+            .filter(publisher_keys::publisher_id.eq(publisher_id))
+            .order(publisher_keys::created_at.asc())
+            .select(PublisherKeyRow::as_select())
+            .load(&mut conn)
+            .await
+            .map_err(|error| map_diesel_error(error, "publisher_key", publisher_id.to_string()))?;
+        rows.into_iter().map(PublisherKeyRow::into_record).collect()
+    }
+
+    /// Revoke a publisher key while retaining its historical evidence.
+    async fn revoke_publisher_key(
+        &self,
+        publisher_id: uuid::Uuid,
+        key_id: uuid::Uuid,
+        revoked_at: chrono::DateTime<Utc>,
+    ) -> Result<PublisherKeyRecord, CatalogError> {
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        use diesel_async::AsyncConnection as _;
+        let row = conn
+            .transaction::<PublisherKeyRow, diesel::result::Error, _>(async move |conn| {
+                publisher_profiles::table
+                    .find(publisher_id)
+                    .select(publisher_profiles::id)
+                    .for_update()
+                    .first::<uuid::Uuid>(conn)
+                    .await?;
+                let current = publisher_keys::table
+                    .find(key_id)
+                    .filter(publisher_keys::publisher_id.eq(publisher_id))
+                    .for_update()
+                    .select(PublisherKeyRow::as_select())
+                    .first(conn)
+                    .await?;
+                if current.state == "revoked" {
+                    return Ok(current);
+                }
+                let active_count = publisher_keys::table
+                    .filter(publisher_keys::publisher_id.eq(publisher_id))
+                    .filter(publisher_keys::state.eq("active"))
+                    .count()
+                    .get_result::<i64>(conn)
+                    .await?;
+                if active_count <= 1 {
+                    return Err(diesel::result::Error::RollbackTransaction);
+                }
+                diesel::update(publisher_keys::table.find(key_id))
+                    .set((
+                        publisher_keys::state.eq("revoked"),
+                        publisher_keys::revoked_at.eq(Some(revoked_at)),
+                    ))
+                    .returning(PublisherKeyRow::as_returning())
+                    .get_result(conn)
+                    .await
+            })
+            .await
+            .map_err(|error| match error {
+                diesel::result::Error::RollbackTransaction => CatalogError::Validation(
+                    "cannot revoke the last active publisher key".to_string(),
+                ),
+                other => map_diesel_error(other, "publisher_key", key_id.to_string()),
+            })?;
+        row.into_record()
+    }
+
+    /// Append an immutable, sanitized publisher audit event.
+    async fn append_publisher_audit_event(
+        &self,
+        event: PublisherAuditEventRecord,
+    ) -> Result<(), CatalogError> {
+        if event.action.trim().is_empty() || !event.metadata.is_object() {
+            return Err(CatalogError::Validation(
+                "audit action must be non-blank and metadata must be an object".to_string(),
+            ));
+        }
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        let id = event.id;
+        let row = NewPublisherAuditEventRow {
+            id,
+            actor_account_id: event.actor_account_id,
+            publisher_id: event.publisher_id,
+            action: event.action,
+            target_key_id: event.target_key_id,
+            target_version: event.target_version,
+            request_id: event.request_id,
+            created_at: event.created_at,
+            metadata: event.metadata,
+        };
+        diesel::insert_into(publisher_audit_events::table)
+            .values(row)
+            .execute(&mut conn)
+            .await
+            .map_err(|error| map_diesel_error(error, "publisher_audit_event", id.to_string()))?;
+        Ok(())
+    }
+
     /// Register a new author or confirm an identical author already exists.
     ///
     /// SQL shape:
@@ -334,6 +672,7 @@ impl CatalogBackend for PostgresCatalog {
         let new_pack = NewPackRow {
             name: record.pack_name.clone(),
             current_author: record.author_pubkey.0.to_vec(),
+            publisher_id: None,
             tags: vec![],
             description: String::new(),
             latest_version: Some(record.version.clone()),
@@ -358,6 +697,7 @@ impl CatalogBackend for PostgresCatalog {
             content_hash: record.content_hash.as_bytes().to_vec(),
             signature: record.signature.clone(),
             author_pubkey: record.author_pubkey.0.to_vec(),
+            publisher_key_id: record.publisher_key_id,
             parent_hash: record.parent_hash.map(|h| h.as_bytes().to_vec()),
             capability_manifest_json: capability_json,
             schema_version: schema_version_i32,
@@ -1393,7 +1733,7 @@ impl PostgresCatalog {
         let _ = fts_param_idx;
 
         let sql = format!(
-            "SELECT name, current_author, tags, description, created_at, \
+            "SELECT name, current_author, publisher_id, tags, description, created_at, \
              latest_version, total_downloads, extends \
              FROM packs \
              {where_sql} \
@@ -1763,7 +2103,7 @@ impl PostgresCatalog {
         // so the window duration is a bound parameter (even though it is a constant,
         // keeping it bound makes the pattern consistent with user values above).
         let sql = format!(
-            "SELECT p.name, p.current_author, p.tags, p.description, p.created_at, \
+            "SELECT p.name, p.current_author, p.publisher_id, p.tags, p.description, p.created_at, \
              p.latest_version, p.total_downloads, p.extends \
              FROM packs p \
              LEFT JOIN ( \

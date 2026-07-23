@@ -504,6 +504,7 @@ pub async fn publish_pack(
         content_hash,
         signature: signature_bytes.clone(),
         author_pubkey: pubkey,
+        publisher_key_id: None,
         parent_hash,
         capability_manifest_json,
         schema_version: manifest.schema_version,

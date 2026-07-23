@@ -273,6 +273,7 @@ fn catalog_with_author(signing: &SigningKey, handle: &str) -> (MockCatalog, Ed25
             PackRecord {
                 name: "demo-pack".to_string(),
                 current_author: pubkey,
+                publisher_id: None,
                 tags: vec![],
                 description: "test".to_string(),
                 created_at: Utc::now(),

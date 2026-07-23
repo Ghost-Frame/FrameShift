@@ -20,7 +20,10 @@ use frameshift_catalog::backend::CatalogBackend;
 use frameshift_catalog::error::{CatalogError, HealthStatus};
 use frameshift_catalog::filters::{PackSearchFilters, PackSearchResult};
 use frameshift_catalog::identity::Ed25519PublicKey;
-use frameshift_catalog::records::{AuthorRecord, PackRecord, PackVersionRecord};
+use frameshift_catalog::records::{
+    AccountRecord, AuthorRecord, PackRecord, PackVersionRecord, PublisherAuditEventRecord,
+    PublisherKeyRecord, PublisherKeyState, PublisherMembershipRecord, PublisherProfileRecord,
+};
 use frameshift_catalog::status::{PackStatus, TombstoneRecord};
 // Reuse the exact same version-precedence comparator the Postgres adapter
 // uses for `register_pack_version`'s D8 `latest_version` selection, so the
@@ -35,6 +38,27 @@ use frameshift_pack::ObjectHash;
 /// cheaply and mutated from test setup code.
 #[derive(Default)]
 pub struct MockState {
+    /// OIDC-backed accounts keyed by internal identifier.
+    pub accounts: HashMap<uuid::Uuid, AccountRecord>,
+
+    /// Exact OIDC issuer and subject pairs mapped to account identifiers.
+    pub account_subjects: HashMap<(String, String), uuid::Uuid>,
+
+    /// Public publisher profiles keyed by internal identifier.
+    pub publishers: HashMap<uuid::Uuid, PublisherProfileRecord>,
+
+    /// Normalized publisher handles mapped to publisher identifiers.
+    pub publisher_handles: HashMap<String, uuid::Uuid>,
+
+    /// Account-to-publisher memberships keyed by both identifiers.
+    pub publisher_memberships: HashMap<(uuid::Uuid, uuid::Uuid), PublisherMembershipRecord>,
+
+    /// Enrolled publisher keys keyed by internal identifier.
+    pub publisher_keys: HashMap<uuid::Uuid, PublisherKeyRecord>,
+
+    /// Immutable publisher security audit events.
+    pub publisher_audit_events: Vec<PublisherAuditEventRecord>,
+
     /// Registered authors, keyed by base64url-encoded pubkey.
     pub authors: HashMap<String, AuthorRecord>,
 
@@ -100,6 +124,312 @@ impl Default for MockCatalog {
 #[async_trait]
 /// In-memory implementation of every catalog operation used by server tests.
 impl CatalogBackend for MockCatalog {
+    /// Create an account while enforcing ID and OIDC identity uniqueness.
+    async fn create_account(&self, record: AccountRecord) -> Result<(), CatalogError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        let identity = (record.issuer.clone(), record.subject.clone());
+        if state.accounts.contains_key(&record.id) || state.account_subjects.contains_key(&identity)
+        {
+            return Err(CatalogError::Conflict {
+                kind: "account",
+                key: format!("{}#{}", record.issuer, record.subject),
+            });
+        }
+        state.account_subjects.insert(identity, record.id);
+        state.accounts.insert(record.id, record);
+        Ok(())
+    }
+
+    /// Retrieve an account by internal identifier.
+    async fn get_account(&self, id: uuid::Uuid) -> Result<AccountRecord, CatalogError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        state
+            .accounts
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| CatalogError::NotFound {
+                kind: "account",
+                key: id.to_string(),
+            })
+    }
+
+    /// Retrieve an account by exact OIDC issuer and subject.
+    async fn get_account_by_subject(
+        &self,
+        issuer: &str,
+        subject: &str,
+    ) -> Result<AccountRecord, CatalogError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        let identity = (issuer.to_string(), subject.to_string());
+        let id = state
+            .account_subjects
+            .get(&identity)
+            .ok_or_else(|| CatalogError::NotFound {
+                kind: "account",
+                key: format!("{issuer}#{subject}"),
+            })?;
+        state
+            .accounts
+            .get(id)
+            .cloned()
+            .ok_or_else(|| CatalogError::NotFound {
+                kind: "account",
+                key: id.to_string(),
+            })
+    }
+
+    /// Update mutable account profile fields.
+    async fn update_account_profile(
+        &self,
+        id: uuid::Uuid,
+        email: Option<&str>,
+        display_name: Option<&str>,
+    ) -> Result<AccountRecord, CatalogError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        let account = state
+            .accounts
+            .get_mut(&id)
+            .ok_or_else(|| CatalogError::NotFound {
+                kind: "account",
+                key: id.to_string(),
+            })?;
+        account.email = email.map(str::to_string);
+        account.display_name = display_name.map(str::to_string);
+        account.updated_at = Utc::now();
+        Ok(account.clone())
+    }
+
+    /// Atomically create a publisher and its first owner membership in memory.
+    async fn create_publisher(
+        &self,
+        profile: PublisherProfileRecord,
+        owner: PublisherMembershipRecord,
+    ) -> Result<(), CatalogError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        if profile.id != owner.publisher_id || !state.accounts.contains_key(&owner.account_id) {
+            return Err(CatalogError::Validation(
+                "publisher owner membership is invalid".to_string(),
+            ));
+        }
+        if state.publishers.contains_key(&profile.id)
+            || state.publisher_handles.contains_key(&profile.handle)
+        {
+            return Err(CatalogError::Conflict {
+                kind: "publisher",
+                key: profile.handle,
+            });
+        }
+        state
+            .publisher_handles
+            .insert(profile.handle.clone(), profile.id);
+        state
+            .publisher_memberships
+            .insert((owner.account_id, owner.publisher_id), owner);
+        state.publishers.insert(profile.id, profile);
+        Ok(())
+    }
+
+    /// Retrieve a publisher profile by normalized handle.
+    async fn get_publisher_by_handle(
+        &self,
+        handle: &str,
+    ) -> Result<PublisherProfileRecord, CatalogError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        let id = state
+            .publisher_handles
+            .get(handle)
+            .ok_or_else(|| CatalogError::NotFound {
+                kind: "publisher",
+                key: handle.to_string(),
+            })?;
+        state
+            .publishers
+            .get(id)
+            .cloned()
+            .ok_or_else(|| CatalogError::NotFound {
+                kind: "publisher",
+                key: handle.to_string(),
+            })
+    }
+
+    /// Update mutable publisher profile fields.
+    async fn update_publisher_profile(
+        &self,
+        id: uuid::Uuid,
+        display_name: &str,
+        biography: Option<&str>,
+    ) -> Result<PublisherProfileRecord, CatalogError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        let publisher = state
+            .publishers
+            .get_mut(&id)
+            .ok_or_else(|| CatalogError::NotFound {
+                kind: "publisher",
+                key: id.to_string(),
+            })?;
+        publisher.display_name = display_name.to_string();
+        publisher.biography = biography.map(str::to_string);
+        publisher.updated_at = Utc::now();
+        Ok(publisher.clone())
+    }
+
+    /// List all memberships held by one account.
+    async fn list_account_memberships(
+        &self,
+        account_id: uuid::Uuid,
+    ) -> Result<Vec<PublisherMembershipRecord>, CatalogError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        let mut records: Vec<_> = state
+            .publisher_memberships
+            .values()
+            .filter(|record| record.account_id == account_id)
+            .cloned()
+            .collect();
+        records.sort_by_key(|record| record.created_at);
+        Ok(records)
+    }
+
+    /// Retrieve one account-to-publisher membership.
+    async fn get_publisher_membership(
+        &self,
+        account_id: uuid::Uuid,
+        publisher_id: uuid::Uuid,
+    ) -> Result<PublisherMembershipRecord, CatalogError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        state
+            .publisher_memberships
+            .get(&(account_id, publisher_id))
+            .cloned()
+            .ok_or_else(|| CatalogError::NotFound {
+                kind: "publisher_membership",
+                key: format!("{account_id}:{publisher_id}"),
+            })
+    }
+
+    /// Enroll a public signing key while enforcing global key uniqueness.
+    async fn create_publisher_key(&self, record: PublisherKeyRecord) -> Result<(), CatalogError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        if state.publisher_keys.contains_key(&record.id)
+            || state
+                .publisher_keys
+                .values()
+                .any(|existing| existing.public_key == record.public_key)
+        {
+            return Err(CatalogError::Conflict {
+                kind: "publisher_key",
+                key: record.public_key.to_string(),
+            });
+        }
+        state.publisher_keys.insert(record.id, record);
+        Ok(())
+    }
+
+    /// List a publisher's enrolled public keys.
+    async fn list_publisher_keys(
+        &self,
+        publisher_id: uuid::Uuid,
+    ) -> Result<Vec<PublisherKeyRecord>, CatalogError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        let mut records: Vec<_> = state
+            .publisher_keys
+            .values()
+            .filter(|record| record.publisher_id == publisher_id)
+            .cloned()
+            .collect();
+        records.sort_by_key(|record| record.created_at);
+        Ok(records)
+    }
+
+    /// Revoke a key unless it is the publisher's last active key.
+    async fn revoke_publisher_key(
+        &self,
+        publisher_id: uuid::Uuid,
+        key_id: uuid::Uuid,
+        revoked_at: DateTime<Utc>,
+    ) -> Result<PublisherKeyRecord, CatalogError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        let active_count = state
+            .publisher_keys
+            .values()
+            .filter(|record| {
+                record.publisher_id == publisher_id && record.state == PublisherKeyState::Active
+            })
+            .count();
+        let key = state
+            .publisher_keys
+            .get_mut(&key_id)
+            .ok_or_else(|| CatalogError::NotFound {
+                kind: "publisher_key",
+                key: key_id.to_string(),
+            })?;
+        if key.publisher_id != publisher_id {
+            return Err(CatalogError::NotFound {
+                kind: "publisher_key",
+                key: key_id.to_string(),
+            });
+        }
+        if key.state == PublisherKeyState::Revoked {
+            return Ok(key.clone());
+        }
+        if active_count <= 1 {
+            return Err(CatalogError::Validation(
+                "cannot revoke the last active publisher key".to_string(),
+            ));
+        }
+        key.state = PublisherKeyState::Revoked;
+        key.revoked_at = Some(revoked_at);
+        Ok(key.clone())
+    }
+
+    /// Append an immutable publisher audit event.
+    async fn append_publisher_audit_event(
+        &self,
+        event: PublisherAuditEventRecord,
+    ) -> Result<(), CatalogError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        state.publisher_audit_events.push(event);
+        Ok(())
+    }
+
     /// Register an author, enforcing the trait's uniqueness contract.
     ///
     /// - identical `(pubkey, handle)` -> idempotent `Ok(())`.

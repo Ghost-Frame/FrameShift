@@ -259,6 +259,7 @@ fn make_pack(name: &str, author: Ed25519PublicKey) -> PackRecord {
     PackRecord {
         name: name.to_string(),
         current_author: author,
+        publisher_id: None,
         tags: vec![],
         description: "test pack".to_string(),
         created_at: Utc::now(),
@@ -282,6 +283,7 @@ fn make_version(
         content_hash: hash,
         signature: vec![0u8; 64],
         author_pubkey: author,
+        publisher_key_id: None,
         parent_hash: None,
         capability_manifest_json: "{}".to_string(),
         schema_version: 1,

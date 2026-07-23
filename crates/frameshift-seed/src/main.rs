@@ -332,6 +332,7 @@ async fn seed_persona(
         content_hash,
         signature: signature.to_bytes().to_vec(),
         author_pubkey,
+        publisher_key_id: None,
         parent_hash: None,
         capability_manifest_json: cap_json,
         schema_version: manifest.schema_version,
