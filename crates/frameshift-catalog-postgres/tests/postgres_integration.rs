@@ -292,7 +292,7 @@ async fn publisher_membership_key_and_audit_lifecycle() {
         .list_publisher_keys(publisher_id)
         .await
         .expect("list keys after idempotent retry failed");
-    assert_eq!(keys_after_retry, vec![first_key.clone()]);
+    assert_eq!(keys_after_retry, vec![retried]);
     let last_key_error = catalog
         .revoke_publisher_key(publisher_id, first_key.id, chrono::Utc::now(), None)
         .await

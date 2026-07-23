@@ -151,7 +151,10 @@ pub fn run_keys(args: KeysArgs) -> Result<(), CliError> {
         KeysCommand::Init => initialize(&client),
         KeysCommand::List => list_local(&client),
         KeysCommand::Create { label } => create(&client, &label),
-        KeysCommand::Label { key_id, label } => label(&client, &key_id, &label),
+        KeysCommand::Label {
+            key_id,
+            label: replacement,
+        } => label(&client, &key_id, &replacement),
         KeysCommand::Select { key_id } => select(&client, &key_id),
         KeysCommand::Enroll {
             server,

@@ -556,6 +556,7 @@ impl PublisherKeyStore {
     }
 
     /// Initialize using an injectable credential-store implementation.
+    #[cfg(test)]
     fn initialize_with_store(
         &self,
         credential_store: &dyn CredentialStore,
@@ -623,6 +624,7 @@ impl PublisherKeyStore {
     }
 
     /// Create a key using an injectable credential store.
+    #[cfg(test)]
     fn create_key_with_store(
         &self,
         label: &str,
