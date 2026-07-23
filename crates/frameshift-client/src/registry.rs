@@ -1298,15 +1298,15 @@ mod tests {
 
         let substituted = ownership_version_record(
             "6199b23b-906f-4689-a840-664a184c5f75",
-            "1e41ae38-9a5e-4623-8fcc-8f705928dacf",
+            "cc56ea2b-991d-46eb-a94f-936a9b071a4a",
             EnrolledPublisherKeyState::Active,
-            [8_u8; 32],
+            [7_u8; 32],
         );
         let error = check_or_create_registry_trust(
             &paths,
             "https://registry.example",
             "alice",
-            &[8_u8; 32],
+            &[7_u8; 32],
             &substituted,
         )
         .expect_err("publisher substitution must fail");
