@@ -1199,49 +1199,23 @@ async fn request_id_is_non_empty_uuid() {
 }
 
 // ---------------------------------------------------------------------------
-// AppError::Internal does not leak source details
+// Public error responses do not leak source details
 // ---------------------------------------------------------------------------
 
-/// When the catalog returns `BackendError`, the response body must be the
-/// fixed string "internal server error", not the backend error details.
+/// A missing author returns a structured string error.
 #[tokio::test]
-async fn internal_error_does_not_leak_details_in_body() {
-    // Use the real catalog with no authors: looking up a pack by an existing key
-    // will hit `NotFound`, not `Internal`. Instead inject a bad key via a known
-    // good base64url string for a key that doesn't exist in the catalog.
-    // The mock returns CatalogError::NotFound, not BackendError.
-    // To trigger Internal we need the mock to fail. Use a valid key with no data.
+async fn not_found_response_uses_structured_public_error() {
     let key = Ed25519PublicKey([42u8; 32]);
     let b64 = key.to_string();
 
-    // Empty catalog -> NotFound (404), not Internal.
-    // To test Internal, we need a backend that returns BackendError.
-    // We'll use the error mapping test in error.rs unit tests instead.
-    // For the integration test, verify that 500 body hides details.
-    // Build a catalog whose health() returns an error (simulate Internal).
-    // The healthz handler maps BackendError -> healthy:false, not 500.
-    // The only way to get 500 in the current read-only surface is if a
-    // backend returns BackendError. MockCatalog never returns BackendError
-    // for reads (only NotFound). So we test this via the unit test in error.rs.
-    //
-    // However, we can verify the 404 path shows correct body:
     let state = make_state(MockCatalog::new(), MockPackStore::new());
     let resp = oneshot_get(state, &format!("/v1/authors/{b64}")).await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     let body = body_json(resp).await;
-    // 404 body is allowed to show the resource key; it is not sensitive.
     assert!(body["error"].is_string());
 }
 
-/// `AppError::Internal` body must be exactly "internal server error" (tested
-/// via the download endpoint when both catalog has version but objects fail
-/// in a non-NotFound way).
-///
-/// Note: MockPackStore only returns NotFound (-> 502) for missing keys. There
-/// is no easy way to inject a generic BackendError from the mock without extra
-/// infrastructure. The mapping is tested thoroughly in error.rs unit tests.
-/// This integration test instead verifies that the 502 body does not leak
-/// internal blob details.
+/// A missing pack object returns a fixed gateway error without hash or path details.
 #[tokio::test]
 async fn bad_gateway_body_does_not_leak_hash_or_path() {
     let hash = ObjectHash::of(b"secret bytes");
@@ -1276,15 +1250,7 @@ async fn bad_gateway_body_does_not_leak_hash_or_path() {
 // Conflict (409) error mapping
 // ---------------------------------------------------------------------------
 
-/// Inject a Conflict error via MockCatalog's `inject_conflict` flag and verify
-/// the handler returns 409. Since the read endpoints don't trigger Conflict,
-/// we test the error mapping directly via `MockCatalog::register_author` plus
-/// the AppError unit tests for full coverage. The integration test below
-/// exercises the lookup_author path which cannot produce Conflict, so we
-/// verify the conflict mapping via error module unit tests is sufficient.
-///
-/// This test verifies that the mock infrastructure itself works: setting
-/// `inject_conflict = true` and calling `register_author` returns `Conflict`.
+/// The mock conflict switch makes write operations return `Conflict`.
 #[tokio::test]
 async fn mock_catalog_conflict_injection_works() {
     let catalog = MockCatalog::new();

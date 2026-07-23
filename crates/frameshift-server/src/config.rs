@@ -161,7 +161,7 @@ pub struct ServerConfig {
     /// Maximum number of bytes allowed in a request body.
     ///
     /// Applied globally via [`tower_http::limit::RequestBodyLimitLayer`].
-    /// Publish endpoints in a later milestone will override this per-route.
+    /// Individual routes may apply a tighter per-route limit.
     /// Default: 1 MiB (1 048 576 bytes).
     pub max_request_bytes: usize,
 

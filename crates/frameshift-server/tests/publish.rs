@@ -359,11 +359,8 @@ fn catalog_with_author(signing: &SigningKey, handle: &str) -> (MockCatalog, Ed25
                 oauth_links: vec![],
             },
         );
-        // Pre-populate the parent pack record so downstream `GET /v1/packs/{name}`
-        // succeeds after publish. The MockCatalog does not auto-create parent
-        // records on `register_pack_version`, but the catalog trait requires
-        // real backends to. We seed it manually here so the test exercises the
-        // happy-path GET path.
+        // Pre-populate the parent pack with metadata so the downstream GET
+        // exercises publishing into an existing head record.
         s.packs.insert(
             "demo-pack".to_string(),
             PackRecord {
@@ -797,7 +794,7 @@ async fn publisher_revoked_key_cannot_publish() {
 }
 
 // ---------------------------------------------------------------------------
-// description / tags propagation (P0-2 regression test)
+// Description and tags propagation regression
 // ---------------------------------------------------------------------------
 
 /// Publish a pack whose manifest declares `description` and `tags`, then

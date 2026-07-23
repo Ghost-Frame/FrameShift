@@ -26,7 +26,7 @@ use frameshift_catalog::records::{
 };
 use frameshift_catalog::status::{PackStatus, TombstoneRecord};
 // Reuse the exact same version-precedence comparator the Postgres adapter
-// uses for `register_pack_version`'s D8 `latest_version` selection, so the
+// uses for `register_pack_version`'s `latest_version` selection, so the
 // mock's tombstone head-recompute can never drift from the real ordering.
 use frameshift_catalog::PublishQuota;
 use frameshift_catalog_postgres::backend::semver_gt;
@@ -917,7 +917,7 @@ impl CatalogBackend for MockCatalog {
     /// After flipping the status, recomputes the pack head's `latest_version`
     /// (when a head row exists) to the newest remaining `Active` version using
     /// [`semver_gt`] -- the exact same comparator the Postgres adapter uses
-    /// for `register_pack_version`'s D8 ordering -- or clears it to `None`
+    /// for `register_pack_version` ordering -- or clears it to `None`
     /// when no `Active` version remains. A head that was never seeded (tests
     /// that only call `seed_active_version`-style helpers without inserting a
     /// `PackRecord`) is left absent; there is nothing to recompute.

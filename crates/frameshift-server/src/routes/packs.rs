@@ -1128,8 +1128,7 @@ pub struct SearchResponse {
 
 /// `GET /v1/packs?query=&tag=&author=&sort=&limit=&offset=`
 ///
-/// Search the catalog with optional filters. Anonymous; no auth required at
-/// this milestone.
+/// Search the catalog with optional filters. Anonymous; no auth required.
 ///
 /// The `limit` parameter is clamped to `config.max_search_limit`. When clamped,
 /// the response includes a `Warning` header: `299 - "limit clamped to <max>"`.
@@ -1145,9 +1144,6 @@ pub struct SearchResponse {
 /// # Errors
 ///
 /// - `400 Bad Request` if `sort` is not one of `trending`, `top-rated`, `recent`.
-/// - `400 Bad Request` if `limit` exceeds the configured `max_search_limit`
-///   (instead of a Warning, this only applies when the hard cap would be exceeded).
-///   Actually: limit is clamped with a Warning header, not rejected.
 /// - `500 Internal Server Error` on backend failure (request-id only; no
 ///   internal details in body).
 pub async fn search_packs(

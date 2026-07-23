@@ -332,8 +332,8 @@ async fn repeat_tombstone_is_idempotent_200() {
 
 // ---------------------------------------------------------------------------
 // Tombstone read-path: head recompute + search/download visibility
-// (spec_42eb1942 item 1). MockCatalog's `tombstone_pack` mirrors the
-// Postgres adapter's `latest_version` recompute exactly (see
+// MockCatalog's `tombstone_pack` mirrors the Postgres adapter's
+// `latest_version` recompute exactly (see
 // `crates/frameshift-server/tests/mocks/catalog.rs`), so these assertions
 // hold for both backends.
 // ---------------------------------------------------------------------------

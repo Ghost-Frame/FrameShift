@@ -461,15 +461,15 @@ async fn ownership_backfill_preserves_evidence_and_is_idempotent() {
     assert_eq!(post_apply_dry_run.applied, second_apply.applied);
 }
 
-/// Linked Phase 3 rows allow no legacy author but reject one with a foreign key.
+/// Prelinked publisher rows allow no legacy author but reject one with a foreign key.
 #[tokio::test]
 #[ignore = "requires Docker"]
-async fn ownership_backfill_validates_phase3_legacy_handle_when_present() {
+async fn ownership_backfill_validates_prelinked_legacy_handle_when_present() {
     let (catalog, _container) = setup_catalog().await;
-    let handle = "phase3-publisher";
-    let pack_name = "phase3-owned-pack";
+    let handle = "prelinked-publisher";
+    let pack_name = "prelinked-owned-pack";
     let timestamp = ownership_manifest_time();
-    let account = make_account(uuid::Uuid::from_u128(10_101), "phase3-owner");
+    let account = make_account(uuid::Uuid::from_u128(10_101), "prelinked-owner");
     let publisher_id = uuid::Uuid::from_u128(10_102);
     let key_id = uuid::Uuid::from_u128(10_103);
     let audit_id = uuid::Uuid::from_u128(10_104);
@@ -477,13 +477,13 @@ async fn ownership_backfill_validates_phase3_legacy_handle_when_present() {
     catalog
         .create_account(account.clone())
         .await
-        .expect("create Phase 3 account failed");
+        .expect("create prelinked account failed");
     catalog
         .create_publisher(
             PublisherProfileRecord {
                 id: publisher_id,
                 handle: handle.to_string(),
-                display_name: "Phase 3 publisher".to_string(),
+                display_name: "Prelinked publisher".to_string(),
                 biography: Some("Account-backed publisher".to_string()),
                 moderation_status: PublisherModerationStatus::Approved,
                 created_at: timestamp,
@@ -500,12 +500,12 @@ async fn ownership_backfill_validates_phase3_legacy_handle_when_present() {
             None,
         )
         .await
-        .expect("create Phase 3 publisher failed");
+        .expect("create prelinked publisher failed");
     let key = PublisherKeyRecord {
         id: key_id,
         publisher_id,
         public_key: make_pubkey(84),
-        label: "Phase 3 signing key".to_string(),
+        label: "Prelinked signing key".to_string(),
         state: PublisherKeyState::Active,
         created_at: timestamp,
         revoked_at: None,
@@ -514,12 +514,12 @@ async fn ownership_backfill_validates_phase3_legacy_handle_when_present() {
     catalog
         .create_publisher_key(key.clone(), None)
         .await
-        .expect("create Phase 3 key failed");
+        .expect("create prelinked key failed");
     let unused_key = PublisherKeyRecord {
         id: unused_key_id,
         publisher_id,
         public_key: make_pubkey(86),
-        label: "Unused Phase 3 rotation key".to_string(),
+        label: "Unused prelinked rotation key".to_string(),
         state: PublisherKeyState::Active,
         created_at: timestamp,
         revoked_at: None,
@@ -528,17 +528,17 @@ async fn ownership_backfill_validates_phase3_legacy_handle_when_present() {
     catalog
         .create_publisher_key(unused_key.clone(), None)
         .await
-        .expect("create unused Phase 3 key failed");
+        .expect("create unused prelinked key failed");
     let mut version = make_version(pack_name, "1.0.0", 84, 85);
     version.publisher_key_id = Some(key_id);
     catalog
         .register_pack_version(version.clone())
         .await
-        .expect("register Phase 3 pack failed");
+        .expect("register prelinked pack failed");
     let author_error = catalog
         .lookup_author_by_handle(handle)
         .await
-        .expect_err("Phase 3 fixture must not have a legacy author");
+        .expect_err("prelinked fixture must not have a legacy author");
     assert!(matches!(
         author_error,
         CatalogError::NotFound { kind: "author", .. }
@@ -552,7 +552,7 @@ async fn ownership_backfill_validates_phase3_legacy_handle_when_present() {
             id: publisher_id,
             handle: handle.to_string(),
             owner_account_id: account.id,
-            display_name: "Phase 3 publisher".to_string(),
+            display_name: "Prelinked publisher".to_string(),
             biography: Some("Account-backed publisher".to_string()),
             moderation_status: OwnershipManifestModerationStatus::Approved,
             created_at: timestamp,
@@ -595,7 +595,7 @@ async fn ownership_backfill_validates_phase3_legacy_handle_when_present() {
     let dry_run = catalog
         .run_ownership_backfill(&manifest_bytes, None, OwnershipBackfillMode::DryRun)
         .await
-        .expect("Phase 3 dry-run failed");
+        .expect("prelinked dry-run failed");
     assert_eq!(dry_run.census.publisher_profiles_existing, 1);
     assert_eq!(dry_run.census.owner_memberships_existing, 1);
     assert_eq!(dry_run.census.publisher_keys_existing, 2);
@@ -607,7 +607,7 @@ async fn ownership_backfill_validates_phase3_legacy_handle_when_present() {
     let first_apply = catalog
         .run_ownership_backfill(&manifest_bytes, Some(&digest), OwnershipBackfillMode::Apply)
         .await
-        .expect("Phase 3 apply failed");
+        .expect("prelinked apply failed");
     assert_eq!(first_apply.applied.audit_events, 1);
     assert_eq!(first_apply.applied.publisher_profiles, 0);
     assert_eq!(first_apply.applied.owner_memberships, 0);
@@ -618,7 +618,7 @@ async fn ownership_backfill_validates_phase3_legacy_handle_when_present() {
     let second_apply = catalog
         .run_ownership_backfill(&manifest_bytes, Some(&digest), OwnershipBackfillMode::Apply)
         .await
-        .expect("idempotent Phase 3 apply failed");
+        .expect("idempotent prelinked apply failed");
     assert_eq!(second_apply.census.audit_events_existing, 1);
     assert_eq!(second_apply.applied.audit_events, 0);
     assert_eq!(second_apply.applied, OwnershipBackfillApplied::default());
@@ -631,7 +631,7 @@ async fn ownership_backfill_validates_phase3_legacy_handle_when_present() {
     connection
         .batch_execute(
             "INSERT INTO authors (pubkey, handle, display_name, oauth_links) \
-             VALUES (decode(repeat('57', 32), 'hex'), 'phase3-publisher', NULL, '[]'::jsonb)",
+             VALUES (decode(repeat('57', 32), 'hex'), 'prelinked-publisher', NULL, '[]'::jsonb)",
         )
         .await
         .expect("insert foreign same-handle legacy author failed");
@@ -643,7 +643,7 @@ async fn ownership_backfill_validates_phase3_legacy_handle_when_present() {
         .expect_err("foreign same-handle legacy author must fail closed");
     assert!(ambiguity
         .to_string()
-        .contains("legacy author handle phase3-publisher has an unmapped or foreign key"));
+        .contains("legacy author handle prelinked-publisher has an unmapped or foreign key"));
 }
 
 /// A database failure after bootstrap inserts rolls back every mutation.
@@ -1701,10 +1701,9 @@ async fn test_tombstone_not_found() {
 }
 
 /// Tombstoning the current latest of two `Active` versions recomputes the
-/// pack head's `latest_version` to the older remaining `Active` version
-/// (spec_42eb1942 item 1: the head, not just the version row, must reflect
-/// the tombstone). The pack must remain visible in `search_packs` because it
-/// still has one `Active` version left.
+/// pack head's `latest_version` to the older remaining `Active` version. The
+/// pack must remain visible in `search_packs` because it still has one
+/// `Active` version left.
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_tombstone_latest_recomputes_head_to_older_active_version() {
@@ -1965,7 +1964,7 @@ async fn test_health_returns_healthy() {
     );
 }
 
-/// D5: A second author cannot publish to a pack already owned by another author.
+/// A second author cannot publish to a pack already owned by another author.
 ///
 /// Author A registers `ownership-guard-pack@1.0.0`. Author B attempting to
 /// publish `ownership-guard-pack@1.1.0` must be rejected with `Unauthorized`.
