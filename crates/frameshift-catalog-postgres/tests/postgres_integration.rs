@@ -220,9 +220,9 @@ fn make_publication_claim(intent: &PublicationIntentRecord) -> PublicationIntent
         account_id: intent.account_id,
         publisher_id: intent.publisher_id,
         publisher_key_id: intent.publisher_key_id,
-        archive_hash: intent.archive_hash.clone(),
-        manifest_hash: intent.manifest_hash.clone(),
-        file_inventory_hash: intent.file_inventory_hash.clone(),
+        archive_hash: intent.archive_hash,
+        manifest_hash: intent.manifest_hash,
+        file_inventory_hash: intent.file_inventory_hash,
         scan_schema_version: intent.scan_schema_version,
     }
 }
