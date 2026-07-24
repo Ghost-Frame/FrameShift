@@ -18,15 +18,15 @@ use serde_json::Value as JsonValue;
 
 use frameshift_catalog::{
     AccountRecord, AccountStatus, AuthorRecord, CatalogError, Ed25519PublicKey, MembershipState,
-    OauthLink, ObjectHash, PackRecord, PackStatus, PackVersionRecord, PublisherKeyRecord,
-    PublisherKeyState, PublisherMembershipRecord, PublisherModerationStatus,
+    OauthLink, ObjectHash, PackRecord, PackStatus, PackVersionRecord, PublicationIntentRecord,
+    PublisherKeyRecord, PublisherKeyState, PublisherMembershipRecord, PublisherModerationStatus,
     PublisherProfileRecord, PublisherRole,
 };
 use uuid::Uuid;
 
 use crate::schema::{
-    accounts, authors, handles, pack_downloads, pack_versions, packs, publisher_audit_events,
-    publisher_keys, publisher_memberships, publisher_profiles,
+    accounts, authors, handles, pack_downloads, pack_versions, packs, publication_intents,
+    publisher_audit_events, publisher_keys, publisher_memberships, publisher_profiles,
 };
 
 /// Queryable account row mapped from the `accounts` table.
@@ -219,6 +219,63 @@ pub(crate) struct NewPublisherAuditEventRow {
     pub created_at: DateTime<Utc>,
     /// Sanitized structured metadata.
     pub metadata: JsonValue,
+}
+
+/// Queryable durable publication intent row.
+#[derive(Debug, Clone, Queryable, Selectable)]
+#[diesel(table_name = publication_intents)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub(crate) struct PublicationIntentRow {
+    /// Stable intent identifier.
+    pub id: Uuid,
+    /// Account that created the intent.
+    pub account_id: Uuid,
+    /// Publisher receiving the future submission.
+    pub publisher_id: Uuid,
+    /// Publisher key authorizing the future submission.
+    pub publisher_key_id: Uuid,
+    /// Raw archive SHA-256 digest.
+    pub archive_hash: Vec<u8>,
+    /// Raw canonical manifest SHA-256 digest.
+    pub manifest_hash: Vec<u8>,
+    /// Raw normalized inventory SHA-256 digest.
+    pub file_inventory_hash: Vec<u8>,
+    /// Scanner contract version.
+    pub scan_schema_version: i32,
+    /// Intent creation timestamp.
+    pub created_at: DateTime<Utc>,
+    /// Exclusive intent expiry timestamp.
+    pub expires_at: DateTime<Utc>,
+    /// Successful one-time consumption timestamp.
+    pub consumed_at: Option<DateTime<Utc>>,
+}
+
+/// Insertable durable publication intent row.
+#[derive(Debug, Insertable)]
+#[diesel(table_name = publication_intents)]
+pub(crate) struct NewPublicationIntentRow {
+    /// Stable intent identifier.
+    pub id: Uuid,
+    /// Account that created the intent.
+    pub account_id: Uuid,
+    /// Publisher receiving the future submission.
+    pub publisher_id: Uuid,
+    /// Publisher key authorizing the future submission.
+    pub publisher_key_id: Uuid,
+    /// Raw archive SHA-256 digest.
+    pub archive_hash: Vec<u8>,
+    /// Raw canonical manifest SHA-256 digest.
+    pub manifest_hash: Vec<u8>,
+    /// Raw normalized inventory SHA-256 digest.
+    pub file_inventory_hash: Vec<u8>,
+    /// Scanner contract version.
+    pub scan_schema_version: i32,
+    /// Intent creation timestamp.
+    pub created_at: DateTime<Utc>,
+    /// Exclusive intent expiry timestamp.
+    pub expires_at: DateTime<Utc>,
+    /// Successful one-time consumption timestamp.
+    pub consumed_at: Option<DateTime<Utc>>,
 }
 
 /// Row struct for the `authors` table.
@@ -542,6 +599,31 @@ impl PublisherKeyRow {
             created_at: self.created_at,
             revoked_at: self.revoked_at,
             last_used_at: self.last_used_at,
+        })
+    }
+}
+
+/// Conversion helpers for publication intent rows.
+impl PublicationIntentRow {
+    /// Convert this database row into a typed [`PublicationIntentRecord`].
+    pub(crate) fn into_record(self) -> Result<PublicationIntentRecord, CatalogError> {
+        let scan_schema_version = u32::try_from(self.scan_schema_version).map_err(|_| {
+            CatalogError::BackendError(Box::new(std::io::Error::other(
+                "publication intent scan_schema_version in DB is negative",
+            )))
+        })?;
+        Ok(PublicationIntentRecord {
+            id: self.id,
+            account_id: self.account_id,
+            publisher_id: self.publisher_id,
+            publisher_key_id: self.publisher_key_id,
+            archive_hash: vec_to_hash(self.archive_hash)?,
+            manifest_hash: vec_to_hash(self.manifest_hash)?,
+            file_inventory_hash: vec_to_hash(self.file_inventory_hash)?,
+            scan_schema_version,
+            created_at: self.created_at,
+            expires_at: self.expires_at,
+            consumed_at: self.consumed_at,
         })
     }
 }

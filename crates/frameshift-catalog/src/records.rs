@@ -166,6 +166,58 @@ pub struct PublisherAuditEventRecord {
     pub metadata: serde_json::Value,
 }
 
+/// Durable authorization envelope for one exact publication artifact.
+///
+/// The three hashes bind the intent to the uploaded archive, its manifest, and
+/// the normalized file inventory produced by the declared scanner schema.
+/// Consumption is a one-way transition represented by `consumed_at`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PublicationIntentRecord {
+    /// Stable caller-generated identifier used as the idempotency key.
+    pub id: Uuid,
+    /// Account that requested the publication intent.
+    pub account_id: Uuid,
+    /// Publisher under which the artifact may be submitted.
+    pub publisher_id: Uuid,
+    /// Active publisher key that must sign the eventual submission.
+    pub publisher_key_id: Uuid,
+    /// SHA-256 digest of the exact archive bytes.
+    pub archive_hash: ObjectHash,
+    /// SHA-256 digest of the canonical manifest bytes.
+    pub manifest_hash: ObjectHash,
+    /// SHA-256 digest of the normalized file inventory.
+    pub file_inventory_hash: ObjectHash,
+    /// Positive version of the scanner contract used for the inventory.
+    pub scan_schema_version: u32,
+    /// UTC timestamp when the intent was created.
+    pub created_at: DateTime<Utc>,
+    /// UTC timestamp after which the intent cannot be consumed.
+    pub expires_at: DateTime<Utc>,
+    /// UTC timestamp of the successful one-time consumption, when present.
+    pub consumed_at: Option<DateTime<Utc>>,
+}
+
+/// Exact identity and artifact binding required to consume an intent.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PublicationIntentClaim {
+    /// Identifier of the intent being consumed.
+    pub id: Uuid,
+    /// Account presenting the intent.
+    pub account_id: Uuid,
+    /// Publisher receiving the submission.
+    pub publisher_id: Uuid,
+    /// Publisher key authorizing the submission.
+    pub publisher_key_id: Uuid,
+    /// SHA-256 digest of the submitted archive bytes.
+    pub archive_hash: ObjectHash,
+    /// SHA-256 digest of the submitted canonical manifest.
+    pub manifest_hash: ObjectHash,
+    /// SHA-256 digest of the submitted normalized file inventory.
+    pub file_inventory_hash: ObjectHash,
+    /// Scanner contract version used for the submitted inventory.
+    pub scan_schema_version: u32,
+}
+
 /// A registered marketplace author.
 ///
 /// Authors are identified by their Ed25519 public key (`pubkey`). The `handle`
