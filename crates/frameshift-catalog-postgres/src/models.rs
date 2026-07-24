@@ -19,14 +19,15 @@ use serde_json::Value as JsonValue;
 use frameshift_catalog::{
     AccountRecord, AccountStatus, AuthorRecord, CatalogError, Ed25519PublicKey, MembershipState,
     OauthLink, ObjectHash, PackRecord, PackStatus, PackVersionRecord, PublicationIntentRecord,
-    PublisherKeyRecord, PublisherKeyState, PublisherMembershipRecord, PublisherModerationStatus,
-    PublisherProfileRecord, PublisherRole,
+    PublicationSubmissionRecord, PublicationSubmissionState, PublisherKeyRecord, PublisherKeyState,
+    PublisherMembershipRecord, PublisherModerationStatus, PublisherProfileRecord, PublisherRole,
 };
 use uuid::Uuid;
 
 use crate::schema::{
     accounts, authors, handles, pack_downloads, pack_versions, packs, publication_intents,
-    publisher_audit_events, publisher_keys, publisher_memberships, publisher_profiles,
+    publication_submissions, publisher_audit_events, publisher_keys, publisher_memberships,
+    publisher_profiles,
 };
 
 /// Queryable account row mapped from the `accounts` table.
@@ -276,6 +277,71 @@ pub(crate) struct NewPublicationIntentRow {
     pub expires_at: DateTime<Utc>,
     /// Successful one-time consumption timestamp.
     pub consumed_at: Option<DateTime<Utc>>,
+}
+
+/// Queryable publication submission row retained behind the quarantine boundary.
+#[derive(Debug, Clone, Queryable, Selectable)]
+#[diesel(table_name = publication_submissions)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub(crate) struct PublicationSubmissionRow {
+    /// Stable submission identifier.
+    pub id: Uuid,
+    /// One-time intent consumed by the submission.
+    pub intent_id: Uuid,
+    /// Account that presented the artifact.
+    pub account_id: Uuid,
+    /// Publisher receiving the future reviewed artifact.
+    pub publisher_id: Uuid,
+    /// Publisher key that authorized the artifact.
+    pub publisher_key_id: Uuid,
+    /// Raw archive SHA-256 digest.
+    pub archive_hash: Vec<u8>,
+    /// Raw canonical manifest SHA-256 digest.
+    pub manifest_hash: Vec<u8>,
+    /// Raw normalized inventory SHA-256 digest.
+    pub file_inventory_hash: Vec<u8>,
+    /// Server scanner contract version.
+    pub scan_schema_version: i32,
+    /// Typed server validation report serialized as JSON.
+    pub scan_report: JsonValue,
+    /// Non-public lifecycle state string.
+    pub state: String,
+    /// Database submission creation timestamp.
+    pub created_at: DateTime<Utc>,
+    /// Database lifecycle update timestamp.
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Insertable publication submission row created with a consumed intent.
+#[derive(Debug, Insertable)]
+#[diesel(table_name = publication_submissions)]
+pub(crate) struct NewPublicationSubmissionRow {
+    /// Stable submission identifier.
+    pub id: Uuid,
+    /// One-time intent consumed by the submission.
+    pub intent_id: Uuid,
+    /// Account that presented the artifact.
+    pub account_id: Uuid,
+    /// Publisher receiving the future reviewed artifact.
+    pub publisher_id: Uuid,
+    /// Publisher key that authorized the artifact.
+    pub publisher_key_id: Uuid,
+    /// Raw archive SHA-256 digest.
+    pub archive_hash: Vec<u8>,
+    /// Raw canonical manifest SHA-256 digest.
+    pub manifest_hash: Vec<u8>,
+    /// Raw normalized inventory SHA-256 digest.
+    pub file_inventory_hash: Vec<u8>,
+    /// Server scanner contract version.
+    pub scan_schema_version: i32,
+    /// Typed server validation report serialized as JSON.
+    pub scan_report: JsonValue,
+    /// Initial non-public lifecycle state string.
+    pub state: String,
+    /// Database submission creation timestamp.
+    pub created_at: DateTime<Utc>,
+    /// Database lifecycle update timestamp.
+    pub updated_at: DateTime<Utc>,
 }
 
 /// Row struct for the `authors` table.
@@ -624,6 +690,51 @@ impl PublicationIntentRow {
             created_at: self.created_at,
             expires_at: self.expires_at,
             consumed_at: self.consumed_at,
+        })
+    }
+}
+
+/// Conversion helpers for durable publication submission rows.
+impl PublicationSubmissionRow {
+    /// Convert this database row into a typed quarantine submission record.
+    pub(crate) fn into_record(self) -> Result<PublicationSubmissionRecord, CatalogError> {
+        let scan_schema_version = u32::try_from(self.scan_schema_version).map_err(|_| {
+            CatalogError::BackendError(Box::new(std::io::Error::other(format!(
+                "invalid publication submission scan schema version for {}",
+                self.id
+            ))))
+        })?;
+        let state = match self.state.as_str() {
+            "quarantined" => PublicationSubmissionState::Quarantined,
+            value => {
+                return Err(CatalogError::BackendError(Box::new(std::io::Error::other(
+                    format!(
+                        "invalid publication submission state {value:?} for {}",
+                        self.id
+                    ),
+                ))));
+            }
+        };
+        let scan_report = serde_json::from_value(self.scan_report).map_err(|error| {
+            CatalogError::BackendError(Box::new(std::io::Error::other(format!(
+                "invalid publication submission scan report for {}: {error}",
+                self.id
+            ))))
+        })?;
+        Ok(PublicationSubmissionRecord {
+            id: self.id,
+            intent_id: self.intent_id,
+            account_id: self.account_id,
+            publisher_id: self.publisher_id,
+            publisher_key_id: self.publisher_key_id,
+            archive_hash: vec_to_hash(self.archive_hash)?,
+            manifest_hash: vec_to_hash(self.manifest_hash)?,
+            file_inventory_hash: vec_to_hash(self.file_inventory_hash)?,
+            scan_schema_version,
+            scan_report,
+            state,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
         })
     }
 }

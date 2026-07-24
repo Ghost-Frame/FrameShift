@@ -8,6 +8,7 @@ description = "Catalog backend trait + canonical types for the frameshift market
 
 [dependencies]
 frameshift-pack = { path = "../frameshift-pack" }
+frameshift-publication = { path = "../frameshift-publication" }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
