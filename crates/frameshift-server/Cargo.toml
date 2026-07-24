@@ -16,6 +16,7 @@ frameshift-catalog-postgres = { path = "../frameshift-catalog-postgres" }
 frameshift-objects = { path = "../frameshift-objects" }
 frameshift-objects-fs = { path = "../frameshift-objects-fs" }
 frameshift-objects-r2 = { path = "../frameshift-objects-r2" }
+frameshift-publication = { path = "../frameshift-publication" }
 frameshift-runtime = { path = "../frameshift-runtime" }
 frameshift-memory = { path = "../frameshift-memory" }
 frameshift-memory-http = { path = "../frameshift-memory-http" }

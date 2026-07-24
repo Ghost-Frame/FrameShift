@@ -2356,6 +2356,7 @@ dependencies = [
  "frameshift-objects-fs",
  "frameshift-objects-r2",
  "frameshift-pack",
+ "frameshift-publication",
  "frameshift-runtime",
  "hex",
  "hmac 0.12.1",

@@ -16,6 +16,8 @@
 //! - **malformed archive/manifest** -- POST a corrupt tar.gz or invalid
 //!   `pack.toml`, assert `400` with a fixed, generic error message that never
 //!   echoes the server's temp-directory path or raw `io::Error`/tar text.
+//! - **publication boundary** -- reject unknown files and duplicate archive
+//!   paths before object-store or catalog mutation.
 
 mod mocks;
 
@@ -237,6 +239,21 @@ fn make_targz(dir: &Path) -> Vec<u8> {
     let enc = GzEncoder::new(buf, Compression::default());
     let mut tar = tar::Builder::new(enc);
     tar.append_dir_all(".", dir).unwrap();
+    let enc = tar.into_inner().unwrap();
+    enc.finish().unwrap()
+}
+
+/// Build an archive that repeats `pack.toml` under the same normalized path.
+fn make_targz_with_duplicate_manifest(dir: &Path) -> Vec<u8> {
+    let buf: Vec<u8> = Vec::new();
+    let enc = GzEncoder::new(buf, Compression::default());
+    let mut tar = tar::Builder::new(enc);
+    tar.append_path_with_name(dir.join("pack.toml"), "pack.toml")
+        .unwrap();
+    tar.append_path_with_name(dir.join("README.md"), "README.md")
+        .unwrap();
+    tar.append_path_with_name(dir.join("pack.toml"), "pack.toml")
+        .unwrap();
     let enc = tar.into_inner().unwrap();
     enc.finish().unwrap()
 }
@@ -1324,9 +1341,8 @@ async fn publish_malformed_tar_returns_400_generic_message_without_path_leak() {
 }
 
 /// POST a well-formed tar.gz whose `pack.toml` is not valid TOML -> `400`
-/// with the fixed message `"invalid pack"`, never the underlying
-/// `PackError` text (which can embed the server's absolute
-/// temp-directory path via `PackError::Io`/`NonUtf8Path`).
+/// with the stable publication finding code, never the underlying parser or
+/// filesystem error.
 #[tokio::test]
 async fn publish_malformed_manifest_returns_400_generic_message_without_path_leak() {
     let signing = SigningKey::from_bytes(&[51u8; 32]);
@@ -1334,6 +1350,11 @@ async fn publish_malformed_manifest_returns_400_generic_message_without_path_lea
 
     let tmp = tempfile::TempDir::new().unwrap();
     std::fs::write(tmp.path().join("pack.toml"), b"this is not valid toml {{{").unwrap();
+    std::fs::write(
+        tmp.path().join("README.md"),
+        b"# invalid manifest fixture\n",
+    )
+    .unwrap();
     let archive_bytes = make_targz(tmp.path());
     let fake_signature = vec![0u8; 64];
 
@@ -1350,7 +1371,67 @@ async fn publish_malformed_manifest_returns_400_generic_message_without_path_lea
 
     let body = body_json(resp).await;
     assert_eq!(
-        body["error"], "invalid pack",
-        "publish must return the fixed generic message, not the underlying PackError text"
+        body["error"], "publication validation failed: manifest.invalid",
+        "publish must return only the stable validation code"
     );
+}
+
+/// A correctly signed archive with an unknown file fails before any durable write.
+#[tokio::test]
+async fn publish_unknown_file_returns_400_without_storage_writes() {
+    let signing = SigningKey::from_bytes(&[52u8; 32]);
+    let (catalog, _pubkey) = catalog_with_author(&signing, "victor");
+    let objects = MockPackStore::new();
+    let tmp = tempfile::TempDir::new().unwrap();
+    write_pack(tmp.path(), "policy-pack", "1.0.0", "victor", &signing);
+    std::fs::write(tmp.path().join("notes.txt"), b"not public pack content").unwrap();
+    let pack = Pack::from_dir(tmp.path()).unwrap();
+    let signature = signing.sign(&pack.canonical_hash()).to_bytes().to_vec();
+    let archive = make_targz(tmp.path());
+
+    let response = post_publish(
+        make_state(catalog.clone(), objects.clone()),
+        &archive,
+        &signature,
+        "victor",
+        Some(&signing),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(response).await;
+    assert_eq!(
+        body["error"],
+        "publication validation failed: path.not_allowed"
+    );
+    assert!(objects.blobs.read().unwrap().is_empty());
+    assert!(catalog.state.read().unwrap().versions.is_empty());
+}
+
+/// Duplicate normalized archive paths fail before extraction can overwrite data.
+#[tokio::test]
+async fn publish_duplicate_archive_path_returns_400_without_storage_writes() {
+    let signing = SigningKey::from_bytes(&[53u8; 32]);
+    let (catalog, _pubkey) = catalog_with_author(&signing, "wendy");
+    let objects = MockPackStore::new();
+    let tmp = tempfile::TempDir::new().unwrap();
+    write_pack(tmp.path(), "reject-pack", "1.0.0", "wendy", &signing);
+    let pack = Pack::from_dir(tmp.path()).unwrap();
+    let signature = signing.sign(&pack.canonical_hash()).to_bytes().to_vec();
+    let archive = make_targz_with_duplicate_manifest(tmp.path());
+
+    let response = post_publish(
+        make_state(catalog.clone(), objects.clone()),
+        &archive,
+        &signature,
+        "wendy",
+        Some(&signing),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(response).await;
+    assert_eq!(body["error"], "pack archive contains duplicate paths");
+    assert!(objects.blobs.read().unwrap().is_empty());
+    assert!(catalog.state.read().unwrap().versions.is_empty());
 }
