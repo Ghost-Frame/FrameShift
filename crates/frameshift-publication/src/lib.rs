@@ -5,6 +5,7 @@
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::Read as _;
 use std::path::{Component, Path};
 
 use frameshift_pack::{FilesystemScope, PackManifest};
@@ -15,6 +16,21 @@ use unicode_normalization::UnicodeNormalization;
 
 /// Current schema version for serialized [`PublicationReport`] values.
 pub const REPORT_SCHEMA_VERSION: u32 = 1;
+
+/// Maximum number of regular files accepted by the pack format.
+const MAX_FILE_COUNT: usize = 50;
+
+/// Maximum size of one public file.
+const MAX_FILE_SIZE: u64 = 1024 * 1024;
+
+/// Maximum combined size of public files.
+const MAX_TOTAL_SIZE: u64 = 5 * 1024 * 1024;
+
+/// Maximum directory nesting accepted during validation.
+const MAX_DIRECTORY_DEPTH: usize = 8;
+
+/// Maximum filesystem entries inspected, including directories and rejected entries.
+const MAX_SCANNED_ENTRIES: usize = 256;
 
 /// Files that are valid at the root of a published pack.
 const ROOT_ALLOWLIST: &[&str] = &[
@@ -105,19 +121,28 @@ pub enum PublicationIoError {
 /// `signature.sig` is intentionally ignored because publish transports the
 /// freshly generated signature separately and never includes this local file.
 pub fn validate_directory(root: &Path) -> Result<PublicationReport, PublicationIoError> {
-    let root_metadata = fs::metadata(root).map_err(PublicationIoError::Root)?;
-    if !root_metadata.is_dir() {
+    let root_metadata = fs::symlink_metadata(root).map_err(PublicationIoError::Root)?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
         return Err(PublicationIoError::Root(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "publication root is not a directory",
+            "publication root must be a real directory, not a symlink",
         )));
     }
 
     let mut inventory = Vec::new();
     let mut findings = Vec::new();
-    collect_directory(root, root, &mut inventory, &mut findings)?;
+    let mut scanned_entries = 0;
+    collect_directory(
+        root,
+        root,
+        0,
+        &mut scanned_entries,
+        &mut inventory,
+        &mut findings,
+    )?;
     inventory.sort_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
 
+    validate_inventory(&inventory, &mut findings);
     validate_required_content(&inventory, &mut findings);
     validate_manifest(root, &inventory, &mut findings);
     validate_typed_source(root, &inventory, &mut findings);
@@ -140,20 +165,52 @@ pub fn validate_directory(root: &Path) -> Result<PublicationReport, PublicationI
 fn collect_directory(
     root: &Path,
     current: &Path,
+    depth: usize,
+    scanned_entries: &mut usize,
     inventory: &mut Vec<InventoryEntry>,
     findings: &mut Vec<PublicationFinding>,
 ) -> Result<(), PublicationIoError> {
-    let entries = fs::read_dir(current).map_err(|source| PublicationIoError::Entry {
-        path: relative_path(root, current),
-        source,
-    })?;
-    for entry in entries {
-        let entry = entry.map_err(|source| PublicationIoError::Entry {
+    let mut entries = fs::read_dir(current)
+        .map_err(|source| PublicationIoError::Entry {
+            path: relative_path(root, current),
+            source,
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| PublicationIoError::Entry {
             path: relative_path(root, current),
             source,
         })?;
+    entries.sort_by_key(|entry| relative_path(root, &entry.path()));
+
+    for entry in entries {
+        if *scanned_entries >= MAX_SCANNED_ENTRIES {
+            if !findings
+                .iter()
+                .any(|finding| finding.code == "limits.scanned_entries")
+            {
+                push_error(
+                    findings,
+                    "limits.scanned_entries",
+                    None,
+                    format!(
+                        "directory contains more than {MAX_SCANNED_ENTRIES} filesystem entries"
+                    ),
+                );
+            }
+            return Ok(());
+        }
+        *scanned_entries += 1;
         let path = entry.path();
         let relative = relative_path(root, &path);
+        if has_non_utf8_component(root, &path) {
+            push_error(
+                findings,
+                "path.non_utf8",
+                Some(relative.clone()),
+                "public pack paths must be valid UTF-8",
+            );
+            continue;
+        }
         let file_type = entry
             .file_type()
             .map_err(|source| PublicationIoError::Entry {
@@ -171,7 +228,16 @@ fn collect_directory(
             continue;
         }
         if file_type.is_dir() {
-            collect_directory(root, &path, inventory, findings)?;
+            if depth >= MAX_DIRECTORY_DEPTH {
+                push_error(
+                    findings,
+                    "limits.directory_depth",
+                    Some(relative),
+                    format!("directory nesting exceeds {MAX_DIRECTORY_DEPTH} levels"),
+                );
+                continue;
+            }
+            collect_directory(root, &path, depth + 1, scanned_entries, inventory, findings)?;
             continue;
         }
         if !file_type.is_file() {
@@ -203,10 +269,9 @@ fn collect_directory(
             );
         }
 
-        let bytes = fs::read(&path).map_err(|source| PublicationIoError::Entry {
-            path: relative.clone(),
-            source,
-        })?;
+        let Some(bytes) = read_bounded_regular_file(&path, &relative, findings)? else {
+            continue;
+        };
         inventory.push(InventoryEntry {
             path: relative,
             size: bytes.len() as u64,
@@ -214,6 +279,125 @@ fn collect_directory(
         });
     }
     Ok(())
+}
+
+/// Open and read one bounded regular file without following a replaced symlink.
+fn read_bounded_regular_file(
+    path: &Path,
+    relative: &str,
+    findings: &mut Vec<PublicationFinding>,
+) -> Result<Option<Vec<u8>>, PublicationIoError> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+            push_error(
+                findings,
+                "entry.changed_to_symlink",
+                Some(relative.to_string()),
+                "entry changed to a symbolic link during validation",
+            );
+            return Ok(None);
+        }
+        Err(source) => {
+            return Err(PublicationIoError::Entry {
+                path: relative.to_string(),
+                source,
+            });
+        }
+    };
+    let metadata = file
+        .metadata()
+        .map_err(|source| PublicationIoError::Entry {
+            path: relative.to_string(),
+            source,
+        })?;
+    if !metadata.is_file() {
+        push_error(
+            findings,
+            "entry.changed_type",
+            Some(relative.to_string()),
+            "entry stopped being a regular file during validation",
+        );
+        return Ok(None);
+    }
+    if metadata.len() > MAX_FILE_SIZE {
+        push_error(
+            findings,
+            "limits.file_size",
+            Some(relative.to_string()),
+            format!("file exceeds the {MAX_FILE_SIZE}-byte public limit"),
+        );
+        return Ok(None);
+    }
+
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    (&mut file)
+        .take(MAX_FILE_SIZE + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|source| PublicationIoError::Entry {
+            path: relative.to_string(),
+            source,
+        })?;
+    if bytes.len() as u64 > MAX_FILE_SIZE {
+        push_error(
+            findings,
+            "limits.file_size",
+            Some(relative.to_string()),
+            format!("file exceeds the {MAX_FILE_SIZE}-byte public limit"),
+        );
+        return Ok(None);
+    }
+    if bytes.len() as u64 != metadata.len() {
+        push_error(
+            findings,
+            "entry.changed_size",
+            Some(relative.to_string()),
+            "entry changed size while it was being validated",
+        );
+        return Ok(None);
+    }
+    Ok(Some(bytes))
+}
+
+/// Validate normalized-path uniqueness and aggregate pack-format limits.
+fn validate_inventory(inventory: &[InventoryEntry], findings: &mut Vec<PublicationFinding>) {
+    if inventory.len() > MAX_FILE_COUNT {
+        push_error(
+            findings,
+            "limits.file_count",
+            None,
+            format!(
+                "pack contains {} files; the public limit is {MAX_FILE_COUNT}",
+                inventory.len()
+            ),
+        );
+    }
+    let total_size = inventory.iter().map(|entry| entry.size).sum::<u64>();
+    if total_size > MAX_TOTAL_SIZE {
+        push_error(
+            findings,
+            "limits.total_size",
+            None,
+            format!("pack exceeds the {MAX_TOTAL_SIZE}-byte combined public limit"),
+        );
+    }
+    for pair in inventory.windows(2) {
+        if pair[0].path == pair[1].path {
+            push_error(
+                findings,
+                "path.normalized_collision",
+                Some(pair[0].path.clone()),
+                "multiple filesystem entries normalize to the same public path",
+            );
+        }
+    }
 }
 
 /// Validate that the inventory contains a manifest and supported behavior.
@@ -264,12 +448,12 @@ fn validate_manifest(
     };
     let manifest = match toml::from_str::<PackManifest>(&raw) {
         Ok(manifest) => manifest,
-        Err(error) => {
+        Err(_) => {
             push_error(
                 findings,
                 "manifest.invalid",
                 Some("pack.toml".to_string()),
-                format!("pack.toml does not match the shared schema: {error}"),
+                "pack.toml does not match the shared schema",
             );
             return;
         }
@@ -304,6 +488,18 @@ fn validate_manifest(
             "capability.system_filesystem",
             Some("pack.toml".to_string()),
             "system-wide filesystem access is not publishable",
+        );
+    }
+    if manifest
+        .capability_manifest
+        .as_ref()
+        .is_some_and(|capabilities| capabilities.network_egress)
+    {
+        push_warning(
+            findings,
+            "capability.network_egress",
+            Some("pack.toml".to_string()),
+            "pack declares outbound network access",
         );
     }
 
@@ -360,11 +556,11 @@ fn validate_conformance(
             Some("conformance/bundle.toml".to_string()),
             "conformance bundle hash does not match the manifest baseline",
         ),
-        Err(error) => push_error(
+        Err(_) => push_error(
             findings,
             "conformance.bundle_invalid",
             Some("conformance/bundle.toml".to_string()),
-            format!("conformance bundle is invalid: {error}"),
+            "conformance bundle does not match the shared schema",
         ),
     }
 }
@@ -380,12 +576,12 @@ fn validate_typed_source(
     }
     let source = match PersonaSource::load_from_dir(root) {
         Ok(source) => source,
-        Err(error) => {
+        Err(_) => {
             push_error(
                 findings,
                 "source.invalid",
                 Some("persona.toml".to_string()),
-                format!("typed persona source is invalid: {error}"),
+                "typed persona source does not match the shared schema",
             );
             return;
         }
@@ -470,12 +666,25 @@ fn forbidden_local_code(path: &str) -> Option<&'static str> {
     }
     if lower_path.contains("vault")
         || lower_path.contains("recovery")
+        || lower_path.contains("credential")
+        || lower_path.contains("secret")
         || lower_path.contains("private-source")
         || lower_path.contains("private_source")
     {
         return Some("path.private_state");
     }
     None
+}
+
+/// Return whether any relative path component cannot be represented as UTF-8.
+fn has_non_utf8_component(root: &Path, path: &Path) -> bool {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .components()
+        .any(|component| match component {
+            Component::Normal(part) => part.to_str().is_none(),
+            _ => false,
+        })
 }
 
 /// Normalize a relative filesystem path without exposing the absolute root.
@@ -738,5 +947,84 @@ tone = "precise"
             .inventory
             .iter()
             .any(|entry| entry.path == "signature.sig"));
+    }
+
+    /// Files larger than the canonical per-file limit are rejected without
+    /// reading their unbounded contents.
+    #[test]
+    fn oversized_file_is_blocked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_freeform_pack(dir.path());
+        let file = fs::File::create(dir.path().join("README.md")).expect("large file");
+        file.set_len(MAX_FILE_SIZE + 1).expect("set length");
+
+        let report = validate_directory(dir.path()).expect("report");
+        assert!(!report.valid);
+        assert!(has_code(&report, "limits.file_size"));
+    }
+
+    /// Parser findings never echo source snippets or private absolute paths.
+    #[test]
+    fn parser_findings_are_sanitized() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("pack.toml"),
+            "private_marker = \"must-not-echo\"\ninvalid = [",
+        )
+        .expect("manifest");
+        fs::write(dir.path().join("AGENTS.md"), "# Fixture\n").expect("body");
+
+        let report = validate_directory(dir.path()).expect("report");
+        for finding in &report.findings {
+            assert!(!finding.message.contains("must-not-echo"));
+            assert!(!finding.message.contains(&dir.path().display().to_string()));
+        }
+    }
+
+    /// Network egress is surfaced consistently but does not alone invalidate a pack.
+    #[test]
+    fn network_egress_is_reported_as_warning() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_freeform_pack(dir.path());
+        let mut manifest = fs::read_to_string(dir.path().join("pack.toml")).expect("read");
+        manifest.push_str("\n[capability_manifest]\nnetwork_egress = true\n");
+        fs::write(dir.path().join("pack.toml"), manifest).expect("write");
+
+        let report = validate_directory(dir.path()).expect("report");
+        assert!(report.valid);
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.code == "capability.network_egress")
+            .expect("network finding");
+        assert_eq!(finding.severity, FindingSeverity::Warning);
+    }
+
+    /// Distinct filesystem names that normalize to one public path are blocked.
+    #[test]
+    fn normalized_path_collision_is_blocked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_freeform_pack(dir.path());
+        fs::create_dir(dir.path().join("overlays")).expect("overlays");
+        fs::write(dir.path().join("overlays/\u{e9}.md"), "one").expect("composed");
+        fs::write(dir.path().join("overlays/e\u{301}.md"), "two").expect("decomposed");
+
+        let report = validate_directory(dir.path()).expect("report");
+        assert!(has_code(&report, "path.normalized_collision"));
+    }
+
+    /// A symlink cannot substitute for the publication root itself.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_root_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_freeform_pack(dir.path());
+        let parent = tempfile::tempdir().expect("parent");
+        let link = parent.path().join("pack-link");
+        symlink(dir.path(), &link).expect("root symlink");
+
+        assert!(validate_directory(&link).is_err());
     }
 }

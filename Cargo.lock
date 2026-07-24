@@ -2290,6 +2290,7 @@ dependencies = [
  "frameshift-source",
  "frameshift-template",
  "hex",
+ "libc",
  "serde",
  "sha2 0.10.9",
  "tempfile",
