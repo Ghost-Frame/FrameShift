@@ -14,16 +14,18 @@
 
 use std::time::Duration;
 
-use diesel::QueryDsl as _;
+use diesel::{ExpressionMethods as _, QueryDsl as _};
 use diesel_async::{RunQueryDsl as _, SimpleAsyncConnection as _};
 use frameshift_catalog::{
     AccountRecord, AccountStatus, AuthorRecord, CatalogBackend, CatalogError, Ed25519PublicKey,
-    MembershipState, ObjectHash, PackSearchFilters, PackStatus, PackVersionRecord, PublishQuota,
-    PublisherAuditEventRecord, PublisherKeyRecord, PublisherKeyState, PublisherMembershipRecord,
-    PublisherModerationStatus, PublisherProfileRecord, PublisherRole, SortMode, TombstoneReason,
-    TombstoneRecord,
+    MembershipState, ObjectHash, PackSearchFilters, PackStatus, PackVersionRecord,
+    PublicationIntentClaim, PublicationIntentRecord, PublishQuota, PublisherAuditEventRecord,
+    PublisherKeyRecord, PublisherKeyState, PublisherMembershipRecord, PublisherModerationStatus,
+    PublisherProfileRecord, PublisherRole, SortMode, TombstoneReason, TombstoneRecord,
 };
-use frameshift_catalog_postgres::schema::publisher_audit_events;
+use frameshift_catalog_postgres::schema::{
+    accounts, publisher_audit_events, publisher_memberships,
+};
 use frameshift_catalog_postgres::{
     OwnershipBackfillApplied, OwnershipBackfillManifest, OwnershipBackfillMode,
     OwnershipManifestKey, OwnershipManifestKeyState, OwnershipManifestModerationStatus,
@@ -139,7 +141,7 @@ async fn create_test_publisher(
     catalog: &PostgresCatalog,
     handle: &str,
     key_seed: u8,
-) -> (uuid::Uuid, PublisherKeyRecord) {
+) -> (uuid::Uuid, uuid::Uuid, PublisherKeyRecord) {
     let account = make_account(uuid::Uuid::new_v4(), &format!("{handle}-account"));
     catalog
         .create_account(account.clone())
@@ -184,7 +186,45 @@ async fn create_test_publisher(
         .create_publisher_key(key.clone(), None)
         .await
         .expect("create test publisher key failed");
-    (publisher_id, key)
+    (account.id, publisher_id, key)
+}
+
+/// Build an unconsumed publication intent with deterministic artifact hashes.
+fn make_publication_intent(
+    account_id: uuid::Uuid,
+    publisher_id: uuid::Uuid,
+    publisher_key_id: uuid::Uuid,
+    hash_seed: u8,
+    created_at: chrono::DateTime<chrono::Utc>,
+    expires_at: chrono::DateTime<chrono::Utc>,
+) -> PublicationIntentRecord {
+    PublicationIntentRecord {
+        id: uuid::Uuid::new_v4(),
+        account_id,
+        publisher_id,
+        publisher_key_id,
+        archive_hash: make_hash(hash_seed),
+        manifest_hash: make_hash(hash_seed.wrapping_add(1)),
+        file_inventory_hash: make_hash(hash_seed.wrapping_add(2)),
+        scan_schema_version: 1,
+        created_at,
+        expires_at,
+        consumed_at: None,
+    }
+}
+
+/// Build an exact consumption claim from a persisted intent.
+fn make_publication_claim(intent: &PublicationIntentRecord) -> PublicationIntentClaim {
+    PublicationIntentClaim {
+        id: intent.id,
+        account_id: intent.account_id,
+        publisher_id: intent.publisher_id,
+        publisher_key_id: intent.publisher_key_id,
+        archive_hash: intent.archive_hash,
+        manifest_hash: intent.manifest_hash,
+        file_inventory_hash: intent.file_inventory_hash,
+        scan_schema_version: intent.scan_schema_version,
+    }
 }
 
 /// Return a stable microsecond-safe timestamp for ownership migration manifests.
@@ -1164,6 +1204,228 @@ async fn publisher_membership_key_and_audit_lifecycle() {
     assert!(matches!(lookup_error, CatalogError::NotFound { .. }));
 }
 
+/// Publication intents are exact-idempotent and permit one concurrent consumer.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn publication_intent_roundtrip_idempotency_and_atomic_consumption() {
+    let (catalog, _container) = setup_catalog().await;
+    let (account_id, publisher_id, key) =
+        create_test_publisher(&catalog, "intent-owner", 103).await;
+    let now = chrono::DateTime::from_timestamp_micros(chrono::Utc::now().timestamp_micros())
+        .expect("current timestamp must fit");
+    let intent = make_publication_intent(
+        account_id,
+        publisher_id,
+        key.id,
+        104,
+        now,
+        now + chrono::Duration::minutes(10),
+    );
+
+    let created = catalog
+        .create_publication_intent(intent.clone())
+        .await
+        .expect("create publication intent failed");
+    assert_eq!(created, intent);
+    let retried = catalog
+        .create_publication_intent(intent.clone())
+        .await
+        .expect("exact publication intent retry must be idempotent");
+    assert_eq!(retried, created);
+    let found = catalog
+        .get_publication_intent(intent.id)
+        .await
+        .expect("publication intent lookup failed");
+    assert_eq!(found, created);
+
+    let mut conflicting = intent.clone();
+    conflicting.archive_hash = make_hash(109);
+    let conflict = catalog
+        .create_publication_intent(conflicting)
+        .await
+        .expect_err("altered idempotency-key reuse must fail");
+    assert!(matches!(
+        conflict,
+        CatalogError::Conflict {
+            kind: "publication_intent",
+            ..
+        }
+    ));
+
+    let mut mismatched = make_publication_claim(&intent);
+    mismatched.manifest_hash = make_hash(110);
+    assert!(
+        !catalog
+            .consume_publication_intent(mismatched)
+            .await
+            .expect("mismatched intent claim failed"),
+        "a mismatched digest must not consume the intent"
+    );
+
+    let claim = make_publication_claim(&intent);
+    let (first, second) = tokio::join!(
+        catalog.consume_publication_intent(claim.clone()),
+        catalog.consume_publication_intent(claim),
+    );
+    let outcomes = [
+        first.expect("first concurrent intent claim failed"),
+        second.expect("second concurrent intent claim failed"),
+    ];
+    assert_eq!(
+        outcomes.into_iter().filter(|consumed| *consumed).count(),
+        1,
+        "exactly one concurrent intent claim must consume the record"
+    );
+    let consumed = catalog
+        .get_publication_intent(intent.id)
+        .await
+        .expect("consumed publication intent lookup failed");
+    let consumed_at = consumed
+        .consumed_at
+        .expect("successful consumption must persist the database timestamp");
+    assert!(
+        consumed_at >= consumed.created_at && consumed_at < consumed.expires_at,
+        "database consumption timestamp must remain inside the intent window"
+    );
+    let post_consumption_retry = catalog
+        .create_publication_intent(intent)
+        .await
+        .expect("exact create retry must remain idempotent after consumption");
+    assert_eq!(post_consumption_retry, consumed);
+}
+
+/// Intent consumption revalidates expiry, account, membership, and key state.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn publication_intent_consumption_fails_closed_after_identity_changes() {
+    let (catalog, _container) = setup_catalog().await;
+    let (account_id, publisher_id, key) =
+        create_test_publisher(&catalog, "intent-revalidation", 111).await;
+    let now = chrono::DateTime::from_timestamp_micros(chrono::Utc::now().timestamp_micros())
+        .expect("current timestamp must fit");
+    let expired = make_publication_intent(
+        account_id,
+        publisher_id,
+        key.id,
+        112,
+        now - chrono::Duration::minutes(2),
+        now - chrono::Duration::minutes(1),
+    );
+    catalog
+        .create_publication_intent(expired.clone())
+        .await
+        .expect("create expired test intent failed");
+    assert!(
+        !catalog
+            .consume_publication_intent(make_publication_claim(&expired))
+            .await
+            .expect("expired intent claim failed"),
+        "an expired intent must remain unconsumed"
+    );
+
+    let active = make_publication_intent(
+        account_id,
+        publisher_id,
+        key.id,
+        115,
+        now,
+        now + chrono::Duration::minutes(10),
+    );
+    catalog
+        .create_publication_intent(active.clone())
+        .await
+        .expect("create revalidation intent failed");
+    let mut connection = catalog
+        .pool()
+        .get()
+        .await
+        .expect("identity revalidation connection failed");
+
+    diesel::update(accounts::table.find(account_id))
+        .set(accounts::status.eq("suspended"))
+        .execute(&mut connection)
+        .await
+        .expect("suspend intent account failed");
+    assert!(
+        !catalog
+            .consume_publication_intent(make_publication_claim(&active))
+            .await
+            .expect("suspended-account claim failed"),
+        "a suspended account must not consume an existing intent"
+    );
+    diesel::update(accounts::table.find(account_id))
+        .set(accounts::status.eq("active"))
+        .execute(&mut connection)
+        .await
+        .expect("reactivate intent account failed");
+
+    diesel::update(publisher_memberships::table.find((account_id, publisher_id)))
+        .set(publisher_memberships::state.eq("revoked"))
+        .execute(&mut connection)
+        .await
+        .expect("revoke intent membership failed");
+    assert!(
+        !catalog
+            .consume_publication_intent(make_publication_claim(&active))
+            .await
+            .expect("revoked-membership claim failed"),
+        "a revoked owner membership must not consume an existing intent"
+    );
+    diesel::update(publisher_memberships::table.find((account_id, publisher_id)))
+        .set(publisher_memberships::state.eq("active"))
+        .execute(&mut connection)
+        .await
+        .expect("reactivate intent membership failed");
+    drop(connection);
+
+    let second_key = PublisherKeyRecord {
+        id: uuid::Uuid::new_v4(),
+        publisher_id,
+        public_key: make_pubkey(118),
+        label: "intent fallback key".to_string(),
+        state: PublisherKeyState::Active,
+        created_at: now,
+        revoked_at: None,
+        last_used_at: None,
+    };
+    catalog
+        .create_publisher_key(second_key, None)
+        .await
+        .expect("create intent fallback key failed");
+    catalog
+        .revoke_publisher_key(publisher_id, key.id, now, None)
+        .await
+        .expect("revoke intent signing key failed");
+    assert!(
+        !catalog
+            .consume_publication_intent(make_publication_claim(&active))
+            .await
+            .expect("revoked-key claim failed"),
+        "a revoked signing key must not consume an existing intent"
+    );
+
+    let (_, _, foreign_key) = create_test_publisher(&catalog, "intent-foreign", 119).await;
+    let cross_publisher = make_publication_intent(
+        account_id,
+        publisher_id,
+        foreign_key.id,
+        120,
+        now,
+        now + chrono::Duration::minutes(10),
+    );
+    let unauthorized = catalog
+        .create_publication_intent(cross_publisher)
+        .await
+        .expect_err("cross-publisher key binding must fail");
+    assert!(matches!(
+        unauthorized,
+        CatalogError::Unauthorized {
+            kind: "publication_intent",
+            ..
+        }
+    ));
+}
+
 /// Publisher writes persist identity links and reject revoked keys without hiding history.
 #[tokio::test]
 #[ignore = "requires Docker"]
@@ -1297,8 +1559,9 @@ async fn publisher_pack_registration_enforces_active_key_state() {
 #[ignore = "requires Docker"]
 async fn concurrent_first_publish_enforces_winning_owner() {
     let (catalog, _container) = setup_catalog().await;
-    let (first_publisher_id, first_key) = create_test_publisher(&catalog, "first-racer", 101).await;
-    let (second_publisher_id, second_key) =
+    let (_, first_publisher_id, first_key) =
+        create_test_publisher(&catalog, "first-racer", 101).await;
+    let (_, second_publisher_id, second_key) =
         create_test_publisher(&catalog, "second-racer", 102).await;
     let mut first = make_version("contended-pack", "1.0.0", 101, 101);
     first.publisher_key_id = Some(first_key.id);

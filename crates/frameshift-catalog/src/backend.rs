@@ -13,8 +13,9 @@ use crate::error::{CatalogError, HealthStatus};
 use crate::filters::{PackSearchFilters, PackSearchResult};
 use crate::identity::Ed25519PublicKey;
 use crate::records::{
-    AccountRecord, AuthorRecord, PackRecord, PackVersionRecord, PublisherAuditEventRecord,
-    PublisherKeyRecord, PublisherMembershipRecord, PublisherProfileRecord,
+    AccountRecord, AuthorRecord, PackRecord, PackVersionRecord, PublicationIntentClaim,
+    PublicationIntentRecord, PublisherAuditEventRecord, PublisherKeyRecord,
+    PublisherMembershipRecord, PublisherProfileRecord,
 };
 use crate::status::TombstoneRecord;
 
@@ -197,6 +198,46 @@ pub trait CatalogBackend: Send + Sync {
         &self,
         event: PublisherAuditEventRecord,
     ) -> Result<(), CatalogError>;
+
+    /// Create or idempotently retrieve one exact publication intent.
+    ///
+    /// Backends that do not support the Phase 5 publication workflow fail
+    /// closed through this default implementation.
+    async fn create_publication_intent(
+        &self,
+        record: PublicationIntentRecord,
+    ) -> Result<PublicationIntentRecord, CatalogError> {
+        Err(CatalogError::Validation(format!(
+            "publication intents are not supported by this backend: {}",
+            record.id
+        )))
+    }
+
+    /// Retrieve a durable publication intent by its stable identifier.
+    ///
+    /// The default preserves source compatibility for existing external
+    /// backends while preventing an unsupported backend from authorizing use.
+    async fn get_publication_intent(
+        &self,
+        id: uuid::Uuid,
+    ) -> Result<PublicationIntentRecord, CatalogError> {
+        Err(CatalogError::NotFound {
+            kind: "publication_intent",
+            key: id.to_string(),
+        })
+    }
+
+    /// Atomically consume an unexpired intent with an exact identity and hash binding.
+    ///
+    /// Returns `true` only for the single successful transition. `false`
+    /// intentionally combines missing, expired, consumed, inactive, and
+    /// mismatched cases so callers cannot accidentally weaken the predicate.
+    async fn consume_publication_intent(
+        &self,
+        _claim: PublicationIntentClaim,
+    ) -> Result<bool, CatalogError> {
+        Ok(false)
+    }
 
     /// Register a new author or confirm that an identical author already exists.
     ///

@@ -126,6 +126,34 @@ diesel::table! {
 }
 
 diesel::table! {
+    /// Exact, expiring authorization envelopes for publication submissions.
+    publication_intents (id) {
+        /// Stable intent identifier and idempotency key.
+        id -> Uuid,
+        /// Account that created the intent.
+        account_id -> Uuid,
+        /// Publisher receiving the future submission.
+        publisher_id -> Uuid,
+        /// Publisher key authorizing the future submission.
+        publisher_key_id -> Uuid,
+        /// SHA-256 digest of the exact archive bytes.
+        archive_hash -> Binary,
+        /// SHA-256 digest of the canonical manifest bytes.
+        manifest_hash -> Binary,
+        /// SHA-256 digest of the normalized file inventory.
+        file_inventory_hash -> Binary,
+        /// Positive scanner contract version.
+        scan_schema_version -> Integer,
+        /// Intent creation timestamp.
+        created_at -> Timestamptz,
+        /// Exclusive intent expiry timestamp.
+        expires_at -> Timestamptz,
+        /// Successful one-time consumption timestamp.
+        consumed_at -> Nullable<Timestamptz>,
+    }
+}
+
+diesel::table! {
     /// The `authors` table stores one row per registered Ed25519 keypair.
     ///
     /// Primary key: `pubkey` (raw 32-byte BYTEA).
@@ -284,4 +312,5 @@ diesel::allow_tables_to_appear_in_same_query!(
     publisher_memberships,
     publisher_keys,
     publisher_audit_events,
+    publication_intents,
 );
