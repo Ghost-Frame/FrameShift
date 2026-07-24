@@ -218,6 +218,60 @@ pub struct PublicationIntentClaim {
     pub scan_schema_version: u32,
 }
 
+/// Initial lifecycle state of a durable publication submission.
+///
+/// Phase 5C2 creates only quarantined records. Later additive phases may
+/// introduce reviewed or public states after their policy contracts are fixed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationSubmissionState {
+    /// The artifact remains isolated from every public catalog read.
+    Quarantined,
+}
+
+/// Exact input required to atomically claim an intent and create a submission.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PublicationSubmissionRequest {
+    /// Stable caller-generated submission identifier and idempotency key.
+    pub id: Uuid,
+    /// Exact identity and artifact binding copied from the publication intent.
+    pub intent: PublicationIntentClaim,
+    /// Deterministic server-side validation result for the quarantined artifact.
+    pub scan_report: frameshift_publication::PublicationReport,
+}
+
+/// Durable record for an artifact admitted only to the quarantine boundary.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PublicationSubmissionRecord {
+    /// Stable submission identifier.
+    pub id: Uuid,
+    /// One-time publication intent consumed by this submission.
+    pub intent_id: Uuid,
+    /// Account that presented the submission.
+    pub account_id: Uuid,
+    /// Publisher under which the artifact may eventually be reviewed.
+    pub publisher_id: Uuid,
+    /// Publisher key that authorized the exact artifact.
+    pub publisher_key_id: Uuid,
+    /// SHA-256 digest of the exact quarantined archive bytes.
+    pub archive_hash: ObjectHash,
+    /// SHA-256 digest of the canonical manifest bytes.
+    pub manifest_hash: ObjectHash,
+    /// SHA-256 digest of the normalized file inventory.
+    pub file_inventory_hash: ObjectHash,
+    /// Positive scanner contract version used by the server report.
+    pub scan_schema_version: u32,
+    /// Deterministic server-side validation result retained for review.
+    pub scan_report: frameshift_publication::PublicationReport,
+    /// Current non-public lifecycle state.
+    pub state: PublicationSubmissionState,
+    /// Database timestamp when the intent was consumed and submission created.
+    pub created_at: DateTime<Utc>,
+    /// Database timestamp of the most recent lifecycle update.
+    pub updated_at: DateTime<Utc>,
+}
+
 /// A registered marketplace author.
 ///
 /// Authors are identified by their Ed25519 public key (`pubkey`). The `handle`

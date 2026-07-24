@@ -62,8 +62,9 @@ pub use frameshift_pack::ObjectHash;
 pub use identity::Ed25519PublicKey;
 pub use records::{
     AccountRecord, AccountStatus, AuthorRecord, MembershipState, OauthLink, PackRecord,
-    PackVersionRecord, PublicationIntentClaim, PublicationIntentRecord, PublisherAuditEventRecord,
-    PublisherKeyRecord, PublisherKeyState, PublisherMembershipRecord, PublisherModerationStatus,
-    PublisherProfileRecord, PublisherRole,
+    PackVersionRecord, PublicationIntentClaim, PublicationIntentRecord,
+    PublicationSubmissionRecord, PublicationSubmissionRequest, PublicationSubmissionState,
+    PublisherAuditEventRecord, PublisherKeyRecord, PublisherKeyState, PublisherMembershipRecord,
+    PublisherModerationStatus, PublisherProfileRecord, PublisherRole,
 };
 pub use status::{PackStatus, TombstoneReason, TombstoneRecord};

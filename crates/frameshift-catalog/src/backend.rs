@@ -14,8 +14,9 @@ use crate::filters::{PackSearchFilters, PackSearchResult};
 use crate::identity::Ed25519PublicKey;
 use crate::records::{
     AccountRecord, AuthorRecord, PackRecord, PackVersionRecord, PublicationIntentClaim,
-    PublicationIntentRecord, PublisherAuditEventRecord, PublisherKeyRecord,
-    PublisherMembershipRecord, PublisherProfileRecord,
+    PublicationIntentRecord, PublicationSubmissionRecord, PublicationSubmissionRequest,
+    PublisherAuditEventRecord, PublisherKeyRecord, PublisherMembershipRecord,
+    PublisherProfileRecord,
 };
 use crate::status::TombstoneRecord;
 
@@ -237,6 +238,31 @@ pub trait CatalogBackend: Send + Sync {
         _claim: PublicationIntentClaim,
     ) -> Result<bool, CatalogError> {
         Ok(false)
+    }
+
+    /// Atomically consume an exact intent and create one quarantined submission.
+    ///
+    /// Backends that do not support quarantine persistence fail closed. The
+    /// operation must not consume the intent unless the submission is committed.
+    async fn create_publication_submission(
+        &self,
+        request: PublicationSubmissionRequest,
+    ) -> Result<PublicationSubmissionRecord, CatalogError> {
+        Err(CatalogError::Validation(format!(
+            "publication submissions are not supported by this backend: {}",
+            request.id
+        )))
+    }
+
+    /// Retrieve one durable publication submission by stable identifier.
+    async fn get_publication_submission(
+        &self,
+        id: uuid::Uuid,
+    ) -> Result<PublicationSubmissionRecord, CatalogError> {
+        Err(CatalogError::NotFound {
+            kind: "publication_submission",
+            key: id.to_string(),
+        })
     }
 
     /// Register a new author or confirm that an identical author already exists.

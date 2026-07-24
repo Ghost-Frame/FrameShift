@@ -19,18 +19,22 @@ use diesel_async::{RunQueryDsl as _, SimpleAsyncConnection as _};
 use frameshift_catalog::{
     AccountRecord, AccountStatus, AuthorRecord, CatalogBackend, CatalogError, Ed25519PublicKey,
     MembershipState, ObjectHash, PackSearchFilters, PackStatus, PackVersionRecord,
-    PublicationIntentClaim, PublicationIntentRecord, PublishQuota, PublisherAuditEventRecord,
-    PublisherKeyRecord, PublisherKeyState, PublisherMembershipRecord, PublisherModerationStatus,
+    PublicationIntentClaim, PublicationIntentRecord, PublicationSubmissionRequest,
+    PublicationSubmissionState, PublishQuota, PublisherAuditEventRecord, PublisherKeyRecord,
+    PublisherKeyState, PublisherMembershipRecord, PublisherModerationStatus,
     PublisherProfileRecord, PublisherRole, SortMode, TombstoneReason, TombstoneRecord,
 };
 use frameshift_catalog_postgres::schema::{
-    accounts, publisher_audit_events, publisher_memberships,
+    accounts, publication_submissions, publisher_audit_events, publisher_memberships,
 };
 use frameshift_catalog_postgres::{
     OwnershipBackfillApplied, OwnershipBackfillManifest, OwnershipBackfillMode,
     OwnershipManifestKey, OwnershipManifestKeyState, OwnershipManifestModerationStatus,
     OwnershipManifestPack, OwnershipManifestPublisher, OwnershipManifestVersion, PostgresCatalog,
     PostgresCatalogConfig, OWNERSHIP_BACKFILL_SCHEMA_VERSION,
+};
+use frameshift_publication::{
+    inventory_hash, FindingSeverity, InventoryEntry, PublicationFinding, PublicationReport,
 };
 use secrecy::SecretString;
 use sha2::{Digest as _, Sha256};
@@ -224,6 +228,54 @@ fn make_publication_claim(intent: &PublicationIntentRecord) -> PublicationIntent
         manifest_hash: intent.manifest_hash,
         file_inventory_hash: intent.file_inventory_hash,
         scan_schema_version: intent.scan_schema_version,
+    }
+}
+
+/// Build a valid deterministic server report bound to one intent inventory hash.
+fn make_publication_report(intent: &PublicationIntentRecord) -> PublicationReport {
+    let inventory = vec![InventoryEntry {
+        path: "pack.toml".to_string(),
+        size: 12,
+        sha256: make_hash(151).to_hex(),
+    }];
+    PublicationReport {
+        schema_version: intent.scan_schema_version,
+        valid: true,
+        inventory_hash: inventory_hash(&inventory),
+        inventory,
+        findings: Vec::new(),
+    }
+}
+
+/// Build an intent whose inventory digest matches the stable submission fixture.
+fn make_publication_submission_intent(
+    account_id: uuid::Uuid,
+    publisher_id: uuid::Uuid,
+    publisher_key_id: uuid::Uuid,
+    hash_seed: u8,
+    created_at: chrono::DateTime<chrono::Utc>,
+    expires_at: chrono::DateTime<chrono::Utc>,
+) -> PublicationIntentRecord {
+    let mut intent = make_publication_intent(
+        account_id,
+        publisher_id,
+        publisher_key_id,
+        hash_seed,
+        created_at,
+        expires_at,
+    );
+    let report = make_publication_report(&intent);
+    intent.file_inventory_hash =
+        ObjectHash::from_hex(&report.inventory_hash).expect("fixture inventory hash must parse");
+    intent
+}
+
+/// Build an exact quarantined submission request for one intent.
+fn make_publication_submission(intent: &PublicationIntentRecord) -> PublicationSubmissionRequest {
+    PublicationSubmissionRequest {
+        id: uuid::Uuid::new_v4(),
+        intent: make_publication_claim(intent),
+        scan_report: make_publication_report(intent),
     }
 }
 
@@ -1424,6 +1476,301 @@ async fn publication_intent_consumption_fails_closed_after_identity_changes() {
             ..
         }
     ));
+}
+
+/// Exact concurrent submission retries persist and return one quarantined row.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn publication_submission_is_atomic_idempotent_and_concurrency_safe() {
+    let (catalog, _container) = setup_catalog().await;
+    let (account_id, publisher_id, key) =
+        create_test_publisher(&catalog, "submission-owner", 152).await;
+    let now = chrono::DateTime::from_timestamp_micros(chrono::Utc::now().timestamp_micros())
+        .expect("current timestamp must fit");
+    let intent = make_publication_submission_intent(
+        account_id,
+        publisher_id,
+        key.id,
+        153,
+        now,
+        now + chrono::Duration::minutes(10),
+    );
+    catalog
+        .create_publication_intent(intent.clone())
+        .await
+        .expect("create submission intent failed");
+    let request = make_publication_submission(&intent);
+
+    let (first, second) = tokio::join!(
+        catalog.create_publication_submission(request.clone()),
+        catalog.create_publication_submission(request.clone()),
+    );
+    let first = first.expect("first concurrent submission failed");
+    let second = second.expect("second concurrent submission retry failed");
+    assert_eq!(first, second);
+    assert_eq!(first.id, request.id);
+    assert_eq!(first.intent_id, intent.id);
+    assert_eq!(first.state, PublicationSubmissionState::Quarantined);
+    assert_eq!(first.created_at, first.updated_at);
+    assert_eq!(
+        catalog
+            .get_publication_submission(request.id)
+            .await
+            .expect("submission lookup failed"),
+        first
+    );
+
+    let mut connection = catalog
+        .pool()
+        .get()
+        .await
+        .expect("submission count connection failed");
+    let count = publication_submissions::table
+        .count()
+        .get_result::<i64>(&mut connection)
+        .await
+        .expect("count publication submissions failed");
+    assert_eq!(count, 1);
+    let consumed = catalog
+        .get_publication_intent(intent.id)
+        .await
+        .expect("consumed submission intent lookup failed");
+    assert_eq!(consumed.consumed_at, Some(first.created_at));
+
+    let mut altered = request.clone();
+    altered.scan_report.findings.push(PublicationFinding {
+        code: "review.advisory".to_string(),
+        severity: FindingSeverity::Warning,
+        path: None,
+        message: "reviewer-visible advisory".to_string(),
+    });
+    let conflict = catalog
+        .create_publication_submission(altered)
+        .await
+        .expect_err("altered submission idempotency retry must fail");
+    assert!(matches!(
+        conflict,
+        CatalogError::Conflict {
+            kind: "publication_submission",
+            ..
+        }
+    ));
+
+    let mut second_id = request;
+    second_id.id = uuid::Uuid::new_v4();
+    let intent_conflict = catalog
+        .create_publication_submission(second_id)
+        .await
+        .expect_err("one intent must not create a second submission");
+    assert!(matches!(
+        intent_conflict,
+        CatalogError::Conflict {
+            kind: "publication_submission",
+            ..
+        }
+    ));
+}
+
+/// Submission admission rejects report drift and inactive authorization chains.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn publication_submission_revalidates_report_expiry_and_identity() {
+    let (catalog, _container) = setup_catalog().await;
+    let (account_id, publisher_id, key) =
+        create_test_publisher(&catalog, "submission-revalidation", 160).await;
+    let now = chrono::DateTime::from_timestamp_micros(chrono::Utc::now().timestamp_micros())
+        .expect("current timestamp must fit");
+    let expired = make_publication_submission_intent(
+        account_id,
+        publisher_id,
+        key.id,
+        161,
+        now - chrono::Duration::minutes(2),
+        now - chrono::Duration::minutes(1),
+    );
+    catalog
+        .create_publication_intent(expired.clone())
+        .await
+        .expect("create expired submission intent failed");
+    let expired_error = catalog
+        .create_publication_submission(make_publication_submission(&expired))
+        .await
+        .expect_err("expired intent must reject submission");
+    assert!(matches!(expired_error, CatalogError::Unauthorized { .. }));
+
+    let active = make_publication_submission_intent(
+        account_id,
+        publisher_id,
+        key.id,
+        164,
+        now,
+        now + chrono::Duration::minutes(10),
+    );
+    catalog
+        .create_publication_intent(active.clone())
+        .await
+        .expect("create active submission intent failed");
+
+    let mut mismatched_report = make_publication_submission(&active);
+    mismatched_report.scan_report.inventory_hash = make_hash(170).to_hex();
+    let report_error = catalog
+        .create_publication_submission(mismatched_report)
+        .await
+        .expect_err("inventory report mismatch must reject submission");
+    assert!(matches!(report_error, CatalogError::Unauthorized { .. }));
+
+    let mut inconsistent_report = make_publication_submission(&active);
+    inconsistent_report.scan_report.inventory[0].size += 1;
+    let consistency_error = catalog
+        .create_publication_submission(inconsistent_report)
+        .await
+        .expect_err("internally inconsistent report must reject submission");
+    assert!(matches!(consistency_error, CatalogError::Validation(_)));
+
+    let mut invalid_report = make_publication_submission(&active);
+    invalid_report.scan_report.valid = false;
+    let invalid_error = catalog
+        .create_publication_submission(invalid_report)
+        .await
+        .expect_err("invalid server report must reject submission");
+    assert!(matches!(invalid_error, CatalogError::Validation(_)));
+
+    let mut connection = catalog
+        .pool()
+        .get()
+        .await
+        .expect("submission identity connection failed");
+    diesel::update(accounts::table.find(account_id))
+        .set(accounts::status.eq("suspended"))
+        .execute(&mut connection)
+        .await
+        .expect("suspend submission account failed");
+    let request = make_publication_submission(&active);
+    assert!(matches!(
+        catalog
+            .create_publication_submission(request.clone())
+            .await
+            .expect_err("suspended account must reject submission"),
+        CatalogError::Unauthorized { .. }
+    ));
+    diesel::update(accounts::table.find(account_id))
+        .set(accounts::status.eq("active"))
+        .execute(&mut connection)
+        .await
+        .expect("reactivate submission account failed");
+
+    diesel::update(publisher_memberships::table.find((account_id, publisher_id)))
+        .set(publisher_memberships::state.eq("revoked"))
+        .execute(&mut connection)
+        .await
+        .expect("revoke submission membership failed");
+    assert!(matches!(
+        catalog
+            .create_publication_submission(request.clone())
+            .await
+            .expect_err("revoked owner membership must reject submission"),
+        CatalogError::Unauthorized { .. }
+    ));
+    diesel::update(publisher_memberships::table.find((account_id, publisher_id)))
+        .set(publisher_memberships::state.eq("active"))
+        .execute(&mut connection)
+        .await
+        .expect("reactivate submission membership failed");
+    drop(connection);
+
+    let fallback_key = PublisherKeyRecord {
+        id: uuid::Uuid::new_v4(),
+        publisher_id,
+        public_key: make_pubkey(171),
+        label: "submission fallback key".to_string(),
+        state: PublisherKeyState::Active,
+        created_at: now,
+        revoked_at: None,
+        last_used_at: None,
+    };
+    catalog
+        .create_publisher_key(fallback_key, None)
+        .await
+        .expect("create submission fallback key failed");
+    catalog
+        .revoke_publisher_key(publisher_id, key.id, now, None)
+        .await
+        .expect("revoke submission key failed");
+    assert!(matches!(
+        catalog
+            .create_publication_submission(request)
+            .await
+            .expect_err("revoked publisher key must reject submission"),
+        CatalogError::Unauthorized { .. }
+    ));
+    let unconsumed = catalog
+        .get_publication_intent(active.id)
+        .await
+        .expect("unconsumed submission intent lookup failed");
+    assert!(unconsumed.consumed_at.is_none());
+}
+
+/// A database insertion failure rolls back the intent consumption timestamp.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn publication_submission_insert_failure_does_not_burn_intent() {
+    let (catalog, _container) = setup_catalog().await;
+    let (account_id, publisher_id, key) =
+        create_test_publisher(&catalog, "submission-rollback", 172).await;
+    let now = chrono::DateTime::from_timestamp_micros(chrono::Utc::now().timestamp_micros())
+        .expect("current timestamp must fit");
+    let intent = make_publication_submission_intent(
+        account_id,
+        publisher_id,
+        key.id,
+        173,
+        now,
+        now + chrono::Duration::minutes(10),
+    );
+    catalog
+        .create_publication_intent(intent.clone())
+        .await
+        .expect("create rollback submission intent failed");
+    let mut connection = catalog
+        .pool()
+        .get()
+        .await
+        .expect("submission rollback connection failed");
+    connection
+        .batch_execute(
+            r#"
+            CREATE FUNCTION reject_test_submission() RETURNS trigger
+            LANGUAGE plpgsql AS $$
+            BEGIN
+                RAISE EXCEPTION 'forced submission insertion failure';
+            END
+            $$;
+            CREATE TRIGGER reject_test_submission
+            BEFORE INSERT ON publication_submissions
+            FOR EACH ROW EXECUTE FUNCTION reject_test_submission();
+            "#,
+        )
+        .await
+        .expect("install submission rejection trigger failed");
+    drop(connection);
+
+    catalog
+        .create_publication_submission(make_publication_submission(&intent))
+        .await
+        .expect_err("forced insertion failure must surface");
+    let preserved = catalog
+        .get_publication_intent(intent.id)
+        .await
+        .expect("rollback intent lookup failed");
+    assert!(
+        preserved.consumed_at.is_none(),
+        "failed submission insertion must roll back intent consumption"
+    );
+    let missing = catalog
+        .get_publication_submission(uuid::Uuid::new_v4())
+        .await
+        .expect_err("failed insertion must not leave a submission");
+    assert!(matches!(missing, CatalogError::NotFound { .. }));
 }
 
 /// Publisher writes persist identity links and reject revoked keys without hiding history.

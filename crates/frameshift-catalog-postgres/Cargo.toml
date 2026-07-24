@@ -9,6 +9,7 @@ description = "Postgres adapter for the frameshift catalog backend"
 [dependencies]
 frameshift-catalog = { path = "../frameshift-catalog" }
 frameshift-pack = { path = "../frameshift-pack" }
+frameshift-publication = { path = "../frameshift-publication" }
 diesel = { workspace = true }
 diesel-async = { workspace = true }
 diesel_migrations = { workspace = true }

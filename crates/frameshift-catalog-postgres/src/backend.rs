@@ -26,25 +26,28 @@ use tracing::{debug, error, instrument};
 use frameshift_catalog::{
     AccountRecord, AuthorRecord, CatalogBackend, CatalogError, Ed25519PublicKey, HealthStatus,
     MembershipState, PackRecord, PackSearchFilters, PackSearchResult, PackVersionRecord,
-    PublicationIntentClaim, PublicationIntentRecord, PublishQuota, PublisherAuditEventRecord,
-    PublisherKeyRecord, PublisherMembershipRecord, PublisherProfileRecord, SortMode,
-    TombstoneRecord,
+    PublicationIntentClaim, PublicationIntentRecord, PublicationSubmissionRecord,
+    PublicationSubmissionRequest, PublicationSubmissionState, PublishQuota,
+    PublisherAuditEventRecord, PublisherKeyRecord, PublisherMembershipRecord,
+    PublisherProfileRecord, SortMode, TombstoneRecord,
 };
+use frameshift_publication::{inventory_hash, FindingSeverity, REPORT_SCHEMA_VERSION};
 
 use crate::config::PostgresCatalogConfig;
 use crate::errors::{map_diesel_error, map_migration_error, map_pool_error};
 use crate::models::{
     encode_text_enum, vec_to_pubkey, AccountRow, AuthorRow, HandleRow, NewAccountRow, NewAuthorRow,
     NewHandleRow, NewPackDownloadRow, NewPackRow, NewPackVersionRow, NewPublicationIntentRow,
-    NewPublisherAuditEventRow, NewPublisherKeyRow, NewPublisherMembershipRow,
-    NewPublisherProfileRow, PackRow, PackVersionRow, PublicationIntentRow, PublisherKeyRow,
-    PublisherMembershipRow, PublisherProfileRow,
+    NewPublicationSubmissionRow, NewPublisherAuditEventRow, NewPublisherKeyRow,
+    NewPublisherMembershipRow, NewPublisherProfileRow, PackRow, PackVersionRow,
+    PublicationIntentRow, PublicationSubmissionRow, PublisherKeyRow, PublisherMembershipRow,
+    PublisherProfileRow,
 };
 use crate::pool::{build_pool, PgPool};
 use crate::schema::{
     accounts, authors, handles, pack_downloads, pack_versions, packs, publication_intents,
-    publisher_audit_events, publisher_keys, publisher_memberships, publisher_profiles,
-    signed_request_nonces,
+    publication_submissions, publisher_audit_events, publisher_keys, publisher_memberships,
+    publisher_profiles, signed_request_nonces,
 };
 
 /// Embedded migration files compiled into the binary at build time.
@@ -167,6 +170,120 @@ fn publication_intent_unauthorized(id: uuid::Uuid) -> CatalogTransactionError {
         kind: "publication_intent",
         key: id.to_string(),
     })
+}
+
+/// Validate a typed server report against the exact intent claim.
+fn validate_publication_submission(
+    request: &PublicationSubmissionRequest,
+) -> Result<(i32, serde_json::Value), CatalogError> {
+    let scan_schema_version = publication_intent_scan_schema(request.intent.scan_schema_version)?;
+    if request.scan_report.schema_version != request.intent.scan_schema_version {
+        return Err(CatalogError::InvalidArgument(
+            "publication submission report schema must match its intent".to_string(),
+        ));
+    }
+    if request.scan_report.schema_version != REPORT_SCHEMA_VERSION {
+        return Err(CatalogError::InvalidArgument(
+            "publication submission report schema is not supported".to_string(),
+        ));
+    }
+    if !request.scan_report.valid
+        || request
+            .scan_report
+            .findings
+            .iter()
+            .any(|finding| finding.severity == FindingSeverity::Error)
+    {
+        return Err(CatalogError::Validation(
+            "publication submission requires a valid server scan report".to_string(),
+        ));
+    }
+    let declared_inventory_hash = frameshift_catalog::ObjectHash::from_hex(
+        &request.scan_report.inventory_hash,
+    )
+    .map_err(|_| {
+        CatalogError::InvalidArgument(
+            "publication submission report has an invalid inventory hash".to_string(),
+        )
+    })?;
+    if declared_inventory_hash != request.intent.file_inventory_hash {
+        return Err(CatalogError::Unauthorized {
+            kind: "publication_submission",
+            key: request.id.to_string(),
+        });
+    }
+    if frameshift_catalog::ObjectHash::from_hex(&inventory_hash(&request.scan_report.inventory))
+        .map_err(|_| {
+            CatalogError::BackendError(Box::new(std::io::Error::other(
+                "shared publication inventory hash was not valid hexadecimal",
+            )))
+        })?
+        != declared_inventory_hash
+    {
+        return Err(CatalogError::Validation(
+            "publication submission report inventory hash is inconsistent".to_string(),
+        ));
+    }
+    if !request
+        .scan_report
+        .inventory
+        .windows(2)
+        .all(|pair| pair[0].path.as_bytes() < pair[1].path.as_bytes())
+        || !request
+            .scan_report
+            .findings
+            .windows(2)
+            .all(|pair| pair[0] <= pair[1])
+    {
+        return Err(CatalogError::InvalidArgument(
+            "publication submission report must be deterministically sorted".to_string(),
+        ));
+    }
+    let scan_report = serde_json::to_value(&request.scan_report)
+        .map_err(|error| CatalogError::BackendError(Box::new(error)))?;
+    Ok((scan_schema_version, scan_report))
+}
+
+/// Compare an exact submission retry without caller-controlled timestamps.
+fn publication_submission_matches(
+    existing: &PublicationSubmissionRecord,
+    requested: &PublicationSubmissionRequest,
+) -> bool {
+    existing.id == requested.id
+        && existing.intent_id == requested.intent.id
+        && existing.account_id == requested.intent.account_id
+        && existing.publisher_id == requested.intent.publisher_id
+        && existing.publisher_key_id == requested.intent.publisher_key_id
+        && existing.archive_hash == requested.intent.archive_hash
+        && existing.manifest_hash == requested.intent.manifest_hash
+        && existing.file_inventory_hash == requested.intent.file_inventory_hash
+        && existing.scan_schema_version == requested.intent.scan_schema_version
+        && existing.scan_report == requested.scan_report
+        && existing.state == PublicationSubmissionState::Quarantined
+}
+
+/// Construct an exact idempotency conflict for a publication submission.
+fn publication_submission_conflict(id: uuid::Uuid) -> CatalogTransactionError {
+    CatalogTransactionError::Catalog(CatalogError::Conflict {
+        kind: "publication_submission",
+        key: id.to_string(),
+    })
+}
+
+/// Convert an existing row into an exact retry or an idempotency conflict.
+fn resolve_publication_submission_retry(
+    row: PublicationSubmissionRow,
+    request: &PublicationSubmissionRequest,
+) -> Result<PublicationSubmissionRow, CatalogTransactionError> {
+    let record = row
+        .clone()
+        .into_record()
+        .map_err(CatalogTransactionError::Catalog)?;
+    if publication_submission_matches(&record, request) {
+        Ok(row)
+    } else {
+        Err(publication_submission_conflict(request.id))
+    }
 }
 
 /// Inherent methods on [`PostgresCatalog`]: constructor, pool accessor.
@@ -890,6 +1007,171 @@ impl CatalogBackend for PostgresCatalog {
         .await
         .map_err(|error| map_diesel_error(error, "publication_intent", claim.id.to_string()))?;
         Ok(changed == 1)
+    }
+
+    /// Atomically consume one exact intent and persist its quarantined submission.
+    async fn create_publication_submission(
+        &self,
+        request: PublicationSubmissionRequest,
+    ) -> Result<PublicationSubmissionRecord, CatalogError> {
+        let (scan_schema_version, scan_report) = validate_publication_submission(&request)?;
+        let request_id = request.id;
+        let intent_id = request.intent.id;
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        use diesel_async::AsyncConnection as _;
+        let result = conn
+            .transaction::<PublicationSubmissionRow, CatalogTransactionError, _>(
+                async move |conn| {
+                    let existing_by_id = publication_submissions::table
+                        .find(request.id)
+                        .select(PublicationSubmissionRow::as_select())
+                        .first(conn)
+                        .await
+                        .optional()?;
+                    if let Some(existing) = existing_by_id {
+                        return resolve_publication_submission_retry(existing, &request);
+                    }
+
+                    let existing_for_intent = publication_submissions::table
+                        .filter(publication_submissions::intent_id.eq(request.intent.id))
+                        .select(PublicationSubmissionRow::as_select())
+                        .first(conn)
+                        .await
+                        .optional()?;
+                    if let Some(existing) = existing_for_intent {
+                        return resolve_publication_submission_retry(existing, &request);
+                    }
+
+                    let database_now = diesel::dsl::now;
+                    let active_account = diesel::dsl::exists(
+                        accounts::table
+                            .filter(accounts::id.eq(request.intent.account_id))
+                            .filter(accounts::status.eq("active")),
+                    );
+                    let active_membership = diesel::dsl::exists(
+                        publisher_memberships::table
+                            .filter(publisher_memberships::account_id.eq(request.intent.account_id))
+                            .filter(
+                                publisher_memberships::publisher_id.eq(request.intent.publisher_id),
+                            )
+                            .filter(publisher_memberships::role.eq("owner"))
+                            .filter(publisher_memberships::state.eq("active")),
+                    );
+                    let active_key = diesel::dsl::exists(
+                        publisher_keys::table
+                            .filter(publisher_keys::id.eq(request.intent.publisher_key_id))
+                            .filter(publisher_keys::publisher_id.eq(request.intent.publisher_id))
+                            .filter(publisher_keys::state.eq("active")),
+                    );
+                    let consumed_at = diesel::update(
+                        publication_intents::table
+                            .find(request.intent.id)
+                            .filter(publication_intents::account_id.eq(request.intent.account_id))
+                            .filter(
+                                publication_intents::publisher_id.eq(request.intent.publisher_id),
+                            )
+                            .filter(
+                                publication_intents::publisher_key_id
+                                    .eq(request.intent.publisher_key_id),
+                            )
+                            .filter(
+                                publication_intents::archive_hash
+                                    .eq(request.intent.archive_hash.as_bytes()),
+                            )
+                            .filter(
+                                publication_intents::manifest_hash
+                                    .eq(request.intent.manifest_hash.as_bytes()),
+                            )
+                            .filter(
+                                publication_intents::file_inventory_hash
+                                    .eq(request.intent.file_inventory_hash.as_bytes()),
+                            )
+                            .filter(
+                                publication_intents::scan_schema_version.eq(scan_schema_version),
+                            )
+                            .filter(publication_intents::consumed_at.is_null())
+                            .filter(publication_intents::created_at.le(database_now))
+                            .filter(publication_intents::expires_at.gt(database_now))
+                            .filter(active_account)
+                            .filter(active_membership)
+                            .filter(active_key),
+                    )
+                    .set(publication_intents::consumed_at.eq(database_now))
+                    .returning(publication_intents::consumed_at)
+                    .get_result::<Option<chrono::DateTime<Utc>>>(conn)
+                    .await
+                    .optional()?
+                    .flatten();
+
+                    let Some(created_at) = consumed_at else {
+                        let retry = publication_submissions::table
+                            .filter(publication_submissions::intent_id.eq(request.intent.id))
+                            .select(PublicationSubmissionRow::as_select())
+                            .first(conn)
+                            .await
+                            .optional()?;
+                        return match retry {
+                            Some(existing) => {
+                                resolve_publication_submission_retry(existing, &request)
+                            }
+                            None => Err(CatalogTransactionError::Catalog(
+                                CatalogError::Unauthorized {
+                                    kind: "publication_submission",
+                                    key: request.id.to_string(),
+                                },
+                            )),
+                        };
+                    };
+
+                    let row = NewPublicationSubmissionRow {
+                        id: request.id,
+                        intent_id: request.intent.id,
+                        account_id: request.intent.account_id,
+                        publisher_id: request.intent.publisher_id,
+                        publisher_key_id: request.intent.publisher_key_id,
+                        archive_hash: request.intent.archive_hash.as_bytes().to_vec(),
+                        manifest_hash: request.intent.manifest_hash.as_bytes().to_vec(),
+                        file_inventory_hash: request.intent.file_inventory_hash.as_bytes().to_vec(),
+                        scan_schema_version,
+                        scan_report,
+                        state: "quarantined".to_string(),
+                        created_at,
+                        updated_at: created_at,
+                    };
+                    diesel::insert_into(publication_submissions::table)
+                        .values(row)
+                        .returning(PublicationSubmissionRow::as_returning())
+                        .get_result(conn)
+                        .await
+                        .map_err(CatalogTransactionError::Diesel)
+                },
+            )
+            .await;
+
+        match result {
+            Ok(row) => row.into_record(),
+            Err(CatalogTransactionError::Catalog(error)) => Err(error),
+            Err(CatalogTransactionError::Diesel(error)) => Err(map_diesel_error(
+                error,
+                "publication_submission",
+                format!("{request_id}:{intent_id}"),
+            )),
+        }
+    }
+
+    /// Retrieve one durable publication submission without changing its state.
+    async fn get_publication_submission(
+        &self,
+        id: uuid::Uuid,
+    ) -> Result<PublicationSubmissionRecord, CatalogError> {
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        publication_submissions::table
+            .find(id)
+            .select(PublicationSubmissionRow::as_select())
+            .first(&mut conn)
+            .await
+            .map_err(|error| map_diesel_error(error, "publication_submission", id.to_string()))?
+            .into_record()
     }
 
     /// Register a new author or confirm an identical author already exists.

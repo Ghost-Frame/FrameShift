@@ -154,6 +154,38 @@ diesel::table! {
 }
 
 diesel::table! {
+    /// Artifacts admitted only to the internal publication quarantine boundary.
+    publication_submissions (id) {
+        /// Stable submission identifier and idempotency key.
+        id -> Uuid,
+        /// One-time intent consumed by the submission.
+        intent_id -> Uuid,
+        /// Account that presented the artifact.
+        account_id -> Uuid,
+        /// Publisher receiving the future reviewed artifact.
+        publisher_id -> Uuid,
+        /// Publisher key that authorized the artifact.
+        publisher_key_id -> Uuid,
+        /// SHA-256 digest of the exact archive bytes.
+        archive_hash -> Binary,
+        /// SHA-256 digest of the canonical manifest bytes.
+        manifest_hash -> Binary,
+        /// SHA-256 digest of the normalized file inventory.
+        file_inventory_hash -> Binary,
+        /// Positive server scanner contract version.
+        scan_schema_version -> Integer,
+        /// Typed server validation report serialized as JSON.
+        scan_report -> Jsonb,
+        /// Non-public lifecycle state.
+        state -> Text,
+        /// Submission creation timestamp.
+        created_at -> Timestamptz,
+        /// Most recent lifecycle update timestamp.
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     /// The `authors` table stores one row per registered Ed25519 keypair.
     ///
     /// Primary key: `pubkey` (raw 32-byte BYTEA).
@@ -299,6 +331,7 @@ diesel::joinable!(publisher_keys -> publisher_profiles (publisher_id));
 diesel::joinable!(publisher_audit_events -> accounts (actor_account_id));
 diesel::joinable!(publisher_audit_events -> publisher_profiles (publisher_id));
 diesel::joinable!(publisher_audit_events -> publisher_keys (target_key_id));
+diesel::joinable!(publication_submissions -> publication_intents (intent_id));
 
 diesel::allow_tables_to_appear_in_same_query!(
     authors,
@@ -313,4 +346,5 @@ diesel::allow_tables_to_appear_in_same_query!(
     publisher_keys,
     publisher_audit_events,
     publication_intents,
+    publication_submissions,
 );
