@@ -41,6 +41,7 @@ impl MockPackStore {
     }
 
     /// Make subsequent object writes fail with an opaque backend error.
+    #[allow(dead_code)]
     pub fn fail_put_with(&self, message: &str) {
         *self.put_error.write().expect("MockPackStore lock poisoned") = Some(message.to_string());
     }
