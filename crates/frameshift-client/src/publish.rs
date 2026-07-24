@@ -13,12 +13,13 @@
 //!
 //! # Publish flow
 //!
-//! 1. Load the [`Pack`] from `pack_dir` (must contain `pack.toml`).
-//! 2. Sign the pack's canonical hash -> the 64-byte `signature` field.
-//! 3. Pack the directory into a gzipped tar (excluding `signature.sig`).
-//! 4. Build a `multipart/form-data` body (`pack`, `signature`, `author_handle`).
-//! 5. Sign the request envelope over `POST` + the resolved endpoint path + body hash.
-//! 6. `POST` and parse the [`PublishOutcome`].
+//! 1. Validate the exact public inventory and shared publication policy.
+//! 2. Load the [`Pack`] from `pack_dir` (must contain `pack.toml`).
+//! 3. Sign the pack's canonical hash -> the 64-byte `signature` field.
+//! 4. Pack the directory into a gzipped tar (excluding `signature.sig`).
+//! 5. Build a `multipart/form-data` body (`pack`, `signature`, `author_handle`).
+//! 6. Sign the request envelope over `POST` + the resolved endpoint path + body hash.
+//! 7. `POST` and parse the [`PublishOutcome`].
 
 use std::fs;
 use std::path::Path;
@@ -28,6 +29,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use ed25519_dalek::{Signer as _, SigningKey};
 use frameshift_pack::Pack;
+use frameshift_publication::PublicationReport;
 use rand_core::{OsRng, RngCore as _};
 use secrecy::SecretString;
 use serde::Deserialize;
@@ -100,6 +102,30 @@ pub fn publish_pack_dir(
     author_handle: &str,
     access_token: Option<&SecretString>,
 ) -> Result<PublishOutcome, ClientError> {
+    let report = frameshift_publication::validate_directory(pack_dir)?;
+    if !report.valid {
+        let summary = report
+            .findings
+            .iter()
+            .filter(|finding| finding.severity == frameshift_publication::FindingSeverity::Error)
+            .map(|finding| match &finding.path {
+                Some(path) => format!("{} ({path})", finding.code),
+                None => finding.code.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(ClientError::PublicationValidation {
+            summary,
+            report: Box::new(report),
+        });
+    }
+
+    // Freeze the exact validated inventory before hashing, signing, or
+    // archiving. All later operations use this immutable private snapshot, so
+    // concurrent source-directory changes cannot cross the public boundary.
+    let staged_pack = stage_validated_pack(pack_dir, &report)?;
+    let pack_dir = staged_pack.path();
+
     // Load the pack and sign its canonical hash. We sign the hash directly
     // rather than via Pack::sign so the on-disk pack directory is not mutated
     // (no signature.sig is written into the source the caller owns).
@@ -137,6 +163,79 @@ pub fn publish_pack_dir(
     let response = send_signed(req, url.as_str(), &body)?;
 
     crate::registry::response_json_bounded::<PublishOutcome>(response, url.as_str())
+}
+
+/// Copy the exact validated inventory into a private temporary snapshot.
+///
+/// Every source file is reopened without following symlinks, rehashed, and
+/// compared with the report before its bytes enter the snapshot.
+fn stage_validated_pack(
+    source_root: &Path,
+    report: &PublicationReport,
+) -> Result<tempfile::TempDir, ClientError> {
+    let staged = tempfile::TempDir::new().map_err(|source| ClientError::Io {
+        path: source_root.to_path_buf(),
+        source,
+    })?;
+
+    for entry in &report.inventory {
+        let source_path = source_root.join(&entry.path);
+        let bytes = read_validated_source_file(&source_path, &entry.path)?;
+        if bytes.len() as u64 != entry.size || hex::encode(Sha256::digest(&bytes)) != entry.sha256 {
+            return Err(ClientError::PublicationSourceChanged {
+                path: entry.path.clone(),
+            });
+        }
+
+        let destination = staged.path().join(&entry.path);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).map_err(|source| ClientError::Io {
+                path: destination.clone(),
+                source,
+            })?;
+        }
+        fs::write(&destination, bytes).map_err(|source| ClientError::Io {
+            path: destination,
+            source,
+        })?;
+    }
+
+    Ok(staged)
+}
+
+/// Read one validated source file without following a substituted symlink.
+fn read_validated_source_file(path: &Path, relative: &str) -> Result<Vec<u8>, ClientError> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .map_err(|_| ClientError::PublicationSourceChanged {
+            path: relative.to_string(),
+        })?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| ClientError::PublicationSourceChanged {
+            path: relative.to_string(),
+        })?;
+    if !metadata.is_file() {
+        return Err(ClientError::PublicationSourceChanged {
+            path: relative.to_string(),
+        });
+    }
+    let mut reader = std::io::BufReader::new(file);
+    let mut bytes = Vec::new();
+    use std::io::Read as _;
+    reader
+        .read_to_end(&mut bytes)
+        .map_err(|_| ClientError::PublicationSourceChanged {
+            path: relative.to_string(),
+        })?;
+    Ok(bytes)
 }
 
 /// Send a prepared signed request body, mapping non-2xx statuses to
@@ -359,9 +458,66 @@ mod tests {
         let err = publish_pack_dir("http://127.0.0.1:1", &test_key(), &pack_dir, "local", None)
             .expect_err("sentinel pack must not publish");
         assert!(
-            matches!(err, ClientError::PublishLocalUnsigned { ref name } if name == "legacy"),
-            "expected PublishLocalUnsigned, got: {err:?}"
+            matches!(err, ClientError::PublicationValidation { .. }),
+            "expected publication validation rejection, got: {err:?}"
         );
+    }
+
+    /// An unknown local file is rejected by the shared validator before any
+    /// connection can be attempted.
+    #[test]
+    fn publish_rejects_unknown_file_before_network() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack_dir = dir.path().join("pack");
+        fs::create_dir_all(&pack_dir).unwrap();
+        fs::write(
+            pack_dir.join("pack.toml"),
+            format!(
+                "schema_version = 1\nname = \"fixture\"\nauthor_handle = \"alice\"\n\
+                 author_pubkey = \"{}\"\nversion = \"0.1.0\"\n",
+                hex::encode(test_key().verifying_key().to_bytes())
+            ),
+        )
+        .unwrap();
+        fs::write(pack_dir.join("AGENTS.md"), b"# Fixture\n").unwrap();
+        fs::write(pack_dir.join("notes.txt"), b"local only\n").unwrap();
+
+        let err = publish_pack_dir("http://127.0.0.1:1", &test_key(), &pack_dir, "alice", None)
+            .expect_err("unknown file must block before network");
+        let ClientError::PublicationValidation { report, .. } = err else {
+            panic!("expected publication validation error");
+        };
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.code == "path.not_allowed"));
+    }
+
+    /// Snapshot staging rejects bytes that changed after the report was built.
+    #[test]
+    fn staging_rejects_post_validation_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack_dir = dir.path().join("pack");
+        fs::create_dir_all(&pack_dir).unwrap();
+        fs::write(
+            pack_dir.join("pack.toml"),
+            format!(
+                "schema_version = 1\nname = \"fixture\"\nauthor_handle = \"alice\"\n\
+                 author_pubkey = \"{}\"\nversion = \"0.1.0\"\n",
+                hex::encode(test_key().verifying_key().to_bytes())
+            ),
+        )
+        .unwrap();
+        fs::write(pack_dir.join("AGENTS.md"), b"# Before\n").unwrap();
+        let report = frameshift_publication::validate_directory(&pack_dir).unwrap();
+        assert!(report.valid);
+        fs::write(pack_dir.join("AGENTS.md"), b"# After\n").unwrap();
+
+        let error = stage_validated_pack(&pack_dir, &report).expect_err("change must fail");
+        assert!(matches!(
+            error,
+            ClientError::PublicationSourceChanged { ref path } if path == "AGENTS.md"
+        ));
     }
 
     /// The signed-request envelope reproduces the exact server signing string and

@@ -233,6 +233,26 @@ pub enum ClientError {
     )]
     PublishLocalUnsigned { name: String },
 
+    /// The local pack directory failed the shared public-boundary policy.
+    #[error("pack is not publishable: {summary}")]
+    PublicationValidation {
+        /// Stable summary of every blocking finding.
+        summary: String,
+        /// Complete machine-readable report for CLI, MCP, and desktop callers.
+        report: Box<frameshift_publication::PublicationReport>,
+    },
+
+    /// The local pack directory could not be inspected for publication.
+    #[error("pack publication validation could not inspect the directory: {0}")]
+    PublicationValidationIo(#[from] frameshift_publication::PublicationIoError),
+
+    /// A source file changed after validation but before snapshot staging.
+    #[error("pack file {path:?} changed while preparing the validated publication snapshot")]
+    PublicationSourceChanged {
+        /// Normalized path from the validated public inventory.
+        path: String,
+    },
+
     #[error("author_pubkey is not a supported ed25519 public key encoding: {0}")]
     InvalidAuthorPublicKey(String),
 
