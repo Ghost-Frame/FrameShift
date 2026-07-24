@@ -37,8 +37,10 @@ use frameshift_catalog::Ed25519PublicKey;
 use frameshift_catalog::{CatalogError, MembershipState, PublisherKeyState, PublisherRole};
 use frameshift_objects::{ObjectHash, ObjectStoreError};
 use frameshift_pack::Pack;
+use frameshift_publication::{FindingSeverity, PublicationReport};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::path::{Component, Path as FsPath, PathBuf};
 use uuid::Uuid;
 
 use crate::auth::VerifiedSigner;
@@ -481,7 +483,8 @@ async fn extract_targz(archive_bytes: Vec<u8>, dir: std::path::PathBuf) -> Resul
         let limited = LimitedReader::new(gz, MAX_DECOMPRESSED_BYTES);
         let mut archive = tar::Archive::new(limited);
         archive.set_preserve_permissions(false);
-        archive.set_overwrite(true);
+        archive.set_overwrite(false);
+        let mut paths = BTreeSet::new();
 
         let entries = archive.entries().map_err(|e| {
             // The underlying io::Error text may embed the server's temp
@@ -518,13 +521,18 @@ async fn extract_targz(archive_bytes: Vec<u8>, dir: std::path::PathBuf) -> Resul
                     AppError::BadRequest("invalid archive: unreadable entry path".to_string())
                 })?
                 .into_owned();
-            if path.is_absolute()
-                || path
-                    .components()
-                    .any(|c| matches!(c, std::path::Component::ParentDir))
-            {
+            let normalized = normalize_archive_path(&path)?;
+            if normalized.as_os_str().is_empty() {
+                if entry_type.is_dir() {
+                    continue;
+                }
                 return Err(AppError::BadRequest(
                     "pack archive contains unsafe path".to_string(),
+                ));
+            }
+            if !paths.insert(normalized) {
+                return Err(AppError::BadRequest(
+                    "pack archive contains duplicate paths".to_string(),
                 ));
             }
             entry.unpack_in(&dir).map_err(|e| {
@@ -541,6 +549,45 @@ async fn extract_targz(archive_bytes: Vec<u8>, dir: std::path::PathBuf) -> Resul
     .map_err(|e| AppError::Internal(format!("tar extraction task panicked: {e}")))?
 }
 
+/// Normalize one archive path while rejecting traversal and absolute components.
+fn normalize_archive_path(path: &FsPath) -> Result<PathBuf, AppError> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(AppError::BadRequest(
+                    "pack archive contains unsafe path".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+/// Reject a publication report while exposing only bounded stable finding codes.
+fn enforce_publication_report(report: &PublicationReport) -> Result<(), AppError> {
+    if report.valid {
+        return Ok(());
+    }
+    let codes = report
+        .findings
+        .iter()
+        .filter(|finding| finding.severity == FindingSeverity::Error)
+        .map(|finding| finding.code.as_str())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .take(8)
+        .collect::<Vec<_>>();
+    let message = if codes.is_empty() {
+        "publication validation failed".to_string()
+    } else {
+        format!("publication validation failed: {}", codes.join(", "))
+    };
+    Err(AppError::BadRequest(message))
+}
+
 /// Determine the pack root directory inside an extraction target.
 ///
 /// A pack tarball can either be flat (`pack.toml` at the root of the extract
@@ -551,10 +598,18 @@ fn find_pack_root(extract_dir: &std::path::Path) -> Result<std::path::PathBuf, A
     if extract_dir.join("pack.toml").is_file() {
         return Ok(extract_dir.to_path_buf());
     }
-    let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(extract_dir)
-        .map_err(|e| AppError::BadRequest(format!("read extract dir: {e}")))?
-        .filter_map(|r| r.ok().map(|d| d.path()))
-        .collect();
+    let directory = std::fs::read_dir(extract_dir).map_err(|error| {
+        tracing::warn!(error = %error, "failed to inspect archive extraction directory");
+        AppError::BadRequest("invalid archive: failed to inspect contents".to_string())
+    })?;
+    let mut entries = Vec::new();
+    for entry in directory {
+        let entry = entry.map_err(|error| {
+            tracing::warn!(error = %error, "failed to inspect extracted archive entry");
+            AppError::BadRequest("invalid archive: failed to inspect contents".to_string())
+        })?;
+        entries.push(entry.path());
+    }
     entries.sort();
     if entries.len() == 1 && entries[0].is_dir() && entries[0].join("pack.toml").is_file() {
         return Ok(entries[0].clone());
@@ -657,6 +712,12 @@ pub async fn publish_pack(
     extract_targz(pack_archive.clone(), tmp.path().to_path_buf()).await?;
 
     let pack_root = find_pack_root(tmp.path())?;
+    let publication_report =
+        frameshift_publication::validate_directory(&pack_root).map_err(|error| {
+            tracing::warn!(error = %error, "failed to inspect extracted publication");
+            AppError::BadRequest("publication validation failed".to_string())
+        })?;
+    enforce_publication_report(&publication_report)?;
 
     // Write the supplied signature into the pack dir under `signature.sig` so
     // Pack::verify can pick it up via its on-disk load path.
