@@ -26,14 +26,23 @@ use frameshift_objects::{ObjectHash, ObjectStoreError, ObjectStoreHealth, PackSt
 pub struct MockPackStore {
     /// In-memory blob storage, keyed by content hash.
     pub blobs: Arc<RwLock<HashMap<ObjectHash, Vec<u8>>>>,
+    /// Optional persistent backend failure injected into object writes.
+    pub put_error: Arc<RwLock<Option<String>>>,
 }
 
+/// Construction and failure-injection helpers for [`MockPackStore`].
 impl MockPackStore {
     /// Create an empty [`MockPackStore`] with no pre-populated blobs.
     pub fn new() -> Self {
         Self {
             blobs: Arc::new(RwLock::new(HashMap::new())),
+            put_error: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Make subsequent object writes fail with an opaque backend error.
+    pub fn fail_put_with(&self, message: &str) {
+        *self.put_error.write().expect("MockPackStore lock poisoned") = Some(message.to_string());
     }
 
     /// Insert a blob into the store under `hash`.
@@ -51,6 +60,7 @@ impl MockPackStore {
     }
 }
 
+/// Default construction of an empty in-memory object store.
 impl Default for MockPackStore {
     /// Returns an empty [`MockPackStore`].
     fn default() -> Self {
@@ -59,11 +69,22 @@ impl Default for MockPackStore {
 }
 
 #[async_trait]
+/// In-memory implementation of every object-store operation used by server tests.
 impl PackStore for MockPackStore {
     /// Store `bytes` under `hash`.
     ///
     /// No hash verification in the mock; test code controls correctness.
     async fn put(&self, hash: &ObjectHash, bytes: &[u8]) -> Result<(), ObjectStoreError> {
+        if let Some(message) = self
+            .put_error
+            .read()
+            .map_err(|error| ObjectStoreError::BackendError(error.to_string().into()))?
+            .clone()
+        {
+            return Err(ObjectStoreError::BackendError(
+                std::io::Error::other(message).into(),
+            ));
+        }
         self.blobs
             .write()
             .map_err(|e| ObjectStoreError::BackendError(e.to_string().into()))?

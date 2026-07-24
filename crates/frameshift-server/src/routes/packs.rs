@@ -37,15 +37,16 @@ use frameshift_catalog::Ed25519PublicKey;
 use frameshift_catalog::{CatalogError, MembershipState, PublisherKeyState, PublisherRole};
 use frameshift_objects::{ObjectHash, ObjectStoreError};
 use frameshift_pack::Pack;
-use frameshift_publication::{FindingSeverity, PublicationReport};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap};
-use std::path::{Component, Path as FsPath, PathBuf};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::auth::VerifiedSigner;
 use crate::error::AppError;
 use crate::middleware::account::AuthenticatedAccount;
+use crate::publication::{
+    enforce_publication_report, inspect_publication_archive, PublicationAdmissionError,
+};
 use crate::state::AppState;
 
 /// Resolved signing authority for one legacy author or account-backed publisher.
@@ -87,6 +88,52 @@ pub struct PublisherKeySummary {
     pub id: Uuid,
     /// Current lifecycle state of the historical signing key.
     pub state: PublisherKeyState,
+}
+
+/// Preserve the legacy publish endpoint's public error contract for archive inspection.
+fn map_publication_inspection_error(error: PublicationAdmissionError) -> AppError {
+    tracing::warn!(error = %error, "failed to inspect extracted publication");
+    match error {
+        PublicationAdmissionError::InvalidArchive("too many archive entries") => {
+            AppError::BadRequest("pack archive contains too many entries".to_string())
+        }
+        PublicationAdmissionError::InvalidArchive("non-regular archive entry") => {
+            AppError::BadRequest("pack archive contains a non-regular file entry".to_string())
+        }
+        PublicationAdmissionError::InvalidArchive("unsafe archive path") => {
+            AppError::BadRequest("pack archive contains unsafe path".to_string())
+        }
+        PublicationAdmissionError::InvalidArchive("duplicate archive path") => {
+            AppError::BadRequest("pack archive contains duplicate paths".to_string())
+        }
+        PublicationAdmissionError::InvalidArchive("pack.toml is not at one pack root") => {
+            AppError::BadRequest(
+                "pack archive does not contain a pack.toml at the root".to_string(),
+            )
+        }
+        PublicationAdmissionError::InvalidArchive("archive extraction failed") => {
+            AppError::BadRequest("invalid archive: failed to extract entry".to_string())
+        }
+        PublicationAdmissionError::InvalidArchive(detail) => {
+            AppError::BadRequest(format!("invalid archive: {detail}"))
+        }
+        PublicationAdmissionError::Validation { codes } if codes == "unknown" => {
+            AppError::BadRequest("publication validation failed".to_string())
+        }
+        PublicationAdmissionError::Validation { codes } => {
+            AppError::BadRequest(format!("publication validation failed: {codes}"))
+        }
+        PublicationAdmissionError::Internal(source) => {
+            tracing::warn!(error = %source, "publication inspection failed internally");
+            AppError::Internal("publication inspection failed".to_string())
+        }
+        PublicationAdmissionError::ArchiveHashMismatch
+        | PublicationAdmissionError::IntentMismatch { .. }
+        | PublicationAdmissionError::Quarantine(_)
+        | PublicationAdmissionError::Catalog(_) => {
+            AppError::Internal("unexpected publication inspection state".to_string())
+        }
+    }
 }
 
 /// Additive ownership response for one pack record.
@@ -357,16 +404,6 @@ pub struct PublishResponse {
     pub publisher_key: Option<PublisherKeySummary>,
 }
 
-/// Maximum decoded size of an uploaded pack archive (16 MiB).
-///
-/// The compressed upload is gated by the server-level
-/// `RequestBodyLimitLayer`; this constant caps the decompressed total so a
-/// malicious gzip bomb cannot exhaust the temp directory.
-const MAX_DECOMPRESSED_BYTES: u64 = 16 * 1024 * 1024;
-
-/// Maximum number of filesystem entries accepted from one uploaded archive.
-const MAX_ARCHIVE_ENTRIES: usize = 256;
-
 /// Multipart fields collected from a publish upload.
 ///
 /// All three are required; missing any of them produces `400 Bad Request`.
@@ -421,202 +458,6 @@ async fn collect_multipart(mut multipart: Multipart) -> Result<PublishFields, Ap
         }
     }
     Ok(fields)
-}
-
-/// A [`std::io::Read`] adapter that fails once more than `limit` total bytes
-/// have been pulled from the underlying reader.
-///
-/// This is the decompression-bomb guard. It counts the *actual* bytes read
-/// through the gzip decoder, so a tar entry that lies about its size in the
-/// header (e.g. declares `size = 0` while carrying megabytes of data) cannot
-/// bypass the ceiling -- the cap is enforced on real decompressed throughput,
-/// not on the attacker-controlled header field.
-struct LimitedReader<R> {
-    /// The wrapped reader (the gzip-decompressed tar byte stream).
-    inner: R,
-    /// Maximum number of bytes allowed to be read in total.
-    limit: u64,
-    /// Running count of bytes read so far.
-    read: u64,
-}
-
-/// Construction helpers for [`LimitedReader`].
-impl<R: std::io::Read> LimitedReader<R> {
-    /// Wrap `inner`, allowing at most `limit` total bytes to be read.
-    fn new(inner: R, limit: u64) -> Self {
-        Self {
-            inner,
-            limit,
-            read: 0,
-        }
-    }
-}
-
-/// Enforces the decompressed-byte ceiling while forwarding reads.
-impl<R: std::io::Read> std::io::Read for LimitedReader<R> {
-    /// Read into `buf`, returning an error once the cumulative byte count would
-    /// exceed `limit`.
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = self.inner.read(buf)?;
-        self.read = self.read.saturating_add(n as u64);
-        if self.read > self.limit {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "pack archive exceeds maximum decompressed size",
-            ));
-        }
-        Ok(n)
-    }
-}
-
-/// Extract a `.tar.gz` archive into `dir`, enforcing
-/// [`MAX_DECOMPRESSED_BYTES`] and [`MAX_ARCHIVE_ENTRIES`] across all entries.
-///
-/// Uses synchronous tar/flate2 inside `tokio::task::spawn_blocking` so the
-/// async runtime stays responsive on large uploads.
-async fn extract_targz(archive_bytes: Vec<u8>, dir: std::path::PathBuf) -> Result<(), AppError> {
-    tokio::task::spawn_blocking(move || -> Result<(), AppError> {
-        let gz = flate2::read::GzDecoder::new(std::io::Cursor::new(archive_bytes));
-        // Cap the actual decompressed byte count (not the attacker-controlled
-        // tar header `size` field) so a forged header cannot exhaust the temp
-        // directory.
-        let limited = LimitedReader::new(gz, MAX_DECOMPRESSED_BYTES);
-        let mut archive = tar::Archive::new(limited);
-        archive.set_preserve_permissions(false);
-        archive.set_overwrite(false);
-        let mut paths = BTreeSet::new();
-
-        let entries = archive.entries().map_err(|e| {
-            // The underlying io::Error text may embed the server's temp
-            // directory path; log it internally and return a generic,
-            // path-free message to the client.
-            tracing::warn!(error = %e, "failed to read tar entries");
-            AppError::BadRequest("invalid archive: unreadable tar entries".to_string())
-        })?;
-        for (index, entry) in entries.enumerate() {
-            if index >= MAX_ARCHIVE_ENTRIES {
-                return Err(AppError::BadRequest(
-                    "pack archive contains too many entries".to_string(),
-                ));
-            }
-            let mut entry = entry.map_err(|e| {
-                tracing::warn!(error = %e, "failed to read tar entry");
-                AppError::BadRequest("invalid archive: unreadable tar entry".to_string())
-            })?;
-            // Reject any entry that is not a regular file or directory. Symlinks,
-            // hardlinks, and device nodes have no legitimate place in a pack and
-            // could be used to plant a link that escapes the extraction dir or
-            // is later read through.
-            let entry_type = entry.header().entry_type();
-            if !(entry_type.is_file() || entry_type.is_dir()) {
-                return Err(AppError::BadRequest(
-                    "pack archive contains a non-regular file entry".to_string(),
-                ));
-            }
-            // Path-traversal protection: only allow paths relative to dir.
-            let path = entry
-                .path()
-                .map_err(|e| {
-                    tracing::warn!(error = %e, "failed to read tar entry path");
-                    AppError::BadRequest("invalid archive: unreadable entry path".to_string())
-                })?
-                .into_owned();
-            let normalized = normalize_archive_path(&path)?;
-            if normalized.as_os_str().is_empty() {
-                if entry_type.is_dir() {
-                    continue;
-                }
-                return Err(AppError::BadRequest(
-                    "pack archive contains unsafe path".to_string(),
-                ));
-            }
-            if !paths.insert(normalized) {
-                return Err(AppError::BadRequest(
-                    "pack archive contains duplicate paths".to_string(),
-                ));
-            }
-            entry.unpack_in(&dir).map_err(|e| {
-                // io::Error from unpack_in may embed the server's absolute
-                // temp-directory path; log it internally, keep the client
-                // response generic.
-                tracing::warn!(error = %e, "failed to unpack tar entry");
-                AppError::BadRequest("invalid archive: failed to extract entry".to_string())
-            })?;
-        }
-        Ok(())
-    })
-    .await
-    .map_err(|e| AppError::Internal(format!("tar extraction task panicked: {e}")))?
-}
-
-/// Normalize one archive path while rejecting traversal and absolute components.
-fn normalize_archive_path(path: &FsPath) -> Result<PathBuf, AppError> {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Normal(part) => normalized.push(part),
-            Component::CurDir => {}
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                return Err(AppError::BadRequest(
-                    "pack archive contains unsafe path".to_string(),
-                ));
-            }
-        }
-    }
-    Ok(normalized)
-}
-
-/// Reject a publication report while exposing only bounded stable finding codes.
-fn enforce_publication_report(report: &PublicationReport) -> Result<(), AppError> {
-    if report.valid {
-        return Ok(());
-    }
-    let codes = report
-        .findings
-        .iter()
-        .filter(|finding| finding.severity == FindingSeverity::Error)
-        .map(|finding| finding.code.as_str())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .take(8)
-        .collect::<Vec<_>>();
-    let message = if codes.is_empty() {
-        "publication validation failed".to_string()
-    } else {
-        format!("publication validation failed: {}", codes.join(", "))
-    };
-    Err(AppError::BadRequest(message))
-}
-
-/// Determine the pack root directory inside an extraction target.
-///
-/// A pack tarball can either be flat (`pack.toml` at the root of the extract
-/// dir) or nested (`<single-dir>/pack.toml`). This helper detects both
-/// shapes and returns the correct path. Returns `AppError::BadRequest` if
-/// no `pack.toml` is found.
-fn find_pack_root(extract_dir: &std::path::Path) -> Result<std::path::PathBuf, AppError> {
-    if extract_dir.join("pack.toml").is_file() {
-        return Ok(extract_dir.to_path_buf());
-    }
-    let directory = std::fs::read_dir(extract_dir).map_err(|error| {
-        tracing::warn!(error = %error, "failed to inspect archive extraction directory");
-        AppError::BadRequest("invalid archive: failed to inspect contents".to_string())
-    })?;
-    let mut entries = Vec::new();
-    for entry in directory {
-        let entry = entry.map_err(|error| {
-            tracing::warn!(error = %error, "failed to inspect extracted archive entry");
-            AppError::BadRequest("invalid archive: failed to inspect contents".to_string())
-        })?;
-        entries.push(entry.path());
-    }
-    entries.sort();
-    if entries.len() == 1 && entries[0].is_dir() && entries[0].join("pack.toml").is_file() {
-        return Ok(entries[0].clone());
-    }
-    Err(AppError::BadRequest(
-        "pack archive does not contain a pack.toml at the root".to_string(),
-    ))
 }
 
 /// `POST /v1/packs`
@@ -705,26 +546,19 @@ pub async fn publish_pack(
     let verifying_key = VerifyingKey::from_bytes(&pubkey.0)
         .map_err(|e| AppError::Internal(format!("invalid registered pubkey: {e}")))?;
 
-    // Extract tar.gz into a tempdir, then load the pack from the extracted
-    // directory. The TempDir is dropped at the end of the function and the
-    // bytes are moved into the object store before that point.
-    let tmp = tempfile::TempDir::new().map_err(|e| AppError::Internal(format!("tempdir: {e}")))?;
-    extract_targz(pack_archive.clone(), tmp.path().to_path_buf()).await?;
-
-    let pack_root = find_pack_root(tmp.path())?;
-    let publication_report =
-        frameshift_publication::validate_directory(&pack_root).map_err(|error| {
-            tracing::warn!(error = %error, "failed to inspect extracted publication");
-            AppError::BadRequest("publication validation failed".to_string())
-        })?;
-    enforce_publication_report(&publication_report)?;
+    let inspected = inspect_publication_archive(&pack_archive)
+        .await
+        .map_err(map_publication_inspection_error)?;
+    enforce_publication_report(&inspected.report)
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    let pack_root = inspected.pack_root();
 
     // Write the supplied signature into the pack dir under `signature.sig` so
     // Pack::verify can pick it up via its on-disk load path.
     std::fs::write(pack_root.join("signature.sig"), &signature_bytes)
         .map_err(|e| AppError::Internal(format!("write signature.sig: {e}")))?;
 
-    let pack = Pack::from_dir(&pack_root).map_err(|e| {
+    let pack = Pack::from_dir(pack_root).map_err(|e| {
         // `PackError` variants can embed the server's absolute temp-directory
         // path (e.g. `Io`, `NonUtf8Path`); log the detailed error server-side
         // and return a generic, path-free message to the client.
