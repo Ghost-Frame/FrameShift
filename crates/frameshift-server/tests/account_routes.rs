@@ -13,7 +13,10 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use chrono::Utc;
 use ed25519_dalek::{Signer as _, SigningKey};
-use frameshift_catalog::{AccountStatus, Ed25519PublicKey, MembershipState};
+use frameshift_catalog::{
+    AccountStatus, Ed25519PublicKey, MembershipState, PublisherKeyRecord, PublisherKeyState,
+    PublisherMembershipRecord, PublisherModerationStatus, PublisherProfileRecord, PublisherRole,
+};
 use frameshift_server::account_auth::{BearerTokenVerifier, OidcAuthError, VerifiedOidcIdentity};
 use frameshift_server::metrics::Metrics;
 use frameshift_server::{app, AppState, LogFormat, OidcConfig, ServerConfig};
@@ -21,6 +24,7 @@ use http_body_util::BodyExt as _;
 use secrecy::SecretString;
 use serde_json::{json, Value};
 use tower::ServiceExt as _;
+use uuid::Uuid;
 
 use mocks::catalog::MockCatalog;
 use mocks::objects::MockPackStore;
@@ -172,6 +176,76 @@ async fn send(
 async fn response_json(response: axum::http::Response<axum::body::Body>) -> Value {
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     serde_json::from_slice(&bytes).unwrap()
+}
+
+/// Provision one test account and return its generated stable identifier.
+async fn provision_account(state: AppState, token: &str) -> Uuid {
+    let response = send(state, Method::GET, "/v1/account", Some(token), None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    Uuid::parse_str(
+        response_json(response).await["account"]["id"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+/// Seed one publisher, owner membership, and active key for an account.
+fn seed_publisher(catalog: &MockCatalog, account_id: Uuid) -> (Uuid, Uuid) {
+    let publisher_id = Uuid::new_v4();
+    let key_id = Uuid::new_v4();
+    let now = Utc::now();
+    let mut state = catalog.state.write().unwrap();
+    state.publishers.insert(
+        publisher_id,
+        PublisherProfileRecord {
+            id: publisher_id,
+            handle: format!("publisher-{}", &publisher_id.to_string()[..8]),
+            display_name: "Intent Publisher".to_string(),
+            biography: None,
+            moderation_status: PublisherModerationStatus::Pending,
+            created_at: now,
+            updated_at: now,
+        },
+    );
+    state.publisher_memberships.insert(
+        (account_id, publisher_id),
+        PublisherMembershipRecord {
+            account_id,
+            publisher_id,
+            role: PublisherRole::Owner,
+            state: MembershipState::Active,
+            created_at: now,
+            updated_at: now,
+        },
+    );
+    state.publisher_keys.insert(
+        key_id,
+        PublisherKeyRecord {
+            id: key_id,
+            publisher_id,
+            public_key: Ed25519PublicKey([41; 32]),
+            label: "intent-test".to_string(),
+            state: PublisherKeyState::Active,
+            created_at: now,
+            revoked_at: None,
+            last_used_at: None,
+        },
+    );
+    (publisher_id, key_id)
+}
+
+/// Construct a valid exact publication-intent request body.
+fn intent_body(id: Uuid, publisher_id: Uuid, key_id: Uuid) -> Value {
+    json!({
+        "id": id,
+        "publisher_id": publisher_id,
+        "publisher_key_id": key_id,
+        "archive_hash": "11".repeat(32),
+        "manifest_hash": "22".repeat(32),
+        "file_inventory_hash": "33".repeat(32),
+        "scan_schema_version": 1
+    })
 }
 
 /// Disabled auth omits protected routes while retaining public capability metadata.
@@ -427,4 +501,211 @@ async fn account_and_publisher_security_workflow_is_enforced() {
     let catalog_state = catalog.state.read().unwrap();
     assert_eq!(catalog_state.accounts.len(), 2);
     assert_eq!(catalog_state.publisher_audit_events.len(), 2);
+}
+
+/// Publication-intent routes are absent without auth and reject missing credentials.
+#[tokio::test]
+async fn publication_intent_routes_require_configured_bearer_authentication() {
+    let id = Uuid::new_v4();
+    let disabled = send(
+        test_state(MockCatalog::new(), None),
+        Method::GET,
+        &format!("/v1/publish-intents/{id}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(disabled.status(), StatusCode::NOT_FOUND);
+
+    let verifier = FakeVerifier::new();
+    verifier.allow(
+        "owner",
+        "owner-subject",
+        u64::try_from(Utc::now().timestamp()).unwrap(),
+    );
+    let enabled = test_state(MockCatalog::new(), Some(verifier));
+    let missing = send(
+        enabled.clone(),
+        Method::GET,
+        &format!("/v1/publish-intents/{id}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+    let invalid = send(
+        enabled,
+        Method::GET,
+        &format!("/v1/publish-intents/{id}"),
+        Some("invalid"),
+        None,
+    )
+    .await;
+    assert_eq!(invalid.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// Creation binds server-owned fields and preserves exact retry semantics.
+#[tokio::test]
+async fn publication_intent_creation_is_bound_and_idempotent() {
+    let verifier = FakeVerifier::new();
+    verifier.allow(
+        "owner",
+        "owner-subject",
+        u64::try_from(Utc::now().timestamp()).unwrap(),
+    );
+    let catalog = MockCatalog::new();
+    let state = test_state(catalog.clone(), Some(verifier));
+    let account_id = provision_account(state.clone(), "owner").await;
+    let (publisher_id, key_id) = seed_publisher(&catalog, account_id);
+    let id = Uuid::new_v4();
+    let body = intent_body(id, publisher_id, key_id);
+
+    let first = send(
+        state.clone(),
+        Method::POST,
+        "/v1/publish-intents",
+        Some("owner"),
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_json = response_json(first).await;
+    assert_eq!(first_json["account_id"], account_id.to_string());
+    assert!(first_json["consumed_at"].is_null());
+    let created_at = first_json["created_at"].as_str().unwrap();
+    let expires_at = first_json["expires_at"].as_str().unwrap();
+    let ttl = expires_at
+        .parse::<chrono::DateTime<Utc>>()
+        .unwrap()
+        .signed_duration_since(created_at.parse::<chrono::DateTime<Utc>>().unwrap());
+    assert_eq!(ttl, chrono::Duration::minutes(15));
+
+    let retry = send(
+        state.clone(),
+        Method::POST,
+        "/v1/publish-intents",
+        Some("owner"),
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(retry.status(), StatusCode::OK);
+    assert_eq!(response_json(retry).await, first_json);
+
+    let mut changed = body;
+    changed["scan_schema_version"] = json!(2);
+    let conflict = send(
+        state,
+        Method::POST,
+        "/v1/publish-intents",
+        Some("owner"),
+        Some(changed),
+    )
+    .await;
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+}
+
+/// Retrieval returns owned intents while hiding foreign and missing identifiers.
+#[tokio::test]
+async fn publication_intent_retrieval_is_account_scoped() {
+    let now = u64::try_from(Utc::now().timestamp()).unwrap();
+    let verifier = FakeVerifier::new();
+    verifier.allow("owner", "owner-subject", now);
+    verifier.allow("other", "other-subject", now);
+    let catalog = MockCatalog::new();
+    let state = test_state(catalog.clone(), Some(verifier));
+    let owner_id = provision_account(state.clone(), "owner").await;
+    let _other_id = provision_account(state.clone(), "other").await;
+    let (publisher_id, key_id) = seed_publisher(&catalog, owner_id);
+    let id = Uuid::new_v4();
+    let created = send(
+        state.clone(),
+        Method::POST,
+        "/v1/publish-intents",
+        Some("owner"),
+        Some(intent_body(id, publisher_id, key_id)),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::OK);
+
+    let owned = send(
+        state.clone(),
+        Method::GET,
+        &format!("/v1/publish-intents/{id}"),
+        Some("owner"),
+        None,
+    )
+    .await;
+    assert_eq!(owned.status(), StatusCode::OK);
+    assert_eq!(response_json(owned).await["id"], id.to_string());
+
+    let foreign = send(
+        state.clone(),
+        Method::GET,
+        &format!("/v1/publish-intents/{id}"),
+        Some("other"),
+        None,
+    )
+    .await;
+    let foreign_status = foreign.status();
+    let foreign_body = response_json(foreign).await;
+    let missing = send(
+        state,
+        Method::GET,
+        &format!("/v1/publish-intents/{}", Uuid::new_v4()),
+        Some("other"),
+        None,
+    )
+    .await;
+    assert_eq!(foreign_status, StatusCode::NOT_FOUND);
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    assert_eq!(foreign_body, response_json(missing).await);
+}
+
+/// Invalid scanner schemas and unauthorized identity bindings fail closed.
+#[tokio::test]
+async fn publication_intent_creation_rejects_invalid_or_unauthorized_bindings() {
+    let now = u64::try_from(Utc::now().timestamp()).unwrap();
+    let verifier = FakeVerifier::new();
+    verifier.allow("owner", "owner-subject", now);
+    verifier.allow("other", "other-subject", now);
+    let catalog = MockCatalog::new();
+    let state = test_state(catalog.clone(), Some(verifier));
+    let owner_id = provision_account(state.clone(), "owner").await;
+    let _other_id = provision_account(state.clone(), "other").await;
+    let (publisher_id, key_id) = seed_publisher(&catalog, owner_id);
+
+    let mut invalid_schema = intent_body(Uuid::new_v4(), publisher_id, key_id);
+    invalid_schema["scan_schema_version"] = json!(0);
+    let invalid = send(
+        state.clone(),
+        Method::POST,
+        "/v1/publish-intents",
+        Some("owner"),
+        Some(invalid_schema),
+    )
+    .await;
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+
+    let mut injected_server_fields = intent_body(Uuid::new_v4(), publisher_id, key_id);
+    injected_server_fields["account_id"] = json!(owner_id);
+    injected_server_fields["expires_at"] = json!("2099-01-01T00:00:00Z");
+    let injected = send(
+        state.clone(),
+        Method::POST,
+        "/v1/publish-intents",
+        Some("owner"),
+        Some(injected_server_fields),
+    )
+    .await;
+    assert_eq!(injected.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let unauthorized = send(
+        state,
+        Method::POST,
+        "/v1/publish-intents",
+        Some("other"),
+        Some(intent_body(Uuid::new_v4(), publisher_id, key_id)),
+    )
+    .await;
+    assert_eq!(unauthorized.status(), StatusCode::FORBIDDEN);
 }

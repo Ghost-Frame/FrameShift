@@ -9,6 +9,7 @@
 //! - [`ops`] -- `GET /healthz` and `GET /metrics` operational endpoints.
 //! - [`telemetry`] -- `POST /v1/telemetry/selection` opt-in selection telemetry sink.
 //! - [`memory`] -- `GET /v1/memory/health` read-only memory backend health.
+//! - [`publication_intents`] -- authenticated creation and account-scoped retrieval.
 //! - [`admin`] -- `POST /v1/admin/packs/{name}/{version}/tombstone` and other
 //!   allowlist-gated operator endpoints.
 
@@ -20,4 +21,5 @@ pub mod handles;
 pub mod memory;
 pub mod ops;
 pub mod packs;
+pub mod publication_intents;
 pub mod telemetry;
