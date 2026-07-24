@@ -168,6 +168,16 @@ memory_required = "none"
 
 `description` and `tags` feed registry search; `capability_manifest` declares the tools, network egress, filesystem scope, and memory requirement the persona expects (see Capabilities and Memory below). For typed packs, `extends` and `mixin` drive composition. `parent_hash` tracks version lineage; `conformance_baseline` feeds the install-time regression gate (see Conformance below).
 
+Before the client signs or uploads a pack, it builds a versioned publication
+report over the exact public inventory. Root files are limited to the documented
+manifest, render, typed-source, template, and variable files; only
+`overlays/**/*.md` and `conformance/bundle.toml` are accepted below the root.
+Symlinks, unknown files, growth state, hidden or secret-state paths, malformed
+shared schemas, unsafe system-wide filesystem capability requests, stale typed
+renders, and mismatched conformance evidence block publication. The accepted
+files are rehashed into a private temporary snapshot, and that snapshot is the
+only input to hashing, signing, and archive construction.
+
 ### Content addressing and signatures
 
 Every pack has a **canonical hash**: a SHA-256 computed from its files by normalizing each relative path (NFC, forward slashes), sorting byte-lexicographically, and hashing `path \0 length \0 content \0` for each. Because it is derived from the directory's logical contents, the canonical hash is independent of how the pack is later archived or compressed -- two byte-identical pack directories always produce the same hash. This is the pack's identity and the exact value an author signs.

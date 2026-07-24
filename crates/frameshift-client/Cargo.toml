@@ -8,6 +8,8 @@ description = "Client engine for installing and materializing frameshift packs"
 
 [dependencies]
 frameshift-pack = { path = "../frameshift-pack" }
+# Shared fail-closed publication policy and versioned validation reports.
+frameshift-publication = { path = "../frameshift-publication" }
 # Persona composition (extends/mixin resolution) used at render time.
 frameshift-compose = { path = "../frameshift-compose" }
 # Typed persona source loading and deterministic markdown rendering.

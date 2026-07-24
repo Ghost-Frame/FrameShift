@@ -2046,6 +2046,7 @@ dependencies = [
  "frameshift-compose",
  "frameshift-conformance",
  "frameshift-pack",
+ "frameshift-publication",
  "frameshift-source",
  "frameshift-template",
  "frameshift-vault",
@@ -2272,6 +2273,24 @@ version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
  "rand 0.8.6",
+ "serde",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml 0.8.23",
+ "unicode-normalization",
+]
+
+[[package]]
+name = "frameshift-publication"
+version = "0.1.0"
+dependencies = [
+ "frameshift-conformance",
+ "frameshift-pack",
+ "frameshift-source",
+ "frameshift-template",
+ "hex",
+ "libc",
  "serde",
  "sha2 0.10.9",
  "tempfile",

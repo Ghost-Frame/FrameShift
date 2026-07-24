@@ -20,6 +20,7 @@ members = [
     "crates/frameshift-objects-fs",
     "crates/frameshift-orchestrator",
     "crates/frameshift-pack",
+    "crates/frameshift-publication",
     "crates/frameshift-runtime",
     "crates/frameshift-seed",
     "crates/frameshift-server",
