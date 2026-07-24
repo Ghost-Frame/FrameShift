@@ -21,9 +21,10 @@ use frameshift_catalog::error::{CatalogError, HealthStatus};
 use frameshift_catalog::filters::{PackSearchFilters, PackSearchResult};
 use frameshift_catalog::identity::Ed25519PublicKey;
 use frameshift_catalog::records::{
-    AccountRecord, AuthorRecord, PackRecord, PackVersionRecord, PublicationSubmissionRecord,
-    PublicationSubmissionRequest, PublicationSubmissionState, PublisherAuditEventRecord,
-    PublisherKeyRecord, PublisherKeyState, PublisherMembershipRecord, PublisherProfileRecord,
+    AccountRecord, AccountStatus, AuthorRecord, MembershipState, PackRecord, PackVersionRecord,
+    PublicationIntentRecord, PublicationSubmissionRecord, PublicationSubmissionRequest,
+    PublicationSubmissionState, PublisherAuditEventRecord, PublisherKeyRecord, PublisherKeyState,
+    PublisherMembershipRecord, PublisherProfileRecord, PublisherRole,
 };
 use frameshift_catalog::status::{PackStatus, TombstoneRecord};
 // Reuse the exact same version-precedence comparator the Postgres adapter
@@ -87,6 +88,9 @@ pub struct MockState {
 
     /// Shared signed-request nonce claims keyed by signer and nonce.
     pub signed_request_nonces: HashMap<(String, String), DateTime<Utc>>,
+
+    /// Publication intents keyed by their caller-generated idempotency identifier.
+    pub publication_intents: HashMap<uuid::Uuid, PublicationIntentRecord>,
 
     /// Quarantined publication submissions keyed by stable identifier.
     pub publication_submissions: HashMap<uuid::Uuid, PublicationSubmissionRecord>,
@@ -1098,6 +1102,81 @@ impl CatalogBackend for MockCatalog {
         }
         state.signed_request_nonces.insert(key, expires_at);
         Ok(true)
+    }
+
+    /// Create an exact publication intent after validating its identity chain.
+    async fn create_publication_intent(
+        &self,
+        record: PublicationIntentRecord,
+    ) -> Result<PublicationIntentRecord, CatalogError> {
+        if record.scan_schema_version == 0
+            || record.expires_at <= record.created_at
+            || record.consumed_at.is_some()
+        {
+            return Err(CatalogError::InvalidArgument(
+                "invalid publication intent".to_string(),
+            ));
+        }
+        let mut state = self
+            .state
+            .write()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        let account_is_active = state
+            .accounts
+            .get(&record.account_id)
+            .is_some_and(|account| account.status == AccountStatus::Active);
+        let membership_is_active_owner = state
+            .publisher_memberships
+            .get(&(record.account_id, record.publisher_id))
+            .is_some_and(|membership| {
+                membership.role == PublisherRole::Owner
+                    && membership.state == MembershipState::Active
+            });
+        let key_is_active_for_publisher = state
+            .publisher_keys
+            .get(&record.publisher_key_id)
+            .is_some_and(|key| {
+                key.publisher_id == record.publisher_id && key.state == PublisherKeyState::Active
+            });
+        if !state.publishers.contains_key(&record.publisher_id)
+            || !account_is_active
+            || !membership_is_active_owner
+            || !key_is_active_for_publisher
+        {
+            return Err(CatalogError::Unauthorized {
+                kind: "publication_intent",
+                key: record.id.to_string(),
+            });
+        }
+        if let Some(existing) = state.publication_intents.get(&record.id) {
+            return if existing == &record {
+                Ok(existing.clone())
+            } else {
+                Err(CatalogError::Conflict {
+                    kind: "publication_intent",
+                    key: record.id.to_string(),
+                })
+            };
+        }
+        state.publication_intents.insert(record.id, record.clone());
+        Ok(record)
+    }
+
+    /// Retrieve one publication intent by stable identifier.
+    async fn get_publication_intent(
+        &self,
+        id: uuid::Uuid,
+    ) -> Result<PublicationIntentRecord, CatalogError> {
+        self.state
+            .read()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?
+            .publication_intents
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| CatalogError::NotFound {
+                kind: "publication_intent",
+                key: id.to_string(),
+            })
     }
 
     /// Persist one quarantined submission with exact retry semantics.

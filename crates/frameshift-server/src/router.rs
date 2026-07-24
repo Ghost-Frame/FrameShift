@@ -73,6 +73,7 @@ use crate::routes::handles::handles_router;
 use crate::routes::memory::memory_router;
 use crate::routes::ops::ops_router;
 use crate::routes::packs::{packs_router, publish_pack};
+use crate::routes::publication_intents::publication_intent_router;
 use crate::routes::telemetry::telemetry_router;
 use crate::state::AppState;
 
@@ -91,6 +92,7 @@ use crate::state::AppState;
 ///     /auth/config -- public OIDC capability metadata
 ///     /account  -- OIDC-authenticated account profile and memberships
 ///     /publishers -- public profiles plus OIDC-authenticated owner operations
+///     /publish-intents -- OIDC-authenticated creation and account-scoped retrieval
 ///     /telemetry -- POST /selection opt-in selection telemetry sink
 ///     /memory   -- GET /health read-only memory backend health
 ///     /admin    -- POST /packs/{name}/{version}/tombstone (signed + allowlist)
@@ -165,7 +167,10 @@ pub fn app(state: AppState) -> Router {
 
     if state.account_auth.is_some() {
         let account_layer = axum::middleware::from_fn_with_state(state.clone(), require_account);
-        v1 = v1.merge(account_write_router().route_layer(account_layer));
+        let account_routes = account_write_router()
+            .merge(Router::new().nest("/publish-intents", publication_intent_router()))
+            .route_layer(account_layer);
+        v1 = v1.merge(account_routes);
     }
 
     let x_request_id = axum::http::HeaderName::from_static("x-request-id");
