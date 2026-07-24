@@ -21,7 +21,8 @@ use frameshift_catalog::error::{CatalogError, HealthStatus};
 use frameshift_catalog::filters::{PackSearchFilters, PackSearchResult};
 use frameshift_catalog::identity::Ed25519PublicKey;
 use frameshift_catalog::records::{
-    AccountRecord, AuthorRecord, PackRecord, PackVersionRecord, PublisherAuditEventRecord,
+    AccountRecord, AuthorRecord, PackRecord, PackVersionRecord, PublicationSubmissionRecord,
+    PublicationSubmissionRequest, PublicationSubmissionState, PublisherAuditEventRecord,
     PublisherKeyRecord, PublisherKeyState, PublisherMembershipRecord, PublisherProfileRecord,
 };
 use frameshift_catalog::status::{PackStatus, TombstoneRecord};
@@ -86,6 +87,12 @@ pub struct MockState {
 
     /// Shared signed-request nonce claims keyed by signer and nonce.
     pub signed_request_nonces: HashMap<(String, String), DateTime<Utc>>,
+
+    /// Quarantined publication submissions keyed by stable identifier.
+    pub publication_submissions: HashMap<uuid::Uuid, PublicationSubmissionRecord>,
+
+    /// Optional persistent backend failure injected into submission creation.
+    pub publication_submission_error: Option<String>,
 }
 
 /// In-memory [`CatalogBackend`] for integration tests.
@@ -1091,6 +1098,97 @@ impl CatalogBackend for MockCatalog {
         }
         state.signed_request_nonces.insert(key, expires_at);
         Ok(true)
+    }
+
+    /// Persist one quarantined submission with exact retry semantics.
+    async fn create_publication_submission(
+        &self,
+        request: PublicationSubmissionRequest,
+    ) -> Result<PublicationSubmissionRecord, CatalogError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        if let Some(message) = &state.publication_submission_error {
+            return Err(CatalogError::BackendError(
+                std::io::Error::other(message.clone()).into(),
+            ));
+        }
+        let exact_retry = |record: &PublicationSubmissionRecord| {
+            record.id == request.id
+                && record.intent_id == request.intent.id
+                && record.account_id == request.intent.account_id
+                && record.publisher_id == request.intent.publisher_id
+                && record.publisher_key_id == request.intent.publisher_key_id
+                && record.archive_hash == request.intent.archive_hash
+                && record.manifest_hash == request.intent.manifest_hash
+                && record.file_inventory_hash == request.intent.file_inventory_hash
+                && record.scan_schema_version == request.intent.scan_schema_version
+                && record.scan_report == request.scan_report
+                && record.state == PublicationSubmissionState::Quarantined
+        };
+        if let Some(existing) = state.publication_submissions.get(&request.id) {
+            return if exact_retry(existing) {
+                Ok(existing.clone())
+            } else {
+                Err(CatalogError::Conflict {
+                    kind: "publication_submission",
+                    key: request.id.to_string(),
+                })
+            };
+        }
+        if let Some(existing) = state
+            .publication_submissions
+            .values()
+            .find(|record| record.intent_id == request.intent.id)
+        {
+            return if exact_retry(existing) {
+                Ok(existing.clone())
+            } else {
+                Err(CatalogError::Conflict {
+                    kind: "publication_submission",
+                    key: request.id.to_string(),
+                })
+            };
+        }
+
+        let now = Utc::now();
+        let record = PublicationSubmissionRecord {
+            id: request.id,
+            intent_id: request.intent.id,
+            account_id: request.intent.account_id,
+            publisher_id: request.intent.publisher_id,
+            publisher_key_id: request.intent.publisher_key_id,
+            archive_hash: request.intent.archive_hash,
+            manifest_hash: request.intent.manifest_hash,
+            file_inventory_hash: request.intent.file_inventory_hash,
+            scan_schema_version: request.intent.scan_schema_version,
+            scan_report: request.scan_report,
+            state: PublicationSubmissionState::Quarantined,
+            created_at: now,
+            updated_at: now,
+        };
+        state
+            .publication_submissions
+            .insert(record.id, record.clone());
+        Ok(record)
+    }
+
+    /// Retrieve one quarantined publication submission by identifier.
+    async fn get_publication_submission(
+        &self,
+        id: uuid::Uuid,
+    ) -> Result<PublicationSubmissionRecord, CatalogError> {
+        self.state
+            .read()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?
+            .publication_submissions
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| CatalogError::NotFound {
+                kind: "publication_submission",
+                key: id.to_string(),
+            })
     }
 }
 

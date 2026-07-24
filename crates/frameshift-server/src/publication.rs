@@ -1,0 +1,342 @@
+//! Internal server boundary for inspecting and quarantining publication archives.
+//!
+//! This module deliberately exposes no HTTP route and performs no public object
+//! promotion. Callers must inject a store dedicated to quarantine objects.
+
+use std::collections::BTreeSet;
+use std::io::Read;
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+
+use frameshift_catalog::{
+    CatalogBackend, CatalogError, PublicationIntentClaim, PublicationSubmissionRecord,
+    PublicationSubmissionRequest,
+};
+use frameshift_objects::{ObjectHash, ObjectStoreError, PackStore};
+use frameshift_publication::{FindingSeverity, PublicationReport};
+use uuid::Uuid;
+
+/// Maximum decoded size of one uploaded publication archive.
+const MAX_DECOMPRESSED_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Maximum number of filesystem entries accepted from one publication archive.
+const MAX_ARCHIVE_ENTRIES: usize = 256;
+
+/// A validated extracted archive retained for the lifetime of its temporary directory.
+pub(crate) struct InspectedPublicationArchive {
+    /// Temporary extraction directory whose ownership keeps `pack_root` alive.
+    _temp_dir: tempfile::TempDir,
+    /// Root containing the validated `pack.toml`.
+    pack_root: PathBuf,
+    /// Fresh deterministic report generated from the extracted bytes.
+    pub(crate) report: PublicationReport,
+}
+
+/// Read-only accessors for an inspected publication archive.
+impl InspectedPublicationArchive {
+    /// Return the extracted pack root while retaining the temporary-directory guard.
+    pub(crate) fn pack_root(&self) -> &Path {
+        &self.pack_root
+    }
+}
+
+/// Failures while inspecting or admitting a publication archive.
+#[derive(Debug, thiserror::Error)]
+pub enum PublicationAdmissionError {
+    /// The uploaded archive does not match the hash authorized by the intent.
+    #[error("publication archive hash does not match the intent")]
+    ArchiveHashMismatch,
+    /// The archive could not be safely decoded or did not contain one pack root.
+    #[error("invalid publication archive: {0}")]
+    InvalidArchive(&'static str),
+    /// The server-side deterministic scan emitted blocking findings.
+    #[error("publication validation failed: {codes}")]
+    Validation {
+        /// Bounded stable finding codes without local paths.
+        codes: String,
+    },
+    /// A server-observed binding does not match the exact publication intent.
+    #[error("publication {field} does not match the intent")]
+    IntentMismatch {
+        /// Stable name of the mismatched binding.
+        field: &'static str,
+    },
+    /// The quarantine object store rejected or failed the write.
+    #[error("publication quarantine write failed")]
+    Quarantine(#[source] ObjectStoreError),
+    /// The catalog rejected or failed the atomic submission transaction.
+    #[error("publication catalog persistence failed")]
+    Catalog(#[source] CatalogError),
+    /// Internal temporary-file or task execution failed.
+    #[error("publication inspection failed")]
+    Internal(#[source] Box<dyn std::error::Error + Send + Sync>),
+}
+
+/// Route-free application service that admits exact archives to quarantine.
+///
+/// The injected [`PackStore`] must be isolated from the public download store.
+/// This type cannot promote objects or create active catalog versions.
+#[derive(Clone)]
+pub struct PublicationAdmissionService {
+    /// Catalog boundary that atomically consumes intents and creates submissions.
+    catalog: Arc<dyn CatalogBackend>,
+    /// Non-public object store dedicated to quarantine bytes.
+    quarantine: Arc<dyn PackStore>,
+}
+
+/// Construction and admission operations for [`PublicationAdmissionService`].
+impl PublicationAdmissionService {
+    /// Construct a service over an explicit catalog and quarantine-only store.
+    pub fn new(catalog: Arc<dyn CatalogBackend>, quarantine: Arc<dyn PackStore>) -> Self {
+        Self {
+            catalog,
+            quarantine,
+        }
+    }
+
+    /// Validate, quarantine, and persist one exact publication submission.
+    ///
+    /// All deterministic checks finish before either backend is mutated.
+    /// Quarantine storage happens before catalog persistence, so a catalog
+    /// failure can leave only an unreachable content-addressed quarantine blob.
+    pub async fn admit(
+        &self,
+        submission_id: Uuid,
+        intent: PublicationIntentClaim,
+        archive_bytes: Vec<u8>,
+    ) -> Result<PublicationSubmissionRecord, PublicationAdmissionError> {
+        let archive_hash = ObjectHash::of(&archive_bytes);
+        if archive_hash != intent.archive_hash {
+            return Err(PublicationAdmissionError::ArchiveHashMismatch);
+        }
+
+        let inspected = inspect_publication_archive(&archive_bytes).await?;
+        enforce_publication_report(&inspected.report)?;
+        validate_intent_bindings(&intent, &inspected.report)?;
+
+        self.quarantine
+            .put(&archive_hash, &archive_bytes)
+            .await
+            .map_err(PublicationAdmissionError::Quarantine)?;
+
+        self.catalog
+            .create_publication_submission(PublicationSubmissionRequest {
+                id: submission_id,
+                intent,
+                scan_report: inspected.report,
+            })
+            .await
+            .map_err(PublicationAdmissionError::Catalog)
+    }
+}
+
+/// Inspect a bounded gzip-tar archive and return its freshly validated pack root.
+pub(crate) async fn inspect_publication_archive(
+    archive_bytes: &[u8],
+) -> Result<InspectedPublicationArchive, PublicationAdmissionError> {
+    let temp_dir = tempfile::TempDir::new()
+        .map_err(|error| PublicationAdmissionError::Internal(Box::new(error)))?;
+    extract_targz(archive_bytes.to_vec(), temp_dir.path().to_path_buf()).await?;
+    let pack_root = find_pack_root(temp_dir.path())?;
+    let report = frameshift_publication::validate_directory(&pack_root)
+        .map_err(|error| PublicationAdmissionError::Internal(Box::new(error)))?;
+    Ok(InspectedPublicationArchive {
+        _temp_dir: temp_dir,
+        pack_root,
+        report,
+    })
+}
+
+/// Compare every server-observed report binding with the authorized intent.
+fn validate_intent_bindings(
+    intent: &PublicationIntentClaim,
+    report: &PublicationReport,
+) -> Result<(), PublicationAdmissionError> {
+    if report.schema_version != intent.scan_schema_version {
+        return Err(PublicationAdmissionError::IntentMismatch {
+            field: "scan schema",
+        });
+    }
+
+    let inventory_hash = ObjectHash::from_hex(&report.inventory_hash).map_err(|_| {
+        PublicationAdmissionError::IntentMismatch {
+            field: "file inventory",
+        }
+    })?;
+    if inventory_hash != intent.file_inventory_hash {
+        return Err(PublicationAdmissionError::IntentMismatch {
+            field: "file inventory",
+        });
+    }
+
+    let manifest_hash = report
+        .inventory
+        .iter()
+        .find(|entry| entry.path == "pack.toml")
+        .and_then(|entry| ObjectHash::from_hex(&entry.sha256).ok())
+        .ok_or(PublicationAdmissionError::IntentMismatch { field: "manifest" })?;
+    if manifest_hash != intent.manifest_hash {
+        return Err(PublicationAdmissionError::IntentMismatch { field: "manifest" });
+    }
+    Ok(())
+}
+
+/// Reject a report while exposing only bounded stable finding codes.
+pub(crate) fn enforce_publication_report(
+    report: &PublicationReport,
+) -> Result<(), PublicationAdmissionError> {
+    if report.valid {
+        return Ok(());
+    }
+    let codes = report
+        .findings
+        .iter()
+        .filter(|finding| finding.severity == FindingSeverity::Error)
+        .map(|finding| finding.code.as_str())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .take(8)
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(PublicationAdmissionError::Validation {
+        codes: if codes.is_empty() {
+            "unknown".to_string()
+        } else {
+            codes
+        },
+    })
+}
+
+/// A reader that fails once decompressed throughput exceeds its byte ceiling.
+struct LimitedReader<R> {
+    /// Wrapped gzip-decoded tar byte stream.
+    inner: R,
+    /// Maximum cumulative bytes allowed.
+    limit: u64,
+    /// Cumulative bytes returned by the wrapped reader.
+    read: u64,
+}
+
+/// Construction helpers for [`LimitedReader`].
+impl<R: Read> LimitedReader<R> {
+    /// Wrap `inner` with a cumulative byte limit.
+    fn new(inner: R, limit: u64) -> Self {
+        Self {
+            inner,
+            limit,
+            read: 0,
+        }
+    }
+}
+
+/// Enforce the decompressed-byte ceiling while forwarding reads.
+impl<R: Read> Read for LimitedReader<R> {
+    /// Read bytes and fail when the cumulative count crosses the limit.
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let count = self.inner.read(buffer)?;
+        self.read = self.read.saturating_add(count as u64);
+        if self.read > self.limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "publication archive exceeds maximum decompressed size",
+            ));
+        }
+        Ok(count)
+    }
+}
+
+/// Extract one bounded gzip-tar archive without following unsafe entry types.
+async fn extract_targz(
+    archive_bytes: Vec<u8>,
+    directory: PathBuf,
+) -> Result<(), PublicationAdmissionError> {
+    tokio::task::spawn_blocking(move || {
+        let gzip = flate2::read::GzDecoder::new(std::io::Cursor::new(archive_bytes));
+        let limited = LimitedReader::new(gzip, MAX_DECOMPRESSED_BYTES);
+        let mut archive = tar::Archive::new(limited);
+        archive.set_preserve_permissions(false);
+        archive.set_overwrite(false);
+        let mut paths = BTreeSet::new();
+
+        let entries = archive
+            .entries()
+            .map_err(|_| PublicationAdmissionError::InvalidArchive("unreadable tar entries"))?;
+        for (index, entry) in entries.enumerate() {
+            if index >= MAX_ARCHIVE_ENTRIES {
+                return Err(PublicationAdmissionError::InvalidArchive(
+                    "too many archive entries",
+                ));
+            }
+            let mut entry = entry
+                .map_err(|_| PublicationAdmissionError::InvalidArchive("unreadable tar entry"))?;
+            let entry_type = entry.header().entry_type();
+            if !(entry_type.is_file() || entry_type.is_dir()) {
+                return Err(PublicationAdmissionError::InvalidArchive(
+                    "non-regular archive entry",
+                ));
+            }
+            let path = entry
+                .path()
+                .map_err(|_| PublicationAdmissionError::InvalidArchive("unreadable entry path"))?
+                .into_owned();
+            let normalized = normalize_archive_path(&path)?;
+            if normalized.as_os_str().is_empty() {
+                if entry_type.is_dir() {
+                    continue;
+                }
+                return Err(PublicationAdmissionError::InvalidArchive(
+                    "unsafe archive path",
+                ));
+            }
+            if !paths.insert(normalized) {
+                return Err(PublicationAdmissionError::InvalidArchive(
+                    "duplicate archive path",
+                ));
+            }
+            entry.unpack_in(&directory).map_err(|_| {
+                PublicationAdmissionError::InvalidArchive("archive extraction failed")
+            })?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| PublicationAdmissionError::Internal(Box::new(error)))?
+}
+
+/// Normalize one archive path while rejecting traversal and absolute components.
+fn normalize_archive_path(path: &Path) -> Result<PathBuf, PublicationAdmissionError> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(PublicationAdmissionError::InvalidArchive(
+                    "unsafe archive path",
+                ));
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+/// Find a flat or single-directory pack root inside an extraction target.
+fn find_pack_root(extract_dir: &Path) -> Result<PathBuf, PublicationAdmissionError> {
+    if extract_dir.join("pack.toml").is_file() {
+        return Ok(extract_dir.to_path_buf());
+    }
+    let directory = std::fs::read_dir(extract_dir)
+        .map_err(|error| PublicationAdmissionError::Internal(Box::new(error)))?;
+    let mut entries = Vec::new();
+    for entry in directory {
+        let entry = entry.map_err(|error| PublicationAdmissionError::Internal(Box::new(error)))?;
+        entries.push(entry.path());
+    }
+    entries.sort();
+    if entries.len() == 1 && entries[0].is_dir() && entries[0].join("pack.toml").is_file() {
+        return Ok(entries[0].clone());
+    }
+    Err(PublicationAdmissionError::InvalidArchive(
+        "pack.toml is not at one pack root",
+    ))
+}
