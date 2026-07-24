@@ -34,7 +34,7 @@ use frameshift_catalog_postgres::{
     PostgresCatalogConfig, OWNERSHIP_BACKFILL_SCHEMA_VERSION,
 };
 use frameshift_publication::{
-    FindingSeverity, InventoryEntry, PublicationFinding, PublicationReport,
+    inventory_hash, FindingSeverity, InventoryEntry, PublicationFinding, PublicationReport,
 };
 use secrecy::SecretString;
 use sha2::{Digest as _, Sha256};
@@ -233,17 +233,41 @@ fn make_publication_claim(intent: &PublicationIntentRecord) -> PublicationIntent
 
 /// Build a valid deterministic server report bound to one intent inventory hash.
 fn make_publication_report(intent: &PublicationIntentRecord) -> PublicationReport {
+    let inventory = vec![InventoryEntry {
+        path: "pack.toml".to_string(),
+        size: 12,
+        sha256: make_hash(151).to_hex(),
+    }];
     PublicationReport {
         schema_version: intent.scan_schema_version,
         valid: true,
-        inventory_hash: intent.file_inventory_hash.to_hex(),
-        inventory: vec![InventoryEntry {
-            path: "pack.toml".to_string(),
-            size: 12,
-            sha256: make_hash(151).to_hex(),
-        }],
+        inventory_hash: inventory_hash(&inventory),
+        inventory,
         findings: Vec::new(),
     }
+}
+
+/// Build an intent whose inventory digest matches the stable submission fixture.
+fn make_publication_submission_intent(
+    account_id: uuid::Uuid,
+    publisher_id: uuid::Uuid,
+    publisher_key_id: uuid::Uuid,
+    hash_seed: u8,
+    created_at: chrono::DateTime<chrono::Utc>,
+    expires_at: chrono::DateTime<chrono::Utc>,
+) -> PublicationIntentRecord {
+    let mut intent = make_publication_intent(
+        account_id,
+        publisher_id,
+        publisher_key_id,
+        hash_seed,
+        created_at,
+        expires_at,
+    );
+    let report = make_publication_report(&intent);
+    intent.file_inventory_hash =
+        ObjectHash::from_hex(&report.inventory_hash).expect("fixture inventory hash must parse");
+    intent
 }
 
 /// Build an exact quarantined submission request for one intent.
@@ -1463,7 +1487,7 @@ async fn publication_submission_is_atomic_idempotent_and_concurrency_safe() {
         create_test_publisher(&catalog, "submission-owner", 152).await;
     let now = chrono::DateTime::from_timestamp_micros(chrono::Utc::now().timestamp_micros())
         .expect("current timestamp must fit");
-    let intent = make_publication_intent(
+    let intent = make_publication_submission_intent(
         account_id,
         publisher_id,
         key.id,
@@ -1556,7 +1580,7 @@ async fn publication_submission_revalidates_report_expiry_and_identity() {
         create_test_publisher(&catalog, "submission-revalidation", 160).await;
     let now = chrono::DateTime::from_timestamp_micros(chrono::Utc::now().timestamp_micros())
         .expect("current timestamp must fit");
-    let expired = make_publication_intent(
+    let expired = make_publication_submission_intent(
         account_id,
         publisher_id,
         key.id,
@@ -1574,7 +1598,7 @@ async fn publication_submission_revalidates_report_expiry_and_identity() {
         .expect_err("expired intent must reject submission");
     assert!(matches!(expired_error, CatalogError::Unauthorized { .. }));
 
-    let active = make_publication_intent(
+    let active = make_publication_submission_intent(
         account_id,
         publisher_id,
         key.id,
@@ -1594,6 +1618,14 @@ async fn publication_submission_revalidates_report_expiry_and_identity() {
         .await
         .expect_err("inventory report mismatch must reject submission");
     assert!(matches!(report_error, CatalogError::Unauthorized { .. }));
+
+    let mut inconsistent_report = make_publication_submission(&active);
+    inconsistent_report.scan_report.inventory[0].size += 1;
+    let consistency_error = catalog
+        .create_publication_submission(inconsistent_report)
+        .await
+        .expect_err("internally inconsistent report must reject submission");
+    assert!(matches!(consistency_error, CatalogError::Validation(_)));
 
     let mut invalid_report = make_publication_submission(&active);
     invalid_report.scan_report.valid = false;
@@ -1687,7 +1719,7 @@ async fn publication_submission_insert_failure_does_not_burn_intent() {
         create_test_publisher(&catalog, "submission-rollback", 172).await;
     let now = chrono::DateTime::from_timestamp_micros(chrono::Utc::now().timestamp_micros())
         .expect("current timestamp must fit");
-    let intent = make_publication_intent(
+    let intent = make_publication_submission_intent(
         account_id,
         publisher_id,
         key.id,

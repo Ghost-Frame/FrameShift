@@ -31,7 +31,7 @@ use frameshift_catalog::{
     PublisherAuditEventRecord, PublisherKeyRecord, PublisherMembershipRecord,
     PublisherProfileRecord, SortMode, TombstoneRecord,
 };
-use frameshift_publication::FindingSeverity;
+use frameshift_publication::{inventory_hash, FindingSeverity, REPORT_SCHEMA_VERSION};
 
 use crate::config::PostgresCatalogConfig;
 use crate::errors::{map_diesel_error, map_migration_error, map_pool_error};
@@ -182,6 +182,11 @@ fn validate_publication_submission(
             "publication submission report schema must match its intent".to_string(),
         ));
     }
+    if request.scan_report.schema_version != REPORT_SCHEMA_VERSION {
+        return Err(CatalogError::InvalidArgument(
+            "publication submission report schema is not supported".to_string(),
+        ));
+    }
     if !request.scan_report.valid
         || request
             .scan_report
@@ -193,7 +198,7 @@ fn validate_publication_submission(
             "publication submission requires a valid server scan report".to_string(),
         ));
     }
-    let inventory_hash = frameshift_catalog::ObjectHash::from_hex(
+    let declared_inventory_hash = frameshift_catalog::ObjectHash::from_hex(
         &request.scan_report.inventory_hash,
     )
     .map_err(|_| {
@@ -201,11 +206,23 @@ fn validate_publication_submission(
             "publication submission report has an invalid inventory hash".to_string(),
         )
     })?;
-    if inventory_hash != request.intent.file_inventory_hash {
+    if declared_inventory_hash != request.intent.file_inventory_hash {
         return Err(CatalogError::Unauthorized {
             kind: "publication_submission",
             key: request.id.to_string(),
         });
+    }
+    if frameshift_catalog::ObjectHash::from_hex(&inventory_hash(&request.scan_report.inventory))
+        .map_err(|_| {
+            CatalogError::BackendError(Box::new(std::io::Error::other(
+                "shared publication inventory hash was not valid hexadecimal",
+            )))
+        })?
+        != declared_inventory_hash
+    {
+        return Err(CatalogError::Validation(
+            "publication submission report inventory hash is inconsistent".to_string(),
+        ));
     }
     if !request
         .scan_report

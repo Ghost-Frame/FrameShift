@@ -155,7 +155,7 @@ pub fn validate_directory(root: &Path) -> Result<PublicationReport, PublicationI
     Ok(PublicationReport {
         schema_version: REPORT_SCHEMA_VERSION,
         valid,
-        inventory_hash: hash_inventory(&inventory),
+        inventory_hash: inventory_hash(&inventory),
         inventory,
         findings,
     })
@@ -705,7 +705,10 @@ fn inventory_paths(inventory: &[InventoryEntry]) -> BTreeSet<&str> {
 }
 
 /// Hash deterministic inventory metadata without depending on JSON formatting.
-fn hash_inventory(inventory: &[InventoryEntry]) -> String {
+///
+/// Persistence boundaries use this function to verify that a serialized report
+/// still binds its declared digest to the exact inventory entries it carries.
+pub fn inventory_hash(inventory: &[InventoryEntry]) -> String {
     let mut hasher = Sha256::new();
     for entry in inventory {
         hasher.update(entry.path.as_bytes());
