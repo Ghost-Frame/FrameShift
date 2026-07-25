@@ -12,6 +12,8 @@ mod publisher;
 mod registry;
 /// Persona-selection history (local JSONL) and opt-in telemetry.
 mod selection;
+/// Provider-neutral OIDC session establishment and lifecycle operations.
+pub mod session;
 
 pub use error::ClientError;
 /// Re-exported so callers of [`InstallReport::conformance_upgrade`] can match
