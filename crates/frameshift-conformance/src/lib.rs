@@ -29,5 +29,5 @@ pub use caller::{score_bundle_with_caller, CallerScorer};
 pub use case::{ExpectedBehavior, ScorerKind, TestCase};
 pub use error::ConformanceError;
 pub use gate::{CrossVersionDecision, RegressionGate};
-pub use runner::{MockRunner, Runner};
+pub use runner::{run_bundle, ConformanceRunReport, ConformanceTestResult, MockRunner, Runner};
 pub use score::{bundle_score, score_test, Score};

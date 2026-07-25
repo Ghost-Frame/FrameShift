@@ -11,9 +11,7 @@ use std::path::PathBuf;
 
 use clap::Args;
 use frameshift_client::Client;
-use frameshift_conformance::{
-    bundle_score, load_from_dir, score_test, MockRunner, Runner, TestCase,
-};
+use frameshift_conformance::{load_from_dir, run_bundle, MockRunner, Runner};
 
 use crate::util::{persona_source_dir, CliError};
 
@@ -63,6 +61,12 @@ pub struct VerifyArgs {
 /// prints a results table, and returns an error if the overall score is
 /// below the threshold.
 pub fn run_verify(args: VerifyArgs) -> Result<(), CliError> {
+    if !args.threshold.is_finite() || !(0.0..=1.0).contains(&args.threshold) {
+        return Err(CliError::Growth(
+            "threshold must be finite and within 0.0..=1.0".to_string(),
+        ));
+    }
+
     // Validate that exactly one of --persona or --bundle is specified.
     let bundle_dir = match (&args.persona, &args.bundle) {
         (Some(_), Some(_)) => {
@@ -114,27 +118,18 @@ pub fn run_verify(args: VerifyArgs) -> Result<(), CliError> {
         }
     };
 
-    // Run each test case, collecting (TestCase, response) pairs.
+    // Run the authoritative bundle through the shared path-free executor.
     let rt = tokio::runtime::Runtime::new()
         .map_err(|e| CliError::Growth(format!("failed to create runtime: {e}")))?;
-
-    let results: Vec<(TestCase, String)> = bundle
-        .tests
-        .iter()
-        .map(|test| {
-            let response = rt
-                .block_on(runner.run(&test.prompt))
-                .map_err(|e| CliError::Growth(format!("runner error: {e}")))?;
-            Ok((test.clone(), response))
-        })
-        .collect::<Result<_, CliError>>()?;
+    let report = rt
+        .block_on(run_bundle(&bundle, runner.as_ref()))
+        .map_err(|e| CliError::Growth(format!("conformance execution failed: {e}")))?;
 
     // Print the results table.
     println!("{:<20} {:<12} {:<8} result", "id", "scorer", "score");
     println!("{}", "-".repeat(55));
-    for (test, response) in &results {
-        let score = score_test(test, response);
-        let pass = if score.0 >= args.threshold {
+    for test in &report.tests {
+        let pass = if test.score >= args.threshold {
             "pass"
         } else {
             "FAIL"
@@ -143,23 +138,21 @@ pub fn run_verify(args: VerifyArgs) -> Result<(), CliError> {
             "{:<20} {:<12} {:<8.3} {}",
             test.id,
             format!("{:?}", test.scorer),
-            score.0,
+            test.score,
             pass
         );
     }
     println!("{}", "-".repeat(55));
 
-    // Compute and print the overall score.
-    let overall = bundle_score(&bundle, &results);
     println!(
         "overall score: {:.3} (threshold: {:.3})",
-        overall.0, args.threshold
+        report.score, args.threshold
     );
 
-    if overall.0 < args.threshold {
+    if report.score < args.threshold {
         return Err(CliError::Growth(format!(
             "score {:.3} is below threshold {:.3}",
-            overall.0, args.threshold
+            report.score, args.threshold
         )));
     }
 
@@ -302,6 +295,24 @@ value = "{expected_value}"
         assert!(
             run_verify(args).is_err(),
             "score 0.0 should fail threshold 0.5"
+        );
+    }
+
+    /// Non-finite thresholds fail before loading or executing a bundle.
+    #[test]
+    fn verify_rejects_non_finite_threshold() {
+        let args = VerifyArgs {
+            persona: None,
+            bundle: None,
+            canned_response: String::new(),
+            threshold: f32::NAN,
+            runner: RunnerKind::Mock,
+            model: "Gemini 3.1 Pro (High)".to_string(),
+        };
+        let result = run_verify(args);
+        assert!(
+            matches!(result, Err(CliError::Growth(ref message)) if message.contains("threshold")),
+            "expected threshold error, got {result:?}"
         );
     }
 

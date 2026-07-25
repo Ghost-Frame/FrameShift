@@ -8,9 +8,12 @@ use std::fs;
 use std::io::{Read as _, Write as _};
 use std::path::{Component, Path, PathBuf};
 
+use frameshift_conformance::{
+    bundle_hash, run_bundle, ConformanceError, ConformanceTestResult, Runner, TestBundle,
+};
 use frameshift_pack::{ForkOrigin, PackManifest, LOCAL_UNSIGNED_PUBKEY};
 use frameshift_publication::{
-    is_allowed_public_path, validate_directory, PublicationReport, MAX_FILE_SIZE,
+    is_allowed_public_path, validate_directory, FindingSeverity, PublicationReport, MAX_FILE_SIZE,
 };
 use frameshift_source::{render_to_markdown, Author, Persona, PersonaSource, RenderTarget};
 use serde::{Deserialize, Serialize};
@@ -18,6 +21,9 @@ use sha2::{Digest as _, Sha256};
 
 /// Current schema version for persisted draft metadata.
 pub const DRAFT_SCHEMA_VERSION: u32 = 1;
+
+/// Current schema version for serialized exact-draft validation reports.
+pub const DRAFT_VALIDATION_SCHEMA_VERSION: u32 = 1;
 
 /// Filename holding private Creator Studio draft metadata.
 const METADATA_FILENAME: &str = "draft.json";
@@ -81,6 +87,67 @@ pub struct DraftStatus {
     pub review_current: bool,
     /// Whether publish intent still matches the current review and bytes.
     pub submission_intent_current: bool,
+}
+
+/// Scanner and conformance result bound to one exact draft revision and inventory.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DraftValidationReport {
+    /// Version of this serialized validation report contract.
+    pub schema_version: u32,
+    /// Draft revision whose exact bytes were validated.
+    pub revision: u64,
+    /// Deterministic hash of the exact validated public inventory.
+    pub inventory_hash: String,
+    /// Shared publication scanner report over the same bytes.
+    pub publication: PublicationReport,
+    /// Whether both publication policy and applicable conformance gates passed.
+    pub valid: bool,
+    /// Path-free conformance result for the exact frozen bundle.
+    pub conformance: DraftConformanceReport,
+}
+
+/// Path-free conformance result for one exact frozen draft inventory.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DraftConformanceReport {
+    /// Lifecycle state reached by conformance validation.
+    pub status: DraftConformanceStatus,
+    /// Whether all applicable conformance gates passed.
+    pub valid: bool,
+    /// Canonical bundle hash when an executable bundle was present.
+    pub bundle_hash: Option<String>,
+    /// Aggregate score when the bundle completed.
+    pub score: Option<f32>,
+    /// Caller-selected minimum aggregate score.
+    pub threshold: f32,
+    /// Path-free per-test scores in authoritative bundle order.
+    pub tests: Vec<ConformanceTestResult>,
+    /// Stable path-free findings suitable for user interfaces and automation.
+    pub findings: Vec<ConformanceFinding>,
+}
+
+/// Lifecycle state reached while validating a draft conformance bundle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DraftConformanceStatus {
+    /// The pack declares no conformance bundle or baseline.
+    NotProvided,
+    /// The exact frozen bundle ran to completion.
+    Completed,
+    /// Publication policy or a conformance invariant prevented execution.
+    Blocked,
+}
+
+/// One stable path-free conformance finding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConformanceFinding {
+    /// Stable code for programmatic handling.
+    pub code: String,
+    /// Whether the finding blocks a valid result.
+    pub severity: FindingSeverity,
+    /// Optional public test identifier associated with the finding.
+    pub test_id: Option<String>,
+    /// Human-readable explanation containing no response or local path.
+    pub message: String,
 }
 
 /// Immutable path-free copy of one exact reviewed draft inventory.
@@ -251,6 +318,9 @@ pub enum StudioError {
     /// Draft content changed while an immutable snapshot was being built.
     #[error("draft content changed while it was being frozen")]
     SnapshotChanged,
+    /// The requested conformance threshold is non-finite or outside `0.0..=1.0`.
+    #[error("conformance threshold must be finite and within 0.0..=1.0")]
+    InvalidConformanceThreshold,
     /// Target preview requires valid structured persona source.
     #[error("draft preview requires valid typed persona source")]
     InvalidPreviewSource,
@@ -729,6 +799,132 @@ impl Studio {
             return Err(StudioError::ReviewHashMismatch);
         }
 
+        self.freeze_status(id, status)
+    }
+
+    /// Run scanner and conformance validation against one exact frozen draft inventory.
+    ///
+    /// The caller-supplied runner must already be scoped to the persona under test.
+    /// Raw responses are scored inside the shared executor and never enter the report.
+    pub async fn validate_draft(
+        &self,
+        id: &str,
+        threshold: f32,
+        runner: &dyn Runner,
+    ) -> Result<DraftValidationReport, StudioError> {
+        if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
+            return Err(StudioError::InvalidConformanceThreshold);
+        }
+
+        let status = self.status(id)?;
+        if !status.publication.valid {
+            let report = validation_report(
+                &status,
+                blocked_conformance(
+                    threshold,
+                    "publication.invalid",
+                    "publication policy must pass before conformance execution",
+                ),
+            );
+            self.ensure_status_current(id, report.revision, &report.publication)?;
+            return Ok(report);
+        }
+
+        let snapshot = self.freeze_status(id, status)?;
+        let Some(manifest_file) = snapshot.files.iter().find(|file| file.path == "pack.toml")
+        else {
+            return Err(StudioError::SnapshotChanged);
+        };
+        let manifest = std::str::from_utf8(&manifest_file.bytes)
+            .ok()
+            .and_then(|raw| toml::from_str::<PackManifest>(raw).ok())
+            .ok_or(StudioError::SnapshotChanged)?;
+        let bundle_file = snapshot
+            .files
+            .iter()
+            .find(|file| file.path == "conformance/bundle.toml");
+
+        let conformance =
+            match bundle_file {
+                None => DraftConformanceReport {
+                    status: DraftConformanceStatus::NotProvided,
+                    valid: true,
+                    bundle_hash: None,
+                    score: None,
+                    threshold,
+                    tests: Vec::new(),
+                    findings: vec![ConformanceFinding {
+                        code: "conformance.not_provided".to_string(),
+                        severity: FindingSeverity::Warning,
+                        test_id: None,
+                        message: "pack declares no conformance bundle or baseline".to_string(),
+                    }],
+                },
+                Some(file) => {
+                    let bundle = match std::str::from_utf8(&file.bytes)
+                        .ok()
+                        .and_then(|raw| toml::from_str::<TestBundle>(raw).ok())
+                    {
+                        Some(bundle) => bundle,
+                        None => {
+                            return Ok(validation_report_from_snapshot(
+                                &snapshot,
+                                blocked_conformance(
+                                    threshold,
+                                    "conformance.bundle_invalid",
+                                    "conformance bundle does not match the shared schema",
+                                ),
+                            ));
+                        }
+                    };
+                    if bundle.name != manifest.name || bundle.version != manifest.version {
+                        blocked_conformance(
+                            threshold,
+                            "conformance.identity_mismatch",
+                            "conformance bundle identity must match the pack manifest",
+                        )
+                    } else if bundle.tests.is_empty() {
+                        blocked_conformance(
+                            threshold,
+                            "conformance.empty_bundle",
+                            "conformance bundle must declare at least one test",
+                        )
+                    } else {
+                        let exact_hash =
+                            bundle_hash(&bundle).map_err(|_| StudioError::SnapshotChanged)?;
+                        match run_bundle(&bundle, runner).await {
+                        Ok(run) => completed_conformance(
+                            threshold,
+                            exact_hash,
+                            run,
+                            manifest.conformance_baseline.as_ref().map(|baseline| baseline.score),
+                        ),
+                        Err(ConformanceError::UnsupportedCallerScorer(_)) => blocked_conformance(
+                            threshold,
+                            "conformance.unsupported_caller_scorer",
+                            "caller-scored tests require an explicit scoring implementation",
+                        ),
+                        Err(ConformanceError::Runner(_)) => blocked_conformance(
+                            threshold,
+                            "conformance.runner_failed",
+                            "the conformance runner failed without producing a score",
+                        ),
+                        Err(_) => blocked_conformance(
+                            threshold,
+                            "conformance.execution_failed",
+                            "conformance execution failed before producing a score",
+                        ),
+                    }
+                    }
+                }
+            };
+
+        self.ensure_status_current(id, snapshot.revision, &snapshot.publication)?;
+        Ok(validation_report_from_snapshot(&snapshot, conformance))
+    }
+
+    /// Freeze every scanner-inventoried regular file from one fresh status.
+    fn freeze_status(&self, id: &str, status: DraftStatus) -> Result<DraftSnapshot, StudioError> {
         let paths = self.draft_paths(id)?;
         let mut files = Vec::with_capacity(status.publication.inventory.len());
         for entry in &status.publication.inventory {
@@ -753,6 +949,20 @@ impl Studio {
             publication: status.publication,
             files,
         })
+    }
+
+    /// Prove a previously observed revision and inventory still describe the draft.
+    fn ensure_status_current(
+        &self,
+        id: &str,
+        revision: u64,
+        publication: &PublicationReport,
+    ) -> Result<(), StudioError> {
+        let current = self.status(id)?;
+        if current.draft.revision != revision || current.publication != *publication {
+            return Err(StudioError::SnapshotChanged);
+        }
+        Ok(())
     }
 
     /// Resolve and verify the private and public paths for one draft.
@@ -823,6 +1033,109 @@ impl Studio {
             }
             Err(error) => Err(StudioError::Io(error)),
         }
+    }
+}
+
+/// Build a combined validation report from a scanner status.
+fn validation_report(
+    status: &DraftStatus,
+    conformance: DraftConformanceReport,
+) -> DraftValidationReport {
+    DraftValidationReport {
+        schema_version: DRAFT_VALIDATION_SCHEMA_VERSION,
+        revision: status.draft.revision,
+        inventory_hash: status.publication.inventory_hash.clone(),
+        valid: status.publication.valid && conformance.valid,
+        publication: status.publication.clone(),
+        conformance,
+    }
+}
+
+/// Build a combined validation report from an immutable scanner snapshot.
+fn validation_report_from_snapshot(
+    snapshot: &DraftSnapshot,
+    conformance: DraftConformanceReport,
+) -> DraftValidationReport {
+    DraftValidationReport {
+        schema_version: DRAFT_VALIDATION_SCHEMA_VERSION,
+        revision: snapshot.revision,
+        inventory_hash: snapshot.publication.inventory_hash.clone(),
+        valid: snapshot.publication.valid && conformance.valid,
+        publication: snapshot.publication.clone(),
+        conformance,
+    }
+}
+
+/// Build a stable blocked conformance result without exposing a local path or response.
+fn blocked_conformance(threshold: f32, code: &str, message: &str) -> DraftConformanceReport {
+    DraftConformanceReport {
+        status: DraftConformanceStatus::Blocked,
+        valid: false,
+        bundle_hash: None,
+        score: None,
+        threshold,
+        tests: Vec::new(),
+        findings: vec![ConformanceFinding {
+            code: code.to_string(),
+            severity: FindingSeverity::Error,
+            test_id: None,
+            message: message.to_string(),
+        }],
+    }
+}
+
+/// Build a completed result and apply caller and manifest score gates.
+fn completed_conformance(
+    threshold: f32,
+    exact_hash: String,
+    run: frameshift_conformance::ConformanceRunReport,
+    claimed_score: Option<f32>,
+) -> DraftConformanceReport {
+    let mut findings = run
+        .tests
+        .iter()
+        .filter(|test| test.score < threshold)
+        .map(|test| ConformanceFinding {
+            code: "conformance.test_below_threshold".to_string(),
+            severity: FindingSeverity::Warning,
+            test_id: Some(test.id.clone()),
+            message: "test score is below the selected aggregate threshold".to_string(),
+        })
+        .collect::<Vec<_>>();
+    if run.score < threshold {
+        findings.push(ConformanceFinding {
+            code: "conformance.score_below_threshold".to_string(),
+            severity: FindingSeverity::Error,
+            test_id: None,
+            message: "aggregate score is below the selected threshold".to_string(),
+        });
+    }
+    if claimed_score.is_some_and(|score| run.score < score) {
+        findings.push(ConformanceFinding {
+            code: "conformance.baseline_score_unmet".to_string(),
+            severity: FindingSeverity::Error,
+            test_id: None,
+            message: "aggregate score is below the score claimed by the pack manifest".to_string(),
+        });
+    }
+    findings.sort_by(|left, right| {
+        (&left.code, &left.test_id, &left.message).cmp(&(
+            &right.code,
+            &right.test_id,
+            &right.message,
+        ))
+    });
+    let valid = !findings
+        .iter()
+        .any(|finding| finding.severity == FindingSeverity::Error);
+    DraftConformanceReport {
+        status: DraftConformanceStatus::Completed,
+        valid,
+        bundle_hash: Some(exact_hash),
+        score: Some(run.score),
+        threshold,
+        tests: run.tests,
+        findings,
     }
 }
 
@@ -1129,6 +1442,7 @@ fn sync_directory(path: &Path) {
 /// Focused tests for draft persistence and trust-boundary behavior.
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// Deterministic 32-byte public-key encoding used by publication fixtures.
     const TEST_PUBLIC_KEY: &str =
@@ -1145,6 +1459,67 @@ mod tests {
         )
         .unwrap();
         fs::write(root.join("AGENTS.md"), "# Test\n\nPrecise behavior.\n").unwrap();
+    }
+
+    /// Write one valid pack with a single built-in conformance test.
+    fn write_conformance_pack(
+        root: &Path,
+        bundle_name: &str,
+        bundle_version: &str,
+        scorer: &str,
+        baseline_score: Option<f32>,
+    ) {
+        fs::create_dir_all(root.join("conformance")).unwrap();
+        let expected = if scorer == "caller" {
+            "[tests.expected]\nkind = \"custom\"\nid = \"external-judge\""
+        } else {
+            "[tests.expected]\nkind = \"contains\"\nvalue = \"hello\""
+        };
+        let bundle_raw = format!(
+            "name = \"{bundle_name}\"\nversion = \"{bundle_version}\"\n\n\
+             [[tests]]\nid = \"greets\"\nprompt = \"Return a greeting.\"\n\
+             scorer = \"{scorer}\"\n\n{expected}\n"
+        );
+        fs::write(root.join("conformance/bundle.toml"), &bundle_raw).unwrap();
+        let bundle: TestBundle = toml::from_str(&bundle_raw).unwrap();
+        let baseline = baseline_score.map(|score| {
+            format!(
+                "\n[conformance_baseline]\nscore = {score}\nbundle_hash = \"{}\"\n",
+                bundle_hash(&bundle).unwrap()
+            )
+        });
+        fs::write(
+            root.join("pack.toml"),
+            format!(
+                "schema_version = 1\nname = \"test\"\nauthor_handle = \"tester\"\n\
+                 author_pubkey = \"{TEST_PUBLIC_KEY}\"\nversion = \"0.1.0\"\n{}",
+                baseline.unwrap_or_default()
+            ),
+        )
+        .unwrap();
+        fs::write(root.join("AGENTS.md"), "# Test\n\nPrecise behavior.\n").unwrap();
+    }
+
+    /// Runner that mutates its draft during the first conformance prompt.
+    struct MutatingRunner {
+        /// Draft store changed while conformance execution is in flight.
+        studio: Studio,
+        /// Ensures only the first prompt mutates the draft.
+        changed: AtomicBool,
+    }
+
+    /// Mutate the source inventory before returning one otherwise passing response.
+    #[async_trait::async_trait]
+    impl Runner for MutatingRunner {
+        /// Change the draft once and then return a passing response.
+        async fn run(&self, _prompt: &str) -> Result<String, ConformanceError> {
+            if !self.changed.swap(true, Ordering::SeqCst) {
+                self.studio
+                    .write_file("draft", "AGENTS.md", b"# Changed during validation\n")
+                    .map_err(|error| ConformanceError::Runner(error.to_string()))?;
+            }
+            Ok("hello".to_string())
+        }
     }
 
     /// Write a minimal valid pack with structured source for target previews.
@@ -1256,6 +1631,177 @@ mod tests {
         let parsed: PackManifest = toml::from_str(std::str::from_utf8(&manifest).unwrap()).unwrap();
         assert!(parsed.forkable);
         assert_eq!(parsed.license.as_deref(), Some("MIT"));
+    }
+
+    /// Validation runs the exact frozen bundle and excludes raw responses.
+    #[tokio::test]
+    async fn validation_returns_path_free_exact_bundle_scores() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        write_conformance_pack(&source, "test", "0.1.0", "substring", Some(1.0));
+        let studio = Studio::open(temporary.path().join("studio")).unwrap();
+        let imported = studio.import("draft", "Draft", &source).unwrap();
+
+        let report = studio
+            .validate_draft(
+                "draft",
+                0.5,
+                &frameshift_conformance::MockRunner::new("hello private response"),
+            )
+            .await
+            .unwrap();
+
+        assert!(report.valid);
+        assert_eq!(report.revision, imported.draft.revision);
+        assert_eq!(report.inventory_hash, imported.publication.inventory_hash);
+        assert_eq!(report.conformance.status, DraftConformanceStatus::Completed);
+        assert_eq!(report.conformance.score, Some(1.0));
+        assert_eq!(report.conformance.tests[0].id, "greets");
+        let serialized = serde_json::to_string(&report).unwrap();
+        assert!(!serialized.contains("private response"));
+        assert!(!serialized.contains(temporary.path().to_string_lossy().as_ref()));
+    }
+
+    /// Packs without a conformance contract remain explicit and non-blocking.
+    #[tokio::test]
+    async fn validation_reports_conformance_not_provided() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        write_valid_pack(&source);
+        let studio = Studio::open(temporary.path().join("studio")).unwrap();
+        studio.import("draft", "Draft", &source).unwrap();
+
+        let report = studio
+            .validate_draft(
+                "draft",
+                0.5,
+                &frameshift_conformance::MockRunner::new("unused"),
+            )
+            .await
+            .unwrap();
+
+        assert!(report.valid);
+        assert_eq!(
+            report.conformance.status,
+            DraftConformanceStatus::NotProvided
+        );
+        assert_eq!(
+            report.conformance.findings[0].code,
+            "conformance.not_provided"
+        );
+    }
+
+    /// Bundle identity must match the exact pack manifest identity.
+    #[tokio::test]
+    async fn validation_blocks_bundle_identity_mismatch() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        write_conformance_pack(&source, "other", "0.1.0", "substring", None);
+        let studio = Studio::open(temporary.path().join("studio")).unwrap();
+        studio.import("draft", "Draft", &source).unwrap();
+
+        let report = studio
+            .validate_draft(
+                "draft",
+                0.5,
+                &frameshift_conformance::MockRunner::new("hello"),
+            )
+            .await
+            .unwrap();
+
+        assert!(!report.valid);
+        assert_eq!(
+            report.conformance.findings[0].code,
+            "conformance.identity_mismatch"
+        );
+    }
+
+    /// A run below the signed manifest claim blocks a valid report.
+    #[tokio::test]
+    async fn validation_enforces_claimed_baseline_score() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        write_conformance_pack(&source, "test", "0.1.0", "substring", Some(1.0));
+        let studio = Studio::open(temporary.path().join("studio")).unwrap();
+        studio.import("draft", "Draft", &source).unwrap();
+
+        let report = studio
+            .validate_draft(
+                "draft",
+                0.0,
+                &frameshift_conformance::MockRunner::new("goodbye"),
+            )
+            .await
+            .unwrap();
+
+        assert!(!report.valid);
+        assert!(report
+            .conformance
+            .findings
+            .iter()
+            .any(|finding| finding.code == "conformance.baseline_score_unmet"));
+    }
+
+    /// Caller scorers fail closed when no explicit scoring implementation exists.
+    #[tokio::test]
+    async fn validation_rejects_implicit_caller_scorer() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        write_conformance_pack(&source, "test", "0.1.0", "caller", None);
+        let studio = Studio::open(temporary.path().join("studio")).unwrap();
+        studio.import("draft", "Draft", &source).unwrap();
+
+        let report = studio
+            .validate_draft(
+                "draft",
+                0.5,
+                &frameshift_conformance::MockRunner::new("unused"),
+            )
+            .await
+            .unwrap();
+
+        assert!(!report.valid);
+        assert_eq!(
+            report.conformance.findings[0].code,
+            "conformance.unsupported_caller_scorer"
+        );
+    }
+
+    /// A draft mutation during runner execution makes the result stale.
+    #[tokio::test]
+    async fn validation_rejects_concurrent_draft_mutation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        write_conformance_pack(&source, "test", "0.1.0", "substring", None);
+        let studio = Studio::open(temporary.path().join("studio")).unwrap();
+        studio.import("draft", "Draft", &source).unwrap();
+        let runner = MutatingRunner {
+            studio: studio.clone(),
+            changed: AtomicBool::new(false),
+        };
+
+        let result = studio.validate_draft("draft", 0.5, &runner).await;
+
+        assert!(matches!(result, Err(StudioError::SnapshotChanged)));
+    }
+
+    /// Invalid thresholds fail before draft I/O or runner execution.
+    #[tokio::test]
+    async fn validation_rejects_non_finite_threshold() {
+        let temporary = tempfile::tempdir().unwrap();
+        let studio = Studio::open(temporary.path().join("studio")).unwrap();
+        let result = studio
+            .validate_draft(
+                "missing",
+                f32::NAN,
+                &frameshift_conformance::MockRunner::new("unused"),
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(StudioError::InvalidConformanceThreshold)
+        ));
     }
 
     /// Invalid guided fields fail before any destination draft is published.
