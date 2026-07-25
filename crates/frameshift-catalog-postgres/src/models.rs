@@ -18,16 +18,18 @@ use serde_json::Value as JsonValue;
 
 use frameshift_catalog::{
     AccountRecord, AccountStatus, AuthorRecord, CatalogError, Ed25519PublicKey, MembershipState,
-    OauthLink, ObjectHash, PackRecord, PackStatus, PackVersionRecord, PublicationIntentRecord,
-    PublicationSubmissionRecord, PublicationSubmissionState, PublisherKeyRecord, PublisherKeyState,
-    PublisherMembershipRecord, PublisherModerationStatus, PublisherProfileRecord, PublisherRole,
+    OauthLink, ObjectHash, PackRecord, PackStatus, PackVersionRecord, PlatformRole,
+    PlatformRoleRecord, PlatformRoleState, PublicationIntentRecord, PublicationModerationAction,
+    PublicationModerationDecisionRecord, PublicationSubmissionRecord, PublicationSubmissionState,
+    PublisherKeyRecord, PublisherKeyState, PublisherMembershipRecord, PublisherModerationStatus,
+    PublisherProfileRecord, PublisherRole,
 };
 use uuid::Uuid;
 
 use crate::schema::{
-    accounts, authors, handles, pack_downloads, pack_versions, packs, publication_intents,
-    publication_submissions, publisher_audit_events, publisher_keys, publisher_memberships,
-    publisher_profiles,
+    account_platform_roles, accounts, authors, handles, pack_downloads, pack_versions, packs,
+    publication_intents, publication_moderation_decisions, publication_submissions,
+    publisher_audit_events, publisher_keys, publisher_memberships, publisher_profiles,
 };
 
 /// Queryable account row mapped from the `accounts` table.
@@ -50,6 +52,25 @@ pub(crate) struct AccountRow {
     /// Account creation timestamp.
     pub created_at: DateTime<Utc>,
     /// Most recent account update timestamp.
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Queryable global platform-role assignment row.
+#[derive(Debug, Queryable, Selectable)]
+#[diesel(table_name = account_platform_roles)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub(crate) struct PlatformRoleRow {
+    /// Account receiving the authority.
+    pub account_id: Uuid,
+    /// Global role string.
+    pub role: String,
+    /// Assignment lifecycle state string.
+    pub state: String,
+    /// Account that assigned the role.
+    pub assigned_by_account_id: Uuid,
+    /// Assignment creation timestamp.
+    pub created_at: DateTime<Utc>,
+    /// Most recent assignment update timestamp.
     pub updated_at: DateTime<Utc>,
 }
 
@@ -344,6 +365,59 @@ pub(crate) struct NewPublicationSubmissionRow {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Queryable immutable publication moderation decision row.
+#[derive(Debug, Clone, Queryable, Selectable)]
+#[diesel(table_name = publication_moderation_decisions)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub(crate) struct PublicationModerationDecisionRow {
+    /// Stable decision identifier.
+    pub id: Uuid,
+    /// Submission receiving the decision.
+    pub submission_id: Uuid,
+    /// Account that exercised moderation authority.
+    pub actor_account_id: Uuid,
+    /// Review action string.
+    pub action: String,
+    /// Submission state observed before the action.
+    pub from_state: String,
+    /// Submission state committed by the action.
+    pub to_state: String,
+    /// Stable private reason code.
+    pub reason_code: String,
+    /// Optional private explanation for the publisher.
+    pub private_explanation: Option<String>,
+    /// Stable request identifier used for replay detection.
+    pub request_id: Uuid,
+    /// Decision commit timestamp.
+    pub created_at: DateTime<Utc>,
+}
+
+/// Insertable immutable publication moderation decision row.
+#[derive(Debug, Insertable)]
+#[diesel(table_name = publication_moderation_decisions)]
+pub(crate) struct NewPublicationModerationDecisionRow {
+    /// Stable decision identifier.
+    pub id: Uuid,
+    /// Submission receiving the decision.
+    pub submission_id: Uuid,
+    /// Account that exercised moderation authority.
+    pub actor_account_id: Uuid,
+    /// Review action string.
+    pub action: String,
+    /// Submission state observed before the action.
+    pub from_state: String,
+    /// Submission state committed by the action.
+    pub to_state: String,
+    /// Stable private reason code.
+    pub reason_code: String,
+    /// Optional private explanation for the publisher.
+    pub private_explanation: Option<String>,
+    /// Stable request identifier used for replay detection.
+    pub request_id: Uuid,
+    /// Decision commit timestamp.
+    pub created_at: DateTime<Utc>,
+}
+
 /// Row struct for the `authors` table.
 ///
 /// All BYTEA columns are `Vec<u8>`; JSON columns are `serde_json::Value`.
@@ -618,6 +692,21 @@ impl AccountRow {
     }
 }
 
+/// Conversion helpers for global platform-role rows.
+impl PlatformRoleRow {
+    /// Convert this database row into a typed platform-role record.
+    pub(crate) fn into_record(self) -> Result<PlatformRoleRecord, CatalogError> {
+        Ok(PlatformRoleRecord {
+            account_id: self.account_id,
+            role: parse_text_enum::<PlatformRole>(self.role, "platform role")?,
+            state: parse_text_enum::<PlatformRoleState>(self.state, "platform role state")?,
+            assigned_by_account_id: self.assigned_by_account_id,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        })
+    }
+}
+
 /// Conversion helpers for publisher profile rows.
 impl PublisherProfileRow {
     /// Convert this database row into a [`PublisherProfileRecord`].
@@ -706,6 +795,9 @@ impl PublicationSubmissionRow {
         })?;
         let state = match self.state.as_str() {
             "quarantined" => PublicationSubmissionState::Quarantined,
+            "needs_review" => PublicationSubmissionState::NeedsReview,
+            "approved" => PublicationSubmissionState::Approved,
+            "rejected" => PublicationSubmissionState::Rejected,
             value => {
                 return Err(CatalogError::BackendError(Box::new(std::io::Error::other(
                     format!(
@@ -735,6 +827,34 @@ impl PublicationSubmissionRow {
             state,
             created_at: self.created_at,
             updated_at: self.updated_at,
+        })
+    }
+}
+
+/// Conversion helpers for immutable moderation decision rows.
+impl PublicationModerationDecisionRow {
+    /// Convert this database row into a typed moderation decision record.
+    pub(crate) fn into_record(self) -> Result<PublicationModerationDecisionRecord, CatalogError> {
+        Ok(PublicationModerationDecisionRecord {
+            id: self.id,
+            submission_id: self.submission_id,
+            actor_account_id: self.actor_account_id,
+            action: parse_text_enum::<PublicationModerationAction>(
+                self.action,
+                "publication moderation action",
+            )?,
+            from_state: parse_text_enum::<PublicationSubmissionState>(
+                self.from_state,
+                "publication moderation from state",
+            )?,
+            to_state: parse_text_enum::<PublicationSubmissionState>(
+                self.to_state,
+                "publication moderation to state",
+            )?,
+            reason_code: self.reason_code,
+            private_explanation: self.private_explanation,
+            request_id: self.request_id,
+            created_at: self.created_at,
         })
     }
 }

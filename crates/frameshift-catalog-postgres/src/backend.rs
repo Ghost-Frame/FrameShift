@@ -26,7 +26,9 @@ use tracing::{debug, error, instrument};
 use frameshift_catalog::{
     AccountRecord, AuthorRecord, CatalogBackend, CatalogError, Ed25519PublicKey, HealthStatus,
     MembershipState, PackRecord, PackSearchFilters, PackSearchResult, PackVersionRecord,
-    PublicationIntentClaim, PublicationIntentRecord, PublicationSubmissionRecord,
+    PlatformRoleRecord, PublicationIntentClaim, PublicationIntentRecord,
+    PublicationModerationAction, PublicationModerationDecisionRecord,
+    PublicationModerationDecisionRequest, PublicationSubmissionRecord,
     PublicationSubmissionRequest, PublicationSubmissionState, PublishQuota,
     PublisherAuditEventRecord, PublisherKeyRecord, PublisherMembershipRecord,
     PublisherProfileRecord, SortMode, TombstoneRecord,
@@ -38,16 +40,17 @@ use crate::errors::{map_diesel_error, map_migration_error, map_pool_error};
 use crate::models::{
     encode_text_enum, vec_to_pubkey, AccountRow, AuthorRow, HandleRow, NewAccountRow, NewAuthorRow,
     NewHandleRow, NewPackDownloadRow, NewPackRow, NewPackVersionRow, NewPublicationIntentRow,
-    NewPublicationSubmissionRow, NewPublisherAuditEventRow, NewPublisherKeyRow,
-    NewPublisherMembershipRow, NewPublisherProfileRow, PackRow, PackVersionRow,
-    PublicationIntentRow, PublicationSubmissionRow, PublisherKeyRow, PublisherMembershipRow,
-    PublisherProfileRow,
+    NewPublicationModerationDecisionRow, NewPublicationSubmissionRow, NewPublisherAuditEventRow,
+    NewPublisherKeyRow, NewPublisherMembershipRow, NewPublisherProfileRow, PackRow, PackVersionRow,
+    PlatformRoleRow, PublicationIntentRow, PublicationModerationDecisionRow,
+    PublicationSubmissionRow, PublisherKeyRow, PublisherMembershipRow, PublisherProfileRow,
 };
 use crate::pool::{build_pool, PgPool};
 use crate::schema::{
-    accounts, authors, handles, pack_downloads, pack_versions, packs, publication_intents,
-    publication_submissions, publisher_audit_events, publisher_keys, publisher_memberships,
-    publisher_profiles, signed_request_nonces,
+    account_platform_roles, accounts, authors, handles, pack_downloads, pack_versions, packs,
+    publication_intents, publication_moderation_decisions, publication_submissions,
+    publisher_audit_events, publisher_keys, publisher_memberships, publisher_profiles,
+    signed_request_nonces,
 };
 
 /// Embedded migration files compiled into the binary at build time.
@@ -283,6 +286,88 @@ fn resolve_publication_submission_retry(
         Ok(row)
     } else {
         Err(publication_submission_conflict(request.id))
+    }
+}
+
+/// Validate bounded moderation fields before starting a database transaction.
+fn validate_publication_moderation_request(
+    request: &PublicationModerationDecisionRequest,
+) -> Result<(), CatalogError> {
+    let reason = request.reason_code.as_bytes();
+    let reason_valid = !reason.is_empty()
+        && reason.len() <= 64
+        && reason
+            .first()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit());
+    let reason_tail_valid = reason.iter().skip(1).all(|byte| {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'.' | b'-')
+    });
+    if !reason_valid || !reason_tail_valid {
+        return Err(CatalogError::InvalidArgument(
+            "publication moderation reason_code must use 1-64 lowercase ASCII letters, digits, '.', '_', or '-'"
+                .to_string(),
+        ));
+    }
+    if request
+        .private_explanation
+        .as_ref()
+        .is_some_and(|value| value.trim().is_empty() || value.chars().count() > 2_000)
+    {
+        return Err(CatalogError::InvalidArgument(
+            "publication moderation private_explanation must be non-blank and at most 2000 characters"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Return the non-public submission state produced by one moderation action.
+fn publication_moderation_target(
+    action: PublicationModerationAction,
+) -> PublicationSubmissionState {
+    match action {
+        PublicationModerationAction::Approve => PublicationSubmissionState::Approved,
+        PublicationModerationAction::RequestChanges => PublicationSubmissionState::NeedsReview,
+        PublicationModerationAction::Reject => PublicationSubmissionState::Rejected,
+    }
+}
+
+/// Compare an immutable moderation decision with an exact retry request.
+fn publication_moderation_decision_matches(
+    existing: &PublicationModerationDecisionRecord,
+    request: &PublicationModerationDecisionRequest,
+) -> bool {
+    existing.id == request.id
+        && existing.submission_id == request.submission_id
+        && existing.actor_account_id == request.actor_account_id
+        && existing.action == request.action
+        && existing.to_state == publication_moderation_target(request.action)
+        && existing.reason_code == request.reason_code
+        && existing.private_explanation == request.private_explanation
+        && existing.request_id == request.request_id
+}
+
+/// Construct a uniform moderation idempotency conflict.
+fn publication_moderation_conflict(id: uuid::Uuid) -> CatalogTransactionError {
+    CatalogTransactionError::Catalog(CatalogError::Conflict {
+        kind: "publication_moderation_decision",
+        key: id.to_string(),
+    })
+}
+
+/// Convert an existing decision into an exact retry or idempotency conflict.
+fn resolve_publication_moderation_retry(
+    row: PublicationModerationDecisionRow,
+    request: &PublicationModerationDecisionRequest,
+) -> Result<PublicationModerationDecisionRow, CatalogTransactionError> {
+    let record = row
+        .clone()
+        .into_record()
+        .map_err(CatalogTransactionError::Catalog)?;
+    if publication_moderation_decision_matches(&record, request) {
+        Ok(row)
+    } else {
+        Err(publication_moderation_conflict(request.id))
     }
 }
 
@@ -1172,6 +1257,189 @@ impl CatalogBackend for PostgresCatalog {
             .await
             .map_err(|error| map_diesel_error(error, "publication_submission", id.to_string()))?
             .into_record()
+    }
+
+    /// List an account's global platform roles in stable role order.
+    async fn list_account_platform_roles(
+        &self,
+        account_id: uuid::Uuid,
+    ) -> Result<Vec<PlatformRoleRecord>, CatalogError> {
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        account_platform_roles::table
+            .filter(account_platform_roles::account_id.eq(account_id))
+            .order(account_platform_roles::role.asc())
+            .select(PlatformRoleRow::as_select())
+            .load(&mut conn)
+            .await
+            .map_err(|error| map_diesel_error(error, "platform_role", account_id.to_string()))?
+            .into_iter()
+            .map(PlatformRoleRow::into_record)
+            .collect()
+    }
+
+    /// Atomically authorize, record, and apply one non-public moderation decision.
+    async fn moderate_publication_submission(
+        &self,
+        request: PublicationModerationDecisionRequest,
+    ) -> Result<PublicationModerationDecisionRecord, CatalogError> {
+        validate_publication_moderation_request(&request)?;
+        let action = encode_text_enum(request.action)?;
+        let target_state = publication_moderation_target(request.action);
+        let target_state_text = encode_text_enum(target_state)?;
+        let decision_id = request.id;
+        let submission_id = request.submission_id;
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        use diesel_async::AsyncConnection as _;
+        let result = conn
+            .transaction::<PublicationModerationDecisionRow, CatalogTransactionError, _>(
+                async move |conn| {
+                    let actor_status = accounts::table
+                        .find(request.actor_account_id)
+                        .for_update()
+                        .select(accounts::status)
+                        .first::<String>(conn)
+                        .await
+                        .optional()?;
+                    let active_role = account_platform_roles::table
+                        .filter(account_platform_roles::account_id.eq(request.actor_account_id))
+                        .filter(account_platform_roles::state.eq("active"))
+                        .filter(account_platform_roles::role.eq_any(["moderator", "administrator"]))
+                        .order(account_platform_roles::role.asc())
+                        .for_update()
+                        .select(PlatformRoleRow::as_select())
+                        .first(conn)
+                        .await
+                        .optional()?;
+                    if actor_status.as_deref() != Some("active") || active_role.is_none() {
+                        return Err(CatalogTransactionError::Catalog(
+                            CatalogError::Unauthorized {
+                                kind: "publication_moderation",
+                                key: request.id.to_string(),
+                            },
+                        ));
+                    }
+
+                    let submission = publication_submissions::table
+                        .find(request.submission_id)
+                        .for_update()
+                        .select(PublicationSubmissionRow::as_select())
+                        .first(conn)
+                        .await
+                        .optional()?
+                        .ok_or_else(|| {
+                            CatalogTransactionError::Catalog(CatalogError::NotFound {
+                                kind: "publication_submission",
+                                key: request.submission_id.to_string(),
+                            })
+                        })?;
+                    let submission_record = submission
+                        .clone()
+                        .into_record()
+                        .map_err(CatalogTransactionError::Catalog)?;
+                    let active_ownership = publisher_memberships::table
+                        .filter(publisher_memberships::account_id.eq(request.actor_account_id))
+                        .filter(
+                            publisher_memberships::publisher_id.eq(submission_record.publisher_id),
+                        )
+                        .filter(publisher_memberships::role.eq("owner"))
+                        .filter(publisher_memberships::state.eq("active"))
+                        .for_update()
+                        .select(PublisherMembershipRow::as_select())
+                        .first(conn)
+                        .await
+                        .optional()?;
+                    if active_ownership.is_some() {
+                        return Err(CatalogTransactionError::Catalog(
+                            CatalogError::Unauthorized {
+                                kind: "publication_moderation",
+                                key: request.id.to_string(),
+                            },
+                        ));
+                    }
+
+                    let existing_by_id = publication_moderation_decisions::table
+                        .find(request.id)
+                        .select(PublicationModerationDecisionRow::as_select())
+                        .first(conn)
+                        .await
+                        .optional()?;
+                    if let Some(existing) = existing_by_id {
+                        return resolve_publication_moderation_retry(existing, &request);
+                    }
+                    let existing_by_request = publication_moderation_decisions::table
+                        .filter(publication_moderation_decisions::request_id.eq(request.request_id))
+                        .select(PublicationModerationDecisionRow::as_select())
+                        .first(conn)
+                        .await
+                        .optional()?;
+                    if let Some(existing) = existing_by_request {
+                        return resolve_publication_moderation_retry(existing, &request);
+                    }
+
+                    if !matches!(
+                        submission_record.state,
+                        PublicationSubmissionState::Quarantined
+                            | PublicationSubmissionState::NeedsReview
+                    ) {
+                        return Err(CatalogTransactionError::Catalog(CatalogError::Conflict {
+                            kind: "publication_submission",
+                            key: request.submission_id.to_string(),
+                        }));
+                    }
+                    let from_state_text = encode_text_enum(submission_record.state)
+                        .map_err(CatalogTransactionError::Catalog)?;
+                    let created_at = diesel::select(diesel::dsl::sql::<
+                        diesel::sql_types::Timestamptz,
+                    >("CURRENT_TIMESTAMP"))
+                    .get_result::<chrono::DateTime<Utc>>(conn)
+                    .await?;
+                    let decision = diesel::insert_into(publication_moderation_decisions::table)
+                        .values(NewPublicationModerationDecisionRow {
+                            id: request.id,
+                            submission_id: request.submission_id,
+                            actor_account_id: request.actor_account_id,
+                            action,
+                            from_state: from_state_text.clone(),
+                            to_state: target_state_text.clone(),
+                            reason_code: request.reason_code,
+                            private_explanation: request.private_explanation,
+                            request_id: request.request_id,
+                            created_at,
+                        })
+                        .returning(PublicationModerationDecisionRow::as_returning())
+                        .get_result(conn)
+                        .await?;
+                    let changed = diesel::update(
+                        publication_submissions::table
+                            .find(request.submission_id)
+                            .filter(publication_submissions::state.eq(from_state_text)),
+                    )
+                    .set((
+                        publication_submissions::state.eq(target_state_text),
+                        publication_submissions::updated_at.eq(created_at),
+                    ))
+                    .execute(conn)
+                    .await?;
+                    if changed != 1 {
+                        return Err(CatalogTransactionError::Catalog(CatalogError::Conflict {
+                            kind: "publication_submission",
+                            key: request.submission_id.to_string(),
+                        }));
+                    }
+                    Ok(decision)
+                },
+            )
+            .await;
+
+        match result {
+            Ok(row) => row.into_record(),
+            Err(CatalogTransactionError::Catalog(error)) => Err(error),
+            Err(CatalogTransactionError::Diesel(error)) => Err(map_diesel_error(
+                error,
+                "publication_moderation_decision",
+                format!("{decision_id}:{submission_id}"),
+            )),
+        }
     }
 
     /// Register a new author or confirm an identical author already exists.

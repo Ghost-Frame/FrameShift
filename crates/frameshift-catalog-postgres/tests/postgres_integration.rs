@@ -18,14 +18,17 @@ use diesel::{ExpressionMethods as _, QueryDsl as _};
 use diesel_async::{RunQueryDsl as _, SimpleAsyncConnection as _};
 use frameshift_catalog::{
     AccountRecord, AccountStatus, AuthorRecord, CatalogBackend, CatalogError, Ed25519PublicKey,
-    MembershipState, ObjectHash, PackSearchFilters, PackStatus, PackVersionRecord,
-    PublicationIntentClaim, PublicationIntentRecord, PublicationSubmissionRequest,
-    PublicationSubmissionState, PublishQuota, PublisherAuditEventRecord, PublisherKeyRecord,
-    PublisherKeyState, PublisherMembershipRecord, PublisherModerationStatus,
-    PublisherProfileRecord, PublisherRole, SortMode, TombstoneReason, TombstoneRecord,
+    MembershipState, ObjectHash, PackSearchFilters, PackStatus, PackVersionRecord, PlatformRole,
+    PlatformRoleState, PublicationIntentClaim, PublicationIntentRecord,
+    PublicationModerationAction, PublicationModerationDecisionRequest,
+    PublicationSubmissionRequest, PublicationSubmissionState, PublishQuota,
+    PublisherAuditEventRecord, PublisherKeyRecord, PublisherKeyState, PublisherMembershipRecord,
+    PublisherModerationStatus, PublisherProfileRecord, PublisherRole, SortMode, TombstoneReason,
+    TombstoneRecord,
 };
 use frameshift_catalog_postgres::schema::{
-    accounts, publication_submissions, publisher_audit_events, publisher_memberships,
+    account_platform_roles, accounts, publication_moderation_decisions, publication_submissions,
+    publisher_audit_events, publisher_memberships,
 };
 use frameshift_catalog_postgres::{
     OwnershipBackfillApplied, OwnershipBackfillManifest, OwnershipBackfillMode,
@@ -276,6 +279,74 @@ fn make_publication_submission(intent: &PublicationIntentRecord) -> PublicationS
         id: uuid::Uuid::new_v4(),
         intent: make_publication_claim(intent),
         scan_report: make_publication_report(intent),
+    }
+}
+
+/// Persist one active global role directly for a moderation fixture.
+async fn assign_test_platform_role(catalog: &PostgresCatalog, account_id: uuid::Uuid, role: &str) {
+    let now = chrono::Utc::now();
+    let mut connection = catalog
+        .pool()
+        .get()
+        .await
+        .expect("platform role fixture connection failed");
+    diesel::insert_into(account_platform_roles::table)
+        .values((
+            account_platform_roles::account_id.eq(account_id),
+            account_platform_roles::role.eq(role),
+            account_platform_roles::state.eq("active"),
+            account_platform_roles::assigned_by_account_id.eq(account_id),
+            account_platform_roles::created_at.eq(now),
+            account_platform_roles::updated_at.eq(now),
+        ))
+        .execute(&mut connection)
+        .await
+        .expect("insert platform role fixture failed");
+}
+
+/// Create and persist one quarantined submission for moderation tests.
+async fn create_test_publication_submission(
+    catalog: &PostgresCatalog,
+    handle: &str,
+    seed: u8,
+) -> (uuid::Uuid, uuid::Uuid, uuid::Uuid) {
+    let (owner_account_id, publisher_id, key) = create_test_publisher(catalog, handle, seed).await;
+    let now = chrono::DateTime::from_timestamp_micros(chrono::Utc::now().timestamp_micros())
+        .expect("current timestamp must fit");
+    let intent = make_publication_submission_intent(
+        owner_account_id,
+        publisher_id,
+        key.id,
+        seed.wrapping_add(1),
+        now,
+        now + chrono::Duration::minutes(10),
+    );
+    catalog
+        .create_publication_intent(intent.clone())
+        .await
+        .expect("create moderation intent failed");
+    let request = make_publication_submission(&intent);
+    let submission = catalog
+        .create_publication_submission(request)
+        .await
+        .expect("create moderation submission failed");
+    (owner_account_id, publisher_id, submission.id)
+}
+
+/// Build one bounded moderation request for a submission and actor.
+fn make_moderation_request(
+    submission_id: uuid::Uuid,
+    actor_account_id: uuid::Uuid,
+    action: PublicationModerationAction,
+) -> PublicationModerationDecisionRequest {
+    PublicationModerationDecisionRequest {
+        id: uuid::Uuid::new_v4(),
+        submission_id,
+        actor_account_id,
+        action,
+        reason_code: "policy.reviewed".to_string(),
+        private_explanation: Some("The submission completed manual review.".to_string()),
+        request_id: uuid::Uuid::new_v4(),
     }
 }
 
@@ -1771,6 +1842,432 @@ async fn publication_submission_insert_failure_does_not_burn_intent() {
         .await
         .expect_err("failed insertion must not leave a submission");
     assert!(matches!(missing, CatalogError::NotFound { .. }));
+}
+
+/// Authorized review is atomic, non-public, and exactly idempotent.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn publication_moderation_is_authorized_audited_and_idempotent() {
+    let (catalog, _container) = setup_catalog().await;
+    let (_owner_account_id, _publisher_id, submission_id) =
+        create_test_publication_submission(&catalog, "moderation-happy", 180).await;
+    let moderator = make_account(uuid::Uuid::new_v4(), "moderation-happy-reviewer");
+    catalog
+        .create_account(moderator.clone())
+        .await
+        .expect("create moderator account failed");
+    assign_test_platform_role(&catalog, moderator.id, "moderator").await;
+
+    let request = make_moderation_request(
+        submission_id,
+        moderator.id,
+        PublicationModerationAction::Approve,
+    );
+    let first = catalog
+        .moderate_publication_submission(request.clone())
+        .await
+        .expect("authorized moderation failed");
+    assert_eq!(first.id, request.id);
+    assert_eq!(first.from_state, PublicationSubmissionState::Quarantined);
+    assert_eq!(first.to_state, PublicationSubmissionState::Approved);
+    assert_eq!(
+        catalog
+            .get_publication_submission(submission_id)
+            .await
+            .expect("approved submission lookup failed")
+            .state,
+        PublicationSubmissionState::Approved
+    );
+    let roles = catalog
+        .list_account_platform_roles(moderator.id)
+        .await
+        .expect("moderator role lookup failed");
+    assert_eq!(roles.len(), 1);
+    assert_eq!(roles[0].role, PlatformRole::Moderator);
+    assert_eq!(roles[0].state, PlatformRoleState::Active);
+
+    let retry = catalog
+        .moderate_publication_submission(request.clone())
+        .await
+        .expect("exact moderation retry failed");
+    assert_eq!(retry, first);
+
+    let mut conflicting_id = request.clone();
+    conflicting_id.private_explanation = Some("Conflicting retry content.".to_string());
+    assert!(matches!(
+        catalog
+            .moderate_publication_submission(conflicting_id)
+            .await
+            .expect_err("conflicting decision id must fail"),
+        CatalogError::Conflict {
+            kind: "publication_moderation_decision",
+            ..
+        }
+    ));
+
+    let mut conflicting_request = request.clone();
+    conflicting_request.id = uuid::Uuid::new_v4();
+    assert!(matches!(
+        catalog
+            .moderate_publication_submission(conflicting_request)
+            .await
+            .expect_err("reused request id must fail"),
+        CatalogError::Conflict {
+            kind: "publication_moderation_decision",
+            ..
+        }
+    ));
+
+    let terminal = make_moderation_request(
+        submission_id,
+        moderator.id,
+        PublicationModerationAction::Reject,
+    );
+    assert!(matches!(
+        catalog
+            .moderate_publication_submission(terminal)
+            .await
+            .expect_err("terminal submission must not be re-reviewed"),
+        CatalogError::Conflict {
+            kind: "publication_submission",
+            ..
+        }
+    ));
+
+    let mut connection = catalog
+        .pool()
+        .get()
+        .await
+        .expect("moderation decision count connection failed");
+    let decision_count = publication_moderation_decisions::table
+        .count()
+        .get_result::<i64>(&mut connection)
+        .await
+        .expect("count moderation decisions failed");
+    assert_eq!(decision_count, 1);
+    diesel::update(publication_moderation_decisions::table.find(first.id))
+        .set(publication_moderation_decisions::reason_code.eq("policy.rewritten"))
+        .execute(&mut connection)
+        .await
+        .expect_err("moderation decision updates must be rejected");
+    diesel::delete(publication_moderation_decisions::table.find(first.id))
+        .execute(&mut connection)
+        .await
+        .expect_err("moderation decision deletes must be rejected");
+    assert_eq!(
+        publication_moderation_decisions::table
+            .count()
+            .get_result::<i64>(&mut connection)
+            .await
+            .expect("recount immutable moderation decisions failed"),
+        1
+    );
+}
+
+/// A request-changes decision can be followed by a fresh approval decision.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn publication_moderation_supports_the_needs_review_loop() {
+    let (catalog, _container) = setup_catalog().await;
+    let (_owner_account_id, _publisher_id, submission_id) =
+        create_test_publication_submission(&catalog, "moderation-revision", 181).await;
+    let moderator = make_account(uuid::Uuid::new_v4(), "moderation-revision-reviewer");
+    catalog
+        .create_account(moderator.clone())
+        .await
+        .expect("create revision moderator account failed");
+    assign_test_platform_role(&catalog, moderator.id, "moderator").await;
+
+    let changes = catalog
+        .moderate_publication_submission(make_moderation_request(
+            submission_id,
+            moderator.id,
+            PublicationModerationAction::RequestChanges,
+        ))
+        .await
+        .expect("request-changes moderation failed");
+    assert_eq!(changes.from_state, PublicationSubmissionState::Quarantined);
+    assert_eq!(changes.to_state, PublicationSubmissionState::NeedsReview);
+
+    let approval = catalog
+        .moderate_publication_submission(make_moderation_request(
+            submission_id,
+            moderator.id,
+            PublicationModerationAction::Approve,
+        ))
+        .await
+        .expect("approval after requested changes failed");
+    assert_eq!(approval.from_state, PublicationSubmissionState::NeedsReview);
+    assert_eq!(approval.to_state, PublicationSubmissionState::Approved);
+    assert_ne!(approval.id, changes.id);
+    assert_ne!(approval.request_id, changes.request_id);
+
+    let mut connection = catalog
+        .pool()
+        .get()
+        .await
+        .expect("revision decision count connection failed");
+    assert_eq!(
+        publication_moderation_decisions::table
+            .filter(publication_moderation_decisions::submission_id.eq(submission_id))
+            .count()
+            .get_result::<i64>(&mut connection)
+            .await
+            .expect("count revision decisions failed"),
+        2
+    );
+}
+
+/// Missing authority, inactive accounts, and self-review all fail closed.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn publication_moderation_rejects_unauthorized_inactive_and_self_review() {
+    let (catalog, _container) = setup_catalog().await;
+    let (owner_account_id, _publisher_id, submission_id) =
+        create_test_publication_submission(&catalog, "moderation-authz", 183).await;
+    let administrator = make_account(uuid::Uuid::new_v4(), "moderation-authz-admin");
+    catalog
+        .create_account(administrator.clone())
+        .await
+        .expect("create administrator account failed");
+    let request = make_moderation_request(
+        submission_id,
+        administrator.id,
+        PublicationModerationAction::Approve,
+    );
+    assert!(matches!(
+        catalog
+            .moderate_publication_submission(request.clone())
+            .await
+            .expect_err("account without platform role must fail"),
+        CatalogError::Unauthorized {
+            kind: "publication_moderation",
+            ..
+        }
+    ));
+    let unauthorized_missing = make_moderation_request(
+        uuid::Uuid::new_v4(),
+        administrator.id,
+        PublicationModerationAction::Approve,
+    );
+    assert!(matches!(
+        catalog
+            .moderate_publication_submission(unauthorized_missing)
+            .await
+            .expect_err("unauthorized actor must not probe missing submissions"),
+        CatalogError::Unauthorized {
+            kind: "publication_moderation",
+            ..
+        }
+    ));
+
+    assign_test_platform_role(&catalog, administrator.id, "administrator").await;
+    let mut connection = catalog
+        .pool()
+        .get()
+        .await
+        .expect("moderation authorization connection failed");
+    diesel::update(accounts::table.find(administrator.id))
+        .set(accounts::status.eq("suspended"))
+        .execute(&mut connection)
+        .await
+        .expect("suspend administrator failed");
+    assert!(matches!(
+        catalog
+            .moderate_publication_submission(request.clone())
+            .await
+            .expect_err("suspended administrator must fail"),
+        CatalogError::Unauthorized { .. }
+    ));
+    diesel::update(accounts::table.find(administrator.id))
+        .set(accounts::status.eq("active"))
+        .execute(&mut connection)
+        .await
+        .expect("reactivate administrator failed");
+    diesel::update(
+        account_platform_roles::table.find((administrator.id, "administrator".to_string())),
+    )
+    .set(account_platform_roles::state.eq("revoked"))
+    .execute(&mut connection)
+    .await
+    .expect("revoke administrator role failed");
+    assert!(matches!(
+        catalog
+            .moderate_publication_submission(request.clone())
+            .await
+            .expect_err("revoked administrator role must fail"),
+        CatalogError::Unauthorized { .. }
+    ));
+    diesel::update(
+        account_platform_roles::table.find((administrator.id, "administrator".to_string())),
+    )
+    .set(account_platform_roles::state.eq("active"))
+    .execute(&mut connection)
+    .await
+    .expect("reactivate administrator role failed");
+    drop(connection);
+
+    assign_test_platform_role(&catalog, owner_account_id, "moderator").await;
+    let owner_request = make_moderation_request(
+        submission_id,
+        owner_account_id,
+        PublicationModerationAction::Reject,
+    );
+    assert!(matches!(
+        catalog
+            .moderate_publication_submission(owner_request)
+            .await
+            .expect_err("publisher owner must not review their own submission"),
+        CatalogError::Unauthorized {
+            kind: "publication_moderation",
+            ..
+        }
+    ));
+
+    let approved = catalog
+        .moderate_publication_submission(request)
+        .await
+        .expect("foreign active administrator should review");
+    assert_eq!(approved.to_state, PublicationSubmissionState::Approved);
+
+    let missing = make_moderation_request(
+        uuid::Uuid::new_v4(),
+        administrator.id,
+        PublicationModerationAction::Approve,
+    );
+    assert!(matches!(
+        catalog
+            .moderate_publication_submission(missing)
+            .await
+            .expect_err("missing submission must fail"),
+        CatalogError::NotFound {
+            kind: "publication_submission",
+            ..
+        }
+    ));
+}
+
+/// Malformed or oversized private moderation fields never mutate state.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn publication_moderation_validates_bounded_private_fields() {
+    let (catalog, _container) = setup_catalog().await;
+    let (_owner_account_id, _publisher_id, submission_id) =
+        create_test_publication_submission(&catalog, "moderation-bounds", 186).await;
+    let moderator = make_account(uuid::Uuid::new_v4(), "moderation-bounds-reviewer");
+    catalog
+        .create_account(moderator.clone())
+        .await
+        .expect("create bounds moderator failed");
+    assign_test_platform_role(&catalog, moderator.id, "moderator").await;
+    let base = make_moderation_request(
+        submission_id,
+        moderator.id,
+        PublicationModerationAction::Reject,
+    );
+
+    let mut invalid_requests = Vec::new();
+    let mut blank_reason = base.clone();
+    blank_reason.reason_code.clear();
+    invalid_requests.push(blank_reason);
+    let mut uppercase_reason = base.clone();
+    uppercase_reason.reason_code = "Policy.Invalid".to_string();
+    invalid_requests.push(uppercase_reason);
+    let mut long_reason = base.clone();
+    long_reason.reason_code = "a".repeat(65);
+    invalid_requests.push(long_reason);
+    let mut blank_explanation = base.clone();
+    blank_explanation.private_explanation = Some("   ".to_string());
+    invalid_requests.push(blank_explanation);
+    let mut long_explanation = base;
+    long_explanation.private_explanation = Some("x".repeat(2_001));
+    invalid_requests.push(long_explanation);
+
+    for invalid in invalid_requests {
+        assert!(matches!(
+            catalog
+                .moderate_publication_submission(invalid)
+                .await
+                .expect_err("invalid moderation field must fail"),
+            CatalogError::InvalidArgument(_)
+        ));
+    }
+    assert_eq!(
+        catalog
+            .get_publication_submission(submission_id)
+            .await
+            .expect("bounded submission lookup failed")
+            .state,
+        PublicationSubmissionState::Quarantined
+    );
+    let mut connection = catalog
+        .pool()
+        .get()
+        .await
+        .expect("bounded decision count connection failed");
+    assert_eq!(
+        publication_moderation_decisions::table
+            .count()
+            .get_result::<i64>(&mut connection)
+            .await
+            .expect("count bounded moderation decisions failed"),
+        0
+    );
+}
+
+/// A decision insert failure rolls back the submission lifecycle update.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn publication_moderation_insert_failure_rolls_back_state() {
+    let (catalog, _container) = setup_catalog().await;
+    let (_owner_account_id, _publisher_id, submission_id) =
+        create_test_publication_submission(&catalog, "moderation-rollback", 189).await;
+    let moderator = make_account(uuid::Uuid::new_v4(), "moderation-rollback-reviewer");
+    catalog
+        .create_account(moderator.clone())
+        .await
+        .expect("create rollback moderator failed");
+    assign_test_platform_role(&catalog, moderator.id, "moderator").await;
+    let mut connection = catalog
+        .pool()
+        .get()
+        .await
+        .expect("moderation rollback connection failed");
+    connection
+        .batch_execute(
+            r#"
+            CREATE FUNCTION reject_test_moderation_decision() RETURNS trigger
+            LANGUAGE plpgsql AS $$
+            BEGIN
+                RAISE EXCEPTION 'forced moderation decision failure';
+            END
+            $$;
+            CREATE TRIGGER reject_test_moderation_decision
+            BEFORE INSERT ON publication_moderation_decisions
+            FOR EACH ROW EXECUTE FUNCTION reject_test_moderation_decision();
+            "#,
+        )
+        .await
+        .expect("install moderation rejection trigger failed");
+    drop(connection);
+
+    let request = make_moderation_request(
+        submission_id,
+        moderator.id,
+        PublicationModerationAction::Reject,
+    );
+    catalog
+        .moderate_publication_submission(request)
+        .await
+        .expect_err("forced moderation insertion failure must surface");
+    assert_eq!(
+        catalog
+            .get_publication_submission(submission_id)
+            .await
+            .expect("rollback submission lookup failed")
+            .state,
+        PublicationSubmissionState::Quarantined
+    );
 }
 
 /// Publisher writes persist identity links and reject revoked keys without hiding history.

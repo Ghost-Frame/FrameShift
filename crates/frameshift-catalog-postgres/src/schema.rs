@@ -154,6 +154,24 @@ diesel::table! {
 }
 
 diesel::table! {
+    /// Global moderation authority assigned independently of publisher ownership.
+    account_platform_roles (account_id, role) {
+        /// Account receiving the global authority.
+        account_id -> Uuid,
+        /// Assigned global role.
+        role -> Text,
+        /// Assignment lifecycle state.
+        state -> Text,
+        /// Account that assigned the role.
+        assigned_by_account_id -> Uuid,
+        /// Assignment creation timestamp.
+        created_at -> Timestamptz,
+        /// Most recent assignment update timestamp.
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     /// Artifacts admitted only to the internal publication quarantine boundary.
     publication_submissions (id) {
         /// Stable submission identifier and idempotency key.
@@ -182,6 +200,32 @@ diesel::table! {
         created_at -> Timestamptz,
         /// Most recent lifecycle update timestamp.
         updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    /// Immutable review decisions for quarantined publication submissions.
+    publication_moderation_decisions (id) {
+        /// Stable decision identifier and idempotency key.
+        id -> Uuid,
+        /// Submission receiving the decision.
+        submission_id -> Uuid,
+        /// Account that exercised moderation authority.
+        actor_account_id -> Uuid,
+        /// Review action applied to the submission.
+        action -> Text,
+        /// Submission state observed before the decision.
+        from_state -> Text,
+        /// Submission state committed by the decision.
+        to_state -> Text,
+        /// Stable private reason code.
+        reason_code -> Text,
+        /// Optional private explanation for the publisher.
+        private_explanation -> Nullable<Text>,
+        /// Stable request identifier used for replay detection.
+        request_id -> Uuid,
+        /// Decision commit timestamp.
+        created_at -> Timestamptz,
     }
 }
 
@@ -332,6 +376,9 @@ diesel::joinable!(publisher_audit_events -> accounts (actor_account_id));
 diesel::joinable!(publisher_audit_events -> publisher_profiles (publisher_id));
 diesel::joinable!(publisher_audit_events -> publisher_keys (target_key_id));
 diesel::joinable!(publication_submissions -> publication_intents (intent_id));
+diesel::joinable!(account_platform_roles -> accounts (account_id));
+diesel::joinable!(publication_moderation_decisions -> accounts (actor_account_id));
+diesel::joinable!(publication_moderation_decisions -> publication_submissions (submission_id));
 
 diesel::allow_tables_to_appear_in_same_query!(
     authors,
@@ -341,10 +388,12 @@ diesel::allow_tables_to_appear_in_same_query!(
     pack_downloads,
     signed_request_nonces,
     accounts,
+    account_platform_roles,
     publisher_profiles,
     publisher_memberships,
     publisher_keys,
     publisher_audit_events,
     publication_intents,
     publication_submissions,
+    publication_moderation_decisions,
 );
