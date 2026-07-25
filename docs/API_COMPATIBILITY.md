@@ -147,6 +147,45 @@ application release. It does not run a down migration, clear linked identifiers,
 rewrite history, or delete publisher records. Database restoration is reserved for
 a failed apply and uses the restore procedure proven before the transaction.
 
+## Publication admission and promotion
+
+The account-backed publication workflow is an additive API surface. The standard
+application router does not mount publication-submission or promotion writes.
+Operators must explicitly construct the publication-enabled router with an
+isolated quarantine store before these endpoints exist.
+
+Publication archives submitted to `POST /v1/publication-submissions` must contain
+the manifest-declared files plus `signature.sig`. FrameShift verifies the detached
+Ed25519 signature with the exact active publisher key bound by the durable
+publication intent. Unsigned archives, malformed signatures, unexpected signer
+keys, and manifest or inventory mismatches fail closed before catalog admission.
+
+An independent active moderator or administrator promotes an approved submission
+with:
+
+```http
+POST /v1/moderation/publication-submissions/{submission_id}/promotion
+Authorization: Bearer <account token>
+X-Request-Id: <stable UUID>
+Content-Type: application/json
+
+{"id":"<stable promotion UUID>"}
+```
+
+The path submission identifier, promotion identifier, actor account, request
+identifier, archive hash, pack name, and semantic version are bound into immutable
+promotion evidence. The server re-reads and re-verifies the exact quarantine
+archive, writes it to the public content-addressed store, and atomically registers
+one catalog version while moving the submission from `approved` to `promoted`.
+Publisher owners cannot promote their own submissions. An exact retry returns the
+existing evidence even if the reviewer's role or signing key was revoked after the
+first successful commit; identifier substitution and conflicting retries fail.
+
+The promotion schema is forward-only because its rows are publication audit
+evidence. Application rollback removes the opt-in routes but does not erase
+promotion rows, active versions, signer evidence, or public content-addressed
+objects.
+
 ## Release evidence
 
 Every public contract change must include focused tests, generated implementation

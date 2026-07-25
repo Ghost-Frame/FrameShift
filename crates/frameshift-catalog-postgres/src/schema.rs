@@ -172,6 +172,28 @@ diesel::table! {
 }
 
 diesel::table! {
+    /// Immutable evidence linking approved submissions to public catalog versions.
+    publication_promotions (id) {
+        /// Stable promotion identifier.
+        id -> Uuid,
+        /// Submission activated by this promotion.
+        submission_id -> Uuid,
+        /// Account that exercised promotion authority.
+        actor_account_id -> Uuid,
+        /// Public pack name.
+        pack_name -> Text,
+        /// Public semantic version.
+        version -> Text,
+        /// Raw 32-byte public object hash.
+        content_hash -> Binary,
+        /// Stable request correlation identifier.
+        request_id -> Uuid,
+        /// Promotion commit timestamp.
+        created_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     /// Artifacts admitted only to the internal publication quarantine boundary.
     publication_submissions (id) {
         /// Stable submission identifier and idempotency key.
@@ -379,6 +401,8 @@ diesel::joinable!(publication_submissions -> publication_intents (intent_id));
 diesel::joinable!(account_platform_roles -> accounts (account_id));
 diesel::joinable!(publication_moderation_decisions -> accounts (actor_account_id));
 diesel::joinable!(publication_moderation_decisions -> publication_submissions (submission_id));
+// Allow Diesel join inference from immutable promotions to their submissions.
+diesel::joinable!(publication_promotions -> publication_submissions (submission_id));
 
 diesel::allow_tables_to_appear_in_same_query!(
     authors,
@@ -396,4 +420,5 @@ diesel::allow_tables_to_appear_in_same_query!(
     publication_intents,
     publication_submissions,
     publication_moderation_decisions,
+    publication_promotions,
 );

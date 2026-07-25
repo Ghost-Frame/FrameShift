@@ -11,7 +11,7 @@ use axum::{Extension, Json, Router};
 use frameshift_catalog::{
     CatalogError, MembershipState, PlatformRole, PlatformRoleState, PublicationModerationAction,
     PublicationModerationDecisionRecord, PublicationModerationDecisionRequest,
-    PublicationSubmissionRecord, PublisherRole,
+    PublicationPromotionRecord, PublicationSubmissionRecord, PublisherRole,
 };
 use frameshift_objects::{ObjectHash, PackStore};
 use serde::Deserialize;
@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 use crate::error::AppError;
 use crate::middleware::account::AuthenticatedAccount;
+use crate::publication::{PublicationPromotionError, PublicationPromotionService};
 use crate::state::AppState;
 
 /// Caller-controlled fields accepted for one publication moderation decision.
@@ -35,22 +36,42 @@ struct ModeratePublicationRequest {
     private_explanation: Option<String>,
 }
 
+/// Caller-controlled identity for one approved-submission promotion.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PromotePublicationRequest {
+    /// Stable caller-generated promotion identifier.
+    id: Uuid,
+}
+
 /// Build role-gated publication moderation routes.
 ///
 /// Artifact access is mounted only when the caller supplies the isolated
 /// quarantine store used by publication admission.
-pub fn moderation_router(quarantine: Option<Arc<dyn PackStore>>) -> Router<AppState> {
+pub fn moderation_router(
+    quarantine: Option<Arc<dyn PackStore>>,
+    promotion: Option<Arc<PublicationPromotionService>>,
+) -> Router<AppState> {
     let router = Router::new()
         .route("/{submission_id}", get(get_moderation_submission))
         .route(
             "/{submission_id}/decisions",
             post(create_moderation_decision),
         );
-    if let Some(quarantine) = quarantine {
+    let router = if let Some(quarantine) = quarantine {
         router.merge(
             Router::new()
                 .route("/{submission_id}/artifact", get(get_moderation_artifact))
                 .layer(Extension(quarantine)),
+        )
+    } else {
+        router
+    };
+    if let Some(promotion) = promotion {
+        router.merge(
+            Router::new()
+                .route("/{submission_id}/promotion", post(promote_publication))
+                .layer(Extension(promotion)),
         )
     } else {
         router
@@ -136,6 +157,36 @@ async fn create_moderation_decision(
         .map_err(map_moderation_submission_error)
 }
 
+/// Promote one path-bound approved submission using only server-verified bytes.
+async fn promote_publication(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthenticatedAccount>,
+    Extension(promotion): Extension<Arc<PublicationPromotionService>>,
+    Path(submission_id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(body): Json<PromotePublicationRequest>,
+) -> Result<Json<PublicationPromotionRecord>, AppError> {
+    let submission = state
+        .catalog
+        .get_publication_submission(submission_id)
+        .await
+        .map_err(map_moderation_submission_error)?;
+    if submission.state != frameshift_catalog::PublicationSubmissionState::Promoted {
+        require_moderation_role(&state, auth.account.id).await?;
+        require_independent_reviewer(&state, auth.account.id, submission.publisher_id).await?;
+    }
+    promotion
+        .promote(
+            body.id,
+            submission_id,
+            auth.account.id,
+            request_id(&headers)?,
+        )
+        .await
+        .map(Json)
+        .map_err(map_publication_promotion_error)
+}
+
 /// Require an active moderator or administrator assignment for one account.
 async fn require_moderation_role(state: &AppState, account_id: Uuid) -> Result<(), AppError> {
     let authorized = state
@@ -200,5 +251,27 @@ fn map_moderation_submission_error(error: CatalogError) -> AppError {
             AppError::NotFound("publication submission not found".to_string())
         }
         other => AppError::from_catalog(other, "publication moderation"),
+    }
+}
+
+/// Map promotion failures without exposing private archive or catalog details.
+fn map_publication_promotion_error(error: PublicationPromotionError) -> AppError {
+    match error {
+        PublicationPromotionError::Catalog(error) => map_moderation_submission_error(error),
+        PublicationPromotionError::NotApproved => {
+            AppError::Conflict("publication submission is not approved".to_string())
+        }
+        PublicationPromotionError::Quarantine(_)
+        | PublicationPromotionError::Integrity
+        | PublicationPromotionError::Verification(_)
+        | PublicationPromotionError::ReportMismatch => {
+            AppError::BadGateway("publication quarantine artifact failed verification".to_string())
+        }
+        PublicationPromotionError::Manifest(field) => {
+            AppError::BadRequest(format!("publication manifest {field} is invalid"))
+        }
+        PublicationPromotionError::PublicStore(_) => {
+            AppError::ServiceUnavailable("public object storage is unavailable".to_string())
+        }
     }
 }

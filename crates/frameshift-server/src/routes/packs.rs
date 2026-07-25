@@ -129,6 +129,7 @@ fn map_publication_inspection_error(error: PublicationAdmissionError) -> AppErro
         }
         PublicationAdmissionError::ArchiveHashMismatch
         | PublicationAdmissionError::IntentMismatch { .. }
+        | PublicationAdmissionError::Signature
         | PublicationAdmissionError::Quarantine(_)
         | PublicationAdmissionError::Catalog(_) => {
             AppError::Internal("unexpected publication inspection state".to_string())

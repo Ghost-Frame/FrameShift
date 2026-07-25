@@ -24,10 +24,10 @@ use frameshift_catalog::records::{
     AccountRecord, AccountStatus, AuthorRecord, MembershipState, PackRecord, PackVersionRecord,
     PlatformRole, PlatformRoleRecord, PlatformRoleState, PublicationIntentRecord,
     PublicationModerationAction, PublicationModerationDecisionRecord,
-    PublicationModerationDecisionRequest, PublicationSubmissionRecord,
-    PublicationSubmissionRequest, PublicationSubmissionState, PublisherAuditEventRecord,
-    PublisherKeyRecord, PublisherKeyState, PublisherMembershipRecord, PublisherProfileRecord,
-    PublisherRole,
+    PublicationModerationDecisionRequest, PublicationPromotionRecord, PublicationPromotionRequest,
+    PublicationSubmissionRecord, PublicationSubmissionRequest, PublicationSubmissionState,
+    PublisherAuditEventRecord, PublisherKeyRecord, PublisherKeyState, PublisherMembershipRecord,
+    PublisherModerationStatus, PublisherProfileRecord, PublisherRole,
 };
 use frameshift_catalog::status::{PackStatus, TombstoneRecord};
 // Reuse the exact same version-precedence comparator the Postgres adapter
@@ -104,8 +104,14 @@ pub struct MockState {
     /// Immutable publication moderation decisions keyed by stable identifier.
     pub publication_moderation_decisions: HashMap<uuid::Uuid, PublicationModerationDecisionRecord>,
 
+    /// Immutable successful promotions keyed by stable identifier.
+    pub publication_promotions: HashMap<uuid::Uuid, PublicationPromotionRecord>,
+
     /// Optional persistent backend failure injected into submission creation.
     pub publication_submission_error: Option<String>,
+
+    /// Optional persistent backend failure injected into publication promotion.
+    pub publication_promotion_error: Option<String>,
 
     /// Whether submission creation enforces the durable intent transaction invariants.
     pub enforce_publication_submission_invariants: bool,
@@ -1473,6 +1479,165 @@ impl CatalogBackend for MockCatalog {
             .publication_moderation_decisions
             .insert(decision.id, decision.clone());
         Ok(decision)
+    }
+
+    /// Authorize and atomically activate one approved publication submission.
+    async fn promote_publication_submission(
+        &self,
+        request: PublicationPromotionRequest,
+        _quota: PublishQuota,
+    ) -> Result<PublicationPromotionRecord, CatalogError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        let exact_retry = |record: &PublicationPromotionRecord| {
+            record.id == request.id
+                && record.submission_id == request.submission_id
+                && record.actor_account_id == request.actor_account_id
+                && record.pack_name == request.version.pack_name
+                && record.version == request.version.version
+                && record.content_hash == request.version.content_hash
+                && record.request_id == request.request_id
+        };
+        if let Some(existing) = state.publication_promotions.values().find(|record| {
+            record.id == request.id
+                || record.submission_id == request.submission_id
+                || record.request_id == request.request_id
+        }) {
+            return if exact_retry(existing) {
+                Ok(existing.clone())
+            } else {
+                Err(CatalogError::Conflict {
+                    kind: "publication_promotion",
+                    key: request.id.to_string(),
+                })
+            };
+        }
+        if let Some(message) = &state.publication_promotion_error {
+            return Err(CatalogError::BackendError(
+                std::io::Error::other(message.clone()).into(),
+            ));
+        }
+
+        let submission = state
+            .publication_submissions
+            .get(&request.submission_id)
+            .cloned()
+            .ok_or_else(|| CatalogError::NotFound {
+                kind: "publication_submission",
+                key: request.submission_id.to_string(),
+            })?;
+        let actor_is_active = state
+            .accounts
+            .get(&request.actor_account_id)
+            .is_some_and(|account| account.status == AccountStatus::Active);
+        let role_is_active = state.platform_roles.iter().any(|role| {
+            role.account_id == request.actor_account_id
+                && role.state == PlatformRoleState::Active
+                && matches!(
+                    role.role,
+                    PlatformRole::Moderator | PlatformRole::Administrator
+                )
+        });
+        let actor_is_owner = state.publisher_memberships.values().any(|membership| {
+            membership.account_id == request.actor_account_id
+                && membership.publisher_id == submission.publisher_id
+                && membership.role == PublisherRole::Owner
+                && membership.state == MembershipState::Active
+        });
+        let publisher_is_approved =
+            state
+                .publishers
+                .get(&submission.publisher_id)
+                .is_some_and(|publisher| {
+                    publisher.moderation_status == PublisherModerationStatus::Approved
+                });
+        let key_is_active = state
+            .publisher_keys
+            .get(&submission.publisher_key_id)
+            .is_some_and(|key| {
+                key.publisher_id == submission.publisher_id
+                    && key.state == PublisherKeyState::Active
+                    && key.public_key == request.version.author_pubkey
+            });
+        if submission.state != PublicationSubmissionState::Approved
+            || request.version.content_hash != submission.archive_hash
+            || request.version.publisher_key_id != Some(submission.publisher_key_id)
+        {
+            return Err(CatalogError::Conflict {
+                kind: "publication_submission",
+                key: request.submission_id.to_string(),
+            });
+        }
+        if !actor_is_active
+            || !role_is_active
+            || actor_is_owner
+            || !publisher_is_approved
+            || !key_is_active
+        {
+            return Err(CatalogError::Unauthorized {
+                kind: "publication_promotion",
+                key: request.id.to_string(),
+            });
+        }
+        let version_key = (
+            request.version.pack_name.clone(),
+            request.version.version.clone(),
+        );
+        if state.versions.contains_key(&version_key) {
+            return Err(CatalogError::Conflict {
+                kind: "pack_version",
+                key: format!("{}@{}", version_key.0, version_key.1),
+            });
+        }
+
+        let now = Utc::now();
+        let pack = state
+            .packs
+            .entry(request.version.pack_name.clone())
+            .or_insert_with(|| PackRecord {
+                name: request.version.pack_name.clone(),
+                current_author: request.version.author_pubkey,
+                publisher_id: Some(submission.publisher_id),
+                tags: Vec::new(),
+                description: String::new(),
+                created_at: now,
+                latest_version: None,
+                total_downloads: 0,
+                extends: None,
+            });
+        if pack.publisher_id != Some(submission.publisher_id) {
+            return Err(CatalogError::Unauthorized {
+                kind: "pack",
+                key: request.version.pack_name,
+            });
+        }
+        pack.latest_version = Some(request.version.version.clone());
+        pack.description = request.description;
+        pack.tags = request.tags;
+        pack.extends = request.extends;
+        state.versions.insert(version_key, request.version.clone());
+        let promotion = PublicationPromotionRecord {
+            id: request.id,
+            submission_id: request.submission_id,
+            actor_account_id: request.actor_account_id,
+            pack_name: request.version.pack_name,
+            version: request.version.version,
+            content_hash: request.version.content_hash,
+            request_id: request.request_id,
+            created_at: now,
+        };
+        let stored_submission = state
+            .publication_submissions
+            .get_mut(&request.submission_id)
+            .expect("validated publication submission must remain present");
+        stored_submission.state = PublicationSubmissionState::Promoted;
+        stored_submission.updated_at = now;
+        state
+            .publication_promotions
+            .insert(promotion.id, promotion.clone());
+        Ok(promotion)
     }
 }
 
