@@ -11,9 +11,10 @@ use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
 use frameshift_catalog::{
-    AccountRecord, CatalogError, Ed25519PublicKey, MembershipState, PublicationLifecycleCursor,
-    PublicationLifecycleDecisionRecord, PublisherAuditEventRecord, PublisherKeyRecord,
-    PublisherKeyState, PublisherMembershipRecord, PublisherModerationStatus,
+    AccountRecord, CatalogError, Ed25519PublicKey, MembershipState, PublicationAppealCaseRecord,
+    PublicationAppealCursor, PublicationAppealRecord, PublicationAppealRequest,
+    PublicationLifecycleCursor, PublicationLifecycleDecisionRecord, PublisherAuditEventRecord,
+    PublisherKeyRecord, PublisherKeyState, PublisherMembershipRecord, PublisherModerationStatus,
     PublisherProfileRecord, PublisherRole,
 };
 use serde::{Deserialize, Serialize};
@@ -21,6 +22,7 @@ use uuid::Uuid;
 
 use crate::error::AppError;
 use crate::middleware::account::AuthenticatedAccount;
+use crate::middleware::request_id::ClientRequestId;
 use crate::state::AppState;
 
 /// Maximum accepted account email length in Unicode scalar values.
@@ -42,6 +44,16 @@ struct PublisherLifecycleQuery {
     before_id: Option<Uuid>,
     /// Bounded result count, defaulting to fifty.
     limit: Option<u32>,
+}
+
+/// Caller-controlled fields for one publisher-owner appeal filing.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FilePublicationAppealRequest {
+    /// Stable caller-generated appeal identifier.
+    id: Uuid,
+    /// Bounded private statement explaining the appeal.
+    statement: String,
 }
 
 /// Public OIDC bootstrap metadata returned to clients.
@@ -155,6 +167,76 @@ pub fn account_write_router() -> Router<AppState> {
             "/publishers/{handle}/publication-decisions",
             get(list_publisher_publication_decisions),
         )
+        .route(
+            "/publishers/{handle}/publication-decisions/{decision_id}/appeal",
+            post(file_publication_appeal),
+        )
+        .route(
+            "/publishers/{handle}/publication-appeals",
+            get(list_publisher_publication_appeals),
+        )
+}
+
+/// File one path-bound appeal as an authenticated publisher owner.
+async fn file_publication_appeal(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthenticatedAccount>,
+    Extension(client_request_id): Extension<ClientRequestId>,
+    Path((handle, decision_id)): Path<(String, Uuid)>,
+    Json(body): Json<FilePublicationAppealRequest>,
+) -> Result<Json<PublicationAppealRecord>, AppError> {
+    let profile = state
+        .catalog
+        .get_publisher_by_handle(&handle)
+        .await
+        .map_err(|error| AppError::from_catalog(error, "publisher"))?;
+    state
+        .catalog
+        .file_publication_appeal(PublicationAppealRequest {
+            id: body.id,
+            decision_id,
+            publisher_id: profile.id,
+            actor_account_id: auth.account.id,
+            statement: body.statement,
+            request_id: required_request_id(client_request_id)?,
+        })
+        .await
+        .map(Json)
+        .map_err(|error| AppError::from_catalog(error, "publication appeal"))
+}
+
+/// List private appeal cases for an authorized publisher owner or administrator.
+async fn list_publisher_publication_appeals(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthenticatedAccount>,
+    Path(handle): Path<String>,
+    Query(query): Query<PublisherLifecycleQuery>,
+) -> Result<Json<Vec<PublicationAppealCaseRecord>>, AppError> {
+    let profile = state
+        .catalog
+        .get_publisher_by_handle(&handle)
+        .await
+        .map_err(|error| AppError::from_catalog(error, "publisher"))?;
+    let before = match (query.before_created_at, query.before_id) {
+        (None, None) => None,
+        (Some(created_at), Some(id)) => Some(PublicationAppealCursor { created_at, id }),
+        _ => {
+            return Err(AppError::BadRequest(
+                "before_created_at and before_id must be supplied together".to_string(),
+            ));
+        }
+    };
+    state
+        .catalog
+        .list_publisher_publication_appeals(
+            auth.account.id,
+            profile.id,
+            before,
+            query.limit.unwrap_or(50),
+        )
+        .await
+        .map(Json)
+        .map_err(|error| AppError::from_catalog(error, "publication appeal"))
 }
 
 /// List immutable lifecycle evidence for an authorized publisher owner or administrator.
@@ -536,6 +618,13 @@ fn request_id(headers: &HeaderMap) -> Option<Uuid> {
         .get("x-request-id")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| Uuid::parse_str(value).ok())
+}
+
+/// Parse the mandatory request correlation header for an idempotent appeal.
+fn required_request_id(client_request_id: ClientRequestId) -> Result<Uuid, AppError> {
+    client_request_id
+        .0
+        .ok_or_else(|| AppError::BadRequest("x-request-id must be a UUID".to_string()))
 }
 
 /// Build one sanitized account-driven publisher audit event.

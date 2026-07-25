@@ -62,14 +62,16 @@ pub use frameshift_pack::ObjectHash;
 pub use identity::Ed25519PublicKey;
 pub use records::{
     AccountRecord, AccountStatus, AuthorRecord, MembershipState, OauthLink, PackRecord,
-    PackVersionRecord, PlatformRole, PlatformRoleRecord, PlatformRoleState, PublicationIntentClaim,
-    PublicationIntentRecord, PublicationLifecycleAction, PublicationLifecycleCursor,
-    PublicationLifecycleDecisionRecord, PublicationModerationAction,
-    PublicationModerationDecisionRecord, PublicationModerationDecisionRequest,
-    PublicationPromotionRecord, PublicationPromotionRequest, PublicationSubmissionRecord,
-    PublicationSubmissionRequest, PublicationSubmissionState, PublicationTombstoneRequest,
-    PublicationWithdrawalRequest, PublisherAuditEventRecord, PublisherKeyRecord, PublisherKeyState,
-    PublisherMembershipRecord, PublisherModerationStatus, PublisherProfileRecord, PublisherRole,
-    PublisherSuspensionRequest,
+    PackVersionRecord, PlatformRole, PlatformRoleRecord, PlatformRoleState,
+    PublicationAppealCaseRecord, PublicationAppealCursor, PublicationAppealDisposition,
+    PublicationAppealRecord, PublicationAppealRequest, PublicationAppealResolutionRecord,
+    PublicationAppealResolutionRequest, PublicationIntentClaim, PublicationIntentRecord,
+    PublicationLifecycleAction, PublicationLifecycleCursor, PublicationLifecycleDecisionRecord,
+    PublicationModerationAction, PublicationModerationDecisionRecord,
+    PublicationModerationDecisionRequest, PublicationPromotionRecord, PublicationPromotionRequest,
+    PublicationSubmissionRecord, PublicationSubmissionRequest, PublicationSubmissionState,
+    PublicationTombstoneRequest, PublicationWithdrawalRequest, PublisherAuditEventRecord,
+    PublisherKeyRecord, PublisherKeyState, PublisherMembershipRecord, PublisherModerationStatus,
+    PublisherProfileRecord, PublisherRole, PublisherSuspensionRequest,
 };
 pub use status::{PackStatus, TombstoneReason, TombstoneRecord};

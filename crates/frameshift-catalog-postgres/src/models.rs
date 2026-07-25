@@ -19,7 +19,8 @@ use serde_json::Value as JsonValue;
 use frameshift_catalog::{
     AccountRecord, AccountStatus, AuthorRecord, CatalogError, Ed25519PublicKey, MembershipState,
     OauthLink, ObjectHash, PackRecord, PackStatus, PackVersionRecord, PlatformRole,
-    PlatformRoleRecord, PlatformRoleState, PublicationIntentRecord, PublicationLifecycleAction,
+    PlatformRoleRecord, PlatformRoleState, PublicationAppealDisposition, PublicationAppealRecord,
+    PublicationAppealResolutionRecord, PublicationIntentRecord, PublicationLifecycleAction,
     PublicationLifecycleDecisionRecord, PublicationModerationAction,
     PublicationModerationDecisionRecord, PublicationPromotionRecord, PublicationSubmissionRecord,
     PublicationSubmissionState, PublisherKeyRecord, PublisherKeyState, PublisherMembershipRecord,
@@ -29,9 +30,10 @@ use uuid::Uuid;
 
 use crate::schema::{
     account_platform_roles, accounts, authors, handles, pack_downloads, pack_versions, packs,
-    publication_intents, publication_lifecycle_decisions, publication_moderation_decisions,
-    publication_promotions, publication_submissions, publisher_audit_events, publisher_keys,
-    publisher_memberships, publisher_profiles,
+    publication_appeal_resolutions, publication_appeals, publication_intents,
+    publication_lifecycle_decisions, publication_moderation_decisions, publication_promotions,
+    publication_submissions, publisher_audit_events, publisher_keys, publisher_memberships,
+    publisher_profiles,
 };
 
 /// Queryable account row mapped from the `accounts` table.
@@ -417,6 +419,96 @@ pub(crate) struct NewPublicationModerationDecisionRow {
     /// Stable request identifier used for replay detection.
     pub request_id: Uuid,
     /// Decision commit timestamp.
+    pub created_at: DateTime<Utc>,
+}
+
+/// Queryable immutable publication appeal filing row.
+#[derive(Debug, Clone, Queryable, Selectable)]
+#[diesel(table_name = publication_appeals)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub(crate) struct PublicationAppealRow {
+    /// Stable appeal identifier.
+    pub id: Uuid,
+    /// Immutable moderation decision being appealed.
+    pub decision_id: Uuid,
+    /// Submission bound to the original decision.
+    pub submission_id: Uuid,
+    /// Publisher that owns the submission.
+    pub publisher_id: Uuid,
+    /// Authenticated owner that filed the appeal.
+    pub actor_account_id: Uuid,
+    /// Bounded private appeal statement.
+    pub statement: String,
+    /// Stable request identifier used for replay detection.
+    pub request_id: Uuid,
+    /// Appeal filing timestamp.
+    pub created_at: DateTime<Utc>,
+}
+
+/// Insertable immutable publication appeal filing row.
+#[derive(Debug, Insertable)]
+#[diesel(table_name = publication_appeals)]
+pub(crate) struct NewPublicationAppealRow {
+    /// Stable appeal identifier.
+    pub id: Uuid,
+    /// Immutable moderation decision being appealed.
+    pub decision_id: Uuid,
+    /// Submission bound to the original decision.
+    pub submission_id: Uuid,
+    /// Publisher that owns the submission.
+    pub publisher_id: Uuid,
+    /// Authenticated owner that filed the appeal.
+    pub actor_account_id: Uuid,
+    /// Bounded private appeal statement.
+    pub statement: String,
+    /// Stable request identifier used for replay detection.
+    pub request_id: Uuid,
+    /// Appeal filing timestamp.
+    pub created_at: DateTime<Utc>,
+}
+
+/// Queryable immutable publication appeal resolution row.
+#[derive(Debug, Clone, Queryable, Selectable)]
+#[diesel(table_name = publication_appeal_resolutions)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub(crate) struct PublicationAppealResolutionRow {
+    /// Stable resolution identifier.
+    pub id: Uuid,
+    /// Appeal resolved by this record.
+    pub appeal_id: Uuid,
+    /// Authenticated administrator that resolved the appeal.
+    pub actor_account_id: Uuid,
+    /// Final disposition string.
+    pub disposition: String,
+    /// Bounded private resolution rationale.
+    pub rationale: String,
+    /// Audited reason for unavoidable sole-administrator self-resolution.
+    pub separation_exception_reason: Option<String>,
+    /// Stable request identifier used for replay detection.
+    pub request_id: Uuid,
+    /// Resolution commit timestamp.
+    pub created_at: DateTime<Utc>,
+}
+
+/// Insertable immutable publication appeal resolution row.
+#[derive(Debug, Insertable)]
+#[diesel(table_name = publication_appeal_resolutions)]
+pub(crate) struct NewPublicationAppealResolutionRow {
+    /// Stable resolution identifier.
+    pub id: Uuid,
+    /// Appeal resolved by this record.
+    pub appeal_id: Uuid,
+    /// Authenticated administrator that resolved the appeal.
+    pub actor_account_id: Uuid,
+    /// Final disposition string.
+    pub disposition: String,
+    /// Bounded private resolution rationale.
+    pub rationale: String,
+    /// Audited reason for unavoidable sole-administrator self-resolution.
+    pub separation_exception_reason: Option<String>,
+    /// Stable request identifier used for replay detection.
+    pub request_id: Uuid,
+    /// Resolution commit timestamp.
     pub created_at: DateTime<Utc>,
 }
 
@@ -1004,6 +1096,43 @@ impl PublicationModerationDecisionRow {
             )?,
             reason_code: self.reason_code,
             private_explanation: self.private_explanation,
+            request_id: self.request_id,
+            created_at: self.created_at,
+        })
+    }
+}
+
+/// Conversion helpers for immutable publication appeal filing rows.
+impl PublicationAppealRow {
+    /// Convert this database row into typed appeal filing evidence.
+    pub(crate) fn into_record(self) -> PublicationAppealRecord {
+        PublicationAppealRecord {
+            id: self.id,
+            decision_id: self.decision_id,
+            submission_id: self.submission_id,
+            publisher_id: self.publisher_id,
+            actor_account_id: self.actor_account_id,
+            statement: self.statement,
+            request_id: self.request_id,
+            created_at: self.created_at,
+        }
+    }
+}
+
+/// Conversion helpers for immutable publication appeal resolution rows.
+impl PublicationAppealResolutionRow {
+    /// Convert this database row into typed appeal resolution evidence.
+    pub(crate) fn into_record(self) -> Result<PublicationAppealResolutionRecord, CatalogError> {
+        Ok(PublicationAppealResolutionRecord {
+            id: self.id,
+            appeal_id: self.appeal_id,
+            actor_account_id: self.actor_account_id,
+            disposition: parse_text_enum::<PublicationAppealDisposition>(
+                self.disposition,
+                "publication appeal disposition",
+            )?,
+            rationale: self.rationale,
+            separation_exception_reason: self.separation_exception_reason,
             request_id: self.request_id,
             created_at: self.created_at,
         })

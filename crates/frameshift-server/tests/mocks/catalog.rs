@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 
 use frameshift_catalog::backend::CatalogBackend;
 use frameshift_catalog::error::{CatalogError, HealthStatus};
@@ -22,14 +22,17 @@ use frameshift_catalog::filters::{PackSearchFilters, PackSearchResult};
 use frameshift_catalog::identity::Ed25519PublicKey;
 use frameshift_catalog::records::{
     AccountRecord, AccountStatus, AuthorRecord, MembershipState, PackRecord, PackVersionRecord,
-    PlatformRole, PlatformRoleRecord, PlatformRoleState, PublicationIntentRecord,
-    PublicationLifecycleAction, PublicationLifecycleCursor, PublicationLifecycleDecisionRecord,
-    PublicationModerationAction, PublicationModerationDecisionRecord,
-    PublicationModerationDecisionRequest, PublicationPromotionRecord, PublicationPromotionRequest,
-    PublicationSubmissionRecord, PublicationSubmissionRequest, PublicationSubmissionState,
-    PublicationTombstoneRequest, PublicationWithdrawalRequest, PublisherAuditEventRecord,
-    PublisherKeyRecord, PublisherKeyState, PublisherMembershipRecord, PublisherModerationStatus,
-    PublisherProfileRecord, PublisherRole, PublisherSuspensionRequest,
+    PlatformRole, PlatformRoleRecord, PlatformRoleState, PublicationAppealCaseRecord,
+    PublicationAppealCursor, PublicationAppealDisposition, PublicationAppealRecord,
+    PublicationAppealRequest, PublicationAppealResolutionRecord,
+    PublicationAppealResolutionRequest, PublicationIntentRecord, PublicationLifecycleAction,
+    PublicationLifecycleCursor, PublicationLifecycleDecisionRecord, PublicationModerationAction,
+    PublicationModerationDecisionRecord, PublicationModerationDecisionRequest,
+    PublicationPromotionRecord, PublicationPromotionRequest, PublicationSubmissionRecord,
+    PublicationSubmissionRequest, PublicationSubmissionState, PublicationTombstoneRequest,
+    PublicationWithdrawalRequest, PublisherAuditEventRecord, PublisherKeyRecord, PublisherKeyState,
+    PublisherMembershipRecord, PublisherModerationStatus, PublisherProfileRecord, PublisherRole,
+    PublisherSuspensionRequest,
 };
 use frameshift_catalog::status::{PackStatus, TombstoneRecord};
 // Reuse the exact same version-precedence comparator the Postgres adapter
@@ -105,6 +108,12 @@ pub struct MockState {
 
     /// Immutable publication moderation decisions keyed by stable identifier.
     pub publication_moderation_decisions: HashMap<uuid::Uuid, PublicationModerationDecisionRecord>,
+
+    /// Immutable publication appeal filings keyed by stable identifier.
+    pub publication_appeals: HashMap<uuid::Uuid, PublicationAppealRecord>,
+
+    /// Immutable publication appeal resolutions keyed by stable identifier.
+    pub publication_appeal_resolutions: HashMap<uuid::Uuid, PublicationAppealResolutionRecord>,
 
     /// Immutable successful promotions keyed by stable identifier.
     pub publication_promotions: HashMap<uuid::Uuid, PublicationPromotionRecord>,
@@ -1486,6 +1495,292 @@ impl CatalogBackend for MockCatalog {
         Ok(decision)
     }
 
+    /// File one owner-authenticated appeal against an adverse moderation decision.
+    async fn file_publication_appeal(
+        &self,
+        request: PublicationAppealRequest,
+    ) -> Result<PublicationAppealRecord, CatalogError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        let exact_retry = |record: &PublicationAppealRecord| {
+            record.id == request.id
+                && record.decision_id == request.decision_id
+                && record.publisher_id == request.publisher_id
+                && record.actor_account_id == request.actor_account_id
+                && record.statement == request.statement
+                && record.request_id == request.request_id
+        };
+        if let Some(existing) = state.publication_appeals.values().find(|record| {
+            record.id == request.id
+                || record.decision_id == request.decision_id
+                || record.request_id == request.request_id
+        }) {
+            return if exact_retry(existing) {
+                Ok(existing.clone())
+            } else {
+                Err(CatalogError::Conflict {
+                    kind: "publication_appeal",
+                    key: request.id.to_string(),
+                })
+            };
+        }
+        if request.statement.trim().is_empty() || request.statement.chars().count() > 4_000 {
+            return Err(CatalogError::InvalidArgument(
+                "publication appeal statement must be non-blank and at most 4000 characters"
+                    .to_string(),
+            ));
+        }
+        let active_owner = mock_active_account(&state, request.actor_account_id)
+            && state.publisher_memberships.values().any(|membership| {
+                membership.account_id == request.actor_account_id
+                    && membership.publisher_id == request.publisher_id
+                    && membership.role == PublisherRole::Owner
+                    && membership.state == MembershipState::Active
+            });
+        if !active_owner {
+            return Err(CatalogError::Unauthorized {
+                kind: "publication_appeal",
+                key: request.id.to_string(),
+            });
+        }
+        let decision = state
+            .publication_moderation_decisions
+            .get(&request.decision_id)
+            .cloned()
+            .ok_or_else(|| CatalogError::NotFound {
+                kind: "publication_moderation_decision",
+                key: request.decision_id.to_string(),
+            })?;
+        if !matches!(
+            decision.action,
+            PublicationModerationAction::RequestChanges | PublicationModerationAction::Reject
+        ) {
+            return Err(CatalogError::Conflict {
+                kind: "publication_moderation_decision",
+                key: request.decision_id.to_string(),
+            });
+        }
+        let submission = state
+            .publication_submissions
+            .get(&decision.submission_id)
+            .cloned()
+            .ok_or_else(|| CatalogError::NotFound {
+                kind: "publication_submission",
+                key: decision.submission_id.to_string(),
+            })?;
+        if submission.publisher_id != request.publisher_id {
+            return Err(CatalogError::Unauthorized {
+                kind: "publication_appeal",
+                key: request.id.to_string(),
+            });
+        }
+        if submission.state != decision.to_state {
+            return Err(CatalogError::Conflict {
+                kind: "publication_submission",
+                key: submission.id.to_string(),
+            });
+        }
+        let created_at = Utc::now();
+        let age = created_at.signed_duration_since(decision.created_at);
+        if age < Duration::zero() || age > Duration::days(30) {
+            return Err(CatalogError::Conflict {
+                kind: "publication_appeal_deadline",
+                key: request.decision_id.to_string(),
+            });
+        }
+        let appeal = PublicationAppealRecord {
+            id: request.id,
+            decision_id: request.decision_id,
+            submission_id: submission.id,
+            publisher_id: submission.publisher_id,
+            actor_account_id: request.actor_account_id,
+            statement: request.statement,
+            request_id: request.request_id,
+            created_at,
+        };
+        state.publication_appeals.insert(appeal.id, appeal.clone());
+        Ok(appeal)
+    }
+
+    /// Resolve one appeal under administrator and reviewer-separation policy.
+    async fn resolve_publication_appeal(
+        &self,
+        request: PublicationAppealResolutionRequest,
+    ) -> Result<PublicationAppealResolutionRecord, CatalogError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        let exact_retry = |record: &PublicationAppealResolutionRecord| {
+            record.id == request.id
+                && record.appeal_id == request.appeal_id
+                && record.actor_account_id == request.actor_account_id
+                && record.disposition == request.disposition
+                && record.rationale == request.rationale
+                && record.separation_exception_reason == request.separation_exception_reason
+                && record.request_id == request.request_id
+        };
+        if let Some(existing) = state
+            .publication_appeal_resolutions
+            .values()
+            .find(|record| {
+                record.id == request.id
+                    || record.appeal_id == request.appeal_id
+                    || record.request_id == request.request_id
+            })
+        {
+            return if exact_retry(existing) {
+                Ok(existing.clone())
+            } else {
+                Err(CatalogError::Conflict {
+                    kind: "publication_appeal_resolution",
+                    key: request.id.to_string(),
+                })
+            };
+        }
+        if request.rationale.trim().is_empty() || request.rationale.chars().count() > 4_000 {
+            return Err(CatalogError::InvalidArgument(
+                "publication appeal rationale must be non-blank and at most 4000 characters"
+                    .to_string(),
+            ));
+        }
+        if request
+            .separation_exception_reason
+            .as_ref()
+            .is_some_and(|reason| reason.trim().is_empty() || reason.chars().count() > 1_000)
+        {
+            return Err(CatalogError::InvalidArgument(
+                "publication appeal separation_exception_reason must be non-blank and at most 1000 characters"
+                    .to_string(),
+            ));
+        }
+        if !mock_active_administrator(&state, request.actor_account_id) {
+            return Err(CatalogError::Unauthorized {
+                kind: "publication_appeal_resolution",
+                key: request.id.to_string(),
+            });
+        }
+        let appeal = state
+            .publication_appeals
+            .get(&request.appeal_id)
+            .cloned()
+            .ok_or_else(|| CatalogError::NotFound {
+                kind: "publication_appeal",
+                key: request.appeal_id.to_string(),
+            })?;
+        let decision = state
+            .publication_moderation_decisions
+            .get(&appeal.decision_id)
+            .cloned()
+            .ok_or_else(|| CatalogError::NotFound {
+                kind: "publication_moderation_decision",
+                key: appeal.decision_id.to_string(),
+            })?;
+        let self_resolution = request.actor_account_id == decision.actor_account_id;
+        let another_administrator = state.platform_roles.iter().any(|role| {
+            role.account_id != request.actor_account_id
+                && role.role == PlatformRole::Administrator
+                && role.state == PlatformRoleState::Active
+                && mock_active_account(&state, role.account_id)
+        });
+        if self_resolution
+            && (another_administrator || request.separation_exception_reason.is_none())
+        {
+            return Err(CatalogError::Unauthorized {
+                kind: "publication_appeal_separation",
+                key: request.appeal_id.to_string(),
+            });
+        }
+        if !self_resolution && request.separation_exception_reason.is_some() {
+            return Err(CatalogError::InvalidArgument(
+                "separation_exception_reason is allowed only for unavoidable self-resolution"
+                    .to_string(),
+            ));
+        }
+        let submission = state
+            .publication_submissions
+            .get_mut(&appeal.submission_id)
+            .ok_or_else(|| CatalogError::NotFound {
+                kind: "publication_submission",
+                key: appeal.submission_id.to_string(),
+            })?;
+        if submission.state != decision.to_state {
+            return Err(CatalogError::Conflict {
+                kind: "publication_submission",
+                key: submission.id.to_string(),
+            });
+        }
+        let created_at = Utc::now();
+        if request.disposition == PublicationAppealDisposition::Overturn {
+            submission.state = PublicationSubmissionState::Approved;
+            submission.updated_at = created_at;
+        }
+        let resolution = PublicationAppealResolutionRecord {
+            id: request.id,
+            appeal_id: request.appeal_id,
+            actor_account_id: request.actor_account_id,
+            disposition: request.disposition,
+            rationale: request.rationale,
+            separation_exception_reason: request.separation_exception_reason,
+            request_id: request.request_id,
+            created_at,
+        };
+        state
+            .publication_appeal_resolutions
+            .insert(resolution.id, resolution.clone());
+        Ok(resolution)
+    }
+
+    /// List one publisher's private appeal cases for an owner or administrator.
+    async fn list_publisher_publication_appeals(
+        &self,
+        actor_account_id: uuid::Uuid,
+        publisher_id: uuid::Uuid,
+        before: Option<PublicationAppealCursor>,
+        limit: u32,
+    ) -> Result<Vec<PublicationAppealCaseRecord>, CatalogError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        let active_owner = mock_active_account(&state, actor_account_id)
+            && state.publisher_memberships.values().any(|membership| {
+                membership.account_id == actor_account_id
+                    && membership.publisher_id == publisher_id
+                    && membership.role == PublisherRole::Owner
+                    && membership.state == MembershipState::Active
+            });
+        if !active_owner && !mock_active_administrator(&state, actor_account_id) {
+            return Err(CatalogError::Unauthorized {
+                kind: "publication_appeal",
+                key: format!("{actor_account_id}:{publisher_id}"),
+            });
+        }
+        Ok(mock_appeal_page(&state, Some(publisher_id), before, limit))
+    }
+
+    /// List global private appeal cases for an active administrator.
+    async fn list_administrator_publication_appeals(
+        &self,
+        actor_account_id: uuid::Uuid,
+        before: Option<PublicationAppealCursor>,
+        limit: u32,
+    ) -> Result<Vec<PublicationAppealCaseRecord>, CatalogError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        if !mock_active_administrator(&state, actor_account_id) {
+            return Err(CatalogError::Unauthorized {
+                kind: "publication_appeal",
+                key: actor_account_id.to_string(),
+            });
+        }
+        Ok(mock_appeal_page(&state, None, before, limit))
+    }
+
     /// Authorize and atomically activate one approved publication submission.
     async fn promote_publication_submission(
         &self,
@@ -2071,6 +2366,45 @@ fn mock_lifecycle_page(
             })
         })
         .take(limit.min(100) as usize)
+        .collect()
+}
+
+/// Sort, keyset-filter, bound, and resolve one mock appeal page.
+fn mock_appeal_page(
+    state: &MockState,
+    publisher_id: Option<uuid::Uuid>,
+    before: Option<PublicationAppealCursor>,
+    limit: u32,
+) -> Vec<PublicationAppealCaseRecord> {
+    let mut appeals = state
+        .publication_appeals
+        .values()
+        .filter(|appeal| publisher_id.is_none_or(|id| appeal.publisher_id == id))
+        .cloned()
+        .collect::<Vec<_>>();
+    appeals.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| right.id.cmp(&left.id))
+    });
+    appeals
+        .into_iter()
+        .filter(|appeal| {
+            before.is_none_or(|cursor| {
+                appeal.created_at < cursor.created_at
+                    || (appeal.created_at == cursor.created_at && appeal.id < cursor.id)
+            })
+        })
+        .take(limit.min(100) as usize)
+        .map(|appeal| {
+            let resolution = state
+                .publication_appeal_resolutions
+                .values()
+                .find(|resolution| resolution.appeal_id == appeal.id)
+                .cloned();
+            PublicationAppealCaseRecord { appeal, resolution }
+        })
         .collect()
 }
 

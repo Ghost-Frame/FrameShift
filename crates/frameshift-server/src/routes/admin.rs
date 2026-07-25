@@ -6,6 +6,8 @@ use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use chrono::{DateTime, Utc};
 use frameshift_catalog::{
+    PublicationAppealCaseRecord, PublicationAppealCursor, PublicationAppealDisposition,
+    PublicationAppealResolutionRecord, PublicationAppealResolutionRequest,
     PublicationLifecycleCursor, PublicationLifecycleDecisionRecord, PublicationTombstoneRequest,
     PublisherSuspensionRequest, TombstoneReason,
 };
@@ -14,6 +16,7 @@ use uuid::Uuid;
 
 use crate::error::AppError;
 use crate::middleware::account::AuthenticatedAccount;
+use crate::middleware::request_id::ClientRequestId;
 use crate::routes::packs::{validate_pack_name, validate_pack_version};
 use crate::state::AppState;
 
@@ -31,6 +34,11 @@ pub fn admin_router() -> Router<AppState> {
         .route(
             "/publication-decisions",
             get(list_publication_decisions_route),
+        )
+        .route("/publication-appeals", get(list_publication_appeals_route))
+        .route(
+            "/publication-appeals/{appeal_id}/resolution",
+            post(resolve_publication_appeal_route),
         )
 }
 
@@ -64,6 +72,20 @@ struct PublicationDecisionQuery {
     before_id: Option<Uuid>,
     /// Bounded result count, defaulting to fifty.
     limit: Option<u32>,
+}
+
+/// Caller-controlled fields for one administrator appeal resolution.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolvePublicationAppealRequestBody {
+    /// Stable caller-generated resolution identifier.
+    id: Uuid,
+    /// Final appeal disposition.
+    disposition: PublicationAppealDisposition,
+    /// Bounded private rationale for the disposition.
+    rationale: String,
+    /// Required reason only for unavoidable sole-administrator self-resolution.
+    separation_exception_reason: Option<String>,
 }
 
 /// Tombstone one active release under atomic account administrator authority.
@@ -131,6 +153,53 @@ async fn list_publication_decisions_route(
         .map_err(|error| AppError::from_catalog(error, "publication lifecycle audit"))
 }
 
+/// Resolve one appeal under atomic administrator and separation enforcement.
+async fn resolve_publication_appeal_route(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthenticatedAccount>,
+    Extension(client_request_id): Extension<ClientRequestId>,
+    Path(appeal_id): Path<Uuid>,
+    Json(body): Json<ResolvePublicationAppealRequestBody>,
+) -> Result<Json<PublicationAppealResolutionRecord>, AppError> {
+    state
+        .catalog
+        .resolve_publication_appeal(PublicationAppealResolutionRequest {
+            id: body.id,
+            appeal_id,
+            actor_account_id: auth.account.id,
+            disposition: body.disposition,
+            rationale: body.rationale,
+            separation_exception_reason: body.separation_exception_reason,
+            request_id: required_client_request_id(client_request_id)?,
+        })
+        .await
+        .map(Json)
+        .map_err(|error| AppError::from_catalog(error, "publication appeal resolution"))
+}
+
+/// List global private appeal cases for an active administrator.
+async fn list_publication_appeals_route(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthenticatedAccount>,
+    Query(query): Query<PublicationDecisionQuery>,
+) -> Result<Json<Vec<PublicationAppealCaseRecord>>, AppError> {
+    let before = match (query.before_created_at, query.before_id) {
+        (None, None) => None,
+        (Some(created_at), Some(id)) => Some(PublicationAppealCursor { created_at, id }),
+        _ => {
+            return Err(AppError::BadRequest(
+                "before_created_at and before_id must be supplied together".to_string(),
+            ));
+        }
+    };
+    state
+        .catalog
+        .list_administrator_publication_appeals(auth.account.id, before, query.limit.unwrap_or(50))
+        .await
+        .map(Json)
+        .map_err(|error| AppError::from_catalog(error, "publication appeal"))
+}
+
 /// Require both components of a keyset cursor or neither component.
 fn lifecycle_cursor(
     created_at: Option<DateTime<Utc>>,
@@ -151,5 +220,12 @@ fn request_id(headers: &HeaderMap) -> Result<Uuid, AppError> {
         .get("x-request-id")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| Uuid::parse_str(value).ok())
+        .ok_or_else(|| AppError::BadRequest("x-request-id must be a UUID".to_string()))
+}
+
+/// Require a valid request UUID that was present before tracing middleware ran.
+fn required_client_request_id(client_request_id: ClientRequestId) -> Result<Uuid, AppError> {
+    client_request_id
+        .0
         .ok_or_else(|| AppError::BadRequest("x-request-id must be a UUID".to_string()))
 }

@@ -22,7 +22,27 @@
 //! The `tracing` span recording happens inside [`RequestIdGenerator::make_request_id`]
 //! so the ID is available for all downstream span events.
 
+use axum::extract::Request;
+use axum::middleware::Next;
+use axum::response::Response;
 use tower_http::request_id::{MakeRequestId, RequestId};
+
+/// UUID supplied by the client before tracing middleware can synthesize one.
+#[derive(Clone, Copy, Debug)]
+pub struct ClientRequestId(pub Option<uuid::Uuid>);
+
+/// Preserve a valid caller-supplied request ID before tracing fills a missing header.
+pub async fn capture_client_request_id(mut request: Request, next: Next) -> Response {
+    let client_request_id = request
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| uuid::Uuid::parse_str(value).ok());
+    request
+        .extensions_mut()
+        .insert(ClientRequestId(client_request_id));
+    next.run(request).await
+}
 
 /// UUID v4 request-ID generator.
 ///
@@ -32,6 +52,7 @@ use tower_http::request_id::{MakeRequestId, RequestId};
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RequestIdGenerator;
 
+/// Generate a tracing request ID only when the incoming request lacks one.
 impl MakeRequestId for RequestIdGenerator {
     /// Generate a new UUID v4 request ID for each request.
     ///

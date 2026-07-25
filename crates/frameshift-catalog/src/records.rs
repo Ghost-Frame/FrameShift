@@ -330,6 +330,112 @@ pub struct PublicationModerationDecisionRecord {
     pub created_at: DateTime<Utc>,
 }
 
+/// Final administrator disposition for one publication appeal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationAppealDisposition {
+    /// Preserve the original adverse moderation decision and submission state.
+    Uphold,
+    /// Reverse the adverse decision and approve the unchanged submission.
+    Overturn,
+}
+
+/// Exact input for one idempotent publisher-owner appeal filing.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PublicationAppealRequest {
+    /// Stable appeal identifier and primary idempotency key.
+    pub id: Uuid,
+    /// Immutable adverse moderation decision being appealed.
+    pub decision_id: Uuid,
+    /// Path-bound publisher expected to own the appealed submission.
+    pub publisher_id: Uuid,
+    /// Authenticated publisher owner filing the appeal.
+    pub actor_account_id: Uuid,
+    /// Bounded private statement explaining the appeal.
+    pub statement: String,
+    /// Stable request identifier used to reject replay substitution.
+    pub request_id: Uuid,
+}
+
+/// Immutable evidence for one accepted publication appeal filing.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PublicationAppealRecord {
+    /// Stable appeal identifier.
+    pub id: Uuid,
+    /// Immutable adverse moderation decision being appealed.
+    pub decision_id: Uuid,
+    /// Submission bound to the original decision.
+    pub submission_id: Uuid,
+    /// Publisher that owns the appealed submission.
+    pub publisher_id: Uuid,
+    /// Authenticated owner that filed the appeal.
+    pub actor_account_id: Uuid,
+    /// Bounded private appeal statement.
+    pub statement: String,
+    /// Stable request identifier retained for replay detection.
+    pub request_id: Uuid,
+    /// Database timestamp when the appeal was filed.
+    pub created_at: DateTime<Utc>,
+}
+
+/// Exact input for one idempotent administrator appeal resolution.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PublicationAppealResolutionRequest {
+    /// Stable resolution identifier and primary idempotency key.
+    pub id: Uuid,
+    /// Appeal being resolved.
+    pub appeal_id: Uuid,
+    /// Authenticated administrator resolving the appeal.
+    pub actor_account_id: Uuid,
+    /// Final appeal disposition.
+    pub disposition: PublicationAppealDisposition,
+    /// Bounded private rationale for the disposition.
+    pub rationale: String,
+    /// Required audited reason only for unavoidable self-resolution.
+    pub separation_exception_reason: Option<String>,
+    /// Stable request identifier used to reject replay substitution.
+    pub request_id: Uuid,
+}
+
+/// Immutable evidence for one completed publication appeal resolution.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PublicationAppealResolutionRecord {
+    /// Stable resolution identifier.
+    pub id: Uuid,
+    /// Appeal resolved by this record.
+    pub appeal_id: Uuid,
+    /// Authenticated administrator that resolved the appeal.
+    pub actor_account_id: Uuid,
+    /// Final appeal disposition.
+    pub disposition: PublicationAppealDisposition,
+    /// Bounded private rationale for the disposition.
+    pub rationale: String,
+    /// Audited reason for an unavoidable sole-administrator self-resolution.
+    pub separation_exception_reason: Option<String>,
+    /// Stable request identifier retained for replay detection.
+    pub request_id: Uuid,
+    /// Database timestamp when the resolution committed.
+    pub created_at: DateTime<Utc>,
+}
+
+/// One appeal filing paired with its optional immutable resolution.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PublicationAppealCaseRecord {
+    /// Immutable appeal filing evidence.
+    pub appeal: PublicationAppealRecord,
+    /// Immutable resolution evidence once the appeal has been decided.
+    pub resolution: Option<PublicationAppealResolutionRecord>,
+}
+
+/// Stable keyset cursor for newest-first publication appeal reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PublicationAppealCursor {
+    /// Timestamp of the last appeal returned by the preceding page.
+    pub created_at: DateTime<Utc>,
+    /// Identifier used to order appeals that share the same timestamp.
+    pub id: Uuid,
+}
+
 /// Exact input required to atomically claim an intent and create a submission.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PublicationSubmissionRequest {

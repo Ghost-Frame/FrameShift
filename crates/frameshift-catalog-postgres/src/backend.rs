@@ -17,7 +17,9 @@
 //! Pool checkout failures are mapped by [`crate::errors::map_pool_error`].
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use std::collections::HashMap;
+
+use chrono::{DateTime, Duration, Utc};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 use diesel_migrations::{embed_migrations, EmbeddedMigrations, MigrationHarness as _};
@@ -26,14 +28,17 @@ use tracing::{debug, error, instrument};
 use frameshift_catalog::{
     AccountRecord, AuthorRecord, CatalogBackend, CatalogError, Ed25519PublicKey, HealthStatus,
     MembershipState, PackRecord, PackSearchFilters, PackSearchResult, PackStatus,
-    PackVersionRecord, PlatformRoleRecord, PublicationIntentClaim, PublicationIntentRecord,
-    PublicationLifecycleAction, PublicationLifecycleCursor, PublicationLifecycleDecisionRecord,
-    PublicationModerationAction, PublicationModerationDecisionRecord,
-    PublicationModerationDecisionRequest, PublicationPromotionRecord, PublicationPromotionRequest,
-    PublicationSubmissionRecord, PublicationSubmissionRequest, PublicationSubmissionState,
-    PublicationTombstoneRequest, PublicationWithdrawalRequest, PublishQuota,
-    PublisherAuditEventRecord, PublisherKeyRecord, PublisherMembershipRecord,
-    PublisherProfileRecord, PublisherSuspensionRequest, SortMode, TombstoneRecord,
+    PackVersionRecord, PlatformRoleRecord, PublicationAppealCaseRecord, PublicationAppealCursor,
+    PublicationAppealDisposition, PublicationAppealRecord, PublicationAppealRequest,
+    PublicationAppealResolutionRecord, PublicationAppealResolutionRequest, PublicationIntentClaim,
+    PublicationIntentRecord, PublicationLifecycleAction, PublicationLifecycleCursor,
+    PublicationLifecycleDecisionRecord, PublicationModerationAction,
+    PublicationModerationDecisionRecord, PublicationModerationDecisionRequest,
+    PublicationPromotionRecord, PublicationPromotionRequest, PublicationSubmissionRecord,
+    PublicationSubmissionRequest, PublicationSubmissionState, PublicationTombstoneRequest,
+    PublicationWithdrawalRequest, PublishQuota, PublisherAuditEventRecord, PublisherKeyRecord,
+    PublisherMembershipRecord, PublisherProfileRecord, PublisherSuspensionRequest, SortMode,
+    TombstoneRecord,
 };
 use frameshift_publication::{inventory_hash, FindingSeverity, REPORT_SCHEMA_VERSION};
 
@@ -41,20 +46,22 @@ use crate::config::PostgresCatalogConfig;
 use crate::errors::{map_diesel_error, map_migration_error, map_pool_error};
 use crate::models::{
     encode_text_enum, vec_to_pubkey, AccountRow, AuthorRow, HandleRow, NewAccountRow, NewAuthorRow,
-    NewHandleRow, NewPackDownloadRow, NewPackRow, NewPackVersionRow, NewPublicationIntentRow,
+    NewHandleRow, NewPackDownloadRow, NewPackRow, NewPackVersionRow,
+    NewPublicationAppealResolutionRow, NewPublicationAppealRow, NewPublicationIntentRow,
     NewPublicationLifecycleDecisionRow, NewPublicationModerationDecisionRow,
     NewPublicationPromotionRow, NewPublicationSubmissionRow, NewPublisherAuditEventRow,
     NewPublisherKeyRow, NewPublisherMembershipRow, NewPublisherProfileRow, PackRow, PackVersionRow,
-    PlatformRoleRow, PublicationIntentRow, PublicationLifecycleDecisionRow,
-    PublicationModerationDecisionRow, PublicationPromotionRow, PublicationSubmissionRow,
-    PublisherKeyRow, PublisherMembershipRow, PublisherProfileRow,
+    PlatformRoleRow, PublicationAppealResolutionRow, PublicationAppealRow, PublicationIntentRow,
+    PublicationLifecycleDecisionRow, PublicationModerationDecisionRow, PublicationPromotionRow,
+    PublicationSubmissionRow, PublisherKeyRow, PublisherMembershipRow, PublisherProfileRow,
 };
 use crate::pool::{build_pool, PgPool};
 use crate::schema::{
     account_platform_roles, accounts, authors, handles, pack_downloads, pack_versions, packs,
-    publication_intents, publication_lifecycle_decisions, publication_moderation_decisions,
-    publication_promotions, publication_submissions, publisher_audit_events, publisher_keys,
-    publisher_memberships, publisher_profiles, signed_request_nonces,
+    publication_appeal_resolutions, publication_appeals, publication_intents,
+    publication_lifecycle_decisions, publication_moderation_decisions, publication_promotions,
+    publication_submissions, publisher_audit_events, publisher_keys, publisher_memberships,
+    publisher_profiles, signed_request_nonces,
 };
 
 /// Embedded migration files compiled into the binary at build time.
@@ -491,6 +498,133 @@ fn resolve_publication_moderation_retry(
     } else {
         Err(publication_moderation_conflict(request.id))
     }
+}
+
+/// Validate one required bounded private appeal text field.
+fn validate_publication_appeal_text(
+    value: &str,
+    field: &str,
+    maximum: usize,
+) -> Result<(), CatalogError> {
+    if value.trim().is_empty() || value.chars().count() > maximum {
+        return Err(CatalogError::InvalidArgument(format!(
+            "publication appeal {field} must be non-blank and at most {maximum} characters"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate all caller-controlled fields for one appeal filing.
+fn validate_publication_appeal_request(
+    request: &PublicationAppealRequest,
+) -> Result<(), CatalogError> {
+    validate_publication_appeal_text(&request.statement, "statement", 4_000)
+}
+
+/// Validate all caller-controlled fields for one appeal resolution.
+fn validate_publication_appeal_resolution_request(
+    request: &PublicationAppealResolutionRequest,
+) -> Result<(), CatalogError> {
+    validate_publication_appeal_text(&request.rationale, "rationale", 4_000)?;
+    if let Some(reason) = &request.separation_exception_reason {
+        validate_publication_appeal_text(reason, "separation_exception_reason", 1_000)?;
+    }
+    Ok(())
+}
+
+/// Return whether one moderation action may be appealed under the launch policy.
+fn publication_moderation_action_is_appealable(action: PublicationModerationAction) -> bool {
+    matches!(
+        action,
+        PublicationModerationAction::RequestChanges | PublicationModerationAction::Reject
+    )
+}
+
+/// Return an idempotency conflict for an appeal filing.
+fn publication_appeal_conflict(id: uuid::Uuid) -> CatalogTransactionError {
+    CatalogTransactionError::Catalog(CatalogError::Conflict {
+        kind: "publication_appeal",
+        key: id.to_string(),
+    })
+}
+
+/// Resolve one completed appeal filing retry or reject identifier substitution.
+fn resolve_publication_appeal_retry(
+    row: PublicationAppealRow,
+    request: &PublicationAppealRequest,
+) -> Result<PublicationAppealRow, CatalogTransactionError> {
+    let record = row.clone().into_record();
+    if record.id == request.id
+        && record.decision_id == request.decision_id
+        && record.publisher_id == request.publisher_id
+        && record.actor_account_id == request.actor_account_id
+        && record.statement == request.statement
+        && record.request_id == request.request_id
+    {
+        Ok(row)
+    } else {
+        Err(publication_appeal_conflict(request.id))
+    }
+}
+
+/// Return an idempotency conflict for an appeal resolution.
+fn publication_appeal_resolution_conflict(id: uuid::Uuid) -> CatalogTransactionError {
+    CatalogTransactionError::Catalog(CatalogError::Conflict {
+        kind: "publication_appeal_resolution",
+        key: id.to_string(),
+    })
+}
+
+/// Resolve one completed appeal resolution retry or reject substitution.
+fn resolve_publication_appeal_resolution_retry(
+    row: PublicationAppealResolutionRow,
+    request: &PublicationAppealResolutionRequest,
+) -> Result<PublicationAppealResolutionRow, CatalogTransactionError> {
+    let record = row
+        .clone()
+        .into_record()
+        .map_err(CatalogTransactionError::Catalog)?;
+    if record.id == request.id
+        && record.appeal_id == request.appeal_id
+        && record.actor_account_id == request.actor_account_id
+        && record.disposition == request.disposition
+        && record.rationale == request.rationale
+        && record.separation_exception_reason == request.separation_exception_reason
+        && record.request_id == request.request_id
+    {
+        Ok(row)
+    } else {
+        Err(publication_appeal_resolution_conflict(request.id))
+    }
+}
+
+/// Validate a bounded publication appeal page size.
+fn publication_appeal_limit(limit: u32) -> Result<i64, CatalogError> {
+    if !(1..=100).contains(&limit) {
+        return Err(CatalogError::InvalidArgument(
+            "publication appeal limit must be between 1 and 100".to_string(),
+        ));
+    }
+    Ok(i64::from(limit))
+}
+
+/// Pair appeal filing rows with optional immutable resolution rows.
+fn publication_appeal_cases(
+    appeals: Vec<PublicationAppealRow>,
+    resolutions: Vec<PublicationAppealResolutionRow>,
+) -> Result<Vec<PublicationAppealCaseRecord>, CatalogError> {
+    let mut resolutions_by_appeal = resolutions
+        .into_iter()
+        .map(|row| row.into_record().map(|record| (record.appeal_id, record)))
+        .collect::<Result<HashMap<_, _>, _>>()?;
+    Ok(appeals
+        .into_iter()
+        .map(|appeal| {
+            let appeal = appeal.into_record();
+            let resolution = resolutions_by_appeal.remove(&appeal.id);
+            PublicationAppealCaseRecord { appeal, resolution }
+        })
+        .collect())
 }
 
 /// Inherent methods on [`PostgresCatalog`]: constructor, pool accessor.
@@ -1947,6 +2081,529 @@ impl CatalogBackend for PostgresCatalog {
                 error,
                 "publication_moderation_decision",
                 format!("{decision_id}:{submission_id}"),
+            )),
+        }
+    }
+
+    /// Atomically file one owner-authenticated appeal against an adverse decision.
+    async fn file_publication_appeal(
+        &self,
+        request: PublicationAppealRequest,
+    ) -> Result<PublicationAppealRecord, CatalogError> {
+        validate_publication_appeal_request(&request)?;
+        let appeal_id = request.id;
+        let decision_id = request.decision_id;
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        use diesel_async::AsyncConnection as _;
+        let result = conn
+            .transaction::<PublicationAppealRow, CatalogTransactionError, _>(async move |conn| {
+                let existing = publication_appeals::table
+                    .filter(
+                        publication_appeals::id
+                            .eq(request.id)
+                            .or(publication_appeals::decision_id.eq(request.decision_id))
+                            .or(publication_appeals::request_id.eq(request.request_id)),
+                    )
+                    .select(PublicationAppealRow::as_select())
+                    .first(conn)
+                    .await
+                    .optional()?;
+                if let Some(existing) = existing {
+                    return resolve_publication_appeal_retry(existing, &request);
+                }
+
+                let actor_status = accounts::table
+                    .find(request.actor_account_id)
+                    .for_update()
+                    .select(accounts::status)
+                    .first::<String>(conn)
+                    .await
+                    .optional()?;
+                let active_owner = publisher_memberships::table
+                    .filter(publisher_memberships::account_id.eq(request.actor_account_id))
+                    .filter(publisher_memberships::publisher_id.eq(request.publisher_id))
+                    .filter(publisher_memberships::role.eq("owner"))
+                    .filter(publisher_memberships::state.eq("active"))
+                    .for_update()
+                    .select(PublisherMembershipRow::as_select())
+                    .first(conn)
+                    .await
+                    .optional()?;
+                if actor_status.as_deref() != Some("active") || active_owner.is_none() {
+                    return Err(CatalogTransactionError::Catalog(
+                        CatalogError::Unauthorized {
+                            kind: "publication_appeal",
+                            key: request.id.to_string(),
+                        },
+                    ));
+                }
+
+                let decision = publication_moderation_decisions::table
+                    .find(request.decision_id)
+                    .for_update()
+                    .select(PublicationModerationDecisionRow::as_select())
+                    .first(conn)
+                    .await
+                    .optional()?
+                    .ok_or_else(|| {
+                        CatalogTransactionError::Catalog(CatalogError::NotFound {
+                            kind: "publication_moderation_decision",
+                            key: request.decision_id.to_string(),
+                        })
+                    })?;
+                let decision_record = decision
+                    .into_record()
+                    .map_err(CatalogTransactionError::Catalog)?;
+                if !publication_moderation_action_is_appealable(decision_record.action) {
+                    return Err(CatalogTransactionError::Catalog(CatalogError::Conflict {
+                        kind: "publication_moderation_decision",
+                        key: request.decision_id.to_string(),
+                    }));
+                }
+
+                let existing = publication_appeals::table
+                    .filter(
+                        publication_appeals::id
+                            .eq(request.id)
+                            .or(publication_appeals::decision_id.eq(request.decision_id))
+                            .or(publication_appeals::request_id.eq(request.request_id)),
+                    )
+                    .select(PublicationAppealRow::as_select())
+                    .first(conn)
+                    .await
+                    .optional()?;
+                if let Some(existing) = existing {
+                    return resolve_publication_appeal_retry(existing, &request);
+                }
+
+                let submission = publication_submissions::table
+                    .find(decision_record.submission_id)
+                    .for_update()
+                    .select(PublicationSubmissionRow::as_select())
+                    .first(conn)
+                    .await?;
+                let submission_record = submission
+                    .into_record()
+                    .map_err(CatalogTransactionError::Catalog)?;
+                if submission_record.publisher_id != request.publisher_id {
+                    return Err(CatalogTransactionError::Catalog(
+                        CatalogError::Unauthorized {
+                            kind: "publication_appeal",
+                            key: request.id.to_string(),
+                        },
+                    ));
+                }
+                if submission_record.state != decision_record.to_state {
+                    return Err(CatalogTransactionError::Catalog(CatalogError::Conflict {
+                        kind: "publication_submission",
+                        key: decision_record.submission_id.to_string(),
+                    }));
+                }
+
+                let created_at = diesel::select(
+                    diesel::dsl::sql::<diesel::sql_types::Timestamptz>("CURRENT_TIMESTAMP"),
+                )
+                .get_result::<DateTime<Utc>>(conn)
+                .await?;
+                let age = created_at.signed_duration_since(decision_record.created_at);
+                if age < Duration::zero() || age > Duration::days(30) {
+                    return Err(CatalogTransactionError::Catalog(CatalogError::Conflict {
+                        kind: "publication_appeal_deadline",
+                        key: request.decision_id.to_string(),
+                    }));
+                }
+
+                diesel::insert_into(publication_appeals::table)
+                    .values(NewPublicationAppealRow {
+                        id: request.id,
+                        decision_id: request.decision_id,
+                        submission_id: decision_record.submission_id,
+                        publisher_id: submission_record.publisher_id,
+                        actor_account_id: request.actor_account_id,
+                        statement: request.statement,
+                        request_id: request.request_id,
+                        created_at,
+                    })
+                    .returning(PublicationAppealRow::as_returning())
+                    .get_result(conn)
+                    .await
+                    .map_err(Into::into)
+            })
+            .await;
+
+        match result {
+            Ok(row) => Ok(row.into_record()),
+            Err(CatalogTransactionError::Catalog(error)) => Err(error),
+            Err(CatalogTransactionError::Diesel(error)) => Err(map_diesel_error(
+                error,
+                "publication_appeal",
+                format!("{appeal_id}:{decision_id}"),
+            )),
+        }
+    }
+
+    /// Atomically resolve one appeal under current administrator authority.
+    async fn resolve_publication_appeal(
+        &self,
+        request: PublicationAppealResolutionRequest,
+    ) -> Result<PublicationAppealResolutionRecord, CatalogError> {
+        validate_publication_appeal_resolution_request(&request)?;
+        let resolution_id = request.id;
+        let appeal_id = request.appeal_id;
+        let disposition_text = encode_text_enum(request.disposition)?;
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        use diesel_async::AsyncConnection as _;
+        let result = conn
+            .transaction::<PublicationAppealResolutionRow, CatalogTransactionError, _>(
+                async move |conn| {
+                    let existing = publication_appeal_resolutions::table
+                        .filter(
+                            publication_appeal_resolutions::id
+                                .eq(request.id)
+                                .or(publication_appeal_resolutions::appeal_id.eq(request.appeal_id))
+                                .or(publication_appeal_resolutions::request_id.eq(request.request_id)),
+                        )
+                        .select(PublicationAppealResolutionRow::as_select())
+                        .first(conn)
+                        .await
+                        .optional()?;
+                    if let Some(existing) = existing {
+                        return resolve_publication_appeal_resolution_retry(existing, &request);
+                    }
+
+                    diesel::sql_query("LOCK TABLE account_platform_roles IN SHARE MODE")
+                        .execute(conn)
+                        .await?;
+                    let active_administrators = accounts::table
+                        .inner_join(
+                            account_platform_roles::table.on(account_platform_roles::account_id
+                                .eq(accounts::id)),
+                        )
+                        .filter(accounts::status.eq("active"))
+                        .filter(account_platform_roles::role.eq("administrator"))
+                        .filter(account_platform_roles::state.eq("active"))
+                        .for_update()
+                        .select(accounts::id)
+                        .load::<uuid::Uuid>(conn)
+                        .await?;
+                    if !active_administrators.contains(&request.actor_account_id) {
+                        return Err(CatalogTransactionError::Catalog(
+                            CatalogError::Unauthorized {
+                                kind: "publication_appeal_resolution",
+                                key: request.id.to_string(),
+                            },
+                        ));
+                    }
+
+                    let appeal = publication_appeals::table
+                        .find(request.appeal_id)
+                        .for_update()
+                        .select(PublicationAppealRow::as_select())
+                        .first(conn)
+                        .await
+                        .optional()?
+                        .ok_or_else(|| {
+                            CatalogTransactionError::Catalog(CatalogError::NotFound {
+                                kind: "publication_appeal",
+                                key: request.appeal_id.to_string(),
+                            })
+                        })?;
+
+                    let existing = publication_appeal_resolutions::table
+                        .filter(
+                            publication_appeal_resolutions::id
+                                .eq(request.id)
+                                .or(publication_appeal_resolutions::appeal_id.eq(request.appeal_id))
+                                .or(publication_appeal_resolutions::request_id.eq(request.request_id)),
+                        )
+                        .select(PublicationAppealResolutionRow::as_select())
+                        .first(conn)
+                        .await
+                        .optional()?;
+                    if let Some(existing) = existing {
+                        return resolve_publication_appeal_resolution_retry(existing, &request);
+                    }
+
+                    let decision = publication_moderation_decisions::table
+                        .find(appeal.decision_id)
+                        .select(PublicationModerationDecisionRow::as_select())
+                        .first(conn)
+                        .await?;
+                    let decision_record = decision
+                        .into_record()
+                        .map_err(CatalogTransactionError::Catalog)?;
+                    let is_self_resolution =
+                        request.actor_account_id == decision_record.actor_account_id;
+                    if is_self_resolution {
+                        let another_administrator = active_administrators
+                            .iter()
+                            .any(|account_id| *account_id != request.actor_account_id);
+                        if another_administrator
+                            || request.separation_exception_reason.is_none()
+                        {
+                            return Err(CatalogTransactionError::Catalog(
+                                CatalogError::Unauthorized {
+                                    kind: "publication_appeal_separation",
+                                    key: request.appeal_id.to_string(),
+                                },
+                            ));
+                        }
+                    } else if request.separation_exception_reason.is_some() {
+                        return Err(CatalogTransactionError::Catalog(
+                            CatalogError::InvalidArgument(
+                                "separation_exception_reason is allowed only for unavoidable self-resolution"
+                                    .to_string(),
+                            ),
+                        ));
+                    }
+
+                    let submission = publication_submissions::table
+                        .find(appeal.submission_id)
+                        .for_update()
+                        .select(PublicationSubmissionRow::as_select())
+                        .first(conn)
+                        .await?;
+                    let submission_record = submission
+                        .into_record()
+                        .map_err(CatalogTransactionError::Catalog)?;
+                    if submission_record.state != decision_record.to_state {
+                        return Err(CatalogTransactionError::Catalog(CatalogError::Conflict {
+                            kind: "publication_submission",
+                            key: appeal.submission_id.to_string(),
+                        }));
+                    }
+
+                    let created_at = diesel::select(diesel::dsl::sql::<
+                        diesel::sql_types::Timestamptz,
+                    >("CURRENT_TIMESTAMP"))
+                    .get_result::<DateTime<Utc>>(conn)
+                    .await?;
+                    if request.disposition == PublicationAppealDisposition::Overturn {
+                        let from_state = encode_text_enum(submission_record.state)
+                            .map_err(CatalogTransactionError::Catalog)?;
+                        let changed = diesel::update(
+                            publication_submissions::table
+                                .find(appeal.submission_id)
+                                .filter(publication_submissions::state.eq(from_state)),
+                        )
+                        .set((
+                            publication_submissions::state.eq("approved"),
+                            publication_submissions::updated_at.eq(created_at),
+                        ))
+                        .execute(conn)
+                        .await?;
+                        if changed != 1 {
+                            return Err(CatalogTransactionError::Catalog(
+                                CatalogError::Conflict {
+                                    kind: "publication_submission",
+                                    key: appeal.submission_id.to_string(),
+                                },
+                            ));
+                        }
+                    }
+
+                    diesel::insert_into(publication_appeal_resolutions::table)
+                        .values(NewPublicationAppealResolutionRow {
+                            id: request.id,
+                            appeal_id: request.appeal_id,
+                            actor_account_id: request.actor_account_id,
+                            disposition: disposition_text,
+                            rationale: request.rationale,
+                            separation_exception_reason: request.separation_exception_reason,
+                            request_id: request.request_id,
+                            created_at,
+                        })
+                        .returning(PublicationAppealResolutionRow::as_returning())
+                        .get_result(conn)
+                        .await
+                        .map_err(Into::into)
+                },
+            )
+            .await;
+
+        match result {
+            Ok(row) => row.into_record(),
+            Err(CatalogTransactionError::Catalog(error)) => Err(error),
+            Err(CatalogTransactionError::Diesel(error)) => Err(map_diesel_error(
+                error,
+                "publication_appeal_resolution",
+                format!("{resolution_id}:{appeal_id}"),
+            )),
+        }
+    }
+
+    /// List one publisher's private appeal cases for an owner or administrator.
+    async fn list_publisher_publication_appeals(
+        &self,
+        actor_account_id: uuid::Uuid,
+        publisher_id: uuid::Uuid,
+        before: Option<PublicationAppealCursor>,
+        limit: u32,
+    ) -> Result<Vec<PublicationAppealCaseRecord>, CatalogError> {
+        let limit = publication_appeal_limit(limit)?;
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        use diesel_async::AsyncConnection as _;
+        let result = conn
+            .transaction::<(
+                Vec<PublicationAppealRow>,
+                Vec<PublicationAppealResolutionRow>,
+            ), CatalogTransactionError, _>(async move |conn| {
+                let actor_status = accounts::table
+                    .find(actor_account_id)
+                    .select(accounts::status)
+                    .first::<String>(conn)
+                    .await
+                    .optional()?;
+                let active_admin = account_platform_roles::table
+                    .filter(account_platform_roles::account_id.eq(actor_account_id))
+                    .filter(account_platform_roles::role.eq("administrator"))
+                    .filter(account_platform_roles::state.eq("active"))
+                    .select(account_platform_roles::account_id)
+                    .first::<uuid::Uuid>(conn)
+                    .await
+                    .optional()?;
+                let active_owner = publisher_memberships::table
+                    .filter(publisher_memberships::account_id.eq(actor_account_id))
+                    .filter(publisher_memberships::publisher_id.eq(publisher_id))
+                    .filter(publisher_memberships::role.eq("owner"))
+                    .filter(publisher_memberships::state.eq("active"))
+                    .select(publisher_memberships::account_id)
+                    .first::<uuid::Uuid>(conn)
+                    .await
+                    .optional()?;
+                if actor_status.as_deref() != Some("active")
+                    || (active_admin.is_none() && active_owner.is_none())
+                {
+                    return Err(CatalogTransactionError::Catalog(
+                        CatalogError::Unauthorized {
+                            kind: "publication_appeal",
+                            key: format!("{actor_account_id}:{publisher_id}"),
+                        },
+                    ));
+                }
+
+                let mut query = publication_appeals::table
+                    .filter(publication_appeals::publisher_id.eq(publisher_id))
+                    .into_boxed();
+                if let Some(cursor) = before {
+                    query = query.filter(
+                        publication_appeals::created_at.lt(cursor.created_at).or(
+                            publication_appeals::created_at
+                                .eq(cursor.created_at)
+                                .and(publication_appeals::id.lt(cursor.id)),
+                        ),
+                    );
+                }
+                let appeals = query
+                    .order((
+                        publication_appeals::created_at.desc(),
+                        publication_appeals::id.desc(),
+                    ))
+                    .limit(limit)
+                    .select(PublicationAppealRow::as_select())
+                    .load(conn)
+                    .await?;
+                let appeal_ids = appeals.iter().map(|appeal| appeal.id).collect::<Vec<_>>();
+                let resolutions = if appeal_ids.is_empty() {
+                    Vec::new()
+                } else {
+                    publication_appeal_resolutions::table
+                        .filter(publication_appeal_resolutions::appeal_id.eq_any(appeal_ids))
+                        .select(PublicationAppealResolutionRow::as_select())
+                        .load(conn)
+                        .await?
+                };
+                Ok((appeals, resolutions))
+            })
+            .await;
+        match result {
+            Ok((appeals, resolutions)) => publication_appeal_cases(appeals, resolutions),
+            Err(CatalogTransactionError::Catalog(error)) => Err(error),
+            Err(CatalogTransactionError::Diesel(error)) => Err(map_diesel_error(
+                error,
+                "publication_appeal",
+                format!("{actor_account_id}:{publisher_id}"),
+            )),
+        }
+    }
+
+    /// List global private appeal cases for an active administrator.
+    async fn list_administrator_publication_appeals(
+        &self,
+        actor_account_id: uuid::Uuid,
+        before: Option<PublicationAppealCursor>,
+        limit: u32,
+    ) -> Result<Vec<PublicationAppealCaseRecord>, CatalogError> {
+        let limit = publication_appeal_limit(limit)?;
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        use diesel_async::AsyncConnection as _;
+        let result = conn
+            .transaction::<(
+                Vec<PublicationAppealRow>,
+                Vec<PublicationAppealResolutionRow>,
+            ), CatalogTransactionError, _>(async move |conn| {
+                let actor_status = accounts::table
+                    .find(actor_account_id)
+                    .select(accounts::status)
+                    .first::<String>(conn)
+                    .await
+                    .optional()?;
+                let active_admin = account_platform_roles::table
+                    .filter(account_platform_roles::account_id.eq(actor_account_id))
+                    .filter(account_platform_roles::role.eq("administrator"))
+                    .filter(account_platform_roles::state.eq("active"))
+                    .select(account_platform_roles::account_id)
+                    .first::<uuid::Uuid>(conn)
+                    .await
+                    .optional()?;
+                if actor_status.as_deref() != Some("active") || active_admin.is_none() {
+                    return Err(CatalogTransactionError::Catalog(
+                        CatalogError::Unauthorized {
+                            kind: "publication_appeal",
+                            key: actor_account_id.to_string(),
+                        },
+                    ));
+                }
+
+                let mut query = publication_appeals::table.into_boxed();
+                if let Some(cursor) = before {
+                    query = query.filter(
+                        publication_appeals::created_at.lt(cursor.created_at).or(
+                            publication_appeals::created_at
+                                .eq(cursor.created_at)
+                                .and(publication_appeals::id.lt(cursor.id)),
+                        ),
+                    );
+                }
+                let appeals = query
+                    .order((
+                        publication_appeals::created_at.desc(),
+                        publication_appeals::id.desc(),
+                    ))
+                    .limit(limit)
+                    .select(PublicationAppealRow::as_select())
+                    .load(conn)
+                    .await?;
+                let appeal_ids = appeals.iter().map(|appeal| appeal.id).collect::<Vec<_>>();
+                let resolutions = if appeal_ids.is_empty() {
+                    Vec::new()
+                } else {
+                    publication_appeal_resolutions::table
+                        .filter(publication_appeal_resolutions::appeal_id.eq_any(appeal_ids))
+                        .select(PublicationAppealResolutionRow::as_select())
+                        .load(conn)
+                        .await?
+                };
+                Ok((appeals, resolutions))
+            })
+            .await;
+        match result {
+            Ok((appeals, resolutions)) => publication_appeal_cases(appeals, resolutions),
+            Err(CatalogTransactionError::Catalog(error)) => Err(error),
+            Err(CatalogTransactionError::Diesel(error)) => Err(map_diesel_error(
+                error,
+                "publication_appeal",
+                actor_account_id.to_string(),
             )),
         }
     }
