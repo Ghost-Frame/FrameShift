@@ -23,7 +23,9 @@
 //!    the stack sees any bytes.
 //! 6. Security response headers (`X-Content-Type-Options`, `X-Frame-Options`,
 //!    `Referrer-Policy`) -- added to every response if not already present.
-//! 7. `CorsLayer` -- outermost; handles preflight `OPTIONS` requests and
+//! 7. Client request-ID capture -- preserves a caller UUID before tracing can
+//!    synthesize a missing request ID.
+//! 8. `CorsLayer` -- outermost; handles preflight `OPTIONS` requests and
 //!    stamps `Access-Control-Allow-*` headers on responses. Only applied
 //!    when `state.config.cors_allowed_origins` is non-empty.
 //!
@@ -63,7 +65,7 @@ use crate::mcp::mcp_router;
 use crate::middleware::account::{require_account, resolve_optional_account};
 use crate::middleware::auth::require_signed_request;
 use crate::middleware::metrics::MetricsLayer;
-use crate::middleware::request_id::RequestIdGenerator;
+use crate::middleware::request_id::{capture_client_request_id, RequestIdGenerator};
 use crate::middleware::tracing::make_trace_layer;
 use crate::publication::{PublicationAdmissionService, PublicationPromotionService};
 use crate::routes::accounts::{account_write_router, auth_config_router, publisher_read_router};
@@ -267,7 +269,8 @@ fn build_app(
         .layer(hdr_xcto)
         .layer(hdr_xfo)
         .layer(hdr_rp)
-        .layer(metrics_layer);
+        .layer(metrics_layer)
+        .layer(axum::middleware::from_fn(capture_client_request_id));
 
     if let Some(cors) = cors {
         router = router.layer(cors);
@@ -380,6 +383,7 @@ fn build_cors_layer(state: &AppState) -> Option<CorsLayer> {
                 HeaderName::from_static("x-frameshift-timestamp"),
                 HeaderName::from_static("x-frameshift-nonce"),
                 HeaderName::from_static("x-frameshift-signature"),
+                HeaderName::from_static("x-request-id"),
             ])
             .expose_headers([expose])
             .max_age(std::time::Duration::from_secs(600)),

@@ -19,18 +19,21 @@ use diesel_async::{RunQueryDsl as _, SimpleAsyncConnection as _};
 use frameshift_catalog::{
     AccountRecord, AccountStatus, AuthorRecord, CatalogBackend, CatalogError, Ed25519PublicKey,
     MembershipState, ObjectHash, PackSearchFilters, PackStatus, PackVersionRecord, PlatformRole,
-    PlatformRoleState, PublicationIntentClaim, PublicationIntentRecord, PublicationLifecycleAction,
-    PublicationLifecycleCursor, PublicationModerationAction, PublicationModerationDecisionRequest,
-    PublicationPromotionRequest, PublicationSubmissionRequest, PublicationSubmissionState,
-    PublicationTombstoneRequest, PublicationWithdrawalRequest, PublishQuota,
-    PublisherAuditEventRecord, PublisherKeyRecord, PublisherKeyState, PublisherMembershipRecord,
-    PublisherModerationStatus, PublisherProfileRecord, PublisherRole, PublisherSuspensionRequest,
-    SortMode, TombstoneReason, TombstoneRecord,
+    PlatformRoleState, PublicationAppealDisposition, PublicationAppealRequest,
+    PublicationAppealResolutionRequest, PublicationIntentClaim, PublicationIntentRecord,
+    PublicationLifecycleAction, PublicationLifecycleCursor, PublicationModerationAction,
+    PublicationModerationDecisionRequest, PublicationPromotionRequest,
+    PublicationSubmissionRequest, PublicationSubmissionState, PublicationTombstoneRequest,
+    PublicationWithdrawalRequest, PublishQuota, PublisherAuditEventRecord, PublisherKeyRecord,
+    PublisherKeyState, PublisherMembershipRecord, PublisherModerationStatus,
+    PublisherProfileRecord, PublisherRole, PublisherSuspensionRequest, SortMode, TombstoneReason,
+    TombstoneRecord,
 };
 use frameshift_catalog_postgres::schema::{
-    account_platform_roles, accounts, pack_versions, publication_lifecycle_decisions,
-    publication_moderation_decisions, publication_promotions, publication_submissions,
-    publisher_audit_events, publisher_keys, publisher_memberships, publisher_profiles,
+    account_platform_roles, accounts, pack_versions, publication_appeal_resolutions,
+    publication_appeals, publication_lifecycle_decisions, publication_moderation_decisions,
+    publication_promotions, publication_submissions, publisher_audit_events, publisher_keys,
+    publisher_memberships, publisher_profiles,
 };
 use frameshift_catalog_postgres::{
     OwnershipBackfillApplied, OwnershipBackfillManifest, OwnershipBackfillMode,
@@ -348,6 +351,41 @@ fn make_moderation_request(
         action,
         reason_code: "policy.reviewed".to_string(),
         private_explanation: Some("The submission completed manual review.".to_string()),
+        request_id: uuid::Uuid::new_v4(),
+    }
+}
+
+/// Build one bounded owner appeal request for an adverse decision.
+fn make_appeal_request(
+    decision_id: uuid::Uuid,
+    publisher_id: uuid::Uuid,
+    actor_account_id: uuid::Uuid,
+) -> PublicationAppealRequest {
+    PublicationAppealRequest {
+        id: uuid::Uuid::new_v4(),
+        decision_id,
+        publisher_id,
+        actor_account_id,
+        statement: "The unchanged artifact should be reconsidered under the stated policy."
+            .to_string(),
+        request_id: uuid::Uuid::new_v4(),
+    }
+}
+
+/// Build one bounded administrator appeal resolution request.
+fn make_appeal_resolution_request(
+    appeal_id: uuid::Uuid,
+    actor_account_id: uuid::Uuid,
+    disposition: PublicationAppealDisposition,
+) -> PublicationAppealResolutionRequest {
+    PublicationAppealResolutionRequest {
+        id: uuid::Uuid::new_v4(),
+        appeal_id,
+        actor_account_id,
+        disposition,
+        rationale: "The appeal was independently reviewed against the original artifact."
+            .to_string(),
+        separation_exception_reason: None,
         request_id: uuid::Uuid::new_v4(),
     }
 }
@@ -2182,6 +2220,398 @@ async fn publication_moderation_supports_the_needs_review_loop() {
             .await
             .expect("count revision decisions failed"),
         2
+    );
+}
+
+/// Owner appeals and independent overturns are exact, private, and immutable.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn publication_appeal_is_atomic_idempotent_and_audited() {
+    let (catalog, _container) = setup_catalog().await;
+    let (owner_id, publisher_id, submission_id) =
+        create_test_publication_submission(&catalog, "appeal-happy", 194).await;
+    let moderator = make_account(uuid::Uuid::new_v4(), "appeal-happy-moderator");
+    catalog
+        .create_account(moderator.clone())
+        .await
+        .expect("create appeal moderator failed");
+    assign_test_platform_role(&catalog, moderator.id, "moderator").await;
+    let decision = catalog
+        .moderate_publication_submission(make_moderation_request(
+            submission_id,
+            moderator.id,
+            PublicationModerationAction::Reject,
+        ))
+        .await
+        .expect("reject appeal submission failed");
+
+    let appeal_request = make_appeal_request(decision.id, publisher_id, owner_id);
+    let (left, right) = tokio::join!(
+        catalog.file_publication_appeal(appeal_request.clone()),
+        catalog.file_publication_appeal(appeal_request.clone())
+    );
+    let left = left.expect("first concurrent appeal failed");
+    let right = right.expect("concurrent exact appeal retry failed");
+    assert_eq!(left, right);
+    assert_eq!(left.decision_id, decision.id);
+    assert_eq!(left.submission_id, submission_id);
+    assert_eq!(left.publisher_id, publisher_id);
+
+    let mut substituted = appeal_request.clone();
+    substituted.statement = "Substituted appeal statement.".to_string();
+    assert!(matches!(
+        catalog
+            .file_publication_appeal(substituted)
+            .await
+            .expect_err("appeal payload substitution must conflict"),
+        CatalogError::Conflict {
+            kind: "publication_appeal",
+            ..
+        }
+    ));
+
+    let administrator = make_account(uuid::Uuid::new_v4(), "appeal-happy-administrator");
+    catalog
+        .create_account(administrator.clone())
+        .await
+        .expect("create appeal administrator failed");
+    assign_test_platform_role(&catalog, administrator.id, "administrator").await;
+    let resolution_request = make_appeal_resolution_request(
+        left.id,
+        administrator.id,
+        PublicationAppealDisposition::Overturn,
+    );
+    let resolution = catalog
+        .resolve_publication_appeal(resolution_request.clone())
+        .await
+        .expect("independent appeal resolution failed");
+    assert_eq!(resolution.appeal_id, left.id);
+    assert_eq!(
+        catalog
+            .get_publication_submission(submission_id)
+            .await
+            .expect("overturned submission lookup failed")
+            .state,
+        PublicationSubmissionState::Approved
+    );
+
+    let owner_cases = catalog
+        .list_publisher_publication_appeals(owner_id, publisher_id, None, 50)
+        .await
+        .expect("owner appeal list failed");
+    assert_eq!(owner_cases.len(), 1);
+    assert_eq!(owner_cases[0].appeal, left);
+    assert_eq!(
+        owner_cases[0].resolution.as_ref().map(|record| record.id),
+        Some(resolution.id)
+    );
+    let admin_cases = catalog
+        .list_administrator_publication_appeals(administrator.id, None, 50)
+        .await
+        .expect("administrator appeal list failed");
+    assert_eq!(admin_cases, owner_cases);
+
+    let mut connection = catalog
+        .pool()
+        .get()
+        .await
+        .expect("appeal evidence connection failed");
+    diesel::update(
+        account_platform_roles::table.find((administrator.id, "administrator".to_string())),
+    )
+    .set(account_platform_roles::state.eq("revoked"))
+    .execute(&mut connection)
+    .await
+    .expect("revoke appeal administrator failed");
+    drop(connection);
+    assert_eq!(
+        catalog
+            .resolve_publication_appeal(resolution_request)
+            .await
+            .expect("completed resolution retry must survive role revocation"),
+        resolution
+    );
+
+    let mut connection = catalog
+        .pool()
+        .get()
+        .await
+        .expect("appeal immutability connection failed");
+    diesel::update(publication_appeals::table.find(left.id))
+        .set(publication_appeals::statement.eq("rewritten"))
+        .execute(&mut connection)
+        .await
+        .expect_err("appeal filing updates must be rejected");
+    diesel::delete(publication_appeal_resolutions::table.find(resolution.id))
+        .execute(&mut connection)
+        .await
+        .expect_err("appeal resolution deletes must be rejected");
+}
+
+/// Self-resolution requires sole-administrator status and explicit evidence.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn publication_appeal_enforces_reviewer_separation() {
+    let (catalog, _container) = setup_catalog().await;
+    let (owner_id, publisher_id, submission_id) =
+        create_test_publication_submission(&catalog, "appeal-separation", 195).await;
+    let original_admin = make_account(uuid::Uuid::new_v4(), "appeal-original-admin");
+    let alternate_admin = make_account(uuid::Uuid::new_v4(), "appeal-alternate-admin");
+    for account in [&original_admin, &alternate_admin] {
+        catalog
+            .create_account(account.clone())
+            .await
+            .expect("create separation administrator failed");
+        assign_test_platform_role(&catalog, account.id, "administrator").await;
+    }
+    let decision = catalog
+        .moderate_publication_submission(make_moderation_request(
+            submission_id,
+            original_admin.id,
+            PublicationModerationAction::Reject,
+        ))
+        .await
+        .expect("create self-resolution decision failed");
+    let appeal = catalog
+        .file_publication_appeal(make_appeal_request(decision.id, publisher_id, owner_id))
+        .await
+        .expect("file separation appeal failed");
+
+    let mut self_resolution = make_appeal_resolution_request(
+        appeal.id,
+        original_admin.id,
+        PublicationAppealDisposition::Uphold,
+    );
+    self_resolution.separation_exception_reason =
+        Some("Only administrator available for this appeal.".to_string());
+    assert!(matches!(
+        catalog
+            .resolve_publication_appeal(self_resolution.clone())
+            .await
+            .expect_err("self-resolution must fail while another administrator exists"),
+        CatalogError::Unauthorized {
+            kind: "publication_appeal_separation",
+            ..
+        }
+    ));
+
+    let mut connection = catalog
+        .pool()
+        .get()
+        .await
+        .expect("separation role connection failed");
+    diesel::update(
+        account_platform_roles::table.find((alternate_admin.id, "administrator".to_string())),
+    )
+    .set(account_platform_roles::state.eq("revoked"))
+    .execute(&mut connection)
+    .await
+    .expect("revoke alternate administrator failed");
+    drop(connection);
+
+    let missing_exception = PublicationAppealResolutionRequest {
+        separation_exception_reason: None,
+        ..self_resolution.clone()
+    };
+    assert!(matches!(
+        catalog
+            .resolve_publication_appeal(missing_exception)
+            .await
+            .expect_err("sole administrator self-resolution needs exception evidence"),
+        CatalogError::Unauthorized {
+            kind: "publication_appeal_separation",
+            ..
+        }
+    ));
+    let resolved = catalog
+        .resolve_publication_appeal(self_resolution)
+        .await
+        .expect("audited sole-administrator self-resolution failed");
+    assert!(resolved.separation_exception_reason.is_some());
+    assert_eq!(
+        catalog
+            .get_publication_submission(submission_id)
+            .await
+            .expect("upheld submission lookup failed")
+            .state,
+        PublicationSubmissionState::Rejected
+    );
+}
+
+/// Appeal eligibility, deadlines, ownership, and current state fail closed.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn publication_appeal_rejects_ineligible_stale_and_cross_publisher_requests() {
+    let (catalog, _container) = setup_catalog().await;
+    let (owner_id, publisher_id, submission_id) =
+        create_test_publication_submission(&catalog, "appeal-policy", 196).await;
+    let moderator = make_account(uuid::Uuid::new_v4(), "appeal-policy-moderator");
+    catalog
+        .create_account(moderator.clone())
+        .await
+        .expect("create policy moderator failed");
+    assign_test_platform_role(&catalog, moderator.id, "moderator").await;
+    let approval = catalog
+        .moderate_publication_submission(make_moderation_request(
+            submission_id,
+            moderator.id,
+            PublicationModerationAction::Approve,
+        ))
+        .await
+        .expect("approve policy submission failed");
+    assert!(matches!(
+        catalog
+            .file_publication_appeal(make_appeal_request(approval.id, publisher_id, owner_id))
+            .await
+            .expect_err("approval must not be appealable"),
+        CatalogError::Conflict {
+            kind: "publication_moderation_decision",
+            ..
+        }
+    ));
+
+    let (stale_owner_id, stale_publisher_id, stale_submission_id) =
+        create_test_publication_submission(&catalog, "appeal-stale", 197).await;
+    let stale_decision_id = uuid::Uuid::new_v4();
+    let old = chrono::Utc::now() - chrono::Duration::days(31);
+    let mut connection = catalog
+        .pool()
+        .get()
+        .await
+        .expect("stale appeal fixture connection failed");
+    diesel::update(publication_submissions::table.find(stale_submission_id))
+        .set(publication_submissions::state.eq("rejected"))
+        .execute(&mut connection)
+        .await
+        .expect("set stale submission state failed");
+    diesel::insert_into(publication_moderation_decisions::table)
+        .values((
+            publication_moderation_decisions::id.eq(stale_decision_id),
+            publication_moderation_decisions::submission_id.eq(stale_submission_id),
+            publication_moderation_decisions::actor_account_id.eq(moderator.id),
+            publication_moderation_decisions::action.eq("reject"),
+            publication_moderation_decisions::from_state.eq("quarantined"),
+            publication_moderation_decisions::to_state.eq("rejected"),
+            publication_moderation_decisions::reason_code.eq("policy.stale"),
+            publication_moderation_decisions::private_explanation
+                .eq(Some("Expired appeal fixture.")),
+            publication_moderation_decisions::request_id.eq(uuid::Uuid::new_v4()),
+            publication_moderation_decisions::created_at.eq(old),
+        ))
+        .execute(&mut connection)
+        .await
+        .expect("insert stale moderation decision failed");
+    drop(connection);
+
+    assert!(matches!(
+        catalog
+            .file_publication_appeal(make_appeal_request(
+                stale_decision_id,
+                stale_publisher_id,
+                stale_owner_id
+            ))
+            .await
+            .expect_err("expired appeal must fail"),
+        CatalogError::Conflict {
+            kind: "publication_appeal_deadline",
+            ..
+        }
+    ));
+    assert!(matches!(
+        catalog
+            .file_publication_appeal(make_appeal_request(
+                stale_decision_id,
+                publisher_id,
+                stale_owner_id
+            ))
+            .await
+            .expect_err("cross-publisher path binding must fail"),
+        CatalogError::Unauthorized {
+            kind: "publication_appeal",
+            ..
+        }
+    ));
+}
+
+/// Competing administrator resolutions commit exactly one effective outcome.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn publication_appeal_resolution_is_concurrency_safe() {
+    let (catalog, _container) = setup_catalog().await;
+    let (owner_id, publisher_id, submission_id) =
+        create_test_publication_submission(&catalog, "appeal-concurrent", 198).await;
+    let moderator = make_account(uuid::Uuid::new_v4(), "appeal-concurrent-moderator");
+    catalog
+        .create_account(moderator.clone())
+        .await
+        .expect("create concurrent moderator failed");
+    assign_test_platform_role(&catalog, moderator.id, "moderator").await;
+    let decision = catalog
+        .moderate_publication_submission(make_moderation_request(
+            submission_id,
+            moderator.id,
+            PublicationModerationAction::Reject,
+        ))
+        .await
+        .expect("create concurrent appeal decision failed");
+    let appeal = catalog
+        .file_publication_appeal(make_appeal_request(decision.id, publisher_id, owner_id))
+        .await
+        .expect("file concurrent appeal failed");
+
+    let first_admin = make_account(uuid::Uuid::new_v4(), "appeal-concurrent-admin-one");
+    let second_admin = make_account(uuid::Uuid::new_v4(), "appeal-concurrent-admin-two");
+    for account in [&first_admin, &second_admin] {
+        catalog
+            .create_account(account.clone())
+            .await
+            .expect("create concurrent administrator failed");
+        assign_test_platform_role(&catalog, account.id, "administrator").await;
+    }
+    let uphold = make_appeal_resolution_request(
+        appeal.id,
+        first_admin.id,
+        PublicationAppealDisposition::Uphold,
+    );
+    let overturn = make_appeal_resolution_request(
+        appeal.id,
+        second_admin.id,
+        PublicationAppealDisposition::Overturn,
+    );
+    let (left, right) = tokio::join!(
+        catalog.resolve_publication_appeal(uphold),
+        catalog.resolve_publication_appeal(overturn)
+    );
+    assert_eq!(
+        usize::from(left.is_ok()) + usize::from(right.is_ok()),
+        1,
+        "exactly one competing appeal resolution must commit"
+    );
+    let winner = left.or(right).expect("one appeal resolution must succeed");
+    let expected_state = match winner.disposition {
+        PublicationAppealDisposition::Uphold => PublicationSubmissionState::Rejected,
+        PublicationAppealDisposition::Overturn => PublicationSubmissionState::Approved,
+    };
+    assert_eq!(
+        catalog
+            .get_publication_submission(submission_id)
+            .await
+            .expect("concurrent resolution submission lookup failed")
+            .state,
+        expected_state
+    );
+    let mut connection = catalog
+        .pool()
+        .get()
+        .await
+        .expect("concurrent resolution count connection failed");
+    assert_eq!(
+        publication_appeal_resolutions::table
+            .count()
+            .get_result::<i64>(&mut connection)
+            .await
+            .expect("count concurrent appeal resolutions failed"),
+        1
     );
 }
 

@@ -127,9 +127,9 @@ async fn oneshot_get(state: AppState, path: &str) -> axum::http::Response<axum::
     router.oneshot(request).await.unwrap()
 }
 
-/// Configured browser origins may preflight every signed-request header.
+/// Configured browser origins may preflight signed-write and idempotency headers.
 #[tokio::test]
-async fn cors_preflight_allows_signed_request_headers() {
+async fn cors_preflight_allows_write_request_headers() {
     let mut config = (*test_config()).clone();
     config.cors_allowed_origins = "https://app.frameshift.example".to_string();
     let state = AppState {
@@ -143,7 +143,7 @@ async fn cors_preflight_allows_signed_request_headers() {
         .header("access-control-request-method", "POST")
         .header(
             "access-control-request-headers",
-            "content-type,x-frameshift-pubkey,x-frameshift-timestamp,x-frameshift-nonce,x-frameshift-signature",
+            "content-type,x-frameshift-pubkey,x-frameshift-timestamp,x-frameshift-nonce,x-frameshift-signature,x-request-id",
         )
         .body(axum::body::Body::empty())
         .unwrap();
@@ -162,6 +162,7 @@ async fn cors_preflight_allows_signed_request_headers() {
         "x-frameshift-timestamp",
         "x-frameshift-nonce",
         "x-frameshift-signature",
+        "x-request-id",
     ] {
         assert!(allowed.contains(required), "missing CORS header {required}");
     }

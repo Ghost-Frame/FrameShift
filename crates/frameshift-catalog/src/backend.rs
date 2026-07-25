@@ -14,12 +14,15 @@ use crate::filters::{PackSearchFilters, PackSearchResult};
 use crate::identity::Ed25519PublicKey;
 use crate::records::{
     AccountRecord, AuthorRecord, PackRecord, PackVersionRecord, PlatformRoleRecord,
-    PublicationIntentClaim, PublicationIntentRecord, PublicationLifecycleCursor,
-    PublicationLifecycleDecisionRecord, PublicationModerationDecisionRecord,
-    PublicationModerationDecisionRequest, PublicationPromotionRecord, PublicationPromotionRequest,
-    PublicationSubmissionRecord, PublicationSubmissionRequest, PublicationTombstoneRequest,
-    PublicationWithdrawalRequest, PublisherAuditEventRecord, PublisherKeyRecord,
-    PublisherMembershipRecord, PublisherProfileRecord, PublisherSuspensionRequest,
+    PublicationAppealCaseRecord, PublicationAppealCursor, PublicationAppealRecord,
+    PublicationAppealRequest, PublicationAppealResolutionRecord,
+    PublicationAppealResolutionRequest, PublicationIntentClaim, PublicationIntentRecord,
+    PublicationLifecycleCursor, PublicationLifecycleDecisionRecord,
+    PublicationModerationDecisionRecord, PublicationModerationDecisionRequest,
+    PublicationPromotionRecord, PublicationPromotionRequest, PublicationSubmissionRecord,
+    PublicationSubmissionRequest, PublicationTombstoneRequest, PublicationWithdrawalRequest,
+    PublisherAuditEventRecord, PublisherKeyRecord, PublisherMembershipRecord,
+    PublisherProfileRecord, PublisherSuspensionRequest,
 };
 use crate::status::TombstoneRecord;
 
@@ -294,6 +297,66 @@ pub trait CatalogBackend: Send + Sync {
         Err(CatalogError::Unauthorized {
             kind: "publication_moderation",
             key: request.id.to_string(),
+        })
+    }
+
+    /// Atomically file one owner-authenticated appeal against an adverse decision.
+    ///
+    /// Unsupported backends fail closed. Implementations must resolve exact
+    /// completed retries before current authorization checks, enforce one
+    /// appeal per decision and the 30-day deadline, and bind the appeal to the
+    /// original submission and publisher without accepting mutable artifact data.
+    async fn file_publication_appeal(
+        &self,
+        request: PublicationAppealRequest,
+    ) -> Result<PublicationAppealRecord, CatalogError> {
+        Err(CatalogError::Unauthorized {
+            kind: "publication_appeal",
+            key: request.id.to_string(),
+        })
+    }
+
+    /// Atomically resolve one appeal under active administrator authority.
+    ///
+    /// Unsupported backends fail closed. A different administrator from the
+    /// original decision actor is mandatory when available. An unavoidable
+    /// self-resolution requires a retained separation-exception reason.
+    async fn resolve_publication_appeal(
+        &self,
+        request: PublicationAppealResolutionRequest,
+    ) -> Result<PublicationAppealResolutionRecord, CatalogError> {
+        Err(CatalogError::Unauthorized {
+            kind: "publication_appeal_resolution",
+            key: request.id.to_string(),
+        })
+    }
+
+    /// List one publisher's private appeal cases for an owner or administrator.
+    async fn list_publisher_publication_appeals(
+        &self,
+        actor_account_id: uuid::Uuid,
+        publisher_id: uuid::Uuid,
+        before: Option<PublicationAppealCursor>,
+        limit: u32,
+    ) -> Result<Vec<PublicationAppealCaseRecord>, CatalogError> {
+        let _ = (before, limit);
+        Err(CatalogError::Unauthorized {
+            kind: "publication_appeal",
+            key: format!("{actor_account_id}:{publisher_id}"),
+        })
+    }
+
+    /// List global private appeal cases for an active administrator.
+    async fn list_administrator_publication_appeals(
+        &self,
+        actor_account_id: uuid::Uuid,
+        before: Option<PublicationAppealCursor>,
+        limit: u32,
+    ) -> Result<Vec<PublicationAppealCaseRecord>, CatalogError> {
+        let _ = (before, limit);
+        Err(CatalogError::Unauthorized {
+            kind: "publication_appeal",
+            key: actor_account_id.to_string(),
         })
     }
 

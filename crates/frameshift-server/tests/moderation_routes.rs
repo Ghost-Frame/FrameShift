@@ -14,7 +14,7 @@ use chrono::Utc;
 use frameshift_catalog::{
     AccountRecord, AccountStatus, MembershipState, PlatformRole, PlatformRoleRecord,
     PlatformRoleState, PublicationSubmissionRecord, PublicationSubmissionState,
-    PublisherMembershipRecord, PublisherRole,
+    PublisherMembershipRecord, PublisherModerationStatus, PublisherProfileRecord, PublisherRole,
 };
 use frameshift_objects::ObjectHash;
 use frameshift_publication::PublicationReport;
@@ -91,8 +91,12 @@ struct Fixture {
     submission: PublicationSubmissionRecord,
     /// Active moderator account identifier.
     moderator_id: Uuid,
+    /// Active administrator account identifier.
+    administrator_id: Uuid,
     /// Publisher owner who also holds a moderator role.
     owner_id: Uuid,
+    /// Stable publisher handle used by owner-bound appeal routes.
+    publisher_handle: String,
 }
 
 /// Build one verified identity for an exact OIDC subject.
@@ -217,6 +221,7 @@ fn fixture() -> Fixture {
 
     let now = Utc::now();
     let publisher_id = Uuid::new_v4();
+    let publisher_handle = "appeal-publisher".to_string();
     let archive_bytes = b"exact private review archive".to_vec();
     let submission = PublicationSubmissionRecord {
         id: Uuid::new_v4(),
@@ -241,6 +246,21 @@ fn fixture() -> Fixture {
     };
     {
         let mut state = catalog.state.write().unwrap();
+        state.publishers.insert(
+            publisher_id,
+            PublisherProfileRecord {
+                id: publisher_id,
+                handle: publisher_handle.clone(),
+                display_name: "Appeal Publisher".to_string(),
+                biography: None,
+                moderation_status: PublisherModerationStatus::Approved,
+                created_at: now,
+                updated_at: now,
+            },
+        );
+        state
+            .publisher_handles
+            .insert(publisher_handle.clone(), publisher_id);
         state.publisher_memberships.insert(
             (owner_id, publisher_id),
             PublisherMembershipRecord {
@@ -279,7 +299,9 @@ fn fixture() -> Fixture {
         archive_bytes,
         submission,
         moderator_id,
+        administrator_id,
         owner_id,
+        publisher_handle,
     }
 }
 
@@ -334,6 +356,26 @@ fn decision_body(id: Uuid, action: &str) -> Value {
         "reason_code": "review_complete",
         "private_explanation": "The artifact passed review."
     })
+}
+
+/// Reject the fixture submission and return the immutable decision identifier.
+async fn reject_for_appeal(fixture: &Fixture) -> Uuid {
+    let decision_id = Uuid::new_v4();
+    let path = format!(
+        "/v1/moderation/publication-submissions/{}/decisions",
+        fixture.submission.id
+    );
+    let response = send(
+        fixture.router.clone(),
+        Method::POST,
+        &path,
+        Some("moderator-token"),
+        Some(&Uuid::new_v4().to_string()),
+        Some(decision_body(decision_id, "reject")),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    decision_id
 }
 
 #[tokio::test]
@@ -746,4 +788,234 @@ async fn moderation_rejects_malformed_request_id_and_bounds_missing_records() {
         response_json(missing).await,
         json!({"error": "publication submission not found"})
     );
+}
+
+#[tokio::test]
+/// Owner and administrator appeal routes require a valid bearer identity.
+async fn publication_appeal_routes_require_authentication() {
+    let fixture = fixture();
+    let owner_path = format!(
+        "/v1/publishers/{}/publication-appeals",
+        fixture.publisher_handle
+    );
+    let admin_path = "/v1/admin/publication-appeals";
+    for path in [owner_path.as_str(), admin_path] {
+        let response = send(fixture.router.clone(), Method::GET, path, None, None, None).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+}
+
+#[tokio::test]
+/// Filing, private listing, independent overturn, and audit projection bind trusted actors.
+async fn publication_appeal_round_trip_binds_trusted_context() {
+    let fixture = fixture();
+    let decision_id = reject_for_appeal(&fixture).await;
+    let appeal_id = Uuid::new_v4();
+    let request_id = Uuid::new_v4();
+    let file_path = format!(
+        "/v1/publishers/{}/publication-decisions/{decision_id}/appeal",
+        fixture.publisher_handle
+    );
+    let filed = send(
+        fixture.router.clone(),
+        Method::POST,
+        &file_path,
+        Some("owner-token"),
+        Some(&request_id.to_string()),
+        Some(json!({
+            "id": appeal_id,
+            "statement": "The rejection relied on an outdated compatibility result."
+        })),
+    )
+    .await;
+    assert_eq!(filed.status(), StatusCode::OK);
+    let filed_body = response_json(filed).await;
+    assert_eq!(filed_body["id"], appeal_id.to_string());
+    assert_eq!(filed_body["decision_id"], decision_id.to_string());
+    assert_eq!(filed_body["actor_account_id"], fixture.owner_id.to_string());
+    assert_eq!(filed_body["request_id"], request_id.to_string());
+
+    let owner_list_path = format!(
+        "/v1/publishers/{}/publication-appeals?limit=10",
+        fixture.publisher_handle
+    );
+    let owner_list = send(
+        fixture.router.clone(),
+        Method::GET,
+        &owner_list_path,
+        Some("owner-token"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(owner_list.status(), StatusCode::OK);
+    let owner_cases = response_json(owner_list).await;
+    assert_eq!(owner_cases.as_array().unwrap().len(), 1);
+    assert!(owner_cases[0]["resolution"].is_null());
+
+    let resolution_id = Uuid::new_v4();
+    let resolution_request_id = Uuid::new_v4();
+    let resolution_path = format!("/v1/admin/publication-appeals/{appeal_id}/resolution");
+    let resolved = send(
+        fixture.router.clone(),
+        Method::POST,
+        &resolution_path,
+        Some("administrator-token"),
+        Some(&resolution_request_id.to_string()),
+        Some(json!({
+            "id": resolution_id,
+            "disposition": "overturn",
+            "rationale": "Independent review confirmed the compatibility evidence.",
+            "separation_exception_reason": null
+        })),
+    )
+    .await;
+    assert_eq!(resolved.status(), StatusCode::OK);
+    let resolved_body = response_json(resolved).await;
+    assert_eq!(resolved_body["appeal_id"], appeal_id.to_string());
+    assert_eq!(
+        resolved_body["actor_account_id"],
+        fixture.administrator_id.to_string()
+    );
+    assert_eq!(
+        resolved_body["request_id"],
+        resolution_request_id.to_string()
+    );
+
+    let admin_list = send(
+        fixture.router,
+        Method::GET,
+        "/v1/admin/publication-appeals?limit=10",
+        Some("administrator-token"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(admin_list.status(), StatusCode::OK);
+    let admin_cases = response_json(admin_list).await;
+    assert_eq!(
+        admin_cases[0]["resolution"]["id"],
+        resolution_id.to_string()
+    );
+    assert_eq!(
+        fixture
+            .catalog
+            .state
+            .read()
+            .unwrap()
+            .publication_submissions[&fixture.submission.id]
+            .state,
+        PublicationSubmissionState::Approved
+    );
+}
+
+#[tokio::test]
+/// Appeal routes deny foreign actors and reject malformed correlation or DTO fields.
+async fn publication_appeal_routes_enforce_authority_and_request_contracts() {
+    let fixture = fixture();
+    let decision_id = reject_for_appeal(&fixture).await;
+    let file_path = format!(
+        "/v1/publishers/{}/publication-decisions/{decision_id}/appeal",
+        fixture.publisher_handle
+    );
+    let body = json!({
+        "id": Uuid::new_v4(),
+        "statement": "Please review the evidence again."
+    });
+
+    let foreign = send(
+        fixture.router.clone(),
+        Method::POST,
+        &file_path,
+        Some("ordinary-token"),
+        Some(&Uuid::new_v4().to_string()),
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(foreign.status(), StatusCode::FORBIDDEN);
+
+    let missing_request_id = send(
+        fixture.router.clone(),
+        Method::POST,
+        &file_path,
+        Some("owner-token"),
+        None,
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(missing_request_id.status(), StatusCode::BAD_REQUEST);
+
+    let mut unknown_field_body = body;
+    unknown_field_body["actor_account_id"] = json!(fixture.owner_id);
+    let unknown_field = send(
+        fixture.router.clone(),
+        Method::POST,
+        &file_path,
+        Some("owner-token"),
+        Some(&Uuid::new_v4().to_string()),
+        Some(unknown_field_body),
+    )
+    .await;
+    assert_eq!(unknown_field.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let appeal_id = Uuid::new_v4();
+    let filed = send(
+        fixture.router.clone(),
+        Method::POST,
+        &file_path,
+        Some("owner-token"),
+        Some(&Uuid::new_v4().to_string()),
+        Some(json!({
+            "id": appeal_id,
+            "statement": "Please review the corrected compatibility evidence."
+        })),
+    )
+    .await;
+    assert_eq!(filed.status(), StatusCode::OK);
+    let resolution_path = format!("/v1/admin/publication-appeals/{appeal_id}/resolution");
+    let resolution_body = json!({
+        "id": Uuid::new_v4(),
+        "disposition": "uphold",
+        "rationale": "The original decision remains supported.",
+        "separation_exception_reason": null
+    });
+    let foreign_resolution = send(
+        fixture.router.clone(),
+        Method::POST,
+        &resolution_path,
+        Some("ordinary-token"),
+        Some(&Uuid::new_v4().to_string()),
+        Some(resolution_body.clone()),
+    )
+    .await;
+    assert_eq!(foreign_resolution.status(), StatusCode::FORBIDDEN);
+    let missing_resolution_request_id = send(
+        fixture.router.clone(),
+        Method::POST,
+        &resolution_path,
+        Some("administrator-token"),
+        None,
+        Some(resolution_body),
+    )
+    .await;
+    assert_eq!(
+        missing_resolution_request_id.status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    let partial_cursor_path = format!(
+        "/v1/publishers/{}/publication-appeals?before_id={}",
+        fixture.publisher_handle,
+        Uuid::new_v4()
+    );
+    let partial_cursor = send(
+        fixture.router,
+        Method::GET,
+        &partial_cursor_path,
+        Some("owner-token"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(partial_cursor.status(), StatusCode::BAD_REQUEST);
 }

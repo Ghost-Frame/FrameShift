@@ -282,6 +282,50 @@ diesel::table! {
 }
 
 diesel::table! {
+    /// Immutable publisher-owner appeals bound to adverse moderation decisions.
+    publication_appeals (id) {
+        /// Stable appeal identifier.
+        id -> Uuid,
+        /// Immutable moderation decision being appealed.
+        decision_id -> Uuid,
+        /// Submission bound to the original moderation decision.
+        submission_id -> Uuid,
+        /// Publisher that owns the submission.
+        publisher_id -> Uuid,
+        /// Authenticated owner that filed the appeal.
+        actor_account_id -> Uuid,
+        /// Bounded private appeal statement.
+        statement -> Text,
+        /// Stable request identifier used for replay detection.
+        request_id -> Uuid,
+        /// Appeal filing timestamp.
+        created_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    /// Immutable administrator resolutions for publication appeals.
+    publication_appeal_resolutions (id) {
+        /// Stable resolution identifier.
+        id -> Uuid,
+        /// Appeal resolved by this record.
+        appeal_id -> Uuid,
+        /// Authenticated administrator that resolved the appeal.
+        actor_account_id -> Uuid,
+        /// Final disposition string.
+        disposition -> Text,
+        /// Bounded private resolution rationale.
+        rationale -> Text,
+        /// Audited reason for unavoidable sole-administrator self-resolution.
+        separation_exception_reason -> Nullable<Text>,
+        /// Stable request identifier used for replay detection.
+        request_id -> Uuid,
+        /// Resolution commit timestamp.
+        created_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     /// The `authors` table stores one row per registered Ed25519 keypair.
     ///
     /// Primary key: `pubkey` (raw 32-byte BYTEA).
@@ -431,6 +475,13 @@ diesel::joinable!(publication_submissions -> publication_intents (intent_id));
 diesel::joinable!(account_platform_roles -> accounts (account_id));
 diesel::joinable!(publication_moderation_decisions -> accounts (actor_account_id));
 diesel::joinable!(publication_moderation_decisions -> publication_submissions (submission_id));
+// Allow Diesel join inference for private appeal evidence.
+diesel::joinable!(publication_appeals -> accounts (actor_account_id));
+diesel::joinable!(publication_appeals -> publication_moderation_decisions (decision_id));
+diesel::joinable!(publication_appeals -> publication_submissions (submission_id));
+diesel::joinable!(publication_appeals -> publisher_profiles (publisher_id));
+diesel::joinable!(publication_appeal_resolutions -> accounts (actor_account_id));
+diesel::joinable!(publication_appeal_resolutions -> publication_appeals (appeal_id));
 // Allow Diesel join inference from immutable promotions to their submissions.
 diesel::joinable!(publication_promotions -> publication_submissions (submission_id));
 // Allow Diesel join inference from lifecycle decisions to authenticated actors.
@@ -452,6 +503,8 @@ diesel::allow_tables_to_appear_in_same_query!(
     publication_intents,
     publication_submissions,
     publication_moderation_decisions,
+    publication_appeals,
+    publication_appeal_resolutions,
     publication_promotions,
     publication_lifecycle_decisions,
 );
