@@ -268,6 +268,8 @@ pub enum PublicationSubmissionState {
     Approved,
     /// A moderator rejected the artifact while retaining its audit history.
     Rejected,
+    /// The approved artifact is bound to one active public catalog version.
+    Promoted,
 }
 
 /// Review action applied to a quarantined publication submission.
@@ -366,6 +368,48 @@ pub struct PublicationSubmissionRecord {
     pub created_at: DateTime<Utc>,
     /// Database timestamp of the most recent lifecycle update.
     pub updated_at: DateTime<Utc>,
+}
+
+/// Exact input for one idempotent approved-submission promotion.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PublicationPromotionRequest {
+    /// Stable caller-generated promotion identifier and primary idempotency key.
+    pub id: Uuid,
+    /// Approved submission whose exact archive is being promoted.
+    pub submission_id: Uuid,
+    /// Authenticated account exercising promotion authority.
+    pub actor_account_id: Uuid,
+    /// Stable request correlation identifier used to reject replay substitution.
+    pub request_id: Uuid,
+    /// Active catalog version derived exclusively from the verified archive.
+    pub version: PackVersionRecord,
+    /// Public one-line description derived from the verified manifest.
+    pub description: String,
+    /// Public topical tags derived from the verified manifest.
+    pub tags: Vec<String>,
+    /// Optional base pack name derived from the verified manifest.
+    pub extends: Option<String>,
+}
+
+/// Immutable evidence that one approved submission became publicly active.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PublicationPromotionRecord {
+    /// Stable promotion identifier.
+    pub id: Uuid,
+    /// Submission promoted by this event.
+    pub submission_id: Uuid,
+    /// Account that exercised promotion authority.
+    pub actor_account_id: Uuid,
+    /// Public pack name created or extended by the promotion.
+    pub pack_name: String,
+    /// Public semantic version activated by the promotion.
+    pub version: String,
+    /// Exact public object hash bound to the approved submission.
+    pub content_hash: ObjectHash,
+    /// Stable request correlation identifier retained for replay detection.
+    pub request_id: Uuid,
+    /// Database timestamp when the promotion transaction committed.
+    pub created_at: DateTime<Utc>,
 }
 
 /// A registered marketplace author.

@@ -16,11 +16,13 @@ use ed25519_dalek::SigningKey;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use frameshift_catalog::{
-    AccountRecord, AccountStatus, MembershipState, PublicationIntentRecord, PublisherKeyRecord,
+    AccountRecord, AccountStatus, MembershipState, PlatformRole, PlatformRoleRecord,
+    PlatformRoleState, PublicationIntentRecord, PublicationSubmissionState, PublisherKeyRecord,
     PublisherKeyState, PublisherMembershipRecord, PublisherModerationStatus,
     PublisherProfileRecord, PublisherRole,
 };
 use frameshift_objects::ObjectHash;
+use frameshift_pack::Pack;
 use frameshift_server::account_auth::{BearerTokenVerifier, OidcAuthError, VerifiedOidcIdentity};
 use frameshift_server::metrics::Metrics;
 use frameshift_server::{app, app_with_publication_admission, AppState, OidcConfig, ServerConfig};
@@ -161,6 +163,8 @@ fn write_valid_pack(directory: &Path, signing_key: &SigningKey) {
     );
     std::fs::write(directory.join("pack.toml"), manifest).unwrap();
     std::fs::write(directory.join("README.md"), b"# submission fixture\n").unwrap();
+    let mut pack = Pack::from_dir(directory).unwrap();
+    pack.sign(signing_key).unwrap();
 }
 
 /// Encode all pack files as one flat gzip-tar archive.
@@ -358,6 +362,59 @@ async fn send_submission(
         .unwrap()
 }
 
+/// Send one promotion request through the explicit quarantine-enabled router.
+async fn send_promotion(
+    fixture: &RouteFixture,
+    token: &str,
+    submission_id: Uuid,
+    promotion_id: Uuid,
+    request_id: Uuid,
+) -> axum::http::Response<Body> {
+    fixture
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!(
+                    "/v1/moderation/publication-submissions/{submission_id}/promotion"
+                ))
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .header("x-request-id", request_id.to_string())
+                .body(Body::from(
+                    serde_json::json!({ "id": promotion_id }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+/// Approve one admitted submission and grant the foreign account moderation authority.
+fn approve_for_foreign_moderator(fixture: &RouteFixture, submission_id: Uuid) {
+    let now = Utc::now();
+    let mut state = fixture.catalog.state.write().unwrap();
+    state
+        .publication_submissions
+        .get_mut(&submission_id)
+        .unwrap()
+        .state = PublicationSubmissionState::Approved;
+    state
+        .publishers
+        .get_mut(&fixture.intent.publisher_id)
+        .unwrap()
+        .moderation_status = PublisherModerationStatus::Approved;
+    state.platform_roles.push(PlatformRoleRecord {
+        account_id: fixture.foreign_account_id,
+        role: PlatformRole::Moderator,
+        state: PlatformRoleState::Active,
+        assigned_by_account_id: fixture.owner_account_id,
+        created_at: now,
+        updated_at: now,
+    });
+}
+
 /// Decode one JSON response body.
 async fn response_json(response: axum::http::Response<Body>) -> Value {
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
@@ -380,6 +437,239 @@ async fn standard_app_keeps_submission_route_unmounted() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+/// The standard router never mounts the approved-submission promotion write.
+#[tokio::test]
+async fn standard_app_keeps_promotion_route_unmounted() {
+    let fixture = route_fixture();
+    let state = test_state(&fixture.catalog, &fixture.public_objects);
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!(
+                    "/v1/moderation/publication-submissions/{}/promotion",
+                    Uuid::new_v4()
+                ))
+                .header("authorization", "Bearer foreign-token")
+                .header("content-type", "application/json")
+                .header("x-request-id", Uuid::new_v4().to_string())
+                .body(Body::from(
+                    serde_json::json!({ "id": Uuid::new_v4() }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+/// An active independent moderator can promote once and replay after role revocation.
+#[tokio::test]
+async fn promotion_route_activates_and_replays_after_role_revocation() {
+    let fixture = route_fixture();
+    let submission_id = Uuid::new_v4();
+    let admission = send_submission(
+        &fixture,
+        Some("owner-token"),
+        &fixture.signing_key,
+        submission_id,
+    )
+    .await;
+    assert_eq!(admission.status(), StatusCode::OK);
+    approve_for_foreign_moderator(&fixture, submission_id);
+
+    let promotion_id = Uuid::new_v4();
+    let request_id = Uuid::new_v4();
+    let first = send_promotion(
+        &fixture,
+        "foreign-token",
+        submission_id,
+        promotion_id,
+        request_id,
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_json = response_json(first).await;
+    assert_eq!(first_json["id"], promotion_id.to_string());
+
+    fixture
+        .catalog
+        .state
+        .write()
+        .unwrap()
+        .platform_roles
+        .first_mut()
+        .unwrap()
+        .state = PlatformRoleState::Revoked;
+    let replay = send_promotion(
+        &fixture,
+        "foreign-token",
+        submission_id,
+        promotion_id,
+        request_id,
+    )
+    .await;
+    assert_eq!(replay.status(), StatusCode::OK);
+    assert_eq!(response_json(replay).await, first_json);
+    assert_eq!(fixture.public_objects.blobs.read().unwrap().len(), 1);
+    let state = fixture.catalog.state.read().unwrap();
+    assert_eq!(state.publication_promotions.len(), 1);
+    assert_eq!(state.versions.len(), 1);
+}
+
+/// An ordinary account is rejected before any public object write occurs.
+#[tokio::test]
+async fn promotion_route_rejects_ordinary_account_before_public_write() {
+    let fixture = route_fixture();
+    let submission_id = Uuid::new_v4();
+    let admission = send_submission(
+        &fixture,
+        Some("owner-token"),
+        &fixture.signing_key,
+        submission_id,
+    )
+    .await;
+    assert_eq!(admission.status(), StatusCode::OK);
+    {
+        let mut state = fixture.catalog.state.write().unwrap();
+        state
+            .publication_submissions
+            .get_mut(&submission_id)
+            .unwrap()
+            .state = PublicationSubmissionState::Approved;
+        state
+            .publishers
+            .get_mut(&fixture.intent.publisher_id)
+            .unwrap()
+            .moderation_status = PublisherModerationStatus::Approved;
+    }
+
+    let response = send_promotion(
+        &fixture,
+        "foreign-token",
+        submission_id,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(fixture.public_objects.blobs.read().unwrap().is_empty());
+    let state = fixture.catalog.state.read().unwrap();
+    assert!(state.publication_promotions.is_empty());
+    assert!(state.versions.is_empty());
+}
+
+/// Revoked global authority is rejected before the first public object write.
+#[tokio::test]
+async fn promotion_route_rejects_revoked_role_before_public_write() {
+    let fixture = route_fixture();
+    let submission_id = Uuid::new_v4();
+    let admission = send_submission(
+        &fixture,
+        Some("owner-token"),
+        &fixture.signing_key,
+        submission_id,
+    )
+    .await;
+    assert_eq!(admission.status(), StatusCode::OK);
+    approve_for_foreign_moderator(&fixture, submission_id);
+    fixture
+        .catalog
+        .state
+        .write()
+        .unwrap()
+        .platform_roles
+        .first_mut()
+        .unwrap()
+        .state = PlatformRoleState::Revoked;
+
+    let response = send_promotion(
+        &fixture,
+        "foreign-token",
+        submission_id,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(fixture.public_objects.blobs.read().unwrap().is_empty());
+}
+
+/// A globally privileged publisher owner cannot promote their own submission.
+#[tokio::test]
+async fn promotion_route_rejects_publisher_owner_before_public_write() {
+    let fixture = route_fixture();
+    let submission_id = Uuid::new_v4();
+    let admission = send_submission(
+        &fixture,
+        Some("owner-token"),
+        &fixture.signing_key,
+        submission_id,
+    )
+    .await;
+    assert_eq!(admission.status(), StatusCode::OK);
+    approve_for_foreign_moderator(&fixture, submission_id);
+    {
+        let now = Utc::now();
+        let mut state = fixture.catalog.state.write().unwrap();
+        state.platform_roles.push(PlatformRoleRecord {
+            account_id: fixture.owner_account_id,
+            role: PlatformRole::Administrator,
+            state: PlatformRoleState::Active,
+            assigned_by_account_id: fixture.foreign_account_id,
+            created_at: now,
+            updated_at: now,
+        });
+    }
+
+    let response = send_promotion(
+        &fixture,
+        "owner-token",
+        submission_id,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(fixture.public_objects.blobs.read().unwrap().is_empty());
+}
+
+/// Active administrator authority is accepted for independent promotion.
+#[tokio::test]
+async fn promotion_route_accepts_independent_administrator() {
+    let fixture = route_fixture();
+    let submission_id = Uuid::new_v4();
+    let admission = send_submission(
+        &fixture,
+        Some("owner-token"),
+        &fixture.signing_key,
+        submission_id,
+    )
+    .await;
+    assert_eq!(admission.status(), StatusCode::OK);
+    approve_for_foreign_moderator(&fixture, submission_id);
+    fixture
+        .catalog
+        .state
+        .write()
+        .unwrap()
+        .platform_roles
+        .first_mut()
+        .unwrap()
+        .role = PlatformRole::Administrator;
+
+    let response = send_promotion(
+        &fixture,
+        "foreign-token",
+        submission_id,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(fixture.public_objects.blobs.read().unwrap().len(), 1);
 }
 
 /// Both bearer authentication and signed-request proof are mandatory.

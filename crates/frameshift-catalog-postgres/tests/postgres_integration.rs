@@ -20,15 +20,16 @@ use frameshift_catalog::{
     AccountRecord, AccountStatus, AuthorRecord, CatalogBackend, CatalogError, Ed25519PublicKey,
     MembershipState, ObjectHash, PackSearchFilters, PackStatus, PackVersionRecord, PlatformRole,
     PlatformRoleState, PublicationIntentClaim, PublicationIntentRecord,
-    PublicationModerationAction, PublicationModerationDecisionRequest,
+    PublicationModerationAction, PublicationModerationDecisionRequest, PublicationPromotionRequest,
     PublicationSubmissionRequest, PublicationSubmissionState, PublishQuota,
     PublisherAuditEventRecord, PublisherKeyRecord, PublisherKeyState, PublisherMembershipRecord,
     PublisherModerationStatus, PublisherProfileRecord, PublisherRole, SortMode, TombstoneReason,
     TombstoneRecord,
 };
 use frameshift_catalog_postgres::schema::{
-    account_platform_roles, accounts, publication_moderation_decisions, publication_submissions,
-    publisher_audit_events, publisher_memberships, publisher_profiles,
+    account_platform_roles, accounts, pack_versions, publication_moderation_decisions,
+    publication_promotions, publication_submissions, publisher_audit_events, publisher_keys,
+    publisher_memberships, publisher_profiles,
 };
 use frameshift_catalog_postgres::{
     OwnershipBackfillApplied, OwnershipBackfillManifest, OwnershipBackfillMode,
@@ -347,6 +348,46 @@ fn make_moderation_request(
         reason_code: "policy.reviewed".to_string(),
         private_explanation: Some("The submission completed manual review.".to_string()),
         request_id: uuid::Uuid::new_v4(),
+    }
+}
+
+/// Build one active version and exact promotion request from approved evidence.
+async fn make_promotion_request(
+    catalog: &PostgresCatalog,
+    submission_id: uuid::Uuid,
+    actor_account_id: uuid::Uuid,
+) -> PublicationPromotionRequest {
+    let submission = catalog
+        .get_publication_submission(submission_id)
+        .await
+        .expect("promotion submission lookup failed");
+    let key = catalog
+        .get_publisher_key(submission.publisher_key_id)
+        .await
+        .expect("promotion publisher key lookup failed");
+    PublicationPromotionRequest {
+        id: uuid::Uuid::new_v4(),
+        submission_id,
+        actor_account_id,
+        request_id: uuid::Uuid::new_v4(),
+        version: PackVersionRecord {
+            pack_name: format!("promotion-{submission_id}"),
+            version: "1.0.0".to_string(),
+            content_hash: submission.archive_hash,
+            signature: vec![0x51_u8; 64],
+            author_pubkey: key.public_key,
+            publisher_key_id: Some(key.id),
+            parent_hash: None,
+            capability_manifest_json: r#"{"permissions":[]}"#.to_string(),
+            schema_version: 1,
+            license: "MIT".to_string(),
+            published_at: chrono::Utc::now(),
+            status: PackStatus::Active,
+            size_bytes: 2048,
+        },
+        description: "Atomic promotion fixture".to_string(),
+        tags: vec!["promotion".to_string(), "test".to_string()],
+        extends: None,
     }
 }
 
@@ -2141,6 +2182,198 @@ async fn publication_moderation_supports_the_needs_review_loop() {
             .expect("count revision decisions failed"),
         2
     );
+}
+
+/// Concurrent exact promotion creates one active version and immutable evidence row.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn publication_promotion_is_atomic_concurrent_and_exactly_idempotent() {
+    let (catalog, _container) = setup_catalog().await;
+    let (_owner_id, _publisher_id, submission_id) =
+        create_test_publication_submission(&catalog, "promotion-atomic", 191).await;
+    let moderator = make_account(uuid::Uuid::new_v4(), "promotion-atomic-reviewer");
+    catalog
+        .create_account(moderator.clone())
+        .await
+        .expect("create promotion moderator failed");
+    assign_test_platform_role(&catalog, moderator.id, "moderator").await;
+    catalog
+        .moderate_publication_submission(make_moderation_request(
+            submission_id,
+            moderator.id,
+            PublicationModerationAction::Approve,
+        ))
+        .await
+        .expect("approve promotion submission failed");
+    let request = make_promotion_request(&catalog, submission_id, moderator.id).await;
+
+    let left_catalog = catalog.clone();
+    let left_request = request.clone();
+    let right_catalog = catalog.clone();
+    let right_request = request.clone();
+    let (left, right) = tokio::join!(
+        left_catalog.promote_publication_submission(left_request, PublishQuota::unlimited()),
+        right_catalog.promote_publication_submission(right_request, PublishQuota::unlimited())
+    );
+    let left = left.expect("first concurrent promotion failed");
+    let right = right.expect("second concurrent promotion failed");
+    assert_eq!(left, right);
+    assert_eq!(left.id, request.id);
+    assert_eq!(
+        catalog
+            .get_publication_submission(submission_id)
+            .await
+            .expect("promoted submission lookup failed")
+            .state,
+        PublicationSubmissionState::Promoted
+    );
+    let stored_version = catalog
+        .get_pack_version(&request.version.pack_name, &request.version.version)
+        .await
+        .expect("promoted pack version lookup failed");
+    assert_eq!(stored_version.content_hash, request.version.content_hash);
+    assert_eq!(
+        stored_version.publisher_key_id,
+        request.version.publisher_key_id
+    );
+
+    let mut connection = catalog
+        .pool()
+        .get()
+        .await
+        .expect("promotion evidence connection failed");
+    assert_eq!(
+        publication_promotions::table
+            .count()
+            .get_result::<i64>(&mut connection)
+            .await
+            .expect("count promotions failed"),
+        1
+    );
+    assert_eq!(
+        pack_versions::table
+            .filter(pack_versions::pack_name.eq(&request.version.pack_name))
+            .count()
+            .get_result::<i64>(&mut connection)
+            .await
+            .expect("count promoted versions failed"),
+        1
+    );
+
+    diesel::update(account_platform_roles::table.find((moderator.id, "moderator".to_string())))
+        .set(account_platform_roles::state.eq("revoked"))
+        .execute(&mut connection)
+        .await
+        .expect("revoke promotion moderator role failed");
+    diesel::update(publisher_keys::table.find(request.version.publisher_key_id.unwrap()))
+        .set((
+            publisher_keys::state.eq("revoked"),
+            publisher_keys::revoked_at.eq(Some(chrono::Utc::now())),
+        ))
+        .execute(&mut connection)
+        .await
+        .expect("revoke promoted publisher key failed");
+    drop(connection);
+
+    let replay = catalog
+        .promote_publication_submission(request.clone(), PublishQuota::unlimited())
+        .await
+        .expect("completed promotion must replay after authority revocation");
+    assert_eq!(replay, left);
+
+    let mut substituted = request.clone();
+    substituted.id = uuid::Uuid::new_v4();
+    assert!(matches!(
+        catalog
+            .promote_publication_submission(substituted, PublishQuota::unlimited())
+            .await
+            .expect_err("promotion identifier substitution must conflict"),
+        CatalogError::Conflict {
+            kind: "publication_promotion",
+            ..
+        }
+    ));
+
+    let mut connection = catalog
+        .pool()
+        .get()
+        .await
+        .expect("promotion immutability connection failed");
+    diesel::update(publication_promotions::table.find(left.id))
+        .set(publication_promotions::request_id.eq(uuid::Uuid::new_v4()))
+        .execute(&mut connection)
+        .await
+        .expect_err("promotion evidence updates must be rejected");
+    diesel::delete(publication_promotions::table.find(left.id))
+        .execute(&mut connection)
+        .await
+        .expect_err("promotion evidence deletes must be rejected");
+}
+
+/// Promotion evidence insertion failure rolls back version activation and state.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn publication_promotion_failure_rolls_back_catalog_activation() {
+    let (catalog, _container) = setup_catalog().await;
+    let (_owner_id, _publisher_id, submission_id) =
+        create_test_publication_submission(&catalog, "promotion-rollback", 193).await;
+    let moderator = make_account(uuid::Uuid::new_v4(), "promotion-rollback-reviewer");
+    catalog
+        .create_account(moderator.clone())
+        .await
+        .expect("create rollback moderator failed");
+    assign_test_platform_role(&catalog, moderator.id, "administrator").await;
+    catalog
+        .moderate_publication_submission(make_moderation_request(
+            submission_id,
+            moderator.id,
+            PublicationModerationAction::Approve,
+        ))
+        .await
+        .expect("approve rollback submission failed");
+    let request = make_promotion_request(&catalog, submission_id, moderator.id).await;
+    let mut connection = catalog
+        .pool()
+        .get()
+        .await
+        .expect("promotion rollback connection failed");
+    connection
+        .batch_execute(
+            r#"
+            CREATE FUNCTION reject_test_promotion() RETURNS trigger
+            LANGUAGE plpgsql AS $$
+            BEGIN
+                RAISE EXCEPTION 'forced promotion insertion failure';
+            END
+            $$;
+            CREATE TRIGGER reject_test_promotion
+            BEFORE INSERT ON publication_promotions
+            FOR EACH ROW EXECUTE FUNCTION reject_test_promotion();
+            "#,
+        )
+        .await
+        .expect("install promotion rejection trigger failed");
+    drop(connection);
+
+    catalog
+        .promote_publication_submission(request.clone(), PublishQuota::unlimited())
+        .await
+        .expect_err("forced promotion insertion failure must surface");
+    assert_eq!(
+        catalog
+            .get_publication_submission(submission_id)
+            .await
+            .expect("rollback submission lookup failed")
+            .state,
+        PublicationSubmissionState::Approved
+    );
+    assert!(matches!(
+        catalog
+            .get_pack_version(&request.version.pack_name, &request.version.version)
+            .await
+            .expect_err("rolled-back promotion must not leave an active version"),
+        CatalogError::NotFound { .. }
+    ));
 }
 
 /// Missing authority, inactive accounts, and self-review all fail closed.

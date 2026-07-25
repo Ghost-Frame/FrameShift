@@ -64,9 +64,9 @@ pub use records::{
     AccountRecord, AccountStatus, AuthorRecord, MembershipState, OauthLink, PackRecord,
     PackVersionRecord, PlatformRole, PlatformRoleRecord, PlatformRoleState, PublicationIntentClaim,
     PublicationIntentRecord, PublicationModerationAction, PublicationModerationDecisionRecord,
-    PublicationModerationDecisionRequest, PublicationSubmissionRecord,
-    PublicationSubmissionRequest, PublicationSubmissionState, PublisherAuditEventRecord,
-    PublisherKeyRecord, PublisherKeyState, PublisherMembershipRecord, PublisherModerationStatus,
-    PublisherProfileRecord, PublisherRole,
+    PublicationModerationDecisionRequest, PublicationPromotionRecord, PublicationPromotionRequest,
+    PublicationSubmissionRecord, PublicationSubmissionRequest, PublicationSubmissionState,
+    PublisherAuditEventRecord, PublisherKeyRecord, PublisherKeyState, PublisherMembershipRecord,
+    PublisherModerationStatus, PublisherProfileRecord, PublisherRole,
 };
 pub use status::{PackStatus, TombstoneReason, TombstoneRecord};

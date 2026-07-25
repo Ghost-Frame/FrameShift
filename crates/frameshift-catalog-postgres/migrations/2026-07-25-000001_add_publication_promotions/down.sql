@@ -1,0 +1,2 @@
+-- Intentionally irreversible: rolling this migration back would erase immutable
+-- promotion evidence and disconnect active versions from their reviewed source.

@@ -213,6 +213,9 @@ fn map_admission_error(error: PublicationAdmissionError) -> AppError {
         PublicationAdmissionError::IntentMismatch { field } => {
             AppError::BadRequest(format!("publication {field} does not match intent"))
         }
+        PublicationAdmissionError::Signature => {
+            AppError::BadRequest("publication archive signature is not authorized".to_string())
+        }
         PublicationAdmissionError::Catalog(error) => {
             AppError::from_catalog(error, "publication submission")
         }

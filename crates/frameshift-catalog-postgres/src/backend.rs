@@ -25,12 +25,12 @@ use tracing::{debug, error, instrument};
 
 use frameshift_catalog::{
     AccountRecord, AuthorRecord, CatalogBackend, CatalogError, Ed25519PublicKey, HealthStatus,
-    MembershipState, PackRecord, PackSearchFilters, PackSearchResult, PackVersionRecord,
-    PlatformRoleRecord, PublicationIntentClaim, PublicationIntentRecord,
+    MembershipState, PackRecord, PackSearchFilters, PackSearchResult, PackStatus,
+    PackVersionRecord, PlatformRoleRecord, PublicationIntentClaim, PublicationIntentRecord,
     PublicationModerationAction, PublicationModerationDecisionRecord,
-    PublicationModerationDecisionRequest, PublicationSubmissionRecord,
-    PublicationSubmissionRequest, PublicationSubmissionState, PublishQuota,
-    PublisherAuditEventRecord, PublisherKeyRecord, PublisherMembershipRecord,
+    PublicationModerationDecisionRequest, PublicationPromotionRecord, PublicationPromotionRequest,
+    PublicationSubmissionRecord, PublicationSubmissionRequest, PublicationSubmissionState,
+    PublishQuota, PublisherAuditEventRecord, PublisherKeyRecord, PublisherMembershipRecord,
     PublisherProfileRecord, SortMode, TombstoneRecord,
 };
 use frameshift_publication::{inventory_hash, FindingSeverity, REPORT_SCHEMA_VERSION};
@@ -40,17 +40,18 @@ use crate::errors::{map_diesel_error, map_migration_error, map_pool_error};
 use crate::models::{
     encode_text_enum, vec_to_pubkey, AccountRow, AuthorRow, HandleRow, NewAccountRow, NewAuthorRow,
     NewHandleRow, NewPackDownloadRow, NewPackRow, NewPackVersionRow, NewPublicationIntentRow,
-    NewPublicationModerationDecisionRow, NewPublicationSubmissionRow, NewPublisherAuditEventRow,
-    NewPublisherKeyRow, NewPublisherMembershipRow, NewPublisherProfileRow, PackRow, PackVersionRow,
-    PlatformRoleRow, PublicationIntentRow, PublicationModerationDecisionRow,
-    PublicationSubmissionRow, PublisherKeyRow, PublisherMembershipRow, PublisherProfileRow,
+    NewPublicationModerationDecisionRow, NewPublicationPromotionRow, NewPublicationSubmissionRow,
+    NewPublisherAuditEventRow, NewPublisherKeyRow, NewPublisherMembershipRow,
+    NewPublisherProfileRow, PackRow, PackVersionRow, PlatformRoleRow, PublicationIntentRow,
+    PublicationModerationDecisionRow, PublicationPromotionRow, PublicationSubmissionRow,
+    PublisherKeyRow, PublisherMembershipRow, PublisherProfileRow,
 };
 use crate::pool::{build_pool, PgPool};
 use crate::schema::{
     account_platform_roles, accounts, authors, handles, pack_downloads, pack_versions, packs,
-    publication_intents, publication_moderation_decisions, publication_submissions,
-    publisher_audit_events, publisher_keys, publisher_memberships, publisher_profiles,
-    signed_request_nonces,
+    publication_intents, publication_moderation_decisions, publication_promotions,
+    publication_submissions, publisher_audit_events, publisher_keys, publisher_memberships,
+    publisher_profiles, signed_request_nonces,
 };
 
 /// Embedded migration files compiled into the binary at build time.
@@ -289,6 +290,39 @@ fn resolve_publication_submission_retry(
     }
 }
 
+/// Compare immutable promotion evidence with one exact retry request.
+fn publication_promotion_matches(
+    existing: &PublicationPromotionRecord,
+    request: &PublicationPromotionRequest,
+) -> bool {
+    existing.id == request.id
+        && existing.submission_id == request.submission_id
+        && existing.actor_account_id == request.actor_account_id
+        && existing.pack_name == request.version.pack_name
+        && existing.version == request.version.version
+        && existing.content_hash == request.version.content_hash
+        && existing.request_id == request.request_id
+}
+
+/// Resolve one completed promotion retry or reject identifier substitution.
+fn resolve_publication_promotion_retry(
+    row: PublicationPromotionRow,
+    request: &PublicationPromotionRequest,
+) -> Result<PublicationPromotionRow, CatalogTransactionError> {
+    let record = row
+        .clone()
+        .into_record()
+        .map_err(CatalogTransactionError::Catalog)?;
+    if publication_promotion_matches(&record, request) {
+        Ok(row)
+    } else {
+        Err(CatalogTransactionError::Catalog(CatalogError::Conflict {
+            kind: "publication_promotion",
+            key: request.id.to_string(),
+        }))
+    }
+}
+
 /// Validate bounded moderation fields before starting a database transaction.
 fn validate_publication_moderation_request(
     request: &PublicationModerationDecisionRequest,
@@ -431,6 +465,382 @@ impl PostgresCatalog {
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
+}
+
+/// Owned inputs required by one version-registration transaction.
+struct PackRegistrationTransaction {
+    /// Database row inserted after ownership and quota checks pass.
+    new_version: NewPackVersionRow,
+    /// Stable pack name used for locks and conflict mapping.
+    pack_name: String,
+    /// Stable semantic version used for duplicate detection.
+    version: String,
+    /// Exact author key bytes used for ownership validation.
+    incoming_author: Vec<u8>,
+    /// Optional enrolled publisher key selected for the write.
+    incoming_publisher_key_id: Option<uuid::Uuid>,
+    /// Uncompressed catalog size charged against publication quotas.
+    incoming_size: u64,
+    /// Publication quota limits enforced inside the transaction.
+    quota: PublishQuota,
+}
+
+/// Register one pack version using an existing PostgreSQL transaction.
+async fn register_pack_version_on_connection(
+    conn: &mut diesel_async::AsyncPgConnection,
+    registration: PackRegistrationTransaction,
+) -> Result<(), CatalogTransactionError> {
+    // diesel-async 0.9 takes an `AsyncFnOnce`, so the old
+    // `|conn| Box::pin(async move { .. })` wrapper is gone -- the body
+    // is now the async closure directly. `new_pack` and `new_version`
+    // are captured by move under their own names; comparison values
+    // are rebound (by move, no clone) to the short names used below.
+    let PackRegistrationTransaction {
+        new_version,
+        pack_name,
+        version,
+        incoming_author,
+        incoming_publisher_key_id,
+        incoming_size,
+        quota,
+    } = registration;
+    // Cross the ownership migration boundary before resolving
+    // either namespace. ROW EXCLUSIVE conflicts with backfill's
+    // SHARE ROW EXCLUSIVE lock while remaining compatible with
+    // concurrent publishers. Aggregate quota accounting retains
+    // the stronger self-conflicting lock it already required.
+    if quota.max_total_bytes.is_some() {
+        diesel::sql_query("LOCK TABLE pack_versions IN SHARE ROW EXCLUSIVE MODE")
+            .execute(conn)
+            .await?;
+    } else {
+        diesel::sql_query("LOCK TABLE pack_versions IN ROW EXCLUSIVE MODE")
+            .execute(conn)
+            .await?;
+    }
+    // Lock and validate the authoritative write identity before any
+    // quota reads. Publisher profiles serialize quota accounting,
+    // and their key rows serialize publication with revocation;
+    // legacy authors retain their existing key lock.
+    let incoming_publisher_id = if let Some(key_id) = incoming_publisher_key_id {
+        let publisher_id = publisher_keys::table
+            .find(key_id)
+            .select(publisher_keys::publisher_id)
+            .first::<uuid::Uuid>(conn)
+            .await
+            .optional()
+            .map_err(|e| {
+                CatalogTransactionError::Catalog(map_diesel_error(
+                    e,
+                    "publisher_key",
+                    key_id.to_string(),
+                ))
+            })?
+            .ok_or_else(|| {
+                CatalogTransactionError::Catalog(CatalogError::Unauthorized {
+                    kind: "publisher_key",
+                    key: key_id.to_string(),
+                })
+            })?;
+        publisher_profiles::table
+            .find(publisher_id)
+            .for_update()
+            .select(publisher_profiles::id)
+            .first::<uuid::Uuid>(conn)
+            .await
+            .map_err(|e| {
+                CatalogTransactionError::Catalog(map_diesel_error(
+                    e,
+                    "publisher",
+                    publisher_id.to_string(),
+                ))
+            })?;
+        let key = publisher_keys::table
+            .find(key_id)
+            .for_update()
+            .select(PublisherKeyRow::as_select())
+            .first(conn)
+            .await
+            .optional()
+            .map_err(|e| {
+                CatalogTransactionError::Catalog(map_diesel_error(
+                    e,
+                    "publisher_key",
+                    key_id.to_string(),
+                ))
+            })?;
+        match key {
+            Some(key)
+                if key.publisher_id == publisher_id
+                    && key.state == "active"
+                    && key.public_key == incoming_author =>
+            {
+                Some(publisher_id)
+            }
+            _ => {
+                return Err(CatalogTransactionError::Catalog(
+                    CatalogError::Unauthorized {
+                        kind: "publisher_key",
+                        key: key_id.to_string(),
+                    },
+                ));
+            }
+        }
+    } else {
+        let legacy_handle = authors::table
+            .filter(authors::pubkey.eq(&incoming_author))
+            .for_update()
+            .select(authors::handle)
+            .first::<String>(conn)
+            .await
+            .map_err(|e| {
+                CatalogTransactionError::Catalog(map_diesel_error(
+                    e,
+                    "author",
+                    hex::encode(&incoming_author),
+                ))
+            })?;
+        let publisher_exists = publisher_profiles::table
+            .filter(publisher_profiles::handle.eq(&legacy_handle))
+            .select(publisher_profiles::id)
+            .first::<uuid::Uuid>(conn)
+            .await
+            .optional()
+            .map_err(|e| {
+                CatalogTransactionError::Catalog(map_diesel_error(
+                    e,
+                    "publisher",
+                    legacy_handle.clone(),
+                ))
+            })?
+            .is_some();
+        if publisher_exists {
+            return Err(CatalogTransactionError::Catalog(
+                CatalogError::Unauthorized {
+                    kind: "publisher",
+                    key: legacy_handle,
+                },
+            ));
+        }
+        None
+    };
+    let publisher_key_ids: Vec<Option<uuid::Uuid>> =
+        if let Some(publisher_id) = incoming_publisher_id {
+            publisher_keys::table
+                .filter(publisher_keys::publisher_id.eq(publisher_id))
+                .select(publisher_keys::id)
+                .load::<uuid::Uuid>(conn)
+                .await
+                .map_err(|e| {
+                    CatalogTransactionError::Catalog(map_diesel_error(
+                        e,
+                        "publisher_key",
+                        publisher_id.to_string(),
+                    ))
+                })?
+                .into_iter()
+                .map(Some)
+                .collect()
+        } else {
+            Vec::new()
+        };
+    let (version_count, stored_sizes): (i64, Vec<i64>) = if incoming_publisher_id.is_some() {
+        let count = pack_versions::table
+            .filter(pack_versions::publisher_key_id.eq_any(&publisher_key_ids))
+            .count()
+            .get_result(conn)
+            .await
+            .map_err(|e| {
+                CatalogTransactionError::Catalog(map_diesel_error(
+                    e,
+                    "pack_version",
+                    pack_name.clone(),
+                ))
+            })?;
+        let sizes = pack_versions::table
+            .filter(pack_versions::publisher_key_id.eq_any(&publisher_key_ids))
+            .select(pack_versions::size_bytes)
+            .load(conn)
+            .await
+            .map_err(|e| {
+                CatalogTransactionError::Catalog(map_diesel_error(
+                    e,
+                    "pack_version",
+                    pack_name.clone(),
+                ))
+            })?;
+        (count, sizes)
+    } else {
+        let count = pack_versions::table
+            .filter(pack_versions::author_pubkey.eq(&incoming_author))
+            .count()
+            .get_result(conn)
+            .await
+            .map_err(|e| {
+                CatalogTransactionError::Catalog(map_diesel_error(
+                    e,
+                    "pack_version",
+                    pack_name.clone(),
+                ))
+            })?;
+        let sizes = pack_versions::table
+            .filter(pack_versions::author_pubkey.eq(&incoming_author))
+            .select(pack_versions::size_bytes)
+            .load(conn)
+            .await
+            .map_err(|e| {
+                CatalogTransactionError::Catalog(map_diesel_error(
+                    e,
+                    "pack_version",
+                    pack_name.clone(),
+                ))
+            })?;
+        (count, sizes)
+    };
+    let next_versions = u64::try_from(version_count)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let stored_bytes = stored_sizes.into_iter().fold(0u64, |total, size| {
+        total.saturating_add(u64::try_from(size).unwrap_or(u64::MAX))
+    });
+    let next_bytes = stored_bytes.saturating_add(incoming_size);
+    if quota
+        .max_versions
+        .is_some_and(|limit| next_versions > limit)
+    {
+        return Err(CatalogTransactionError::Catalog(CatalogError::Validation(
+            "publisher version quota exceeded".to_string(),
+        )));
+    }
+    if quota.max_bytes.is_some_and(|limit| next_bytes > limit) {
+        return Err(CatalogTransactionError::Catalog(CatalogError::Validation(
+            "publisher storage quota exceeded".to_string(),
+        )));
+    }
+    if let Some(limit) = quota.max_total_bytes {
+        let total_row: TotalBytesRow = diesel::sql_query(
+            "SELECT COALESCE(SUM(size_bytes), 0)::BIGINT AS total FROM pack_versions",
+        )
+        .get_result(conn)
+        .await
+        .map_err(|e| {
+            CatalogTransactionError::Catalog(map_diesel_error(e, "pack_version", pack_name.clone()))
+        })?;
+        let stored_total = u64::try_from(total_row.total).unwrap_or(u64::MAX);
+        let next_total_bytes = stored_total.saturating_add(incoming_size);
+        if next_total_bytes > limit {
+            return Err(CatalogTransactionError::Catalog(CatalogError::Validation(
+                "registry storage quota exceeded".to_string(),
+            )));
+        }
+    }
+    // Upsert the parent pack row; do nothing if it already exists.
+    let new_pack = NewPackRow {
+        name: pack_name.clone(),
+        current_author: incoming_author.clone(),
+        publisher_id: incoming_publisher_id,
+        tags: vec![],
+        description: String::new(),
+        latest_version: Some(version.clone()),
+        extends: None,
+    };
+    diesel::insert_into(packs::table)
+        .values(&new_pack)
+        .on_conflict(packs::name)
+        .do_nothing()
+        .execute(conn)
+        .await
+        .map_err(|e| {
+            CatalogTransactionError::Catalog(map_diesel_error(e, "pack", pack_name.clone()))
+        })?;
+
+    // The conflict-resolving insert above may have waited for a
+    // concurrent first publisher. Authorize against the actual
+    // winning row while holding its lock before inserting a version.
+    let stored_pack: PackRow = packs::table
+        .filter(packs::name.eq(&pack_name))
+        .for_update()
+        .select(PackRow::as_select())
+        .first(conn)
+        .await
+        .map_err(|e| {
+            CatalogTransactionError::Catalog(map_diesel_error(e, "pack", pack_name.clone()))
+        })?;
+    let ownership_matches = match (stored_pack.publisher_id, incoming_publisher_id) {
+        (Some(existing), Some(incoming)) => existing == incoming,
+        (None, None) => stored_pack.current_author == incoming_author,
+        _ => false,
+    };
+    if !ownership_matches {
+        return Err(CatalogTransactionError::Catalog(
+            CatalogError::Unauthorized {
+                kind: "pack",
+                key: pack_name.clone(),
+            },
+        ));
+    }
+
+    // Insert the version row.
+    diesel::insert_into(pack_versions::table)
+        .values(&new_version)
+        .execute(conn)
+        .await
+        .map_err(|e| {
+            CatalogTransactionError::Catalog(map_diesel_error(
+                e,
+                "pack_version",
+                format!("{pack_name}@{version}"),
+            ))
+        })?;
+
+    // Only a committed version counts as key use. Keeping this
+    // update after the insert also leaves conflicts and rollbacks
+    // with their previous last_used_at value.
+    if let Some(key_id) = incoming_publisher_key_id {
+        diesel::update(publisher_keys::table.find(key_id))
+            .set(publisher_keys::last_used_at.eq(Some(Utc::now())))
+            .execute(conn)
+            .await
+            .map_err(|e| {
+                CatalogTransactionError::Catalog(map_diesel_error(
+                    e,
+                    "publisher_key",
+                    key_id.to_string(),
+                ))
+            })?;
+    }
+
+    // Update latest_version using true semver precedence. Read the
+    // current stored value (may have changed from the
+    // row we fetched above if this is a first insert), then
+    // compare using semver_gt before issuing the UPDATE.
+    let current_latest: Option<String> = packs::table
+        .filter(packs::name.eq(&pack_name))
+        .select(packs::latest_version)
+        .first(conn)
+        .await
+        .map_err(|e| {
+            CatalogTransactionError::Catalog(map_diesel_error(e, "pack", pack_name.clone()))
+        })?;
+
+    // Only update when the new version has strictly higher
+    // semver precedence than the stored latest.
+    let should_update = match &current_latest {
+        None => true,
+        Some(stored) => semver_gt(&version, stored),
+    };
+
+    if should_update {
+        diesel::update(packs::table.filter(packs::name.eq(&pack_name)))
+            .set(packs::latest_version.eq(Some(&version)))
+            .execute(conn)
+            .await
+            .map_err(|e| {
+                CatalogTransactionError::Catalog(map_diesel_error(e, "pack", pack_name.clone()))
+            })?;
+    }
+
+    Ok(())
 }
 
 /// PostgreSQL implementation of the [`CatalogBackend`] trait.
@@ -1453,6 +1863,252 @@ impl CatalogBackend for PostgresCatalog {
         }
     }
 
+    /// Atomically activate one approved quarantine submission in the public catalog.
+    async fn promote_publication_submission(
+        &self,
+        request: PublicationPromotionRequest,
+        quota: PublishQuota,
+    ) -> Result<PublicationPromotionRecord, CatalogError> {
+        if request.version.signature.len() != 64 {
+            return Err(CatalogError::InvalidArgument(format!(
+                "signature must be exactly 64 bytes, got {}",
+                request.version.signature.len()
+            )));
+        }
+        if !matches!(request.version.status, PackStatus::Active) {
+            return Err(CatalogError::InvalidArgument(
+                "promoted pack version must be active".to_string(),
+            ));
+        }
+
+        let capability_json: serde_json::Value =
+            serde_json::from_str(&request.version.capability_manifest_json).map_err(|error| {
+                CatalogError::InvalidArgument(format!("capability_manifest_json: {error}"))
+            })?;
+        let status_json = serde_json::to_value(&request.version.status)
+            .map_err(|error| CatalogError::BackendError(Box::new(error)))?;
+        let schema_version = i32::try_from(request.version.schema_version).map_err(|_| {
+            CatalogError::InvalidArgument(format!(
+                "schema_version {} exceeds i32::MAX",
+                request.version.schema_version
+            ))
+        })?;
+        let size_bytes = i64::try_from(request.version.size_bytes).map_err(|_| {
+            CatalogError::InvalidArgument(format!(
+                "size_bytes {} exceeds i64::MAX",
+                request.version.size_bytes
+            ))
+        })?;
+        let new_version = NewPackVersionRow {
+            pack_name: request.version.pack_name.clone(),
+            version: request.version.version.clone(),
+            content_hash: request.version.content_hash.as_bytes().to_vec(),
+            signature: request.version.signature.clone(),
+            author_pubkey: request.version.author_pubkey.0.to_vec(),
+            publisher_key_id: request.version.publisher_key_id,
+            parent_hash: request
+                .version
+                .parent_hash
+                .map(|hash| hash.as_bytes().to_vec()),
+            capability_manifest_json: capability_json,
+            schema_version,
+            license: request.version.license.clone(),
+            status: status_json,
+            size_bytes,
+        };
+
+        let promotion_id = request.id;
+        let submission_id = request.submission_id;
+        let pack_name = request.version.pack_name.clone();
+        let version = request.version.version.clone();
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        use diesel_async::AsyncConnection as _;
+        let result = conn
+            .transaction::<PublicationPromotionRow, CatalogTransactionError, _>(async move |conn| {
+                let submission = publication_submissions::table
+                    .find(request.submission_id)
+                    .for_update()
+                    .select(PublicationSubmissionRow::as_select())
+                    .first(conn)
+                    .await
+                    .optional()?
+                    .ok_or_else(|| {
+                        CatalogTransactionError::Catalog(CatalogError::NotFound {
+                            kind: "publication_submission",
+                            key: request.submission_id.to_string(),
+                        })
+                    })?;
+                let submission_record = submission
+                    .clone()
+                    .into_record()
+                    .map_err(CatalogTransactionError::Catalog)?;
+
+                let existing_by_submission = publication_promotions::table
+                    .filter(publication_promotions::submission_id.eq(request.submission_id))
+                    .select(PublicationPromotionRow::as_select())
+                    .first(conn)
+                    .await
+                    .optional()?;
+                if let Some(existing) = existing_by_submission {
+                    return resolve_publication_promotion_retry(existing, &request);
+                }
+                let existing_by_id = publication_promotions::table
+                    .find(request.id)
+                    .select(PublicationPromotionRow::as_select())
+                    .first(conn)
+                    .await
+                    .optional()?;
+                if let Some(existing) = existing_by_id {
+                    return resolve_publication_promotion_retry(existing, &request);
+                }
+                let existing_by_request = publication_promotions::table
+                    .filter(publication_promotions::request_id.eq(request.request_id))
+                    .select(PublicationPromotionRow::as_select())
+                    .first(conn)
+                    .await
+                    .optional()?;
+                if let Some(existing) = existing_by_request {
+                    return resolve_publication_promotion_retry(existing, &request);
+                }
+
+                if submission_record.state != PublicationSubmissionState::Approved {
+                    return Err(CatalogTransactionError::Catalog(CatalogError::Conflict {
+                        kind: "publication_submission",
+                        key: request.submission_id.to_string(),
+                    }));
+                }
+                if request.version.content_hash != submission_record.archive_hash
+                    || request.version.publisher_key_id != Some(submission_record.publisher_key_id)
+                {
+                    return Err(CatalogTransactionError::Catalog(
+                        CatalogError::Unauthorized {
+                            kind: "publication_promotion",
+                            key: request.id.to_string(),
+                        },
+                    ));
+                }
+
+                let actor_status = accounts::table
+                    .find(request.actor_account_id)
+                    .for_update()
+                    .select(accounts::status)
+                    .first::<String>(conn)
+                    .await
+                    .optional()?;
+                let active_role = account_platform_roles::table
+                    .filter(account_platform_roles::account_id.eq(request.actor_account_id))
+                    .filter(account_platform_roles::state.eq("active"))
+                    .filter(account_platform_roles::role.eq_any(["moderator", "administrator"]))
+                    .order(account_platform_roles::role.asc())
+                    .for_update()
+                    .select(PlatformRoleRow::as_select())
+                    .first(conn)
+                    .await
+                    .optional()?;
+                let active_ownership = publisher_memberships::table
+                    .filter(publisher_memberships::account_id.eq(request.actor_account_id))
+                    .filter(publisher_memberships::publisher_id.eq(submission_record.publisher_id))
+                    .filter(publisher_memberships::role.eq("owner"))
+                    .filter(publisher_memberships::state.eq("active"))
+                    .for_update()
+                    .select(PublisherMembershipRow::as_select())
+                    .first(conn)
+                    .await
+                    .optional()?;
+                let publisher_status = publisher_profiles::table
+                    .find(submission_record.publisher_id)
+                    .for_update()
+                    .select(publisher_profiles::moderation_status)
+                    .first::<String>(conn)
+                    .await
+                    .optional()?;
+                if actor_status.as_deref() != Some("active")
+                    || active_role.is_none()
+                    || active_ownership.is_some()
+                    || publisher_status.as_deref() != Some("approved")
+                {
+                    return Err(CatalogTransactionError::Catalog(
+                        CatalogError::Unauthorized {
+                            kind: "publication_promotion",
+                            key: request.id.to_string(),
+                        },
+                    ));
+                }
+
+                register_pack_version_on_connection(
+                    conn,
+                    PackRegistrationTransaction {
+                        new_version,
+                        pack_name: request.version.pack_name.clone(),
+                        version: request.version.version.clone(),
+                        incoming_author: request.version.author_pubkey.0.to_vec(),
+                        incoming_publisher_key_id: request.version.publisher_key_id,
+                        incoming_size: request.version.size_bytes,
+                        quota,
+                    },
+                )
+                .await?;
+
+                diesel::update(packs::table.find(&request.version.pack_name))
+                    .set((
+                        packs::description.eq(request.description),
+                        packs::tags.eq(request.tags),
+                        packs::extends.eq(request.extends),
+                    ))
+                    .execute(conn)
+                    .await?;
+
+                let created_at = diesel::select(
+                    diesel::dsl::sql::<diesel::sql_types::Timestamptz>("CURRENT_TIMESTAMP"),
+                )
+                .get_result::<chrono::DateTime<Utc>>(conn)
+                .await?;
+                let promotion = diesel::insert_into(publication_promotions::table)
+                    .values(NewPublicationPromotionRow {
+                        id: request.id,
+                        submission_id: request.submission_id,
+                        actor_account_id: request.actor_account_id,
+                        pack_name: request.version.pack_name,
+                        version: request.version.version,
+                        content_hash: request.version.content_hash.as_bytes().to_vec(),
+                        request_id: request.request_id,
+                        created_at,
+                    })
+                    .returning(PublicationPromotionRow::as_returning())
+                    .get_result(conn)
+                    .await?;
+                let changed = diesel::update(
+                    publication_submissions::table
+                        .find(request.submission_id)
+                        .filter(publication_submissions::state.eq("approved")),
+                )
+                .set((
+                    publication_submissions::state.eq("promoted"),
+                    publication_submissions::updated_at.eq(created_at),
+                ))
+                .execute(conn)
+                .await?;
+                if changed != 1 {
+                    return Err(CatalogTransactionError::Catalog(CatalogError::Conflict {
+                        kind: "publication_submission",
+                        key: request.submission_id.to_string(),
+                    }));
+                }
+                Ok(promotion)
+            })
+            .await;
+
+        match result {
+            Ok(row) => row.into_record(),
+            Err(CatalogTransactionError::Catalog(error)) => Err(error),
+            Err(CatalogTransactionError::Diesel(error)) => Err(map_diesel_error(
+                error,
+                "publication_promotion",
+                format!("{promotion_id}:{submission_id}:{pack_name}@{version}"),
+            )),
+        }
+    }
+
     /// Register a new author or confirm an identical author already exists.
     ///
     /// SQL shape:
@@ -1703,363 +2359,31 @@ impl CatalogBackend for PostgresCatalog {
         let incoming_publisher_key_id = record.publisher_key_id;
         let incoming_size_bytes = record.size_bytes;
 
-        // `diesel_async::AsyncConnection::transaction` requires
-        // `E: From<diesel::result::Error>`. We use a local wrapper that carries
-        // either a CatalogError or a raw Diesel error, then unwrap after the
-        // transaction completes.
-        //
-        // This avoids adding `From<diesel::result::Error>` to `CatalogError`
-        // (which is a cross-crate type we cannot modify).
-        enum TxError {
-            Catalog(CatalogError),
-            Diesel(diesel::result::Error),
-        }
-        /// Required by `diesel_async::AsyncConnection::transaction`, which
-        /// constrains `E: From<diesel::result::Error>`.
-        impl From<diesel::result::Error> for TxError {
-            /// Wrap a raw Diesel error in `TxError::Diesel` for transport
-            /// through the transaction boundary.
-            fn from(e: diesel::result::Error) -> Self {
-                TxError::Diesel(e)
-            }
-        }
-
         use diesel_async::AsyncConnection as _;
         let tx_result = conn
-            .transaction::<(), TxError, _>(async move |conn| {
-                // diesel-async 0.9 takes an `AsyncFnOnce`, so the old
-                // `|conn| Box::pin(async move { .. })` wrapper is gone -- the body
-                // is now the async closure directly. `new_pack` and `new_version`
-                // are captured by move under their own names; comparison values
-                // are rebound (by move, no clone) to the short names used below.
-                let pack_name = pack_name_clone;
-                let version = version_clone;
-                let incoming_author = incoming_author_bytes;
-                let incoming_size = incoming_size_bytes;
-                // Cross the ownership migration boundary before resolving
-                // either namespace. ROW EXCLUSIVE conflicts with backfill's
-                // SHARE ROW EXCLUSIVE lock while remaining compatible with
-                // concurrent publishers. Aggregate quota accounting retains
-                // the stronger self-conflicting lock it already required.
-                if quota.max_total_bytes.is_some() {
-                    diesel::sql_query("LOCK TABLE pack_versions IN SHARE ROW EXCLUSIVE MODE")
-                        .execute(conn)
-                        .await?;
-                } else {
-                    diesel::sql_query("LOCK TABLE pack_versions IN ROW EXCLUSIVE MODE")
-                        .execute(conn)
-                        .await?;
-                }
-                // Lock and validate the authoritative write identity before any
-                // quota reads. Publisher profiles serialize quota accounting,
-                // and their key rows serialize publication with revocation;
-                // legacy authors retain their existing key lock.
-                let incoming_publisher_id = if let Some(key_id) = incoming_publisher_key_id {
-                    let publisher_id = publisher_keys::table
-                        .find(key_id)
-                        .select(publisher_keys::publisher_id)
-                        .first::<uuid::Uuid>(conn)
-                        .await
-                        .optional()
-                        .map_err(|e| {
-                            TxError::Catalog(map_diesel_error(
-                                e,
-                                "publisher_key",
-                                key_id.to_string(),
-                            ))
-                        })?
-                        .ok_or_else(|| {
-                            TxError::Catalog(CatalogError::Unauthorized {
-                                kind: "publisher_key",
-                                key: key_id.to_string(),
-                            })
-                        })?;
-                    publisher_profiles::table
-                        .find(publisher_id)
-                        .for_update()
-                        .select(publisher_profiles::id)
-                        .first::<uuid::Uuid>(conn)
-                        .await
-                        .map_err(|e| {
-                            TxError::Catalog(map_diesel_error(
-                                e,
-                                "publisher",
-                                publisher_id.to_string(),
-                            ))
-                        })?;
-                    let key = publisher_keys::table
-                        .find(key_id)
-                        .for_update()
-                        .select(PublisherKeyRow::as_select())
-                        .first(conn)
-                        .await
-                        .optional()
-                        .map_err(|e| {
-                            TxError::Catalog(map_diesel_error(
-                                e,
-                                "publisher_key",
-                                key_id.to_string(),
-                            ))
-                        })?;
-                    match key {
-                        Some(key)
-                            if key.publisher_id == publisher_id
-                                && key.state == "active"
-                                && key.public_key == incoming_author =>
-                        {
-                            Some(publisher_id)
-                        }
-                        _ => {
-                            return Err(TxError::Catalog(CatalogError::Unauthorized {
-                                kind: "publisher_key",
-                                key: key_id.to_string(),
-                            }));
-                        }
-                    }
-                } else {
-                    let legacy_handle = authors::table
-                        .filter(authors::pubkey.eq(&incoming_author))
-                        .for_update()
-                        .select(authors::handle)
-                        .first::<String>(conn)
-                        .await
-                        .map_err(|e| {
-                            TxError::Catalog(map_diesel_error(
-                                e,
-                                "author",
-                                hex::encode(&incoming_author),
-                            ))
-                        })?;
-                    let publisher_exists = publisher_profiles::table
-                        .filter(publisher_profiles::handle.eq(&legacy_handle))
-                        .select(publisher_profiles::id)
-                        .first::<uuid::Uuid>(conn)
-                        .await
-                        .optional()
-                        .map_err(|e| {
-                            TxError::Catalog(map_diesel_error(
-                                e,
-                                "publisher",
-                                legacy_handle.clone(),
-                            ))
-                        })?
-                        .is_some();
-                    if publisher_exists {
-                        return Err(TxError::Catalog(CatalogError::Unauthorized {
-                            kind: "publisher",
-                            key: legacy_handle,
-                        }));
-                    }
-                    None
-                };
-                let publisher_key_ids: Vec<Option<uuid::Uuid>> =
-                    if let Some(publisher_id) = incoming_publisher_id {
-                        publisher_keys::table
-                            .filter(publisher_keys::publisher_id.eq(publisher_id))
-                            .select(publisher_keys::id)
-                            .load::<uuid::Uuid>(conn)
-                            .await
-                            .map_err(|e| {
-                                TxError::Catalog(map_diesel_error(
-                                    e,
-                                    "publisher_key",
-                                    publisher_id.to_string(),
-                                ))
-                            })?
-                            .into_iter()
-                            .map(Some)
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
-                let (version_count, stored_sizes): (i64, Vec<i64>) = if incoming_publisher_id
-                    .is_some()
-                {
-                    let count = pack_versions::table
-                        .filter(pack_versions::publisher_key_id.eq_any(&publisher_key_ids))
-                        .count()
-                        .get_result(conn)
-                        .await
-                        .map_err(|e| {
-                            TxError::Catalog(map_diesel_error(e, "pack_version", pack_name.clone()))
-                        })?;
-                    let sizes = pack_versions::table
-                        .filter(pack_versions::publisher_key_id.eq_any(&publisher_key_ids))
-                        .select(pack_versions::size_bytes)
-                        .load(conn)
-                        .await
-                        .map_err(|e| {
-                            TxError::Catalog(map_diesel_error(e, "pack_version", pack_name.clone()))
-                        })?;
-                    (count, sizes)
-                } else {
-                    let count = pack_versions::table
-                        .filter(pack_versions::author_pubkey.eq(&incoming_author))
-                        .count()
-                        .get_result(conn)
-                        .await
-                        .map_err(|e| {
-                            TxError::Catalog(map_diesel_error(e, "pack_version", pack_name.clone()))
-                        })?;
-                    let sizes = pack_versions::table
-                        .filter(pack_versions::author_pubkey.eq(&incoming_author))
-                        .select(pack_versions::size_bytes)
-                        .load(conn)
-                        .await
-                        .map_err(|e| {
-                            TxError::Catalog(map_diesel_error(e, "pack_version", pack_name.clone()))
-                        })?;
-                    (count, sizes)
-                };
-                let next_versions = u64::try_from(version_count)
-                    .unwrap_or(u64::MAX)
-                    .saturating_add(1);
-                let stored_bytes = stored_sizes.into_iter().fold(0u64, |total, size| {
-                    total.saturating_add(u64::try_from(size).unwrap_or(u64::MAX))
-                });
-                let next_bytes = stored_bytes.saturating_add(incoming_size);
-                if quota
-                    .max_versions
-                    .is_some_and(|limit| next_versions > limit)
-                {
-                    return Err(TxError::Catalog(CatalogError::Validation(
-                        "publisher version quota exceeded".to_string(),
-                    )));
-                }
-                if quota.max_bytes.is_some_and(|limit| next_bytes > limit) {
-                    return Err(TxError::Catalog(CatalogError::Validation(
-                        "publisher storage quota exceeded".to_string(),
-                    )));
-                }
-                if let Some(limit) = quota.max_total_bytes {
-                    let total_row: TotalBytesRow = diesel::sql_query(
-                        "SELECT COALESCE(SUM(size_bytes), 0)::BIGINT AS total FROM pack_versions",
-                    )
-                    .get_result(conn)
-                    .await
-                    .map_err(|e| {
-                        TxError::Catalog(map_diesel_error(e, "pack_version", pack_name.clone()))
-                    })?;
-                    let stored_total = u64::try_from(total_row.total).unwrap_or(u64::MAX);
-                    let next_total_bytes = stored_total.saturating_add(incoming_size);
-                    if next_total_bytes > limit {
-                        return Err(TxError::Catalog(CatalogError::Validation(
-                            "registry storage quota exceeded".to_string(),
-                        )));
-                    }
-                }
-                // Upsert the parent pack row; do nothing if it already exists.
-                let new_pack = NewPackRow {
-                    name: pack_name.clone(),
-                    current_author: incoming_author.clone(),
-                    publisher_id: incoming_publisher_id,
-                    tags: vec![],
-                    description: String::new(),
-                    latest_version: Some(version.clone()),
-                    extends: None,
-                };
-                diesel::insert_into(packs::table)
-                    .values(&new_pack)
-                    .on_conflict(packs::name)
-                    .do_nothing()
-                    .execute(conn)
-                    .await
-                    .map_err(|e| {
-                        TxError::Catalog(map_diesel_error(e, "pack", pack_name.clone()))
-                    })?;
-
-                // The conflict-resolving insert above may have waited for a
-                // concurrent first publisher. Authorize against the actual
-                // winning row while holding its lock before inserting a version.
-                let stored_pack: PackRow = packs::table
-                    .filter(packs::name.eq(&pack_name))
-                    .for_update()
-                    .select(PackRow::as_select())
-                    .first(conn)
-                    .await
-                    .map_err(|e| {
-                        TxError::Catalog(map_diesel_error(e, "pack", pack_name.clone()))
-                    })?;
-                let ownership_matches = match (stored_pack.publisher_id, incoming_publisher_id) {
-                    (Some(existing), Some(incoming)) => existing == incoming,
-                    (None, None) => stored_pack.current_author == incoming_author,
-                    _ => false,
-                };
-                if !ownership_matches {
-                    return Err(TxError::Catalog(CatalogError::Unauthorized {
-                        kind: "pack",
-                        key: pack_name.clone(),
-                    }));
-                }
-
-                // Insert the version row.
-                diesel::insert_into(pack_versions::table)
-                    .values(&new_version)
-                    .execute(conn)
-                    .await
-                    .map_err(|e| {
-                        TxError::Catalog(map_diesel_error(
-                            e,
-                            "pack_version",
-                            format!("{pack_name}@{version}"),
-                        ))
-                    })?;
-
-                // Only a committed version counts as key use. Keeping this
-                // update after the insert also leaves conflicts and rollbacks
-                // with their previous last_used_at value.
-                if let Some(key_id) = incoming_publisher_key_id {
-                    diesel::update(publisher_keys::table.find(key_id))
-                        .set(publisher_keys::last_used_at.eq(Some(Utc::now())))
-                        .execute(conn)
-                        .await
-                        .map_err(|e| {
-                            TxError::Catalog(map_diesel_error(
-                                e,
-                                "publisher_key",
-                                key_id.to_string(),
-                            ))
-                        })?;
-                }
-
-                // Update latest_version using true semver precedence. Read the
-                // current stored value (may have changed from the
-                // row we fetched above if this is a first insert), then
-                // compare using semver_gt before issuing the UPDATE.
-                let current_latest: Option<String> = packs::table
-                    .filter(packs::name.eq(&pack_name))
-                    .select(packs::latest_version)
-                    .first(conn)
-                    .await
-                    .map_err(|e| {
-                        TxError::Catalog(map_diesel_error(e, "pack", pack_name.clone()))
-                    })?;
-
-                // Only update when the new version has strictly higher
-                // semver precedence than the stored latest.
-                let should_update = match &current_latest {
-                    None => true,
-                    Some(stored) => semver_gt(&version, stored),
-                };
-
-                if should_update {
-                    diesel::update(packs::table.filter(packs::name.eq(&pack_name)))
-                        .set(packs::latest_version.eq(Some(&version)))
-                        .execute(conn)
-                        .await
-                        .map_err(|e| {
-                            TxError::Catalog(map_diesel_error(e, "pack", pack_name.clone()))
-                        })?;
-                }
-
-                Ok(())
+            .transaction::<(), CatalogTransactionError, _>(async move |conn| {
+                register_pack_version_on_connection(
+                    conn,
+                    PackRegistrationTransaction {
+                        new_version,
+                        pack_name: pack_name_clone,
+                        version: version_clone,
+                        incoming_author: incoming_author_bytes,
+                        incoming_publisher_key_id,
+                        incoming_size: incoming_size_bytes,
+                        quota,
+                    },
+                )
+                .await
             })
             .await;
 
         match tx_result {
             Ok(()) => Ok(()),
-            Err(TxError::Catalog(e)) => Err(e),
-            Err(TxError::Diesel(e)) => Err(map_diesel_error(e, "pack", record.pack_name.clone())),
+            Err(CatalogTransactionError::Catalog(error)) => Err(error),
+            Err(CatalogTransactionError::Diesel(error)) => {
+                Err(map_diesel_error(error, "pack", record.pack_name.clone()))
+            }
         }
     }
 

@@ -8,11 +8,16 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+use chrono::Utc;
+use ed25519_dalek::VerifyingKey;
 use frameshift_catalog::{
-    CatalogBackend, CatalogError, PublicationIntentClaim, PublicationSubmissionRecord,
-    PublicationSubmissionRequest,
+    CatalogBackend, CatalogError, Ed25519PublicKey, PackStatus, PackVersionRecord,
+    PublicationIntentClaim, PublicationPromotionRecord, PublicationPromotionRequest,
+    PublicationSubmissionRecord, PublicationSubmissionRequest, PublicationSubmissionState,
+    PublishQuota, PublisherKeyRecord, PublisherKeyState,
 };
 use frameshift_objects::{ObjectHash, ObjectStoreError, PackStore};
+use frameshift_pack::{Pack, PackManifest};
 use frameshift_publication::{FindingSeverity, PublicationReport};
 use uuid::Uuid;
 
@@ -67,6 +72,9 @@ pub enum PublicationAdmissionError {
     /// The catalog rejected or failed the atomic submission transaction.
     #[error("publication catalog persistence failed")]
     Catalog(#[source] CatalogError),
+    /// The archive signature or signing identity is not valid for this publication.
+    #[error("publication archive signature is not authorized")]
+    Signature,
     /// Internal temporary-file or task execution failed.
     #[error("publication inspection failed")]
     Internal(#[source] Box<dyn std::error::Error + Send + Sync>),
@@ -113,6 +121,14 @@ impl PublicationAdmissionService {
         let inspected = inspect_publication_archive(&archive_bytes).await?;
         enforce_publication_report(&inspected.report)?;
         validate_intent_bindings(&intent, &inspected.report)?;
+        verify_signed_publication(
+            &*self.catalog,
+            intent.publisher_id,
+            intent.publisher_key_id,
+            inspected.pack_root(),
+            true,
+        )
+        .await?;
 
         self.quarantine
             .put(&archive_hash, &archive_bytes)
@@ -128,6 +144,247 @@ impl PublicationAdmissionService {
             .await
             .map_err(PublicationAdmissionError::Catalog)
     }
+}
+
+/// Failures while promoting one approved quarantine artifact.
+#[derive(Debug, thiserror::Error)]
+pub enum PublicationPromotionError {
+    /// The selected submission does not exist or cannot be read.
+    #[error("publication submission lookup failed")]
+    Catalog(#[source] CatalogError),
+    /// The selected submission has not completed human approval.
+    #[error("publication submission is not approved")]
+    NotApproved,
+    /// The exact quarantine object is absent or unreadable.
+    #[error("publication quarantine read failed")]
+    Quarantine(#[source] ObjectStoreError),
+    /// The quarantine object violates the configured size or hash boundary.
+    #[error("publication quarantine artifact failed integrity bounds")]
+    Integrity,
+    /// Fresh inspection or signature verification failed.
+    #[error("publication quarantine verification failed")]
+    Verification(#[source] PublicationAdmissionError),
+    /// The fresh deterministic report differs from the approved evidence.
+    #[error("publication quarantine report differs from approved evidence")]
+    ReportMismatch,
+    /// The verified manifest contains an invalid catalog field.
+    #[error("publication manifest field is invalid: {0}")]
+    Manifest(&'static str),
+    /// The public object store rejected or failed the write.
+    #[error("publication public-object write failed")]
+    PublicStore(#[source] ObjectStoreError),
+}
+
+/// Route-free service that verifies and activates approved quarantine artifacts.
+#[derive(Clone)]
+pub struct PublicationPromotionService {
+    /// Catalog authority for submission selection and atomic activation.
+    catalog: Arc<dyn CatalogBackend>,
+    /// Non-public object store containing admitted archive bytes.
+    quarantine: Arc<dyn PackStore>,
+    /// Public object store used by ordinary pack downloads.
+    public: Arc<dyn PackStore>,
+    /// Maximum accepted archive size in bytes.
+    max_archive_bytes: usize,
+    /// Per-publisher and registry limits applied during activation.
+    quota: PublishQuota,
+}
+
+/// Construction and activation operations for [`PublicationPromotionService`].
+impl PublicationPromotionService {
+    /// Construct a promotion service over explicitly separated object stores.
+    pub fn new(
+        catalog: Arc<dyn CatalogBackend>,
+        quarantine: Arc<dyn PackStore>,
+        public: Arc<dyn PackStore>,
+        max_archive_bytes: usize,
+        quota: PublishQuota,
+    ) -> Self {
+        Self {
+            catalog,
+            quarantine,
+            public,
+            max_archive_bytes,
+            quota,
+        }
+    }
+
+    /// Re-verify and atomically activate one approved quarantine submission.
+    pub async fn promote(
+        &self,
+        promotion_id: Uuid,
+        submission_id: Uuid,
+        actor_account_id: Uuid,
+        request_id: Uuid,
+    ) -> Result<PublicationPromotionRecord, PublicationPromotionError> {
+        let submission = self
+            .catalog
+            .get_publication_submission(submission_id)
+            .await
+            .map_err(PublicationPromotionError::Catalog)?;
+        if !matches!(
+            submission.state,
+            PublicationSubmissionState::Approved | PublicationSubmissionState::Promoted
+        ) {
+            return Err(PublicationPromotionError::NotApproved);
+        }
+
+        let archive_bytes = self
+            .quarantine
+            .get(&submission.archive_hash)
+            .await
+            .map_err(PublicationPromotionError::Quarantine)?;
+        if archive_bytes.len() > self.max_archive_bytes
+            || ObjectHash::of(&archive_bytes) != submission.archive_hash
+        {
+            return Err(PublicationPromotionError::Integrity);
+        }
+
+        let inspected = inspect_publication_archive(&archive_bytes)
+            .await
+            .map_err(PublicationPromotionError::Verification)?;
+        enforce_publication_report(&inspected.report)
+            .map_err(PublicationPromotionError::Verification)?;
+        validate_submission_bindings(&submission, &inspected.report)
+            .map_err(PublicationPromotionError::Verification)?;
+        if inspected.report != submission.scan_report {
+            return Err(PublicationPromotionError::ReportMismatch);
+        }
+        let verified = verify_signed_publication(
+            &*self.catalog,
+            submission.publisher_id,
+            submission.publisher_key_id,
+            inspected.pack_root(),
+            submission.state != PublicationSubmissionState::Promoted,
+        )
+        .await
+        .map_err(PublicationPromotionError::Verification)?;
+
+        let version = promotion_version(
+            &verified,
+            submission.publisher_key_id,
+            submission.archive_hash,
+            archive_bytes.len(),
+        )?;
+        self.public
+            .put(&submission.archive_hash, &archive_bytes)
+            .await
+            .map_err(PublicationPromotionError::PublicStore)?;
+        self.catalog
+            .promote_publication_submission(
+                PublicationPromotionRequest {
+                    id: promotion_id,
+                    submission_id,
+                    actor_account_id,
+                    request_id,
+                    version,
+                    description: verified.manifest.description.clone().unwrap_or_default(),
+                    tags: verified.manifest.tags.clone(),
+                    extends: verified.manifest.extends.clone(),
+                },
+                self.quota,
+            )
+            .await
+            .map_err(PublicationPromotionError::Catalog)
+    }
+}
+
+/// A pack whose signature and manifest identity match its enrolled publisher key.
+struct VerifiedPublicationPack {
+    /// Parsed immutable manifest from the verified archive.
+    manifest: PackManifest,
+    /// Exact 64-byte signature stored inside the archive.
+    signature: Vec<u8>,
+    /// Enrolled public key that verified the canonical pack hash.
+    author_pubkey: Ed25519PublicKey,
+}
+
+/// Load and verify one signed pack against its catalog-enrolled publisher key.
+async fn verify_signed_publication(
+    catalog: &dyn CatalogBackend,
+    publisher_id: Uuid,
+    publisher_key_id: Uuid,
+    pack_root: &Path,
+    require_active_key: bool,
+) -> Result<VerifiedPublicationPack, PublicationAdmissionError> {
+    let key = catalog
+        .get_publisher_key(publisher_key_id)
+        .await
+        .map_err(PublicationAdmissionError::Catalog)?;
+    if key.publisher_id != publisher_id
+        || (require_active_key && key.state != PublisherKeyState::Active)
+    {
+        return Err(PublicationAdmissionError::Signature);
+    }
+    verify_pack_with_key(pack_root, &key)
+}
+
+/// Verify archive signature bytes and manifest identity against one enrolled key.
+fn verify_pack_with_key(
+    pack_root: &Path,
+    key: &PublisherKeyRecord,
+) -> Result<VerifiedPublicationPack, PublicationAdmissionError> {
+    let signature = std::fs::read(pack_root.join("signature.sig"))
+        .map_err(|_| PublicationAdmissionError::Signature)?;
+    if signature.len() != 64 {
+        return Err(PublicationAdmissionError::Signature);
+    }
+    let pack = Pack::from_dir(pack_root).map_err(|_| PublicationAdmissionError::Signature)?;
+    let manifest_key = hex::decode(&pack.manifest().author_pubkey)
+        .map_err(|_| PublicationAdmissionError::Signature)?;
+    if manifest_key != key.public_key.0 {
+        return Err(PublicationAdmissionError::Signature);
+    }
+    let verifying_key = VerifyingKey::from_bytes(&key.public_key.0)
+        .map_err(|_| PublicationAdmissionError::Signature)?;
+    pack.verify(&verifying_key)
+        .map_err(|_| PublicationAdmissionError::Signature)?;
+    Ok(VerifiedPublicationPack {
+        manifest: pack.manifest().clone(),
+        signature,
+        author_pubkey: key.public_key,
+    })
+}
+
+/// Derive the immutable active catalog version exclusively from verified bytes.
+fn promotion_version(
+    verified: &VerifiedPublicationPack,
+    publisher_key_id: Uuid,
+    archive_hash: ObjectHash,
+    archive_size: usize,
+) -> Result<PackVersionRecord, PublicationPromotionError> {
+    let parent_hash = verified
+        .manifest
+        .parent_hash
+        .as_deref()
+        .map(|value| value.strip_prefix("sha256:").unwrap_or(value))
+        .map(ObjectHash::from_hex)
+        .transpose()
+        .map_err(|_| PublicationPromotionError::Manifest("parent_hash"))?;
+    let capability_manifest_json = verified
+        .manifest
+        .capability_manifest
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|_| PublicationPromotionError::Manifest("capability_manifest"))?
+        .unwrap_or_else(|| "{}".to_string());
+    Ok(PackVersionRecord {
+        pack_name: verified.manifest.name.clone(),
+        version: verified.manifest.version.clone(),
+        content_hash: archive_hash,
+        signature: verified.signature.clone(),
+        author_pubkey: verified.author_pubkey,
+        publisher_key_id: Some(publisher_key_id),
+        parent_hash,
+        capability_manifest_json,
+        schema_version: verified.manifest.schema_version,
+        license: verified.manifest.license.clone().unwrap_or_default(),
+        published_at: Utc::now(),
+        status: PackStatus::Active,
+        size_bytes: u64::try_from(archive_size)
+            .map_err(|_| PublicationPromotionError::Integrity)?,
+    })
 }
 
 /// Inspect a bounded gzip-tar archive and return its freshly validated pack root.
@@ -179,6 +436,26 @@ fn validate_intent_bindings(
         return Err(PublicationAdmissionError::IntentMismatch { field: "manifest" });
     }
     Ok(())
+}
+
+/// Compare fresh report bindings with immutable approved submission evidence.
+fn validate_submission_bindings(
+    submission: &PublicationSubmissionRecord,
+    report: &PublicationReport,
+) -> Result<(), PublicationAdmissionError> {
+    validate_intent_bindings(
+        &PublicationIntentClaim {
+            id: submission.intent_id,
+            account_id: submission.account_id,
+            publisher_id: submission.publisher_id,
+            publisher_key_id: submission.publisher_key_id,
+            archive_hash: submission.archive_hash,
+            manifest_hash: submission.manifest_hash,
+            file_inventory_hash: submission.file_inventory_hash,
+            scan_schema_version: submission.scan_schema_version,
+        },
+        report,
+    )
 }
 
 /// Reject a report while exposing only bounded stable finding codes.

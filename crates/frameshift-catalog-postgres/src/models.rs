@@ -20,16 +20,17 @@ use frameshift_catalog::{
     AccountRecord, AccountStatus, AuthorRecord, CatalogError, Ed25519PublicKey, MembershipState,
     OauthLink, ObjectHash, PackRecord, PackStatus, PackVersionRecord, PlatformRole,
     PlatformRoleRecord, PlatformRoleState, PublicationIntentRecord, PublicationModerationAction,
-    PublicationModerationDecisionRecord, PublicationSubmissionRecord, PublicationSubmissionState,
-    PublisherKeyRecord, PublisherKeyState, PublisherMembershipRecord, PublisherModerationStatus,
-    PublisherProfileRecord, PublisherRole,
+    PublicationModerationDecisionRecord, PublicationPromotionRecord, PublicationSubmissionRecord,
+    PublicationSubmissionState, PublisherKeyRecord, PublisherKeyState, PublisherMembershipRecord,
+    PublisherModerationStatus, PublisherProfileRecord, PublisherRole,
 };
 use uuid::Uuid;
 
 use crate::schema::{
     account_platform_roles, accounts, authors, handles, pack_downloads, pack_versions, packs,
-    publication_intents, publication_moderation_decisions, publication_submissions,
-    publisher_audit_events, publisher_keys, publisher_memberships, publisher_profiles,
+    publication_intents, publication_moderation_decisions, publication_promotions,
+    publication_submissions, publisher_audit_events, publisher_keys, publisher_memberships,
+    publisher_profiles,
 };
 
 /// Queryable account row mapped from the `accounts` table.
@@ -418,6 +419,51 @@ pub(crate) struct NewPublicationModerationDecisionRow {
     pub created_at: DateTime<Utc>,
 }
 
+/// Queryable immutable publication promotion row.
+#[derive(Debug, Clone, Queryable, Selectable)]
+#[diesel(table_name = publication_promotions)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub(crate) struct PublicationPromotionRow {
+    /// Stable promotion identifier.
+    pub id: Uuid,
+    /// Submission activated by this promotion.
+    pub submission_id: Uuid,
+    /// Account that exercised promotion authority.
+    pub actor_account_id: Uuid,
+    /// Public pack name.
+    pub pack_name: String,
+    /// Public semantic version.
+    pub version: String,
+    /// Raw 32-byte public object hash.
+    pub content_hash: Vec<u8>,
+    /// Stable request correlation identifier.
+    pub request_id: Uuid,
+    /// Promotion commit timestamp.
+    pub created_at: DateTime<Utc>,
+}
+
+/// Insertable immutable publication promotion row.
+#[derive(Debug, Insertable)]
+#[diesel(table_name = publication_promotions)]
+pub(crate) struct NewPublicationPromotionRow {
+    /// Stable promotion identifier.
+    pub id: Uuid,
+    /// Submission activated by this promotion.
+    pub submission_id: Uuid,
+    /// Account that exercised promotion authority.
+    pub actor_account_id: Uuid,
+    /// Public pack name.
+    pub pack_name: String,
+    /// Public semantic version.
+    pub version: String,
+    /// Raw 32-byte public object hash.
+    pub content_hash: Vec<u8>,
+    /// Stable request correlation identifier.
+    pub request_id: Uuid,
+    /// Promotion commit timestamp.
+    pub created_at: DateTime<Utc>,
+}
+
 /// Row struct for the `authors` table.
 ///
 /// All BYTEA columns are `Vec<u8>`; JSON columns are `serde_json::Value`.
@@ -798,6 +844,7 @@ impl PublicationSubmissionRow {
             "needs_review" => PublicationSubmissionState::NeedsReview,
             "approved" => PublicationSubmissionState::Approved,
             "rejected" => PublicationSubmissionState::Rejected,
+            "promoted" => PublicationSubmissionState::Promoted,
             value => {
                 return Err(CatalogError::BackendError(Box::new(std::io::Error::other(
                     format!(
@@ -827,6 +874,23 @@ impl PublicationSubmissionRow {
             state,
             created_at: self.created_at,
             updated_at: self.updated_at,
+        })
+    }
+}
+
+/// Conversion helpers for immutable publication promotion rows.
+impl PublicationPromotionRow {
+    /// Convert this database row into typed promotion evidence.
+    pub(crate) fn into_record(self) -> Result<PublicationPromotionRecord, CatalogError> {
+        Ok(PublicationPromotionRecord {
+            id: self.id,
+            submission_id: self.submission_id,
+            actor_account_id: self.actor_account_id,
+            pack_name: self.pack_name,
+            version: self.version,
+            content_hash: vec_to_hash(self.content_hash)?,
+            request_id: self.request_id,
+            created_at: self.created_at,
         })
     }
 }

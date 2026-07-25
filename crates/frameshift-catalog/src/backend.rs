@@ -15,9 +15,9 @@ use crate::identity::Ed25519PublicKey;
 use crate::records::{
     AccountRecord, AuthorRecord, PackRecord, PackVersionRecord, PlatformRoleRecord,
     PublicationIntentClaim, PublicationIntentRecord, PublicationModerationDecisionRecord,
-    PublicationModerationDecisionRequest, PublicationSubmissionRecord,
-    PublicationSubmissionRequest, PublisherAuditEventRecord, PublisherKeyRecord,
-    PublisherMembershipRecord, PublisherProfileRecord,
+    PublicationModerationDecisionRequest, PublicationPromotionRecord, PublicationPromotionRequest,
+    PublicationSubmissionRecord, PublicationSubmissionRequest, PublisherAuditEventRecord,
+    PublisherKeyRecord, PublisherMembershipRecord, PublisherProfileRecord,
 };
 use crate::status::TombstoneRecord;
 
@@ -291,6 +291,24 @@ pub trait CatalogBackend: Send + Sync {
     ) -> Result<PublicationModerationDecisionRecord, CatalogError> {
         Err(CatalogError::Unauthorized {
             kind: "publication_moderation",
+            key: request.id.to_string(),
+        })
+    }
+
+    /// Atomically activate one independently approved quarantine submission.
+    ///
+    /// Unsupported backends fail closed. Implementations must resolve exact
+    /// completed retries, enforce current promotion authority and publisher
+    /// eligibility, register the active pack version, append immutable
+    /// promotion evidence, and transition the submission to `promoted` in one
+    /// transaction.
+    async fn promote_publication_submission(
+        &self,
+        request: PublicationPromotionRequest,
+        _quota: PublishQuota,
+    ) -> Result<PublicationPromotionRecord, CatalogError> {
+        Err(CatalogError::Unauthorized {
+            kind: "publication_promotion",
             key: request.id.to_string(),
         })
     }

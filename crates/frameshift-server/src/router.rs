@@ -66,7 +66,7 @@ use crate::middleware::auth::require_signed_request;
 use crate::middleware::metrics::MetricsLayer;
 use crate::middleware::request_id::RequestIdGenerator;
 use crate::middleware::tracing::make_trace_layer;
-use crate::publication::PublicationAdmissionService;
+use crate::publication::{PublicationAdmissionService, PublicationPromotionService};
 use crate::routes::accounts::{account_write_router, auth_config_router, publisher_read_router};
 use crate::routes::admin::admin_router;
 use crate::routes::authors::{authors_router, authors_write_router};
@@ -99,7 +99,7 @@ use crate::state::AppState;
 ///     /account  -- OIDC-authenticated account profile and memberships
 ///     /publishers -- public profiles plus OIDC-authenticated owner operations
 ///     /publish-intents -- OIDC-authenticated creation and account-scoped retrieval
-///     /moderation/publication-submissions -- role-gated review reads and decisions
+///     /moderation/publication-submissions -- role-gated review, decisions, and promotion
 ///     /telemetry -- POST /selection opt-in selection telemetry sink
 ///     /memory   -- GET /health read-only memory backend health
 ///     /admin    -- POST /packs/{name}/{version}/tombstone (signed + allowlist)
@@ -121,7 +121,7 @@ use crate::state::AppState;
 /// An `axum::Router` with `AppState` already wired in via `.with_state(state)`.
 /// The caller passes this directly to `axum::serve`.
 pub fn app(state: AppState) -> Router {
-    build_app(state, None, None)
+    build_app(state, None, None, None)
 }
 
 /// Build the complete router with explicit publication-quarantine admission.
@@ -137,7 +137,22 @@ pub fn app_with_publication_admission(state: AppState, quarantine: Arc<dyn PackS
         Arc::clone(&state.catalog),
         Arc::clone(&quarantine),
     ));
-    build_app(state, Some(admission), Some(quarantine))
+    let quota = frameshift_catalog::PublishQuota {
+        max_versions: (state.config.max_versions_per_author != 0)
+            .then_some(state.config.max_versions_per_author),
+        max_bytes: (state.config.max_bytes_per_author != 0)
+            .then_some(state.config.max_bytes_per_author),
+        max_total_bytes: (state.config.max_total_bytes != 0)
+            .then_some(state.config.max_total_bytes),
+    };
+    let promotion = Arc::new(PublicationPromotionService::new(
+        Arc::clone(&state.catalog),
+        Arc::clone(&quarantine),
+        Arc::clone(&state.objects),
+        state.config.max_request_bytes,
+        quota,
+    ));
+    build_app(state, Some(admission), Some(quarantine), Some(promotion))
 }
 
 /// Compose the complete router with optional explicit quarantine services.
@@ -145,6 +160,7 @@ fn build_app(
     state: AppState,
     publication_admission: Option<Arc<PublicationAdmissionService>>,
     quarantine_review: Option<Arc<dyn PackStore>>,
+    publication_promotion: Option<Arc<PublicationPromotionService>>,
 ) -> Router {
     let max_body = state.config.max_request_bytes;
     let cors = build_cors_layer(&state);
@@ -203,7 +219,7 @@ fn build_app(
             .merge(Router::new().nest("/publish-intents", publication_intent_router()))
             .merge(Router::new().nest(
                 "/moderation/publication-submissions",
-                moderation_router(quarantine_review),
+                moderation_router(quarantine_review, publication_promotion),
             ));
         if let Some(admission) = publication_admission {
             let submission_writes =
