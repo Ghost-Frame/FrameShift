@@ -15,6 +15,7 @@ pub struct Pack {
     signature: Option<Signature>,
 }
 
+/// Loading, hashing, signing, and verification operations for one pack.
 impl Pack {
     /// Load a pack from a directory on disk.
     pub fn from_dir(dir: &Path) -> Result<Self, PackError> {
@@ -28,6 +29,7 @@ impl Pack {
         let manifest_str =
             std::str::from_utf8(&manifest_entry.content).map_err(|_| PackError::MissingManifest)?;
         let manifest: PackManifest = toml::from_str(manifest_str)?;
+        manifest.validate_fork_contract()?;
 
         let signature = load_signature(dir)?;
 
@@ -120,14 +122,17 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
+/// Pack loading, hashing, signing, and verification tests.
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use std::fs;
     use tempfile::TempDir;
 
+    /// Minimal valid manifest shared by pack fixtures.
     const MANIFEST: &[u8] = b"schema_version = 1\nname = \"test\"\nauthor_handle = \"t\"\nauthor_pubkey = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\nversion = \"0.1.0\"\n";
 
+    /// Write exact fixture files beneath one temporary pack root.
     fn write_pack(dir: &Path, files: &[(&str, &[u8])]) {
         for (path, content) in files {
             let full = dir.join(path);
@@ -138,12 +143,14 @@ mod tests {
         }
     }
 
+    /// Return a deterministic signing and verifying key pair.
     fn test_keypair() -> (SigningKey, VerifyingKey) {
         let signing = SigningKey::from_bytes(&[1u8; 32]);
         let verifying = signing.verifying_key();
         (signing, verifying)
     }
 
+    /// Loading computes a stable hash and exposes the parsed manifest.
     #[test]
     fn load_and_hash() {
         let tmp = TempDir::new().unwrap();
@@ -155,6 +162,7 @@ mod tests {
         assert!(!pack.has_signature());
     }
 
+    /// Pack signatures verify against the signing key that produced them.
     #[test]
     fn sign_and_verify_roundtrip() {
         let tmp = TempDir::new().unwrap();
@@ -168,6 +176,7 @@ mod tests {
         assert!(pack.verify(&verifying).is_ok());
     }
 
+    /// A signature cannot verify against an unrelated public key.
     #[test]
     fn verify_fails_with_wrong_key() {
         let tmp = TempDir::new().unwrap();
@@ -185,6 +194,7 @@ mod tests {
         ));
     }
 
+    /// Changing signed content invalidates the previously written signature.
     #[test]
     fn tampered_content_fails_verification() {
         let tmp = TempDir::new().unwrap();
@@ -208,6 +218,7 @@ mod tests {
         ));
     }
 
+    /// Changing signature bytes makes verification fail closed.
     #[test]
     fn tampered_signature_fails_verification() {
         let tmp = TempDir::new().unwrap();
@@ -227,6 +238,7 @@ mod tests {
         assert!(reloaded.verify(&verifying).is_err());
     }
 
+    /// A present signature with the wrong byte length is never treated as absent.
     #[test]
     fn malformed_signature_wrong_length_is_error() {
         // A present-but-truncated signature.sig must produce MalformedSignature,
@@ -249,6 +261,7 @@ mod tests {
         );
     }
 
+    /// Verification reports a typed error when no signature exists.
     #[test]
     fn no_signature_returns_error() {
         let tmp = TempDir::new().unwrap();
@@ -262,6 +275,7 @@ mod tests {
         ));
     }
 
+    /// A signature written to disk is loaded and verified by a fresh pack.
     #[test]
     fn signature_persisted_to_disk() {
         let tmp = TempDir::new().unwrap();
@@ -275,5 +289,21 @@ mod tests {
         let reloaded = Pack::from_dir(tmp.path()).unwrap();
         assert!(reloaded.has_signature());
         assert!(reloaded.verify(&verifying).is_ok());
+    }
+
+    /// Loading rejects ambiguous same-pack provenance before exposing a pack.
+    #[test]
+    fn from_dir_rejects_invalid_fork_contract() {
+        let tmp = TempDir::new().unwrap();
+        let manifest = b"schema_version = 1\nname = \"test\"\nauthor_handle = \"t\"\n\
+            author_pubkey = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\n\
+            version = \"0.1.0\"\n\n[forked_from]\nname = \"test\"\nversion = \"0.0.9\"\n\
+            content_hash = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n";
+        write_pack(tmp.path(), &[("pack.toml", manifest)]);
+
+        assert!(matches!(
+            Pack::from_dir(tmp.path()),
+            Err(PackError::ForkContract(_))
+        ));
     }
 }

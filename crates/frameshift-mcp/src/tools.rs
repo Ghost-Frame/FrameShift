@@ -7,7 +7,7 @@ use frameshift_orchestrator::{
     AuditLog, Embedder, Mode, ModeState, PolicyWeights, Preferences, SelectionInputs,
 };
 use frameshift_pack::{CapabilityManifest, PackManifest};
-use frameshift_studio::{DraftStatus, Studio};
+use frameshift_studio::{DraftStatus, DraftTemplate, GuidedTemplateInput, Studio};
 
 use crate::context::{resolve_render_target, validate_absolute_path, with_project_root};
 use crate::protocol::{ToolContent, ToolDef, ToolResult};
@@ -215,7 +215,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "frameshift_draft_create".to_string(),
-            description: "Create a local Creator Studio draft, optionally importing an existing public pack directory.".to_string(),
+            description: "Create a local Creator Studio draft as an empty workspace, atomic blank template, validated guided template, or hardened import.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -227,6 +227,66 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                     "import_path": {
                         "type": "string",
                         "description": "Optional absolute directory to import. Symlinks and non-public paths are rejected."
+                    },
+                    "template_mode": {
+                        "type": "string",
+                        "enum": ["blank", "guided"],
+                        "description": "Optional atomic template mode. Omit for the legacy empty draft."
+                    },
+                    "guided": {
+                        "type": "object",
+                        "description": "Required only when template_mode is guided.",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 64,
+                                "pattern": "^[A-Za-z0-9_-]+$"
+                            },
+                            "version": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 64
+                            },
+                            "author_handle": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 64,
+                                "pattern": "^[A-Za-z0-9_-]+$"
+                            },
+                            "author_pubkey": {
+                                "type": "string",
+                                "pattern": "^[0-9a-f]{64}$"
+                            },
+                            "description": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 500
+                            },
+                            "voice_tone": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 500
+                            },
+                            "license": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 64
+                            },
+                            "forkable": {
+                                "type": "boolean",
+                                "default": false
+                            }
+                        },
+                        "required": [
+                            "name",
+                            "version",
+                            "author_handle",
+                            "author_pubkey",
+                            "description",
+                            "voice_tone"
+                        ],
+                        "additionalProperties": false
                     }
                 },
                 "required": ["id", "title"]
@@ -1271,10 +1331,25 @@ fn call_draft_create(arguments: &serde_json::Value, client: &Client) -> ToolResu
         Err(error) => return err_result(error),
     };
 
-    if let Some(raw_import_path) = arguments
-        .get("import_path")
-        .and_then(|value| value.as_str())
-    {
+    let import_path = match arguments.get("import_path") {
+        Some(serde_json::Value::String(value)) => Some(value.as_str()),
+        Some(_) => return err_result("import_path must be a string".to_string()),
+        None => None,
+    };
+    let template_mode = match arguments.get("template_mode") {
+        Some(serde_json::Value::String(value)) => Some(value.as_str()),
+        Some(_) => return err_result("template_mode must be a string".to_string()),
+        None => None,
+    };
+    let guided = arguments.get("guided");
+
+    if import_path.is_some() && (template_mode.is_some() || guided.is_some()) {
+        return err_result(
+            "draft import cannot be combined with template_mode or guided fields".to_string(),
+        );
+    }
+
+    if let Some(raw_import_path) = import_path {
         let import_path = match validate_path_arg(raw_import_path) {
             Ok(path) => path,
             Err(error) => return err_result(error),
@@ -1285,7 +1360,35 @@ fn call_draft_create(arguments: &serde_json::Value, client: &Client) -> ToolResu
         };
     }
 
-    match studio.create(id, title).and_then(|_| studio.status(id)) {
+    let result = match template_mode {
+        None if guided.is_none() => studio.create(id, title).and_then(|_| studio.status(id)),
+        None => return err_result("guided fields require template_mode set to guided".to_string()),
+        Some("blank") if guided.is_some() => {
+            return err_result("blank template does not accept guided fields".to_string())
+        }
+        Some("blank") => studio.create_template(id, title, DraftTemplate::Blank),
+        Some("guided") => {
+            let guided = match guided {
+                Some(value) => match serde_json::from_value::<GuidedTemplateInput>(value.clone()) {
+                    Ok(input) => input,
+                    Err(error) => {
+                        return err_result(format!("invalid guided template fields: {error}"))
+                    }
+                },
+                None => {
+                    return err_result(
+                        "guided template requires the guided fields object".to_string(),
+                    )
+                }
+            };
+            studio.create_template(id, title, DraftTemplate::Guided(guided))
+        }
+        Some(_) => {
+            return err_result("invalid template_mode: expected blank or guided".to_string())
+        }
+    };
+
+    match result {
         Ok(status) => draft_status_result(status),
         Err(error) => err_result(format!("draft creation failed: {error}")),
     }
@@ -1513,6 +1616,31 @@ mod tests {
                 "missing Creator Studio tool {name}"
             );
         }
+    }
+
+    /// Draft creation advertises bounded blank and guided template contracts.
+    #[test]
+    fn draft_create_schema_exposes_template_modes_and_guided_bounds() {
+        let definitions = tool_definitions();
+        let create = definitions
+            .iter()
+            .find(|definition| definition.name == "frameshift_draft_create")
+            .expect("tool_definitions must include frameshift_draft_create");
+        let properties = &create.input_schema["properties"];
+
+        assert_eq!(
+            properties["template_mode"]["enum"],
+            serde_json::json!(["blank", "guided"])
+        );
+        assert_eq!(properties["guided"]["additionalProperties"], false);
+        assert_eq!(
+            properties["guided"]["properties"]["author_pubkey"]["pattern"],
+            "^[0-9a-f]{64}$"
+        );
+        assert_eq!(
+            properties["guided"]["properties"]["description"]["maxLength"],
+            500
+        );
     }
 
     /// Automate advertises an optional sensitivity constrained to the public range.
@@ -2292,6 +2420,104 @@ mod tests {
             .unwrap()
             .iter()
             .all(|target| target["sha256"].as_str().unwrap().len() == 64));
+    }
+
+    /// MCP guided creation produces a valid previewable draft with explicit fork policy.
+    #[test]
+    fn draft_create_guided_template_is_valid_and_previewable() {
+        let temporary = tempfile::tempdir().unwrap();
+        let client = make_client(&temporary.path().join("data"));
+        let created = call_tool(
+            "frameshift_draft_create",
+            &serde_json::json!({
+                "id": "guided",
+                "title": "Guided",
+                "template_mode": "guided",
+                "guided": {
+                    "name": "guided",
+                    "version": "0.1.0",
+                    "author_handle": "tester",
+                    "author_pubkey":
+                        "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+                    "description": "A guided persona.",
+                    "voice_tone": "Precise and calm.",
+                    "license": "MIT",
+                    "forkable": true
+                }
+            }),
+            &client,
+        );
+        assert!(
+            created.is_error.is_none(),
+            "unexpected creation error: {}",
+            created.content[0].text
+        );
+        let status: serde_json::Value = serde_json::from_str(&created.content[0].text).unwrap();
+        assert_eq!(status["publication"]["valid"], true);
+
+        let preview = call_tool(
+            "frameshift_draft_preview",
+            &serde_json::json!({"id": "guided"}),
+            &client,
+        );
+        assert!(preview.is_error.is_none());
+        assert!(preview.content[0].text.contains("Precise and calm."));
+
+        let manifest = call_tool(
+            "frameshift_draft_read",
+            &serde_json::json!({"id": "guided", "path": "pack.toml"}),
+            &client,
+        );
+        assert!(manifest.is_error.is_none());
+        let read: serde_json::Value = serde_json::from_str(&manifest.content[0].text).unwrap();
+        assert!(read["content"]
+            .as_str()
+            .unwrap()
+            .contains("forkable = true"));
+    }
+
+    /// MCP creation rejects ambiguous import and template combinations before mutation.
+    #[test]
+    fn draft_create_rejects_incompatible_modes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let client = make_client(&temporary.path().join("data"));
+        let imported_with_template = call_tool(
+            "frameshift_draft_create",
+            &serde_json::json!({
+                "id": "ambiguous",
+                "title": "Ambiguous",
+                "import_path": "/tmp/source",
+                "template_mode": "blank"
+            }),
+            &client,
+        );
+        assert_eq!(imported_with_template.is_error, Some(true));
+
+        let blank_with_guided = call_tool(
+            "frameshift_draft_create",
+            &serde_json::json!({
+                "id": "also-ambiguous",
+                "title": "Also ambiguous",
+                "template_mode": "blank",
+                "guided": {}
+            }),
+            &client,
+        );
+        assert_eq!(blank_with_guided.is_error, Some(true));
+
+        let malformed_mode = call_tool(
+            "frameshift_draft_create",
+            &serde_json::json!({
+                "id": "malformed",
+                "title": "Malformed",
+                "template_mode": false
+            }),
+            &client,
+        );
+        assert_eq!(malformed_mode.is_error, Some(true));
+
+        let studio = studio_for_client(&client).unwrap();
+        assert!(studio.list().unwrap().is_empty());
     }
 
     /// MCP draft tools complete the hash-bound create, edit, review, and submit flow.

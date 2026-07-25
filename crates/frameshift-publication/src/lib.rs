@@ -470,6 +470,14 @@ fn validate_manifest(
             ),
         );
     }
+    if manifest.validate_fork_contract().is_err() {
+        push_error(
+            findings,
+            "manifest.fork_contract",
+            Some("pack.toml".to_string()),
+            "fork permission or provenance is invalid",
+        );
+    }
     if manifest.is_local_unsigned() {
         push_error(
             findings,
@@ -825,6 +833,23 @@ mod tests {
         let report = validate_directory(dir.path()).expect("report");
         assert!(has_code(&report, "manifest.invalid"));
         assert!(has_code(&report, "template.invalid"));
+    }
+
+    /// Ambiguous same-pack fork provenance blocks publication with a stable finding.
+    #[test]
+    fn invalid_fork_contract_is_blocked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_freeform_pack(dir.path());
+        let mut manifest = fs::read_to_string(dir.path().join("pack.toml")).expect("read");
+        manifest.push_str(
+            "\n[forked_from]\nname = \"fixture\"\nversion = \"0.0.9\"\n\
+             content_hash = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n",
+        );
+        fs::write(dir.path().join("pack.toml"), manifest).expect("write");
+
+        let report = validate_directory(dir.path()).expect("report");
+        assert!(!report.valid);
+        assert!(has_code(&report, "manifest.fork_contract"));
     }
 
     /// System-wide filesystem capability declarations are not publishable.
