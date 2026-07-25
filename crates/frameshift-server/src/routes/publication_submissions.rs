@@ -3,13 +3,16 @@
 use std::sync::Arc;
 
 use axum::extract::{Multipart, Path, State};
+use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use chrono::Utc;
 use frameshift_catalog::{
-    CatalogError, PublicationIntentClaim, PublicationIntentRecord, PublicationSubmissionRecord,
+    CatalogError, PublicationIntentClaim, PublicationIntentRecord,
+    PublicationLifecycleDecisionRecord, PublicationSubmissionRecord, PublicationWithdrawalRequest,
     PublisherKeyState,
 };
+use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::auth::VerifiedSigner;
@@ -28,9 +31,21 @@ struct SubmissionMultipart {
     archive: Vec<u8>,
 }
 
+/// Caller-controlled fields for one owner submission withdrawal.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WithdrawSubmissionBody {
+    /// Stable caller-generated lifecycle decision identifier.
+    id: Uuid,
+    /// Stable bounded private reason code.
+    reason_code: String,
+}
+
 /// Build account-scoped publication-submission read routes.
 pub fn publication_submission_read_router() -> Router<AppState> {
-    Router::new().route("/{id}", get(get_publication_submission))
+    Router::new()
+        .route("/{id}", get(get_publication_submission))
+        .route("/{id}/withdraw", post(withdraw_publication_submission))
 }
 
 /// Build publication-submission writes over one explicit quarantine service.
@@ -81,6 +96,33 @@ async fn get_publication_submission(
         return Err(publication_submission_not_found());
     }
     Ok(Json(record))
+}
+
+/// Withdraw one non-public submission under atomic owner authorization.
+async fn withdraw_publication_submission(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthenticatedAccount>,
+    Path(submission_id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(body): Json<WithdrawSubmissionBody>,
+) -> Result<Json<PublicationLifecycleDecisionRecord>, AppError> {
+    let request_id = headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .ok_or_else(|| AppError::BadRequest("x-request-id must be a UUID".to_string()))?;
+    state
+        .catalog
+        .withdraw_publication_submission(PublicationWithdrawalRequest {
+            id: body.id,
+            submission_id,
+            actor_account_id: auth.account.id,
+            reason_code: body.reason_code,
+            request_id,
+        })
+        .await
+        .map(Json)
+        .map_err(|error| AppError::from_catalog(error, "publication withdrawal"))
 }
 
 /// Parse the strict three-field multipart publication-submission contract.

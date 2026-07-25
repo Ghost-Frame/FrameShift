@@ -34,9 +34,9 @@
 //!   content signature against the handle's currently-registered key.
 //! - Signed download URLs: `POST /v1/downloads` (mint) and `GET /dl/{hash}`.
 //! - Operational endpoints: `/healthz`, `/metrics` (real Prometheus registry).
-//! - Admin: `POST /v1/admin/packs/{name}/{version}/tombstone`, gated by the
-//!   same signed-request middleware plus an operator-controlled pubkey
-//!   allowlist (`FRAMESHIFT_ADMIN_PUBKEYS`; see [`crate::routes::admin`]).
+//! - Administrator lifecycle controls for publisher suspension, release
+//!   tombstones, and immutable audit reads. These require an OIDC account with
+//!   an active administrator role.
 //! - OIDC account and publisher-owner APIs under `/v1/account` and
 //!   `/v1/publishers`, mounted only when a valid verifier is configured.
 //! - MCP placeholder: `/mcp/*` returns 501.

@@ -19,17 +19,18 @@ use diesel_async::{RunQueryDsl as _, SimpleAsyncConnection as _};
 use frameshift_catalog::{
     AccountRecord, AccountStatus, AuthorRecord, CatalogBackend, CatalogError, Ed25519PublicKey,
     MembershipState, ObjectHash, PackSearchFilters, PackStatus, PackVersionRecord, PlatformRole,
-    PlatformRoleState, PublicationIntentClaim, PublicationIntentRecord,
-    PublicationModerationAction, PublicationModerationDecisionRequest, PublicationPromotionRequest,
-    PublicationSubmissionRequest, PublicationSubmissionState, PublishQuota,
+    PlatformRoleState, PublicationIntentClaim, PublicationIntentRecord, PublicationLifecycleAction,
+    PublicationLifecycleCursor, PublicationModerationAction, PublicationModerationDecisionRequest,
+    PublicationPromotionRequest, PublicationSubmissionRequest, PublicationSubmissionState,
+    PublicationTombstoneRequest, PublicationWithdrawalRequest, PublishQuota,
     PublisherAuditEventRecord, PublisherKeyRecord, PublisherKeyState, PublisherMembershipRecord,
-    PublisherModerationStatus, PublisherProfileRecord, PublisherRole, SortMode, TombstoneReason,
-    TombstoneRecord,
+    PublisherModerationStatus, PublisherProfileRecord, PublisherRole, PublisherSuspensionRequest,
+    SortMode, TombstoneReason, TombstoneRecord,
 };
 use frameshift_catalog_postgres::schema::{
-    account_platform_roles, accounts, pack_versions, publication_moderation_decisions,
-    publication_promotions, publication_submissions, publisher_audit_events, publisher_keys,
-    publisher_memberships, publisher_profiles,
+    account_platform_roles, accounts, pack_versions, publication_lifecycle_decisions,
+    publication_moderation_decisions, publication_promotions, publication_submissions,
+    publisher_audit_events, publisher_keys, publisher_memberships, publisher_profiles,
 };
 use frameshift_catalog_postgres::{
     OwnershipBackfillApplied, OwnershipBackfillManifest, OwnershipBackfillMode,
@@ -3719,4 +3720,225 @@ async fn security_publish_quota_is_transactional_under_concurrency() {
         second_persisted.is_ok(),
         "only the quota-winning version may persist"
     );
+}
+
+/// Owner withdrawal is atomic, immutable, and retry-safe after authority revocation.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn publication_withdrawal_commits_state_and_immutable_evidence() {
+    let (catalog, _container) = setup_catalog().await;
+    let (owner_id, publisher_id, submission_id) =
+        create_test_publication_submission(&catalog, "withdraw-owner", 81).await;
+    let request = PublicationWithdrawalRequest {
+        id: uuid::Uuid::new_v4(),
+        submission_id,
+        actor_account_id: owner_id,
+        reason_code: "owner.cancelled".to_string(),
+        request_id: uuid::Uuid::new_v4(),
+    };
+    let (first, concurrent_retry) = tokio::join!(
+        catalog.withdraw_publication_submission(request.clone()),
+        catalog.withdraw_publication_submission(request.clone()),
+    );
+    let first = first.expect("owner withdrawal failed");
+    assert_eq!(
+        concurrent_retry.expect("concurrent exact withdrawal retry failed"),
+        first
+    );
+    assert_eq!(first.action, PublicationLifecycleAction::WithdrawSubmission);
+    assert_eq!(first.publisher_id, Some(publisher_id));
+    assert_eq!(
+        catalog
+            .get_publication_submission(submission_id)
+            .await
+            .expect("withdrawn submission lookup failed")
+            .state,
+        PublicationSubmissionState::Withdrawn
+    );
+
+    let mut connection = catalog
+        .pool()
+        .get()
+        .await
+        .expect("withdrawal fixture connection failed");
+    diesel::update(publisher_memberships::table.find((owner_id, publisher_id)))
+        .set(publisher_memberships::state.eq("revoked"))
+        .execute(&mut connection)
+        .await
+        .expect("revoke owner membership failed");
+    let retry = catalog
+        .withdraw_publication_submission(request.clone())
+        .await
+        .expect("exact retry must resolve before current authorization");
+    assert_eq!(retry, first);
+    let mut substituted = request;
+    substituted.reason_code = "owner.other".to_string();
+    assert!(matches!(
+        catalog
+            .withdraw_publication_submission(substituted)
+            .await
+            .expect_err("retry substitution must conflict"),
+        CatalogError::Conflict { .. }
+    ));
+    let mutation = diesel::update(publication_lifecycle_decisions::table.find(first.id))
+        .set(publication_lifecycle_decisions::reason_code.eq("changed"))
+        .execute(&mut connection)
+        .await;
+    assert!(mutation.is_err(), "lifecycle evidence must reject updates");
+}
+
+/// Administrator suspension rechecks authority and exposes bounded audit evidence.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn publisher_suspension_is_admin_only_and_auditable() {
+    let (catalog, _container) = setup_catalog().await;
+    let (owner_id, publisher_id, _) =
+        create_test_publisher(&catalog, "suspend-publisher", 82).await;
+    let administrator = make_account(uuid::Uuid::new_v4(), "suspension-admin");
+    catalog
+        .create_account(administrator.clone())
+        .await
+        .expect("create administrator failed");
+    let unauthorized = PublisherSuspensionRequest {
+        id: uuid::Uuid::new_v4(),
+        publisher_id,
+        actor_account_id: owner_id,
+        reason_code: "policy.abuse".to_string(),
+        request_id: uuid::Uuid::new_v4(),
+    };
+    assert!(matches!(
+        catalog
+            .suspend_publisher(unauthorized)
+            .await
+            .expect_err("publisher owner must not suspend a publisher"),
+        CatalogError::Unauthorized { .. }
+    ));
+
+    assign_test_platform_role(&catalog, administrator.id, "administrator").await;
+    let request = PublisherSuspensionRequest {
+        id: uuid::Uuid::new_v4(),
+        publisher_id,
+        actor_account_id: administrator.id,
+        reason_code: "policy.abuse".to_string(),
+        request_id: uuid::Uuid::new_v4(),
+    };
+    let (decision, concurrent_retry) = tokio::join!(
+        catalog.suspend_publisher(request.clone()),
+        catalog.suspend_publisher(request),
+    );
+    let decision = decision.expect("administrator suspension failed");
+    assert_eq!(
+        concurrent_retry.expect("concurrent exact suspension retry failed"),
+        decision
+    );
+    assert_eq!(
+        decision.action,
+        PublicationLifecycleAction::SuspendPublisher
+    );
+    assert_eq!(
+        catalog
+            .get_publisher(publisher_id)
+            .await
+            .expect("suspended publisher lookup failed")
+            .moderation_status,
+        PublisherModerationStatus::Suspended
+    );
+    let owner_audit = catalog
+        .list_publisher_lifecycle_decisions(owner_id, publisher_id, None, 50)
+        .await
+        .expect("active owner audit read failed");
+    assert_eq!(owner_audit, vec![decision.clone()]);
+    let admin_audit = catalog
+        .list_administrator_lifecycle_decisions(administrator.id, None, 50)
+        .await
+        .expect("administrator audit read failed");
+    assert_eq!(admin_audit, vec![decision.clone()]);
+    let empty_page = catalog
+        .list_administrator_lifecycle_decisions(
+            administrator.id,
+            Some(PublicationLifecycleCursor {
+                created_at: decision.created_at,
+                id: decision.id,
+            }),
+            50,
+        )
+        .await
+        .expect("cursor audit read failed");
+    assert!(empty_page.is_empty(), "cursor must be exclusive");
+}
+
+/// Administrator tombstone removes every active resolution path and retains evidence.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn publication_tombstone_is_atomic_and_retry_safe() {
+    let (catalog, _container) = setup_catalog().await;
+    catalog
+        .register_author(make_author(83, "lifecycle-tombstone-author"))
+        .await
+        .expect("register tombstone author failed");
+    let version = make_version("lifecycle-tombstone", "1.0.0", 83, 83);
+    catalog
+        .register_pack_version(version.clone())
+        .await
+        .expect("register tombstone version failed");
+    let administrator = make_account(uuid::Uuid::new_v4(), "tombstone-admin");
+    catalog
+        .create_account(administrator.clone())
+        .await
+        .expect("create tombstone administrator failed");
+    assign_test_platform_role(&catalog, administrator.id, "administrator").await;
+    let request = PublicationTombstoneRequest {
+        id: uuid::Uuid::new_v4(),
+        pack_name: version.pack_name.clone(),
+        version: version.version.clone(),
+        actor_account_id: administrator.id,
+        reason: TombstoneReason::TosViolation,
+        request_id: uuid::Uuid::new_v4(),
+    };
+    let (first, concurrent_retry) = tokio::join!(
+        catalog.tombstone_publication_release(request.clone()),
+        catalog.tombstone_publication_release(request.clone()),
+    );
+    let first = first.expect("administrator tombstone failed");
+    assert_eq!(
+        concurrent_retry.expect("concurrent exact tombstone retry failed"),
+        first
+    );
+    assert_eq!(first.action, PublicationLifecycleAction::TombstoneRelease);
+    assert!(matches!(
+        catalog
+            .get_active_pack_version_by_hash(&version.content_hash)
+            .await
+            .expect_err("tombstone must hide active hash resolution"),
+        CatalogError::NotFound { .. }
+    ));
+    assert!(matches!(
+        catalog
+            .get_pack_version(&version.pack_name, &version.version)
+            .await
+            .expect("tombstoned metadata must remain")
+            .status,
+        PackStatus::Tombstone {
+            reason: TombstoneReason::TosViolation,
+            ..
+        }
+    ));
+
+    let mut connection = catalog
+        .pool()
+        .get()
+        .await
+        .expect("tombstone fixture connection failed");
+    diesel::update(
+        account_platform_roles::table.find((administrator.id, "administrator".to_string())),
+    )
+    .set(account_platform_roles::state.eq("revoked"))
+    .execute(&mut connection)
+    .await
+    .expect("revoke administrator role failed");
+    let retry = catalog
+        .tombstone_publication_release(request)
+        .await
+        .expect("exact tombstone retry must survive authority revocation");
+    assert_eq!(retry, first);
 }

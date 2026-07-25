@@ -2,17 +2,18 @@
 
 use std::str::FromStr;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::routing::{delete, get, patch, post};
 use axum::{Extension, Json, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
 use frameshift_catalog::{
-    AccountRecord, CatalogError, Ed25519PublicKey, MembershipState, PublisherAuditEventRecord,
-    PublisherKeyRecord, PublisherKeyState, PublisherMembershipRecord, PublisherModerationStatus,
+    AccountRecord, CatalogError, Ed25519PublicKey, MembershipState, PublicationLifecycleCursor,
+    PublicationLifecycleDecisionRecord, PublisherAuditEventRecord, PublisherKeyRecord,
+    PublisherKeyState, PublisherMembershipRecord, PublisherModerationStatus,
     PublisherProfileRecord, PublisherRole,
 };
 use serde::{Deserialize, Serialize};
@@ -30,6 +31,18 @@ const MAX_DISPLAY_NAME_CHARS: usize = 100;
 const MAX_BIOGRAPHY_CHARS: usize = 2_000;
 /// Maximum accepted publisher key label length.
 const MAX_KEY_LABEL_CHARS: usize = 100;
+
+/// Query parameters for deterministic publisher lifecycle audit pagination.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublisherLifecycleQuery {
+    /// Timestamp component of the exclusive keyset cursor.
+    before_created_at: Option<DateTime<Utc>>,
+    /// Identifier component of the exclusive keyset cursor.
+    before_id: Option<Uuid>,
+    /// Bounded result count, defaulting to fifty.
+    limit: Option<u32>,
+}
 
 /// Public OIDC bootstrap metadata returned to clients.
 #[derive(Debug, Serialize)]
@@ -138,6 +151,44 @@ pub fn account_write_router() -> Router<AppState> {
             "/publishers/{handle}/keys/{key_id}",
             delete(revoke_publisher_key),
         )
+        .route(
+            "/publishers/{handle}/publication-decisions",
+            get(list_publisher_publication_decisions),
+        )
+}
+
+/// List immutable lifecycle evidence for an authorized publisher owner or administrator.
+async fn list_publisher_publication_decisions(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthenticatedAccount>,
+    Path(handle): Path<String>,
+    Query(query): Query<PublisherLifecycleQuery>,
+) -> Result<Json<Vec<PublicationLifecycleDecisionRecord>>, AppError> {
+    let profile = state
+        .catalog
+        .get_publisher_by_handle(&handle)
+        .await
+        .map_err(|error| AppError::from_catalog(error, "publisher"))?;
+    let before = match (query.before_created_at, query.before_id) {
+        (None, None) => None,
+        (Some(created_at), Some(id)) => Some(PublicationLifecycleCursor { created_at, id }),
+        _ => {
+            return Err(AppError::BadRequest(
+                "before_created_at and before_id must be supplied together".to_string(),
+            ));
+        }
+    };
+    state
+        .catalog
+        .list_publisher_lifecycle_decisions(
+            auth.account.id,
+            profile.id,
+            before,
+            query.limit.unwrap_or(50),
+        )
+        .await
+        .map(Json)
+        .map_err(|error| AppError::from_catalog(error, "publication lifecycle audit"))
 }
 
 /// Return the account-bound challenge for a proposed publisher key.

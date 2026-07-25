@@ -14,10 +14,12 @@ use crate::filters::{PackSearchFilters, PackSearchResult};
 use crate::identity::Ed25519PublicKey;
 use crate::records::{
     AccountRecord, AuthorRecord, PackRecord, PackVersionRecord, PlatformRoleRecord,
-    PublicationIntentClaim, PublicationIntentRecord, PublicationModerationDecisionRecord,
+    PublicationIntentClaim, PublicationIntentRecord, PublicationLifecycleCursor,
+    PublicationLifecycleDecisionRecord, PublicationModerationDecisionRecord,
     PublicationModerationDecisionRequest, PublicationPromotionRecord, PublicationPromotionRequest,
-    PublicationSubmissionRecord, PublicationSubmissionRequest, PublisherAuditEventRecord,
-    PublisherKeyRecord, PublisherMembershipRecord, PublisherProfileRecord,
+    PublicationSubmissionRecord, PublicationSubmissionRequest, PublicationTombstoneRequest,
+    PublicationWithdrawalRequest, PublisherAuditEventRecord, PublisherKeyRecord,
+    PublisherMembershipRecord, PublisherProfileRecord, PublisherSuspensionRequest,
 };
 use crate::status::TombstoneRecord;
 
@@ -310,6 +312,85 @@ pub trait CatalogBackend: Send + Sync {
         Err(CatalogError::Unauthorized {
             kind: "publication_promotion",
             key: request.id.to_string(),
+        })
+    }
+
+    /// Atomically withdraw one eligible non-public submission as its publisher owner.
+    ///
+    /// Unsupported backends fail closed. Implementations must resolve exact
+    /// completed retries before current authorization checks, then require an
+    /// active account and active owner membership for a new transition.
+    async fn withdraw_publication_submission(
+        &self,
+        request: PublicationWithdrawalRequest,
+    ) -> Result<PublicationLifecycleDecisionRecord, CatalogError> {
+        Err(CatalogError::Unauthorized {
+            kind: "publication_withdrawal",
+            key: request.id.to_string(),
+        })
+    }
+
+    /// Atomically suspend one publisher profile under active administrator authority.
+    ///
+    /// Unsupported backends fail closed. The profile mutation and immutable
+    /// lifecycle evidence must commit in the same transaction.
+    async fn suspend_publisher(
+        &self,
+        request: PublisherSuspensionRequest,
+    ) -> Result<PublicationLifecycleDecisionRecord, CatalogError> {
+        Err(CatalogError::Unauthorized {
+            kind: "publisher_suspension",
+            key: request.id.to_string(),
+        })
+    }
+
+    /// Atomically tombstone one public release under active administrator authority.
+    ///
+    /// Unsupported backends fail closed. Implementations must retain released
+    /// catalog and object history while removing the version from every active
+    /// resolution path.
+    async fn tombstone_publication_release(
+        &self,
+        request: PublicationTombstoneRequest,
+    ) -> Result<PublicationLifecycleDecisionRecord, CatalogError> {
+        Err(CatalogError::Unauthorized {
+            kind: "publication_tombstone",
+            key: request.id.to_string(),
+        })
+    }
+
+    /// List one publisher's lifecycle evidence after actor authorization.
+    ///
+    /// Unsupported backends fail closed. Implementations must require an active
+    /// publisher owner or active administrator and cap `limit` before querying.
+    async fn list_publisher_lifecycle_decisions(
+        &self,
+        actor_account_id: uuid::Uuid,
+        publisher_id: uuid::Uuid,
+        before: Option<PublicationLifecycleCursor>,
+        limit: u32,
+    ) -> Result<Vec<PublicationLifecycleDecisionRecord>, CatalogError> {
+        let _ = (before, limit);
+        Err(CatalogError::Unauthorized {
+            kind: "publication_lifecycle_audit",
+            key: format!("{actor_account_id}:{publisher_id}"),
+        })
+    }
+
+    /// List global lifecycle evidence after active administrator authorization.
+    ///
+    /// Unsupported backends fail closed. Results must use a deterministic
+    /// newest-first order and a bounded limit.
+    async fn list_administrator_lifecycle_decisions(
+        &self,
+        actor_account_id: uuid::Uuid,
+        before: Option<PublicationLifecycleCursor>,
+        limit: u32,
+    ) -> Result<Vec<PublicationLifecycleDecisionRecord>, CatalogError> {
+        let _ = (before, limit);
+        Err(CatalogError::Unauthorized {
+            kind: "publication_lifecycle_audit",
+            key: actor_account_id.to_string(),
         })
     }
 

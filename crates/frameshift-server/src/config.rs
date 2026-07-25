@@ -36,7 +36,7 @@
 //! | `R2_SECRET_ACCESS_KEY` | `""` | Secret access key (supplied via a secrets manager in production) |
 //! | `TRUST_FORWARDED_FOR` | `false` | Trust `X-Forwarded-For` for rate-limit key extraction; set `true` only behind a trusted proxy |
 //! | `SIGNED_REQUEST_MAX_SKEW_SECS` | `300` | Max allowed clock skew (seconds) between a signed write request's timestamp and server time; also bounds the replay-nonce retention window |
-//! | `FRAMESHIFT_ADMIN_PUBKEYS` | `""` | Comma-separated base64url-no-pad Ed25519 public keys allowed to call `/v1/admin/*` endpoints; empty disables all admin endpoints (404) |
+//! | `FRAMESHIFT_ADMIN_PUBKEYS` | `""` | Deprecated compatibility setting; account-role administrator routes ignore it |
 //! | `PUBLISHER_OWNERSHIP_READS` | `true` | Add publisher-preferred ownership metadata to pack read responses; false returns the legacy response shape |
 //! | `OIDC_ENABLED` | `false` | Enable OIDC-backed account routes when the remaining OIDC configuration is valid |
 //! | `OIDC_ISSUER` | `""` | Exact OIDC issuer URL |
@@ -50,10 +50,9 @@
 //!
 //! Env var names match the struct field names verbatim (figment maps
 //! `download_secret` <-> `DOWNLOAD_SECRET`); shorter aliases would require an
-//! explicit remap step which we don't have yet. `FRAMESHIFT_ADMIN_PUBKEYS` is
-//! the one deliberate exception: it carries the `FRAMESHIFT_` prefix so it
-//! cannot be confused with an unrelated `ADMIN_PUBKEYS` variable that some
-//! other tool in the deployment environment might already own.
+//! explicit remap step which we don't have yet. The deprecated
+//! `FRAMESHIFT_ADMIN_PUBKEYS` setting and publisher admission setting retain
+//! their historical prefix for configuration compatibility.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -292,17 +291,9 @@ pub struct ServerConfig {
     /// Default: 300 seconds (5 minutes).
     pub signed_request_max_skew: Duration,
 
-    /// Base64url-no-pad Ed25519 public keys authorized to call the admin
-    /// endpoints (e.g. `POST /v1/admin/packs/{name}/{version}/tombstone`).
+    /// Deprecated Ed25519 administrator allowlist retained for configuration compatibility.
     ///
-    /// Parsed from the comma-separated `FRAMESHIFT_ADMIN_PUBKEYS` env var.
-    /// Stored in the same base64url-no-pad string representation produced by
-    /// `Ed25519PublicKey`'s `Display` impl, so callers compare with a plain
-    /// string equality against
-    /// `verified_signer.pubkey.to_string()` (see
-    /// [`crate::auth::VerifiedSigner`]). Default: empty (admin endpoints
-    /// disabled; handlers return `404` rather than `403` so the route's
-    /// existence is not disclosed).
+    /// Account-role administrator routes do not consult this setting.
     pub admin_pubkeys: Vec<String>,
 
     /// Whether pack reads resolve additive publisher ownership metadata.
@@ -540,9 +531,7 @@ struct RawConfig {
     /// `SIGNED_REQUEST_MAX_SKEW_SECS`).
     signed_request_max_skew_secs: u64,
 
-    /// Comma-separated base64url-no-pad Ed25519 admin public keys (raw
-    /// string, split into `Vec<String>` on convert). Maps to
-    /// `FRAMESHIFT_ADMIN_PUBKEYS`.
+    /// Deprecated raw Ed25519 administrator allowlist compatibility value.
     admin_pubkeys: String,
 
     /// Whether pack reads add publisher-preferred ownership metadata.
@@ -585,7 +574,7 @@ struct RawConfig {
 /// Mirrors the parsing convention already used by
 /// [`ServerConfig::cors_origins`], but eagerly collects into an owned
 /// `Vec<String>` instead of returning a lazy iterator, since
-/// `admin_pubkeys` is compared on every admin-route request.
+/// The deprecated `admin_pubkeys` value still uses this compatibility parser.
 fn split_comma_list(raw: &str) -> Vec<String> {
     raw.split(',')
         .map(str::trim)
@@ -712,11 +701,9 @@ impl ServerConfig {
     ///
     /// Environment variables are read with no prefix (e.g. `BIND_ADDR` not
     /// `FRAMESHIFT_BIND_ADDR`). See the module-level documentation for the full
-    /// mapping. `admin_pubkeys` is the sole exception: it is read from the
-    /// prefixed `FRAMESHIFT_ADMIN_PUBKEYS` var via a second, narrowly-scoped
-    /// `Env::prefixed(...).only(...)` merge layered on top of the unprefixed
-    /// provider, so every other field keeps the established no-prefix
-    /// convention.
+    /// mapping. Deprecated `admin_pubkeys` and active `publisher_pubkeys`
+    /// retain their historical `FRAMESHIFT_` prefix through a narrow second
+    /// environment provider.
     ///
     /// # Errors
     ///

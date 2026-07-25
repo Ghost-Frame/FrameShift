@@ -194,6 +194,36 @@ diesel::table! {
 }
 
 diesel::table! {
+    /// Immutable owner and administrator publication lifecycle controls.
+    publication_lifecycle_decisions (id) {
+        /// Stable lifecycle-decision identifier.
+        id -> Uuid,
+        /// Stable control action.
+        action -> Text,
+        /// Authenticated account that exercised authority.
+        actor_account_id -> Uuid,
+        /// Affected publisher when linked to current ownership.
+        publisher_id -> Nullable<Uuid>,
+        /// Affected non-public submission for withdrawals.
+        submission_id -> Nullable<Uuid>,
+        /// Affected public pack for release tombstones.
+        pack_name -> Nullable<Text>,
+        /// Affected public semantic version for release tombstones.
+        version -> Nullable<Text>,
+        /// Stable state observed before the control.
+        from_state -> Text,
+        /// Stable state committed by the control.
+        to_state -> Text,
+        /// Bounded reason code or public tombstone category.
+        reason_code -> Text,
+        /// Stable request identifier used to reject replay substitution.
+        request_id -> Uuid,
+        /// Decision commit timestamp.
+        created_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     /// Artifacts admitted only to the internal publication quarantine boundary.
     publication_submissions (id) {
         /// Stable submission identifier and idempotency key.
@@ -403,6 +433,8 @@ diesel::joinable!(publication_moderation_decisions -> accounts (actor_account_id
 diesel::joinable!(publication_moderation_decisions -> publication_submissions (submission_id));
 // Allow Diesel join inference from immutable promotions to their submissions.
 diesel::joinable!(publication_promotions -> publication_submissions (submission_id));
+// Allow Diesel join inference from lifecycle decisions to authenticated actors.
+diesel::joinable!(publication_lifecycle_decisions -> accounts (actor_account_id));
 
 diesel::allow_tables_to_appear_in_same_query!(
     authors,
@@ -421,4 +453,5 @@ diesel::allow_tables_to_appear_in_same_query!(
     publication_submissions,
     publication_moderation_decisions,
     publication_promotions,
+    publication_lifecycle_decisions,
 );
