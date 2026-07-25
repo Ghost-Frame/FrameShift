@@ -22,9 +22,12 @@ use frameshift_catalog::filters::{PackSearchFilters, PackSearchResult};
 use frameshift_catalog::identity::Ed25519PublicKey;
 use frameshift_catalog::records::{
     AccountRecord, AccountStatus, AuthorRecord, MembershipState, PackRecord, PackVersionRecord,
-    PublicationIntentRecord, PublicationSubmissionRecord, PublicationSubmissionRequest,
-    PublicationSubmissionState, PublisherAuditEventRecord, PublisherKeyRecord, PublisherKeyState,
-    PublisherMembershipRecord, PublisherProfileRecord, PublisherRole,
+    PlatformRole, PlatformRoleRecord, PlatformRoleState, PublicationIntentRecord,
+    PublicationModerationAction, PublicationModerationDecisionRecord,
+    PublicationModerationDecisionRequest, PublicationSubmissionRecord,
+    PublicationSubmissionRequest, PublicationSubmissionState, PublisherAuditEventRecord,
+    PublisherKeyRecord, PublisherKeyState, PublisherMembershipRecord, PublisherProfileRecord,
+    PublisherRole,
 };
 use frameshift_catalog::status::{PackStatus, TombstoneRecord};
 // Reuse the exact same version-precedence comparator the Postgres adapter
@@ -94,6 +97,12 @@ pub struct MockState {
 
     /// Quarantined publication submissions keyed by stable identifier.
     pub publication_submissions: HashMap<uuid::Uuid, PublicationSubmissionRecord>,
+
+    /// Global platform-role assignments retained for authorization tests.
+    pub platform_roles: Vec<PlatformRoleRecord>,
+
+    /// Immutable publication moderation decisions keyed by stable identifier.
+    pub publication_moderation_decisions: HashMap<uuid::Uuid, PublicationModerationDecisionRecord>,
 
     /// Optional persistent backend failure injected into submission creation.
     pub publication_submission_error: Option<String>,
@@ -1320,6 +1329,150 @@ impl CatalogBackend for MockCatalog {
                 kind: "publication_submission",
                 key: id.to_string(),
             })
+    }
+
+    /// List an account's global platform roles in stable role order.
+    async fn list_account_platform_roles(
+        &self,
+        account_id: uuid::Uuid,
+    ) -> Result<Vec<PlatformRoleRecord>, CatalogError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        let mut roles: Vec<_> = state
+            .platform_roles
+            .iter()
+            .filter(|record| record.account_id == account_id)
+            .cloned()
+            .collect();
+        roles.sort_by_key(|record| match record.role {
+            PlatformRole::Administrator => 0,
+            PlatformRole::Moderator => 1,
+        });
+        Ok(roles)
+    }
+
+    /// Authorize and atomically apply one publication moderation decision.
+    async fn moderate_publication_submission(
+        &self,
+        request: PublicationModerationDecisionRequest,
+    ) -> Result<PublicationModerationDecisionRecord, CatalogError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        let actor_is_active = state
+            .accounts
+            .get(&request.actor_account_id)
+            .is_some_and(|account| account.status == AccountStatus::Active);
+        let role_is_active = state.platform_roles.iter().any(|record| {
+            record.account_id == request.actor_account_id
+                && record.state == PlatformRoleState::Active
+                && matches!(
+                    record.role,
+                    PlatformRole::Moderator | PlatformRole::Administrator
+                )
+        });
+        if !actor_is_active || !role_is_active {
+            return Err(CatalogError::Unauthorized {
+                kind: "publication_moderation",
+                key: request.id.to_string(),
+            });
+        }
+
+        let submission = state
+            .publication_submissions
+            .get(&request.submission_id)
+            .cloned()
+            .ok_or_else(|| CatalogError::NotFound {
+                kind: "publication_submission",
+                key: request.submission_id.to_string(),
+            })?;
+        let actor_is_owner = state.publisher_memberships.values().any(|membership| {
+            membership.account_id == request.actor_account_id
+                && membership.publisher_id == submission.publisher_id
+                && membership.role == PublisherRole::Owner
+                && membership.state == MembershipState::Active
+        });
+        if actor_is_owner {
+            return Err(CatalogError::Unauthorized {
+                kind: "publication_moderation",
+                key: request.id.to_string(),
+            });
+        }
+
+        let exact_retry = |record: &PublicationModerationDecisionRecord| {
+            record.id == request.id
+                && record.submission_id == request.submission_id
+                && record.actor_account_id == request.actor_account_id
+                && record.action == request.action
+                && record.reason_code == request.reason_code
+                && record.private_explanation == request.private_explanation
+                && record.request_id == request.request_id
+        };
+        if let Some(existing) = state.publication_moderation_decisions.get(&request.id) {
+            return if exact_retry(existing) {
+                Ok(existing.clone())
+            } else {
+                Err(CatalogError::Conflict {
+                    kind: "publication_moderation_decision",
+                    key: request.id.to_string(),
+                })
+            };
+        }
+        if let Some(existing) = state
+            .publication_moderation_decisions
+            .values()
+            .find(|record| record.request_id == request.request_id)
+        {
+            return if exact_retry(existing) {
+                Ok(existing.clone())
+            } else {
+                Err(CatalogError::Conflict {
+                    kind: "publication_moderation_decision",
+                    key: request.request_id.to_string(),
+                })
+            };
+        }
+
+        if !matches!(
+            submission.state,
+            PublicationSubmissionState::Quarantined | PublicationSubmissionState::NeedsReview
+        ) {
+            return Err(CatalogError::Conflict {
+                kind: "publication_submission",
+                key: request.submission_id.to_string(),
+            });
+        }
+        let to_state = match request.action {
+            PublicationModerationAction::Approve => PublicationSubmissionState::Approved,
+            PublicationModerationAction::RequestChanges => PublicationSubmissionState::NeedsReview,
+            PublicationModerationAction::Reject => PublicationSubmissionState::Rejected,
+        };
+        let now = Utc::now();
+        let decision = PublicationModerationDecisionRecord {
+            id: request.id,
+            submission_id: request.submission_id,
+            actor_account_id: request.actor_account_id,
+            action: request.action,
+            from_state: submission.state,
+            to_state,
+            reason_code: request.reason_code,
+            private_explanation: request.private_explanation,
+            request_id: request.request_id,
+            created_at: now,
+        };
+        let stored_submission = state
+            .publication_submissions
+            .get_mut(&request.submission_id)
+            .expect("validated publication submission must remain present");
+        stored_submission.state = to_state;
+        stored_submission.updated_at = now;
+        state
+            .publication_moderation_decisions
+            .insert(decision.id, decision.clone());
+        Ok(decision)
     }
 }
 
