@@ -429,6 +429,27 @@ impl Client {
         registry::registry_version_details(&registry::registry_base_url(), name, version)
     }
 
+    /// Create one atomic Studio draft from an exact cryptographically verified registry version.
+    pub fn fork_registry_draft(
+        &self,
+        studio: &frameshift_studio::Studio,
+        id: &str,
+        title: &str,
+        source: &PersonaSpec,
+        identity: frameshift_studio::ForkIdentityInput,
+    ) -> Result<frameshift_studio::DraftStatus, ClientError> {
+        let verified = registry::fetch_verified_pack(source, &self.data_root)?;
+        studio
+            .fork_import(
+                id,
+                title,
+                verified.pack_root(),
+                verified.origin().clone(),
+                identity,
+            )
+            .map_err(ClientError::from)
+    }
+
     /// Resolve the project id for `project_root`.
     ///
     /// If the `FRAMESHIFT_PROJECT_ID` env var is set to a non-empty value, it

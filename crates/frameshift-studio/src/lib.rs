@@ -8,7 +8,7 @@ use std::fs;
 use std::io::{Read as _, Write as _};
 use std::path::{Component, Path, PathBuf};
 
-use frameshift_pack::{PackManifest, LOCAL_UNSIGNED_PUBKEY};
+use frameshift_pack::{ForkOrigin, PackManifest, LOCAL_UNSIGNED_PUBKEY};
 use frameshift_publication::{
     is_allowed_public_path, validate_directory, PublicationReport, MAX_FILE_SIZE,
 };
@@ -159,6 +159,22 @@ pub struct GuidedTemplateInput {
     pub forkable: bool,
 }
 
+/// New public identity assigned to an explicitly permitted registry fork.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForkIdentityInput {
+    /// Stable public name for the distinct derived pack.
+    pub name: String,
+    /// Initial semantic version for the derived pack.
+    pub version: String,
+    /// Public author or publisher handle for the derived pack.
+    pub author_handle: String,
+    /// Exact lowercase Ed25519 verifying key for the derived pack.
+    pub author_pubkey: String,
+    /// Whether the derived release permits another Creator Studio fork.
+    #[serde(default)]
+    pub forkable: bool,
+}
+
 /// Read-only accessors for an immutable draft snapshot.
 impl DraftSnapshot {
     /// Return the draft revision represented by this snapshot.
@@ -247,6 +263,18 @@ pub enum StudioError {
     /// Generated guided content did not pass the shared publication policy.
     #[error("guided draft template failed shared validation")]
     InvalidGeneratedTemplate,
+    /// The signed source manifest did not explicitly permit Creator Studio forks.
+    #[error("source pack does not explicitly permit forking")]
+    SourceNotForkable,
+    /// The verified registry provenance does not identify the signed source manifest.
+    #[error("verified fork source identity does not match its signed manifest")]
+    ForkSourceMismatch,
+    /// Generated fork content did not pass the shared publication policy.
+    #[error("forked draft failed shared validation")]
+    InvalidGeneratedFork,
+    /// Source typed TOML could not be deserialized for an identity rewrite.
+    #[error("fork source TOML could not be parsed")]
+    ForkSourceToml(#[source] toml::de::Error),
     /// Publication validation could not inspect the draft.
     #[error("draft validation failed: {0}")]
     Validation(#[from] frameshift_publication::PublicationIoError),
@@ -371,6 +399,103 @@ impl Studio {
                 "source changed while it was imported".to_string(),
             ));
         }
+        self.publish_staging(staging, id)?;
+        self.status(id)
+    }
+
+    /// Atomically copy and re-identify an explicitly permitted verified registry source.
+    pub fn fork_import(
+        &self,
+        id: &str,
+        title: &str,
+        source: impl AsRef<Path>,
+        origin: ForkOrigin,
+        identity: ForkIdentityInput,
+    ) -> Result<DraftStatus, StudioError> {
+        validate_fork_identity(&identity)?;
+        let source = source.as_ref();
+        let source_metadata = fs::symlink_metadata(source).map_err(|_| {
+            StudioError::UnsafeImport("source must be a real directory".to_string())
+        })?;
+        if source_metadata.file_type().is_symlink() || !source_metadata.is_dir() {
+            return Err(StudioError::UnsafeImport(
+                "source must be a real directory".to_string(),
+            ));
+        }
+
+        let source_report = validate_directory(source)?;
+        if let Some(finding) = source_report
+            .findings
+            .iter()
+            .find(|finding| import_blocking_code(&finding.code))
+        {
+            return Err(StudioError::UnsafeImport(finding.code.clone()));
+        }
+
+        let manifest_bytes = read_regular_nofollow(&source.join("pack.toml"), MAX_FILE_SIZE)?;
+        let manifest_text = std::str::from_utf8(&manifest_bytes)
+            .map_err(|_| StudioError::InvalidMetadata("pack.toml is not UTF-8".to_string()))?;
+        let mut manifest: PackManifest =
+            toml::from_str(manifest_text).map_err(StudioError::ForkSourceToml)?;
+        if !manifest.forkable {
+            return Err(StudioError::SourceNotForkable);
+        }
+        if manifest.name != origin.name || manifest.version != origin.version {
+            return Err(StudioError::ForkSourceMismatch);
+        }
+
+        let (staging, _) = self.prepare_staging(id, title)?;
+        let content = staging.path().join(CONTENT_DIRECTORY);
+        for entry in &source_report.inventory {
+            let destination = content.join(path_from_public_string(&entry.path)?);
+            let bytes = read_regular_nofollow(&source.join(&entry.path), MAX_FILE_SIZE)?;
+            write_bytes_atomic(&destination, &bytes, false)?;
+        }
+
+        manifest.name = identity.name.clone();
+        manifest.version = identity.version.clone();
+        manifest.author_handle = identity.author_handle.clone();
+        manifest.author_pubkey = identity.author_pubkey.clone();
+        manifest.parent_hash = None;
+        manifest.forkable = identity.forkable;
+        manifest.forked_from = Some(origin);
+        manifest.conformance_baseline = None;
+        manifest
+            .validate_fork_contract()
+            .map_err(|error| StudioError::InvalidMetadata(error.to_string()))?;
+        let rewritten_manifest =
+            toml::to_string(&manifest).map_err(StudioError::TemplateSerialization)?;
+        write_bytes_atomic(
+            &content.join("pack.toml"),
+            rewritten_manifest.as_bytes(),
+            true,
+        )?;
+
+        let persona_path = content.join("persona.toml");
+        if persona_path.is_file() {
+            let persona_bytes = read_regular_nofollow(&persona_path, MAX_FILE_SIZE)?;
+            let persona_text = std::str::from_utf8(&persona_bytes).map_err(|_| {
+                StudioError::InvalidMetadata("persona.toml is not UTF-8".to_string())
+            })?;
+            let mut persona: Persona =
+                toml::from_str(persona_text).map_err(StudioError::ForkSourceToml)?;
+            persona.name = identity.name;
+            persona.version = Some(identity.version);
+            persona.author = Some(Author {
+                handle: identity.author_handle,
+                pubkey: Some(identity.author_pubkey),
+            });
+            persona.license = manifest.license.clone();
+            let rewritten_persona =
+                toml::to_string(&persona).map_err(StudioError::TemplateSerialization)?;
+            write_bytes_atomic(&persona_path, rewritten_persona.as_bytes(), true)?;
+        }
+
+        let copied_report = validate_directory(&content)?;
+        if !copied_report.valid {
+            return Err(StudioError::InvalidGeneratedFork);
+        }
+        sync_directory(&content);
         self.publish_staging(staging, id)?;
         self.status(id)
     }
@@ -806,6 +931,28 @@ fn validate_guided_template(input: &GuidedTemplateInput) -> Result<(), StudioErr
     Ok(())
 }
 
+/// Validate every new fork identity field before staging derived content.
+fn validate_fork_identity(input: &ForkIdentityInput) -> Result<(), StudioError> {
+    if !valid_portable_identifier(&input.name, 64) {
+        return Err(StudioError::InvalidTemplateField("name"));
+    }
+    if semver::Version::parse(&input.version).is_err() || input.version.len() > 64 {
+        return Err(StudioError::InvalidTemplateField("version"));
+    }
+    if !valid_portable_identifier(&input.author_handle, 64) {
+        return Err(StudioError::InvalidTemplateField("author_handle"));
+    }
+    if input.author_pubkey.len() != 64
+        || !input
+            .author_pubkey
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(StudioError::InvalidTemplateField("author_pubkey"));
+    }
+    Ok(())
+}
+
 /// Return whether a value is one bounded portable public identifier.
 fn valid_portable_identifier(value: &str, max_bytes: usize) -> bool {
     (1..=max_bytes).contains(&value.len())
@@ -1032,6 +1179,42 @@ mod tests {
         }
     }
 
+    /// Write one explicitly forkable typed source with attribution and an ignored signature file.
+    fn write_forkable_source(root: &Path, forkable: bool) {
+        fs::create_dir_all(root).unwrap();
+        fs::write(
+            root.join("pack.toml"),
+            format!(
+                "schema_version = 1\nname = \"source\"\nauthor_handle = \"original\"\n\
+                 author_pubkey = \"{TEST_PUBLIC_KEY}\"\nversion = \"1.2.3\"\nlicense = \"MIT\"\n\
+                 forkable = {forkable}\ndescription = \"Original purpose\"\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            root.join("persona.toml"),
+            format!(
+                "schema_version = 1\nname = \"source\"\nversion = \"1.2.3\"\n\
+                 description = \"Original purpose\"\nlicense = \"MIT\"\n\
+                 \n[author]\nhandle = \"original\"\npubkey = \"{TEST_PUBLIC_KEY}\"\n\
+                 \n[voice]\ntone = \"Original voice.\"\n"
+            ),
+        )
+        .unwrap();
+        fs::write(root.join("signature.sig"), [7_u8; 64]).unwrap();
+    }
+
+    /// Build a valid distinct identity for a derived fork.
+    fn fork_identity_input() -> ForkIdentityInput {
+        ForkIdentityInput {
+            name: "derived".to_string(),
+            version: "0.1.0".to_string(),
+            author_handle: "new-author".to_string(),
+            author_pubkey: TEST_PUBLIC_KEY.to_string(),
+            forkable: false,
+        }
+    }
+
     /// Blank templates are typed and previewable but remain local-only.
     #[test]
     fn blank_template_is_previewable_and_publication_invalid() {
@@ -1112,6 +1295,116 @@ mod tests {
             Some(input.description.as_str())
         );
         assert_eq!(parsed.voice.tone, input.voice_tone);
+    }
+
+    /// Fork import preserves license and provenance while replacing public identity atomically.
+    #[test]
+    fn fork_import_rewrites_identity_and_preserves_attribution() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let studio_root = temporary.path().join("studio");
+        write_forkable_source(&source, true);
+        let studio = Studio::open(&studio_root).unwrap();
+        let origin = ForkOrigin {
+            name: "source".to_string(),
+            version: "1.2.3".to_string(),
+            content_hash: "a".repeat(64),
+        };
+
+        let status = studio
+            .fork_import(
+                "derived",
+                "Derived",
+                &source,
+                origin.clone(),
+                fork_identity_input(),
+            )
+            .unwrap();
+
+        assert!(status.publication.valid);
+        let manifest = studio.read_file("derived", "pack.toml").unwrap();
+        let manifest: PackManifest =
+            toml::from_str(std::str::from_utf8(&manifest).unwrap()).unwrap();
+        assert_eq!(manifest.name, "derived");
+        assert_eq!(manifest.version, "0.1.0");
+        assert_eq!(manifest.author_handle, "new-author");
+        assert_eq!(manifest.license.as_deref(), Some("MIT"));
+        assert_eq!(manifest.forked_from, Some(origin));
+        assert!(!manifest.forkable);
+        assert!(manifest.conformance_baseline.is_none());
+
+        let persona = studio.read_file("derived", "persona.toml").unwrap();
+        let persona: Persona = toml::from_str(std::str::from_utf8(&persona).unwrap()).unwrap();
+        assert_eq!(persona.name, "derived");
+        assert_eq!(persona.version.as_deref(), Some("0.1.0"));
+        assert_eq!(
+            persona.author.as_ref().map(|author| author.handle.as_str()),
+            Some("new-author")
+        );
+        assert_eq!(persona.license.as_deref(), Some("MIT"));
+        assert!(!studio_root
+            .join("derived")
+            .join(CONTENT_DIRECTORY)
+            .join("signature.sig")
+            .exists());
+    }
+
+    /// A legacy or denied source cannot create even a partial destination draft.
+    #[test]
+    fn non_forkable_source_leaves_no_draft() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        write_forkable_source(&source, false);
+        let studio = Studio::open(temporary.path().join("studio")).unwrap();
+
+        let error = studio
+            .fork_import(
+                "derived",
+                "Derived",
+                &source,
+                ForkOrigin {
+                    name: "source".to_string(),
+                    version: "1.2.3".to_string(),
+                    content_hash: "b".repeat(64),
+                },
+                fork_identity_input(),
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, StudioError::SourceNotForkable));
+        assert!(matches!(
+            studio.status("derived"),
+            Err(StudioError::NotFound)
+        ));
+    }
+
+    /// Provenance that differs from the signed source identity fails before staging.
+    #[test]
+    fn fork_source_identity_mismatch_leaves_no_draft() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        write_forkable_source(&source, true);
+        let studio = Studio::open(temporary.path().join("studio")).unwrap();
+
+        let error = studio
+            .fork_import(
+                "derived",
+                "Derived",
+                &source,
+                ForkOrigin {
+                    name: "different".to_string(),
+                    version: "1.2.3".to_string(),
+                    content_hash: "c".repeat(64),
+                },
+                fork_identity_input(),
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, StudioError::ForkSourceMismatch));
+        assert!(matches!(
+            studio.status("derived"),
+            Err(StudioError::NotFound)
+        ));
     }
 
     /// Create, reload, review, and submit a valid draft across store instances.

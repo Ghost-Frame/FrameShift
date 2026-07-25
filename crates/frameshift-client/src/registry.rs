@@ -19,7 +19,7 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::VerifyingKey;
 use flate2::read::GzDecoder;
-use frameshift_pack::{ObjectHash, Pack};
+use frameshift_pack::{ForkOrigin, ObjectHash, Pack};
 use serde::Deserialize;
 use std::fs::OpenOptions;
 use std::io::{Read as _, Write as _};
@@ -103,6 +103,29 @@ struct VersionRecord {
     /// Exact enrolled key and lifecycle state attached by ownership-aware registries.
     #[serde(default)]
     publisher_key: Option<RegistryPublisherKeySummary>,
+}
+
+/// Owned temporary result of exact registry transport and cryptographic verification.
+pub(crate) struct VerifiedRegistryPack {
+    /// Temporary extraction root retained for the lifetime of the verified files.
+    _extraction: tempfile::TempDir,
+    /// Directory containing the verified public pack files and transport signature.
+    pack_root: std::path::PathBuf,
+    /// Immutable raw-archive provenance proven by the registry transport.
+    origin: ForkOrigin,
+}
+
+/// Read-only accessors for one verified temporary registry pack.
+impl VerifiedRegistryPack {
+    /// Return the extracted directory containing the verified pack.
+    pub(crate) fn pack_root(&self) -> &Path {
+        &self.pack_root
+    }
+
+    /// Return the exact immutable registry provenance for this download.
+    pub(crate) fn origin(&self) -> &ForkOrigin {
+        &self.origin
+    }
 }
 
 /// Wrapper that deserializes either a base64url string or a raw `[u8; 32]` JSON array.
@@ -414,9 +437,30 @@ pub fn fetch_and_install(
     spec: &PersonaSpec,
     paths: &ProjectPaths,
 ) -> Result<LockedPersona, ClientError> {
+    let data_root = paths.cache_dir.parent().unwrap_or(&paths.cache_dir);
+    let verified = fetch_verified_pack(spec, data_root)?;
+    let pack = Pack::from_dir(verified.pack_root())?;
+
+    // Cache the extracted pack directory only after every verification step.
+    let canonical_hash = pack.canonical_hash_hex();
+    let cache_path = paths.cache_dir.join(&canonical_hash);
+    crate::ensure_cached_pack(verified.pack_root(), &cache_path)?;
+
+    Ok(crate::locked_persona_from_pack(&pack))
+}
+
+/// Fetch, extract, and cryptographically verify one exact immutable registry version.
+pub(crate) fn fetch_verified_pack(
+    spec: &PersonaSpec,
+    data_root: &Path,
+) -> Result<VerifiedRegistryPack, ClientError> {
     let base = registry_base_url();
     let name = &spec.name;
     let version = &spec.version;
+    crate::validate_persona_name(name)?;
+    if version.len() > 64 || semver::Version::parse(version).is_err() {
+        return Err(ClientError::InvalidPersonaSpec(format!("{name}@{version}")));
+    }
 
     // Step 1: fetch the version record (JSON).
     let record_url = format!("{base}/v1/packs/{name}/versions/{version}");
@@ -477,23 +521,35 @@ pub fn fetch_and_install(
         .map_err(|_| ClientError::SignatureVerification)?;
     debug!("pack signature verified against registry pubkey");
 
+    let signer_pubkey = hex::encode(record.author_pubkey.0);
+    if pack.manifest().author_pubkey != signer_pubkey {
+        return Err(ClientError::RegistryOwnershipInvalid {
+            pack: format!("{name}@{version}"),
+            detail: "signed manifest author key does not match the verified registry signer"
+                .to_string(),
+        });
+    }
+
     // Cryptographic validity is not enough when the registry supplies both
     // the signature and key. All responses retain exact key TOFU, while
     // ownership-aware responses additionally pin the stable publisher UUID.
     check_or_create_registry_trust(
-        paths,
+        data_root,
         &base,
         &pack.manifest().author_handle,
         &record.author_pubkey.0,
         &record,
     )?;
 
-    // Step 8: cache the extracted pack directory.
-    let canonical_hash = pack.canonical_hash_hex();
-    let cache_path = paths.cache_dir.join(&canonical_hash);
-    crate::ensure_cached_pack(&pack_root, &cache_path)?;
-
-    Ok(crate::locked_persona_from_pack(&pack))
+    Ok(VerifiedRegistryPack {
+        _extraction: tmp,
+        pack_root,
+        origin: ForkOrigin {
+            name: record.pack_name,
+            version: record.version,
+            content_hash: record.content_hash.to_hex(),
+        },
+    })
 }
 
 /// Require the immutable record identity to match the requested resource.
@@ -513,7 +569,7 @@ fn validate_version_identity(
 
 /// Apply exact signer-key TOFU and additive publisher identity continuity.
 fn check_or_create_registry_trust(
-    paths: &ProjectPaths,
+    data_root: &Path,
     registry: &str,
     author: &str,
     pubkey: &[u8; 32],
@@ -537,7 +593,7 @@ fn check_or_create_registry_trust(
                         .to_string(),
                 });
             }
-            check_or_create_author_pin(paths, registry, author, pubkey)
+            check_or_create_author_pin(data_root, registry, author, pubkey)
         }
         (Some(publisher), None, None) => {
             let legacy_author = record.legacy_author.as_ref().ok_or_else(|| {
@@ -554,7 +610,7 @@ fn check_or_create_registry_trust(
                             .to_string(),
                 });
             }
-            check_or_create_author_pin(paths, registry, author, pubkey)
+            check_or_create_author_pin(data_root, registry, author, pubkey)
         }
         (Some(publisher), Some(publisher_key), Some(linked_key_id)) => {
             if record.legacy_author.is_some() {
@@ -594,7 +650,7 @@ fn check_or_create_registry_trust(
                 });
             }
             check_or_create_publisher_pin(
-                paths,
+                data_root,
                 registry,
                 author,
                 &publisher_id.to_string(),
@@ -610,12 +666,11 @@ fn check_or_create_registry_trust(
 
 /// Verify or atomically establish an author key continuity pin.
 fn check_or_create_author_pin(
-    paths: &ProjectPaths,
+    data_root: &Path,
     registry: &str,
     author: &str,
     pubkey: &[u8; 32],
 ) -> Result<(), ClientError> {
-    let data_root = paths.cache_dir.parent().unwrap_or(&paths.cache_dir);
     let namespace = ObjectHash::of(format!("{registry}\0{author}").as_bytes()).to_hex();
     let pin_dir = data_root.join("trust").join("registry-authors");
     std::fs::create_dir_all(&pin_dir).map_err(|source| ClientError::Io {
@@ -707,7 +762,7 @@ fn verify_author_pin(
 
 /// Verify or atomically establish stable publisher identity continuity.
 fn check_or_create_publisher_pin(
-    paths: &ProjectPaths,
+    data_root: &Path,
     registry: &str,
     author: &str,
     publisher_id: &str,
@@ -716,9 +771,8 @@ fn check_or_create_publisher_pin(
     // Publisher identity is additive trust context, not a replacement for the
     // exact signer pin. Until the wire protocol carries an old-key-signed
     // rotation proof, a newly presented key must retain the existing warning.
-    check_or_create_author_pin(paths, registry, author, presented_pubkey)?;
+    check_or_create_author_pin(data_root, registry, author, presented_pubkey)?;
 
-    let data_root = paths.cache_dir.parent().unwrap_or(&paths.cache_dir);
     let namespace = ObjectHash::of(format!("{registry}\0{author}").as_bytes()).to_hex();
     let pin_dir = data_root.join("trust").join("registry-publishers");
     std::fs::create_dir_all(&pin_dir).map_err(|source| ClientError::Io {
@@ -1111,42 +1165,45 @@ mod tests {
     use std::io::BufRead as _;
     use std::net::TcpListener;
 
-    /// Build project paths whose cache parent is an isolated data root.
-    fn trust_test_paths(root: &Path) -> ProjectPaths {
-        let project_state_dir = root.join("projects").join("test-project");
-        ProjectPaths {
-            project_root: root.join("worktree"),
-            project_id: "test-project".to_string(),
-            config_path: project_state_dir.join("config.toml"),
-            lock_path: project_state_dir.join("lock.toml"),
-            vault_path: project_state_dir.join("vault.age"),
-            cache_dir: root.join("cache"),
-            project_state_dir: project_state_dir.clone(),
-            active_path: project_state_dir.join("active"),
-            personas_dir: project_state_dir.join("personas"),
-        }
+    /// Exact registry versions are bounded before any HTTP request is constructed.
+    #[test]
+    fn verified_fetch_rejects_oversized_semver() {
+        let temp = tempfile::tempdir().unwrap();
+        let error = fetch_verified_pack(
+            &PersonaSpec {
+                name: "bounded-pack".to_string(),
+                version: format!("1.0.0-{}", "a".repeat(64)),
+            },
+            temp.path(),
+        )
+        .err()
+        .expect("oversized exact version must fail before transport");
+
+        assert!(matches!(error, ClientError::InvalidPersonaSpec(_)));
     }
 
     /// The first verified author key is pinned and an exact repeat is accepted.
     #[test]
     fn author_key_tofu_pin_accepts_continuity() {
         let temp = tempfile::tempdir().unwrap();
-        let paths = trust_test_paths(temp.path());
         let key = [7u8; 32];
-        check_or_create_author_pin(&paths, "https://registry.example", "alice", &key).unwrap();
-        check_or_create_author_pin(&paths, "https://registry.example", "alice", &key).unwrap();
+        check_or_create_author_pin(temp.path(), "https://registry.example", "alice", &key).unwrap();
+        check_or_create_author_pin(temp.path(), "https://registry.example", "alice", &key).unwrap();
     }
 
     /// A later registry response cannot silently substitute a new author key.
     #[test]
     fn author_key_tofu_pin_rejects_substitution() {
         let temp = tempfile::tempdir().unwrap();
-        let paths = trust_test_paths(temp.path());
-        check_or_create_author_pin(&paths, "https://registry.example", "alice", &[7u8; 32])
+        check_or_create_author_pin(temp.path(), "https://registry.example", "alice", &[7u8; 32])
             .unwrap();
-        let error =
-            check_or_create_author_pin(&paths, "https://registry.example", "alice", &[8u8; 32])
-                .unwrap_err();
+        let error = check_or_create_author_pin(
+            temp.path(),
+            "https://registry.example",
+            "alice",
+            &[8u8; 32],
+        )
+        .unwrap_err();
         assert!(matches!(
             error,
             ClientError::RegistryAuthorKeyChanged { .. }
@@ -1184,7 +1241,6 @@ mod tests {
     #[test]
     fn publisher_pin_rejects_unproven_key_rotation() {
         let temp = tempfile::tempdir().unwrap();
-        let paths = trust_test_paths(temp.path());
         let publisher_id = "4a128e72-cc91-4721-b452-943ce736799b";
         let first = ownership_version_record(
             publisher_id,
@@ -1193,7 +1249,7 @@ mod tests {
             [7_u8; 32],
         );
         check_or_create_registry_trust(
-            &paths,
+            temp.path(),
             "https://registry.example",
             "alice",
             &[7_u8; 32],
@@ -1208,7 +1264,7 @@ mod tests {
             [8_u8; 32],
         );
         let rotation = check_or_create_registry_trust(
-            &paths,
+            temp.path(),
             "https://registry.example",
             "alice",
             &[8_u8; 32],
@@ -1227,7 +1283,7 @@ mod tests {
             ..first
         };
         check_or_create_registry_trust(
-            &paths,
+            temp.path(),
             "https://registry.example",
             "alice",
             &[7_u8; 32],
@@ -1240,7 +1296,6 @@ mod tests {
     #[test]
     fn publisher_with_legacy_historical_version_uses_author_key_pin() {
         let temp = tempfile::tempdir().unwrap();
-        let paths = trust_test_paths(temp.path());
         let mut historical = ownership_version_record(
             "4a128e72-cc91-4721-b452-943ce736799b",
             "cc56ea2b-991d-46eb-a94f-936a9b071a4a",
@@ -1255,7 +1310,7 @@ mod tests {
         });
 
         check_or_create_registry_trust(
-            &paths,
+            temp.path(),
             "https://registry.example",
             "alice",
             &[7_u8; 32],
@@ -1263,7 +1318,7 @@ mod tests {
         )
         .expect("historical unlinked version must retain legacy key continuity");
         let error = check_or_create_registry_trust(
-            &paths,
+            temp.path(),
             "https://registry.example",
             "alice",
             &[8_u8; 32],
@@ -1280,7 +1335,6 @@ mod tests {
     #[test]
     fn publisher_pin_rejects_identity_substitution() {
         let temp = tempfile::tempdir().unwrap();
-        let paths = trust_test_paths(temp.path());
         let first = ownership_version_record(
             "4a128e72-cc91-4721-b452-943ce736799b",
             "cc56ea2b-991d-46eb-a94f-936a9b071a4a",
@@ -1288,7 +1342,7 @@ mod tests {
             [7_u8; 32],
         );
         check_or_create_registry_trust(
-            &paths,
+            temp.path(),
             "https://registry.example",
             "alice",
             &[7_u8; 32],
@@ -1303,7 +1357,7 @@ mod tests {
             [7_u8; 32],
         );
         let error = check_or_create_registry_trust(
-            &paths,
+            temp.path(),
             "https://registry.example",
             "alice",
             &[7_u8; 32],
@@ -1320,7 +1374,6 @@ mod tests {
     #[test]
     fn publisher_key_summary_mismatch_is_rejected() {
         let temp = tempfile::tempdir().unwrap();
-        let paths = trust_test_paths(temp.path());
         let mut record = ownership_version_record(
             "4a128e72-cc91-4721-b452-943ce736799b",
             "cc56ea2b-991d-46eb-a94f-936a9b071a4a",
@@ -1329,7 +1382,7 @@ mod tests {
         );
         record.publisher_key_id = Some("1e41ae38-9a5e-4623-8fcc-8f705928dacf".to_string());
         let error = check_or_create_registry_trust(
-            &paths,
+            temp.path(),
             "https://registry.example",
             "alice",
             &[7_u8; 32],

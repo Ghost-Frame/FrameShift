@@ -29,7 +29,8 @@ use frameshift_catalog::identity::Ed25519PublicKey;
 use frameshift_catalog::records::PackVersionRecord;
 use frameshift_catalog::status::PackStatus;
 use frameshift_client::{Client, ClientOptions, InstallRequest, InstallSource, PersonaSpec};
-use frameshift_pack::{ObjectHash, Pack};
+use frameshift_pack::{ObjectHash, Pack, PackManifest};
+use frameshift_studio::{ForkIdentityInput, Studio};
 
 /// A single canned HTTP response: status code, `Content-Type` header value,
 /// and raw body bytes.
@@ -110,11 +111,10 @@ fn spawn_registry(routes: HashMap<String, MockResponse>) -> String {
     format!("http://127.0.0.1:{port}")
 }
 
-/// Write a minimal valid pack directory at `dir` with the given name/version
-/// and author handle. Ported from `frameshift-server/tests/publish.rs`.
-fn write_pack(dir: &std::path::Path, name: &str, version: &str, handle: &str) {
+/// Write a minimal valid pack directory with the exact public signing identity.
+fn write_pack(dir: &std::path::Path, name: &str, version: &str, handle: &str, author_pubkey: &str) {
     let manifest = format!(
-        "schema_version = 1\nname = \"{name}\"\nauthor_handle = \"{handle}\"\nauthor_pubkey = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\nversion = \"{version}\"\nlicense = \"MIT\"\n"
+        "schema_version = 1\nname = \"{name}\"\nauthor_handle = \"{handle}\"\nauthor_pubkey = \"{author_pubkey}\"\nversion = \"{version}\"\nlicense = \"MIT\"\n"
     );
     std::fs::create_dir_all(dir).unwrap();
     std::fs::write(dir.join("pack.toml"), manifest).unwrap();
@@ -157,8 +157,23 @@ struct Fixture {
 /// a hand-rolled JSON string) means a future rename/reshape of the server's
 /// wire type breaks this test at compile time.
 fn prepare_signed_fixture(name: &str, version: &str, signing: &SigningKey) -> Fixture {
+    prepare_signed_fixture_with_manifest_key(
+        name,
+        version,
+        signing,
+        &hex::encode(signing.verifying_key().to_bytes()),
+    )
+}
+
+/// Build a signed fixture whose manifest carries a caller-selected author key.
+fn prepare_signed_fixture_with_manifest_key(
+    name: &str,
+    version: &str,
+    signing: &SigningKey,
+    manifest_pubkey: &str,
+) -> Fixture {
     let tmp = tempfile::TempDir::new().unwrap();
-    write_pack(tmp.path(), name, version, "alice");
+    write_pack(tmp.path(), name, version, "alice", manifest_pubkey);
 
     let pack = Pack::from_dir(tmp.path()).unwrap();
     let canonical_hash_bytes = pack.canonical_hash();
@@ -183,6 +198,52 @@ fn prepare_signed_fixture(name: &str, version: &str, signing: &SigningKey) -> Fi
         size_bytes: targz.len() as u64,
     };
 
+    Fixture {
+        targz,
+        record,
+        canonical_hash: pack.canonical_hash_hex(),
+    }
+}
+
+/// Build a signed typed source that explicitly permits Creator Studio forks.
+fn prepare_forkable_fixture(name: &str, version: &str, signing: &SigningKey) -> Fixture {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let author_pubkey = hex::encode(signing.verifying_key().to_bytes());
+    write_pack(tmp.path(), name, version, "alice", &author_pubkey);
+    let manifest_path = tmp.path().join("pack.toml");
+    let mut manifest = std::fs::read_to_string(&manifest_path).unwrap();
+    manifest.push_str("forkable = true\n");
+    std::fs::write(&manifest_path, manifest).unwrap();
+    std::fs::write(
+        tmp.path().join("persona.toml"),
+        format!(
+            "schema_version = 1\nname = \"{name}\"\nversion = \"{version}\"\n\
+             description = \"Forkable fixture\"\nlicense = \"MIT\"\n\
+             \n[author]\nhandle = \"alice\"\n\
+             pubkey = \"{author_pubkey}\"\n\
+             \n[voice]\ntone = \"Original voice.\"\n"
+        ),
+    )
+    .unwrap();
+
+    let pack = Pack::from_dir(tmp.path()).unwrap();
+    let signature = signing.sign(&pack.canonical_hash()).to_bytes().to_vec();
+    let targz = make_targz(tmp.path());
+    let record = PackVersionRecord {
+        pack_name: name.to_string(),
+        version: version.to_string(),
+        content_hash: ObjectHash::of(&targz),
+        signature,
+        author_pubkey: Ed25519PublicKey(signing.verifying_key().to_bytes()),
+        publisher_key_id: None,
+        parent_hash: None,
+        capability_manifest_json: "{}".to_string(),
+        schema_version: 1,
+        license: "MIT".to_string(),
+        published_at: Utc::now(),
+        status: PackStatus::Active,
+        size_bytes: targz.len() as u64,
+    };
     Fixture {
         targz,
         record,
@@ -350,6 +411,115 @@ fn registry_install_happy_path() {
     );
 }
 
+/// Verified registry fork transport creates one valid derived draft without installing it.
+#[test]
+fn registry_fork_happy_path_preserves_exact_provenance() {
+    let signing = SigningKey::from_bytes(&[9_u8; 32]);
+    let fixture = prepare_forkable_fixture("source-pack", "1.2.3", &signing);
+    let expected_archive_hash = fixture.record.content_hash.to_hex();
+    let mut routes = HashMap::new();
+    routes.insert(
+        "/v1/packs/source-pack/versions/1.2.3".to_string(),
+        record_response(&fixture.record),
+    );
+    routes.insert(
+        "/v1/packs/source-pack/versions/1.2.3/pack".to_string(),
+        pack_response(fixture.targz.clone()),
+    );
+    let base = spawn_registry(routes);
+    let _env = EnvGuard::set(&base);
+    let temp = tempfile::tempdir().unwrap();
+    let (client, project_root) = test_client_and_project(&temp);
+    let studio = Studio::open(client.data_root().join("studio")).unwrap();
+
+    let status = client
+        .fork_registry_draft(
+            &studio,
+            "derived",
+            "Derived",
+            &PersonaSpec {
+                name: "source-pack".to_string(),
+                version: "1.2.3".to_string(),
+            },
+            ForkIdentityInput {
+                name: "derived-pack".to_string(),
+                version: "0.1.0".to_string(),
+                author_handle: "bob".to_string(),
+                author_pubkey: "a".repeat(64),
+                forkable: false,
+            },
+        )
+        .expect("verified fork should create a draft");
+
+    assert!(status.publication.valid);
+    let manifest = studio.read_file("derived", "pack.toml").unwrap();
+    let manifest: PackManifest = toml::from_str(std::str::from_utf8(&manifest).unwrap()).unwrap();
+    assert_eq!(manifest.name, "derived-pack");
+    assert_eq!(manifest.license.as_deref(), Some("MIT"));
+    let origin = manifest.forked_from.expect("fork provenance");
+    assert_eq!(origin.name, "source-pack");
+    assert_eq!(origin.version, "1.2.3");
+    assert_eq!(origin.content_hash, expected_archive_hash);
+    assert!(
+        !client
+            .project_paths(&project_root)
+            .unwrap()
+            .lock_path
+            .exists(),
+        "forking must not install or mutate the project lockfile"
+    );
+}
+
+/// A fork hash failure occurs before Studio publishes any destination directory.
+#[test]
+fn registry_fork_hash_mismatch_leaves_no_draft() {
+    let signing = SigningKey::from_bytes(&[10_u8; 32]);
+    let mut fixture = prepare_forkable_fixture("source-pack", "1.2.3", &signing);
+    fixture.record.content_hash = ObjectHash::of(b"different archive");
+    let mut routes = HashMap::new();
+    routes.insert(
+        "/v1/packs/source-pack/versions/1.2.3".to_string(),
+        record_response(&fixture.record),
+    );
+    routes.insert(
+        "/v1/packs/source-pack/versions/1.2.3/pack".to_string(),
+        pack_response(fixture.targz),
+    );
+    let base = spawn_registry(routes);
+    let _env = EnvGuard::set(&base);
+    let temp = tempfile::tempdir().unwrap();
+    let (client, _) = test_client_and_project(&temp);
+    let studio = Studio::open(client.data_root().join("studio")).unwrap();
+
+    let error = client
+        .fork_registry_draft(
+            &studio,
+            "derived",
+            "Derived",
+            &PersonaSpec {
+                name: "source-pack".to_string(),
+                version: "1.2.3".to_string(),
+            },
+            ForkIdentityInput {
+                name: "derived-pack".to_string(),
+                version: "0.1.0".to_string(),
+                author_handle: "bob".to_string(),
+                author_pubkey: "a".repeat(64),
+                forkable: false,
+            },
+        )
+        .expect_err("hash mismatch must block the fork");
+
+    assert!(matches!(
+        error,
+        frameshift_client::ClientError::ContentHashMismatch { .. }
+    ));
+    assert!(matches!(
+        studio.status("derived"),
+        Err(frameshift_studio::StudioError::NotFound)
+    ));
+}
+
 /// A content-hash mismatch (advertised `content_hash` in the version record
 /// does not match `SHA-256` of the actual downloaded archive bytes) is
 /// rejected with `ClientError::ContentHashMismatch`, and nothing is cached.
@@ -451,6 +621,54 @@ fn registry_install_rejects_bad_signature() {
     assert!(
         !paths.cache_dir.join(&fixture.canonical_hash).exists(),
         "no cache entry should exist after a bad-signature rejection"
+    );
+}
+
+/// A signed manifest cannot claim an author key different from its verified signer.
+#[test]
+fn registry_install_rejects_manifest_signer_mismatch() {
+    let signing = SigningKey::from_bytes(&[15u8; 32]);
+    let fixture = prepare_signed_fixture_with_manifest_key(
+        "signer-mismatch-pack",
+        "1.0.0",
+        &signing,
+        "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+    );
+
+    let mut routes = HashMap::new();
+    routes.insert(
+        "/v1/packs/signer-mismatch-pack/versions/1.0.0".to_string(),
+        record_response(&fixture.record),
+    );
+    routes.insert(
+        "/v1/packs/signer-mismatch-pack/versions/1.0.0/pack".to_string(),
+        pack_response(fixture.targz.clone()),
+    );
+    let base = spawn_registry(routes);
+    let _env = EnvGuard::set(&base);
+
+    let temp = tempfile::tempdir().unwrap();
+    let (client, project_root) = test_client_and_project(&temp);
+    let error = client
+        .install(InstallRequest {
+            project_root: project_root.clone(),
+            spec: PersonaSpec {
+                name: "signer-mismatch-pack".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            source: InstallSource::Registry,
+        })
+        .expect_err("manifest signer mismatch must be rejected");
+
+    assert!(matches!(
+        error,
+        frameshift_client::ClientError::RegistryOwnershipInvalid { .. }
+    ));
+    let paths = client.project_paths(&project_root).unwrap();
+    assert!(!paths.cache_dir.join(&fixture.canonical_hash).exists());
+    assert!(
+        !client.data_root().join("trust").exists(),
+        "signer mismatch must fail before establishing registry trust"
     );
 }
 
