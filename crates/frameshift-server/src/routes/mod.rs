@@ -11,6 +11,7 @@
 //! - [`memory`] -- `GET /v1/memory/health` read-only memory backend health.
 //! - [`publication_intents`] -- authenticated creation and account-scoped retrieval.
 //! - [`publication_submissions`] -- signed quarantine admission and account-scoped retrieval.
+//! - [`moderation`] -- authenticated, role-gated publication review.
 //! - [`admin`] -- `POST /v1/admin/packs/{name}/{version}/tombstone` and other
 //!   allowlist-gated operator endpoints.
 
@@ -20,6 +21,7 @@ pub mod authors;
 pub mod downloads;
 pub mod handles;
 pub mod memory;
+pub mod moderation;
 pub mod ops;
 pub mod packs;
 pub mod publication_intents;

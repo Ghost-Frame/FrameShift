@@ -73,6 +73,7 @@ use crate::routes::authors::{authors_router, authors_write_router};
 use crate::routes::downloads::{dl_router, pack_download_url_router};
 use crate::routes::handles::handles_router;
 use crate::routes::memory::memory_router;
+use crate::routes::moderation::moderation_router;
 use crate::routes::ops::ops_router;
 use crate::routes::packs::{packs_router, publish_pack};
 use crate::routes::publication_intents::publication_intent_router;
@@ -98,6 +99,7 @@ use crate::state::AppState;
 ///     /account  -- OIDC-authenticated account profile and memberships
 ///     /publishers -- public profiles plus OIDC-authenticated owner operations
 ///     /publish-intents -- OIDC-authenticated creation and account-scoped retrieval
+///     /moderation/publication-submissions -- role-gated review reads and decisions
 ///     /telemetry -- POST /selection opt-in selection telemetry sink
 ///     /memory   -- GET /health read-only memory backend health
 ///     /admin    -- POST /packs/{name}/{version}/tombstone (signed + allowlist)
@@ -196,7 +198,8 @@ fn build_app(
     if state.account_auth.is_some() {
         let account_layer = axum::middleware::from_fn_with_state(state.clone(), require_account);
         let mut account_routes = account_write_router()
-            .merge(Router::new().nest("/publish-intents", publication_intent_router()));
+            .merge(Router::new().nest("/publish-intents", publication_intent_router()))
+            .merge(Router::new().nest("/moderation/publication-submissions", moderation_router()));
         if let Some(admission) = publication_admission {
             let submission_writes =
                 publication_submission_write_router(admission).route_layer(signed.clone());
