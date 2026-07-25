@@ -17,17 +17,17 @@ use unicode_normalization::UnicodeNormalization;
 /// Current schema version for serialized [`PublicationReport`] values.
 pub const REPORT_SCHEMA_VERSION: u32 = 1;
 
-/// Maximum number of regular files accepted by the pack format.
-const MAX_FILE_COUNT: usize = 50;
+/// Maximum number of regular files accepted by the public pack format.
+pub const MAX_FILE_COUNT: usize = 50;
 
 /// Maximum size of one public file.
-const MAX_FILE_SIZE: u64 = 1024 * 1024;
+pub const MAX_FILE_SIZE: u64 = 1024 * 1024;
 
 /// Maximum combined size of public files.
-const MAX_TOTAL_SIZE: u64 = 5 * 1024 * 1024;
+pub const MAX_TOTAL_SIZE: u64 = 5 * 1024 * 1024;
 
-/// Maximum directory nesting accepted during validation.
-const MAX_DIRECTORY_DEPTH: usize = 8;
+/// Maximum directory nesting accepted by the public pack format.
+pub const MAX_DIRECTORY_DEPTH: usize = 8;
 
 /// Maximum filesystem entries inspected, including directories and rejected entries.
 const MAX_SCANNED_ENTRIES: usize = 256;
@@ -260,7 +260,7 @@ fn collect_directory(
                 Some(relative.clone()),
                 "local or private state must never enter a public pack",
             );
-        } else if !is_allowed_path(&relative) {
+        } else if !is_allowed_public_path(&relative) {
             push_error(
                 findings,
                 "path.not_allowed",
@@ -642,7 +642,7 @@ fn validate_template_manifest(
 }
 
 /// Return whether a normalized relative path is publicly allowed.
-fn is_allowed_path(path: &str) -> bool {
+pub fn is_allowed_public_path(path: &str) -> bool {
     if ROOT_ALLOWLIST.contains(&path) || path == "conformance/bundle.toml" {
         return true;
     }
