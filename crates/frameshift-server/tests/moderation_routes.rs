@@ -9,6 +9,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
+use axum::Router;
 use chrono::Utc;
 use frameshift_catalog::{
     AccountRecord, AccountStatus, MembershipState, PlatformRole, PlatformRoleRecord,
@@ -19,7 +20,7 @@ use frameshift_objects::ObjectHash;
 use frameshift_publication::PublicationReport;
 use frameshift_server::account_auth::{BearerTokenVerifier, OidcAuthError, VerifiedOidcIdentity};
 use frameshift_server::metrics::Metrics;
-use frameshift_server::{app, AppState, OidcConfig, ServerConfig};
+use frameshift_server::{app, app_with_publication_admission, AppState, OidcConfig, ServerConfig};
 use http_body_util::BodyExt as _;
 use serde_json::{json, Value};
 use tower::ServiceExt as _;
@@ -80,6 +81,12 @@ struct Fixture {
     catalog: MockCatalog,
     /// Fully composed application state with bearer authentication enabled.
     state: AppState,
+    /// Explicit quarantine-enabled router used by moderation tests.
+    router: Router,
+    /// Isolated in-memory quarantine store.
+    quarantine: MockPackStore,
+    /// Exact archive bytes bound to the submission record.
+    archive_bytes: Vec<u8>,
     /// Quarantined submission available for moderation.
     submission: PublicationSubmissionRecord,
     /// Active moderator account identifier.
@@ -210,13 +217,14 @@ fn fixture() -> Fixture {
 
     let now = Utc::now();
     let publisher_id = Uuid::new_v4();
+    let archive_bytes = b"exact private review archive".to_vec();
     let submission = PublicationSubmissionRecord {
         id: Uuid::new_v4(),
         intent_id: Uuid::new_v4(),
         account_id: owner_id,
         publisher_id,
         publisher_key_id: Uuid::new_v4(),
-        archive_hash: ObjectHash::of(b"archive"),
+        archive_hash: ObjectHash::of(&archive_bytes),
         manifest_hash: ObjectHash::of(b"manifest"),
         file_inventory_hash: ObjectHash::of(b"inventory"),
         scan_schema_version: 1,
@@ -260,9 +268,15 @@ fn fixture() -> Fixture {
         )),
         account_auth: Some(Arc::new(FakeVerifier::new())),
     };
+    let quarantine = MockPackStore::new();
+    quarantine.insert(submission.archive_hash, archive_bytes.clone());
+    let router = app_with_publication_admission(state.clone(), Arc::new(quarantine.clone()));
     Fixture {
         catalog,
         state,
+        router,
+        quarantine,
+        archive_bytes,
         submission,
         moderator_id,
         owner_id,
@@ -271,7 +285,7 @@ fn fixture() -> Fixture {
 
 /// Send one JSON request through the in-process application.
 async fn send(
-    state: AppState,
+    router: Router,
     method: Method,
     path: &str,
     token: Option<&str>,
@@ -289,7 +303,7 @@ async fn send(
     if !bytes.is_empty() {
         builder = builder.header("content-type", "application/json");
     }
-    app(state)
+    router
         .oneshot(builder.body(Body::from(bytes)).unwrap())
         .await
         .unwrap()
@@ -299,6 +313,17 @@ async fn send(
 async fn response_json(response: axum::http::Response<Body>) -> Value {
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     serde_json::from_slice(&bytes).unwrap()
+}
+
+/// Collect one response body as exact bytes.
+async fn response_bytes(response: axum::http::Response<Body>) -> Vec<u8> {
+    response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec()
 }
 
 /// Build the canonical valid decision body.
@@ -320,7 +345,15 @@ async fn moderation_requires_authentication() {
         fixture.submission.id
     );
     for token in [None, Some("invalid-token")] {
-        let response = send(fixture.state.clone(), Method::GET, &path, token, None, None).await;
+        let response = send(
+            fixture.router.clone(),
+            Method::GET,
+            &path,
+            token,
+            None,
+            None,
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }
@@ -335,7 +368,7 @@ async fn moderation_reads_require_active_role() {
     );
     for token in ["ordinary-token", "revoked-token"] {
         let response = send(
-            fixture.state.clone(),
+            fixture.router.clone(),
             Method::GET,
             &path,
             Some(token),
@@ -348,7 +381,7 @@ async fn moderation_reads_require_active_role() {
     }
     for token in ["moderator-token", "administrator-token"] {
         let response = send(
-            fixture.state.clone(),
+            fixture.router.clone(),
             Method::GET,
             &path,
             Some(token),
@@ -365,6 +398,191 @@ async fn moderation_reads_require_active_role() {
 }
 
 #[tokio::test]
+/// Quarantine artifacts are absent from the standard application surface.
+async fn moderation_artifact_requires_explicit_quarantine_wiring() {
+    let fixture = fixture();
+    let path = format!(
+        "/v1/moderation/publication-submissions/{}/artifact",
+        fixture.submission.id
+    );
+    let response = send(
+        app(fixture.state),
+        Method::GET,
+        &path,
+        Some("moderator-token"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+/// Artifact reads require authentication and independent active review authority.
+async fn moderation_artifact_requires_independent_reviewer() {
+    let fixture = fixture();
+    let path = format!(
+        "/v1/moderation/publication-submissions/{}/artifact",
+        fixture.submission.id
+    );
+    for token in [None, Some("invalid-token")] {
+        let response = send(
+            fixture.router.clone(),
+            Method::GET,
+            &path,
+            token,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+    for token in ["ordinary-token", "revoked-token", "owner-token"] {
+        let response = send(
+            fixture.router.clone(),
+            Method::GET,
+            &path,
+            Some(token),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response_json(response).await, json!({"error": "forbidden"}));
+    }
+}
+
+#[tokio::test]
+/// Active reviewers receive only the catalog-bound exact archive as a private attachment.
+async fn moderation_artifact_returns_verified_private_attachment() {
+    for token in ["moderator-token", "administrator-token"] {
+        let fixture = fixture();
+        let path = format!(
+            "/v1/moderation/publication-submissions/{}/artifact?hash={}",
+            fixture.submission.id,
+            ObjectHash::of(b"caller-selected")
+        );
+        let response = send(fixture.router, Method::GET, &path, Some(token), None, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "application/gzip");
+        assert_eq!(
+            response.headers()["content-disposition"],
+            format!(
+                "attachment; filename=\"publication-{}.tar.gz\"",
+                fixture.submission.id
+            )
+        );
+        assert_eq!(
+            response.headers()["cache-control"],
+            "private, no-store, max-age=0"
+        );
+        assert_eq!(
+            response.headers()["content-length"],
+            fixture.archive_bytes.len().to_string()
+        );
+        assert_eq!(response_bytes(response).await, fixture.archive_bytes);
+    }
+}
+
+#[tokio::test]
+/// Missing, substituted, and oversized quarantine objects return no artifact bytes.
+async fn moderation_artifact_fails_closed_on_storage_mismatch() {
+    let absent_submission = fixture();
+    let absent_path = format!(
+        "/v1/moderation/publication-submissions/{}/artifact",
+        Uuid::new_v4()
+    );
+    let response = send(
+        absent_submission.router,
+        Method::GET,
+        &absent_path,
+        Some("moderator-token"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        response_json(response).await,
+        json!({"error": "publication submission not found"})
+    );
+
+    let missing = fixture();
+    missing
+        .quarantine
+        .blobs
+        .write()
+        .unwrap()
+        .remove(&missing.submission.archive_hash);
+    let missing_path = format!(
+        "/v1/moderation/publication-submissions/{}/artifact",
+        missing.submission.id
+    );
+    let response = send(
+        missing.router,
+        Method::GET,
+        &missing_path,
+        Some("moderator-token"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        response_json(response).await,
+        json!({"error": "upstream backend mismatch"})
+    );
+
+    let substituted = fixture();
+    substituted.quarantine.insert(
+        substituted.submission.archive_hash,
+        b"substituted archive".to_vec(),
+    );
+    let substituted_path = format!(
+        "/v1/moderation/publication-submissions/{}/artifact",
+        substituted.submission.id
+    );
+    let response = send(
+        substituted.router,
+        Method::GET,
+        &substituted_path,
+        Some("moderator-token"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+    let oversized = fixture();
+    let oversized_bytes = vec![0_u8; oversized.state.config.max_request_bytes + 1];
+    let oversized_hash = ObjectHash::of(&oversized_bytes);
+    oversized
+        .catalog
+        .state
+        .write()
+        .unwrap()
+        .publication_submissions
+        .get_mut(&oversized.submission.id)
+        .unwrap()
+        .archive_hash = oversized_hash;
+    oversized.quarantine.insert(oversized_hash, oversized_bytes);
+    let oversized_path = format!(
+        "/v1/moderation/publication-submissions/{}/artifact",
+        oversized.submission.id
+    );
+    let response = send(
+        oversized.router,
+        Method::GET,
+        &oversized_path,
+        Some("moderator-token"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+}
+
+#[tokio::test]
 /// Decisions bind actor, submission, and request identifiers outside the JSON body.
 async fn moderation_decision_uses_trusted_bindings() {
     let fixture = fixture();
@@ -375,7 +593,7 @@ async fn moderation_decision_uses_trusted_bindings() {
         fixture.submission.id
     );
     let response = send(
-        fixture.state.clone(),
+        fixture.router.clone(),
         Method::POST,
         &path,
         Some("moderator-token"),
@@ -411,7 +629,7 @@ async fn moderation_decision_rejects_binding_overrides() {
     let mut body = decision_body(Uuid::new_v4(), "approve");
     body["actor_account_id"] = json!(fixture.owner_id);
     let response = send(
-        fixture.state,
+        fixture.router,
         Method::POST,
         &path,
         Some("moderator-token"),
@@ -431,7 +649,7 @@ async fn moderation_decision_rejects_self_review() {
         fixture.submission.id
     );
     let response = send(
-        fixture.state,
+        fixture.router,
         Method::POST,
         &path,
         Some("owner-token"),
@@ -455,7 +673,7 @@ async fn moderation_decision_enforces_exact_idempotency() {
     let request_id = Uuid::new_v4().to_string();
     let body = decision_body(decision_id, "request_changes");
     let first = send(
-        fixture.state.clone(),
+        fixture.router.clone(),
         Method::POST,
         &path,
         Some("moderator-token"),
@@ -466,7 +684,7 @@ async fn moderation_decision_enforces_exact_idempotency() {
     assert_eq!(first.status(), StatusCode::OK);
     let first_body = response_json(first).await;
     let retry = send(
-        fixture.state.clone(),
+        fixture.router.clone(),
         Method::POST,
         &path,
         Some("moderator-token"),
@@ -478,7 +696,7 @@ async fn moderation_decision_enforces_exact_idempotency() {
     assert_eq!(response_json(retry).await, first_body);
 
     let conflict = send(
-        fixture.state,
+        fixture.router,
         Method::POST,
         &path,
         Some("moderator-token"),
@@ -498,7 +716,7 @@ async fn moderation_rejects_malformed_request_id_and_bounds_missing_records() {
         fixture.submission.id
     );
     let malformed = send(
-        fixture.state.clone(),
+        fixture.router.clone(),
         Method::POST,
         &decision_path,
         Some("moderator-token"),
@@ -515,7 +733,7 @@ async fn moderation_rejects_malformed_request_id_and_bounds_missing_records() {
     let missing_id = Uuid::new_v4();
     let missing_path = format!("/v1/moderation/publication-submissions/{missing_id}");
     let missing = send(
-        fixture.state,
+        fixture.router,
         Method::GET,
         &missing_path,
         Some("moderator-token"),

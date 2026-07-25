@@ -1,14 +1,19 @@
 //! Authenticated HTTP routes for reviewing quarantined publication submissions.
 
+use std::sync::Arc;
+
+use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::HeaderMap;
+use axum::http::{header, HeaderMap};
+use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use frameshift_catalog::{
-    CatalogError, PlatformRole, PlatformRoleState, PublicationModerationAction,
+    CatalogError, MembershipState, PlatformRole, PlatformRoleState, PublicationModerationAction,
     PublicationModerationDecisionRecord, PublicationModerationDecisionRequest,
-    PublicationSubmissionRecord,
+    PublicationSubmissionRecord, PublisherRole,
 };
+use frameshift_objects::{ObjectHash, PackStore};
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -31,13 +36,25 @@ struct ModeratePublicationRequest {
 }
 
 /// Build role-gated publication moderation routes.
-pub fn moderation_router() -> Router<AppState> {
-    Router::new()
+///
+/// Artifact access is mounted only when the caller supplies the isolated
+/// quarantine store used by publication admission.
+pub fn moderation_router(quarantine: Option<Arc<dyn PackStore>>) -> Router<AppState> {
+    let router = Router::new()
         .route("/{submission_id}", get(get_moderation_submission))
         .route(
             "/{submission_id}/decisions",
             post(create_moderation_decision),
+        );
+    if let Some(quarantine) = quarantine {
+        router.merge(
+            Router::new()
+                .route("/{submission_id}/artifact", get(get_moderation_artifact))
+                .layer(Extension(quarantine)),
         )
+    } else {
+        router
+    }
 }
 
 /// Retrieve one submission only after proving active global review authority.
@@ -53,6 +70,45 @@ async fn get_moderation_submission(
         .await
         .map(Json)
         .map_err(map_moderation_submission_error)
+}
+
+/// Return one exact quarantine archive to an independently authorized reviewer.
+async fn get_moderation_artifact(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthenticatedAccount>,
+    Extension(quarantine): Extension<Arc<dyn PackStore>>,
+    Path(submission_id): Path<Uuid>,
+) -> Result<Response, AppError> {
+    require_moderation_role(&state, auth.account.id).await?;
+    let submission = state
+        .catalog
+        .get_publication_submission(submission_id)
+        .await
+        .map_err(map_moderation_submission_error)?;
+    require_independent_reviewer(&state, auth.account.id, submission.publisher_id).await?;
+
+    let bytes = quarantine
+        .get(&submission.archive_hash)
+        .await
+        .map_err(|error| AppError::from_objects(error, "publication quarantine"))?;
+    if bytes.len() > state.config.max_request_bytes
+        || ObjectHash::of(&bytes) != submission.archive_hash
+    {
+        return Err(AppError::BadGateway(
+            "publication quarantine artifact failed integrity bounds".to_string(),
+        ));
+    }
+
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/gzip")
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"publication-{submission_id}.tar.gz\""),
+        )
+        .header(header::CONTENT_LENGTH, bytes.len())
+        .header(header::CACHE_CONTROL, "private, no-store, max-age=0")
+        .body(Body::from(bytes))
+        .map_err(|error| AppError::Internal(format!("artifact response construction: {error}")))
 }
 
 /// Apply one path-, identity-, and request-header-bound moderation decision.
@@ -101,6 +157,30 @@ async fn require_moderation_role(state: &AppState, account_id: Uuid) -> Result<(
         Err(AppError::Forbidden(
             "active moderation role required".to_string(),
         ))
+    }
+}
+
+/// Reject active publisher owners from accessing their own review artifact.
+async fn require_independent_reviewer(
+    state: &AppState,
+    account_id: Uuid,
+    publisher_id: Uuid,
+) -> Result<(), AppError> {
+    match state
+        .catalog
+        .get_publisher_membership(account_id, publisher_id)
+        .await
+    {
+        Ok(membership)
+            if membership.role == PublisherRole::Owner
+                && membership.state == MembershipState::Active =>
+        {
+            Err(AppError::Forbidden(
+                "publisher owners cannot review their own artifacts".to_string(),
+            ))
+        }
+        Ok(_) | Err(CatalogError::NotFound { .. }) => Ok(()),
+        Err(error) => Err(AppError::from_catalog(error, "publisher membership")),
     }
 }
 

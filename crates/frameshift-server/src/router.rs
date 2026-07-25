@@ -121,7 +121,7 @@ use crate::state::AppState;
 /// An `axum::Router` with `AppState` already wired in via `.with_state(state)`.
 /// The caller passes this directly to `axum::serve`.
 pub fn app(state: AppState) -> Router {
-    build_app(state, None)
+    build_app(state, None, None)
 }
 
 /// Build the complete router with explicit publication-quarantine admission.
@@ -129,20 +129,22 @@ pub fn app(state: AppState) -> Router {
 /// The caller must supply `quarantine` as a store isolated from the public
 /// object store. The admission service is constructed with `state.catalog`, so
 /// authorization and atomic intent consumption share one catalog authority.
-/// Keeping this separate from [`app`] prevents accidental quarantine writes
-/// into publicly downloadable storage.
+/// The same isolated store backs authenticated reviewer artifact access.
+/// Keeping this separate from [`app`] prevents accidental quarantine writes or
+/// reads through the standard public application surface.
 pub fn app_with_publication_admission(state: AppState, quarantine: Arc<dyn PackStore>) -> Router {
     let admission = Arc::new(PublicationAdmissionService::new(
         Arc::clone(&state.catalog),
-        quarantine,
+        Arc::clone(&quarantine),
     ));
-    build_app(state, Some(admission))
+    build_app(state, Some(admission), Some(quarantine))
 }
 
-/// Compose the complete router with optional explicit quarantine admission.
+/// Compose the complete router with optional explicit quarantine services.
 fn build_app(
     state: AppState,
     publication_admission: Option<Arc<PublicationAdmissionService>>,
+    quarantine_review: Option<Arc<dyn PackStore>>,
 ) -> Router {
     let max_body = state.config.max_request_bytes;
     let cors = build_cors_layer(&state);
@@ -199,7 +201,10 @@ fn build_app(
         let account_layer = axum::middleware::from_fn_with_state(state.clone(), require_account);
         let mut account_routes = account_write_router()
             .merge(Router::new().nest("/publish-intents", publication_intent_router()))
-            .merge(Router::new().nest("/moderation/publication-submissions", moderation_router()));
+            .merge(Router::new().nest(
+                "/moderation/publication-submissions",
+                moderation_router(quarantine_review),
+            ));
         if let Some(admission) = publication_admission {
             let submission_writes =
                 publication_submission_write_router(admission).route_layer(signed.clone());
