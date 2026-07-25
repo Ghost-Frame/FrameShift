@@ -17,6 +17,7 @@ frameshift-growth = { path = "../frameshift-growth" }
 frameshift-orchestrator = { path = "../frameshift-orchestrator" }
 frameshift-embed-candle = { path = "../frameshift-embed-candle", optional = true }
 frameshift-pack = { path = "../frameshift-pack" }
+frameshift-studio = { path = "../frameshift-studio" }
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["full"] }

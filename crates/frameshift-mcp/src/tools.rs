@@ -7,6 +7,7 @@ use frameshift_orchestrator::{
     AuditLog, Embedder, Mode, ModeState, PolicyWeights, Preferences, SelectionInputs,
 };
 use frameshift_pack::{CapabilityManifest, PackManifest};
+use frameshift_studio::{DraftStatus, Studio};
 
 use crate::context::{resolve_render_target, validate_absolute_path, with_project_root};
 use crate::protocol::{ToolContent, ToolDef, ToolResult};
@@ -210,6 +211,95 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                     }
                 },
                 "required": ["query"]
+            }),
+        },
+        ToolDef {
+            name: "frameshift_draft_create".to_string(),
+            description: "Create a local Creator Studio draft, optionally importing an existing public pack directory.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "Portable lowercase draft ID using letters, numbers, hyphens, or underscores."
+                    },
+                    "title": {"type": "string"},
+                    "import_path": {
+                        "type": "string",
+                        "description": "Optional absolute directory to import. Symlinks and non-public paths are rejected."
+                    }
+                },
+                "required": ["id", "title"]
+            }),
+        },
+        ToolDef {
+            name: "frameshift_draft_list".to_string(),
+            description: "List local Creator Studio drafts without exposing filesystem paths.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {}
+            }),
+        },
+        ToolDef {
+            name: "frameshift_draft_status".to_string(),
+            description: "Validate a draft and return its exact public file inventory, findings, and review freshness.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"}
+                },
+                "required": ["id"]
+            }),
+        },
+        ToolDef {
+            name: "frameshift_draft_read".to_string(),
+            description: "Read one documented public file from a local Creator Studio draft.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "path": {"type": "string"}
+                },
+                "required": ["id", "path"]
+            }),
+        },
+        ToolDef {
+            name: "frameshift_draft_write".to_string(),
+            description: "Write or remove one documented public draft file. Every mutation invalidates prior review and submission intent.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "path": {"type": "string"},
+                    "action": {
+                        "type": "string",
+                        "enum": ["write", "remove"]
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Required when action is write; omitted when action is remove."
+                    }
+                },
+                "required": ["id", "path", "action"]
+            }),
+        },
+        ToolDef {
+            name: "frameshift_draft_review".to_string(),
+            description: "Confirm exact-file human review or explicit submission intent using the inventory hash returned by frameshift_draft_status.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "action": {
+                        "type": "string",
+                        "enum": ["confirm_review", "confirm_submission"]
+                    },
+                    "inventory_hash": {
+                        "type": "string",
+                        "description": "Exact current inventory hash previously shown for review."
+                    }
+                },
+                "required": ["id", "action", "inventory_hash"]
             }),
         },
     ]
@@ -451,6 +541,12 @@ pub fn call_tool(name: &str, arguments: &serde_json::Value, client: &Client) -> 
         "frameshift_prefs" => call_prefs(arguments, client),
         "frameshift_capabilities" => call_capabilities(arguments, client),
         "frameshift_search" => call_search(arguments, client),
+        "frameshift_draft_create" => call_draft_create(arguments, client),
+        "frameshift_draft_list" => call_draft_list(client),
+        "frameshift_draft_status" => call_draft_status(arguments, client),
+        "frameshift_draft_read" => call_draft_read(arguments, client),
+        "frameshift_draft_write" => call_draft_write(arguments, client),
+        "frameshift_draft_review" => call_draft_review(arguments, client),
         _ => err_result(format!("unknown tool: {name}")),
     }
 }
@@ -1123,6 +1219,195 @@ fn call_search(arguments: &serde_json::Value, client: &Client) -> ToolResult {
     }
 }
 
+/// Open the managed Creator Studio draft store for this client.
+fn studio_for_client(client: &Client) -> Result<Studio, String> {
+    Studio::open(client.data_root().join("studio").join("drafts"))
+        .map_err(|error| format!("draft store unavailable: {error}"))
+}
+
+/// Read one required string argument with a stable MCP error.
+fn required_string<'a>(
+    arguments: &'a serde_json::Value,
+    name: &str,
+) -> Result<&'a str, ToolResult> {
+    arguments
+        .get(name)
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| err_result(format!("missing required argument: {name}")))
+}
+
+/// Serialize one draft status without exposing its local filesystem root.
+fn draft_status_result(status: DraftStatus) -> ToolResult {
+    match serde_json::to_string(&status) {
+        Ok(serialized) => ok_result(serialized),
+        Err(error) => err_result(format!("draft response serialization failed: {error}")),
+    }
+}
+
+/// Handle creation or hardened import of one local Creator Studio draft.
+fn call_draft_create(arguments: &serde_json::Value, client: &Client) -> ToolResult {
+    let id = match required_string(arguments, "id") {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    let title = match required_string(arguments, "title") {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    let studio = match studio_for_client(client) {
+        Ok(studio) => studio,
+        Err(error) => return err_result(error),
+    };
+
+    if let Some(raw_import_path) = arguments
+        .get("import_path")
+        .and_then(|value| value.as_str())
+    {
+        let import_path = match validate_path_arg(raw_import_path) {
+            Ok(path) => path,
+            Err(error) => return err_result(error),
+        };
+        return match studio.import(id, title, import_path) {
+            Ok(status) => draft_status_result(status),
+            Err(error) => err_result(format!("draft import failed: {error}")),
+        };
+    }
+
+    match studio.create(id, title).and_then(|_| studio.status(id)) {
+        Ok(status) => draft_status_result(status),
+        Err(error) => err_result(format!("draft creation failed: {error}")),
+    }
+}
+
+/// Handle stable listing of local Creator Studio draft metadata.
+fn call_draft_list(client: &Client) -> ToolResult {
+    let studio = match studio_for_client(client) {
+        Ok(studio) => studio,
+        Err(error) => return err_result(error),
+    };
+    match studio
+        .list()
+        .and_then(|drafts| serde_json::to_string(&drafts).map_err(Into::into))
+    {
+        Ok(serialized) => ok_result(serialized),
+        Err(error) => err_result(format!("draft list failed: {error}")),
+    }
+}
+
+/// Handle fresh deterministic validation and lifecycle status.
+fn call_draft_status(arguments: &serde_json::Value, client: &Client) -> ToolResult {
+    let id = match required_string(arguments, "id") {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    let studio = match studio_for_client(client) {
+        Ok(studio) => studio,
+        Err(error) => return err_result(error),
+    };
+    match studio.status(id) {
+        Ok(status) => draft_status_result(status),
+        Err(error) => err_result(format!("draft status failed: {error}")),
+    }
+}
+
+/// Handle bounded UTF-8 reads of one public draft file.
+fn call_draft_read(arguments: &serde_json::Value, client: &Client) -> ToolResult {
+    let id = match required_string(arguments, "id") {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    let path = match required_string(arguments, "path") {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    let studio = match studio_for_client(client) {
+        Ok(studio) => studio,
+        Err(error) => return err_result(error),
+    };
+    match studio.read_file(id, path).and_then(|bytes| {
+        String::from_utf8(bytes).map_err(|_| frameshift_studio::StudioError::InvalidContentPath)
+    }) {
+        Ok(content) => ok_result(
+            serde_json::json!({
+                "id": id,
+                "path": path,
+                "content": content,
+            })
+            .to_string(),
+        ),
+        Err(error) => err_result(format!("draft read failed: {error}")),
+    }
+}
+
+/// Handle atomic write or explicit removal of one public draft file.
+fn call_draft_write(arguments: &serde_json::Value, client: &Client) -> ToolResult {
+    let id = match required_string(arguments, "id") {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    let path = match required_string(arguments, "path") {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    let action = match required_string(arguments, "action") {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    let studio = match studio_for_client(client) {
+        Ok(studio) => studio,
+        Err(error) => return err_result(error),
+    };
+    let result = match action {
+        "write" => {
+            let content = match required_string(arguments, "content") {
+                Ok(value) => value,
+                Err(result) => return result,
+            };
+            studio.write_file(id, path, content.as_bytes())
+        }
+        "remove" => studio.remove_file(id, path),
+        _ => return err_result("invalid draft action: expected write or remove".to_string()),
+    };
+    match result {
+        Ok(status) => draft_status_result(status),
+        Err(error) => err_result(format!("draft mutation failed: {error}")),
+    }
+}
+
+/// Handle hash-bound review confirmation and explicit submission intent.
+fn call_draft_review(arguments: &serde_json::Value, client: &Client) -> ToolResult {
+    let id = match required_string(arguments, "id") {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    let action = match required_string(arguments, "action") {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    let inventory_hash = match required_string(arguments, "inventory_hash") {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    let studio = match studio_for_client(client) {
+        Ok(studio) => studio,
+        Err(error) => return err_result(error),
+    };
+    let result = match action {
+        "confirm_review" => studio.confirm_review(id, inventory_hash),
+        "confirm_submission" => studio.confirm_submission_intent(id, inventory_hash),
+        _ => {
+            return err_result(
+                "invalid draft review action: expected confirm_review or confirm_submission"
+                    .to_string(),
+            )
+        }
+    };
+    match result {
+        Ok(status) => draft_status_result(status),
+        Err(error) => err_result(format!("draft review failed: {error}")),
+    }
+}
+
 #[cfg(test)]
 /// Unit and integration tests for every published MCP tool.
 mod tests {
@@ -1178,12 +1463,24 @@ mod tests {
         })
     }
 
-    /// Verify that tool_definitions returns the expected number of tools
-    /// (4 original + 4 automate/prefs additions + 1 capabilities + 1 search).
+    /// Verify that tool definitions include runtime and Creator Studio tools.
     #[test]
-    fn tool_definitions_returns_ten() {
+    fn tool_definitions_returns_sixteen() {
         let defs = tool_definitions();
-        assert_eq!(defs.len(), 10);
+        assert_eq!(defs.len(), 16);
+        for name in [
+            "frameshift_draft_create",
+            "frameshift_draft_list",
+            "frameshift_draft_status",
+            "frameshift_draft_read",
+            "frameshift_draft_write",
+            "frameshift_draft_review",
+        ] {
+            assert!(
+                defs.iter().any(|definition| definition.name == name),
+                "missing Creator Studio tool {name}"
+            );
+        }
     }
 
     /// Automate advertises an optional sensitivity constrained to the public range.
@@ -1906,5 +2203,104 @@ mod tests {
             parse_search_tag(&serde_json::json!({"tag": "rust"})),
             Some("rust".to_string())
         );
+    }
+
+    /// MCP draft tools complete the hash-bound create, edit, review, and submit flow.
+    #[test]
+    fn draft_tools_complete_review_workflow() {
+        let temporary = tempfile::tempdir().unwrap();
+        let client = make_client(&temporary.path().join("data"));
+
+        let created = call_tool(
+            "frameshift_draft_create",
+            &serde_json::json!({"id": "mcp-draft", "title": "MCP draft"}),
+            &client,
+        );
+        assert!(created.is_error.is_none());
+
+        for (path, content) in [
+            (
+                "pack.toml",
+                "schema_version = 1\nname = \"mcp-draft\"\nauthor_handle = \"tester\"\nauthor_pubkey = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\nversion = \"0.1.0\"\n",
+            ),
+            ("AGENTS.md", "# MCP draft\n\nPrecise behavior.\n"),
+        ] {
+            let written = call_tool(
+                "frameshift_draft_write",
+                &serde_json::json!({
+                    "id": "mcp-draft",
+                    "path": path,
+                    "action": "write",
+                    "content": content,
+                }),
+                &client,
+            );
+            assert!(
+                written.is_error.is_none(),
+                "unexpected write error: {}",
+                written.content[0].text
+            );
+        }
+
+        let status = call_tool(
+            "frameshift_draft_status",
+            &serde_json::json!({"id": "mcp-draft"}),
+            &client,
+        );
+        let status_json: serde_json::Value = serde_json::from_str(&status.content[0].text).unwrap();
+        assert_eq!(status_json["publication"]["valid"], true);
+        let inventory_hash = status_json["publication"]["inventory_hash"]
+            .as_str()
+            .unwrap();
+
+        for action in ["confirm_review", "confirm_submission"] {
+            let reviewed = call_tool(
+                "frameshift_draft_review",
+                &serde_json::json!({
+                    "id": "mcp-draft",
+                    "action": action,
+                    "inventory_hash": inventory_hash,
+                }),
+                &client,
+            );
+            assert!(
+                reviewed.is_error.is_none(),
+                "unexpected review error: {}",
+                reviewed.content[0].text
+            );
+        }
+
+        let listed = call_tool("frameshift_draft_list", &serde_json::json!({}), &client);
+        assert!(listed.content[0].text.contains("\"id\":\"mcp-draft\""));
+        assert!(!listed.content[0]
+            .text
+            .contains(temporary.path().to_str().unwrap()));
+    }
+
+    /// MCP draft path rejection does not echo the managed absolute store path.
+    #[test]
+    fn draft_tool_rejects_traversal_without_path_leak() {
+        let temporary = tempfile::tempdir().unwrap();
+        let client = make_client(&temporary.path().join("private-data-root"));
+        call_tool(
+            "frameshift_draft_create",
+            &serde_json::json!({"id": "draft", "title": "Draft"}),
+            &client,
+        );
+
+        let result = call_tool(
+            "frameshift_draft_write",
+            &serde_json::json!({
+                "id": "draft",
+                "path": "../secret",
+                "action": "write",
+                "content": "secret",
+            }),
+            &client,
+        );
+        assert_eq!(result.is_error, Some(true));
+        assert!(!result.content[0]
+            .text
+            .contains(temporary.path().to_str().unwrap()));
     }
 }

@@ -2192,6 +2192,7 @@ dependencies = [
  "frameshift-growth",
  "frameshift-orchestrator",
  "frameshift-pack",
+ "frameshift-studio",
  "serde",
  "serde_json",
  "tempfile",
@@ -2430,6 +2431,18 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "toml 0.8.23",
+]
+
+[[package]]
+name = "frameshift-studio"
+version = "0.1.0"
+dependencies = [
+ "frameshift-publication",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

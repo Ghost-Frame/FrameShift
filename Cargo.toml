@@ -25,6 +25,7 @@ members = [
     "crates/frameshift-seed",
     "crates/frameshift-server",
     "crates/frameshift-source",
+    "crates/frameshift-studio",
     "crates/frameshift-template",
     "crates/frameshift-vault",
     "crates/frameshift-vault-local",

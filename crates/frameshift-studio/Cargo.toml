@@ -1,0 +1,18 @@
+[package]
+name = "frameshift-studio"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Secure local draft lifecycle for the Frameshift Creator Studio"
+
+[dependencies]
+frameshift-publication = { path = "../frameshift-publication" }
+libc = "0.2"
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -241,6 +241,9 @@ All state lives under `$XDG_DATA_HOME/frameshift/`:
 ```
 cache/<canonical-hash>/                      Content-addressed pack cache (shared across projects)
 identity/ed25519-signing-key.bin             Your managed author signing key (mode 0600)
+studio/drafts/<draft-id>/
+  draft.json                                 Private versioned review state
+  content/                                   Exact files eligible for publication
 projects/<project-id>/
   config.toml                                Declared dependencies, telemetry opt-in, memory adapter
   lock.toml                                  Exact versions, hashes, author pubkeys
@@ -281,6 +284,22 @@ A typed pack can `extends` a single base persona and `mixin` a list of others. C
 ### Capabilities
 
 Each pack's `capability_manifest` declares the tools it expects, whether it needs network egress, its filesystem scope, and its memory requirement. Over MCP, Frameshift surfaces this contract as **advisory**: the `frameshift_capabilities` tool annotates a proposed tool list against the active persona's declared tools. It never blocks or hides the host agent's own tools -- the manifest names agent-side tools (Read, Bash, ...), a separate namespace from Frameshift's own MCP tools -- it only reports the contract.
+
+### Creator Studio drafts
+
+Creator Studio drafts live in the managed Frameshift data root, separate from
+installed personas and project repositories. Draft writes use same-directory
+temporary files and atomic replacement. Imports reject symlinks, special files,
+private-state paths, traversal, unsupported public paths, and format limits
+before the draft becomes visible.
+
+The local MCP server exposes `frameshift_draft_create`,
+`frameshift_draft_list`, `frameshift_draft_status`,
+`frameshift_draft_read`, `frameshift_draft_write`, and
+`frameshift_draft_review`. Status returns the deterministic validation report
+and exact public file inventory. Review and submission confirmation must echo
+that report's inventory hash. Any later file write or removal clears both
+confirmations before changing content, so interrupted edits fail closed.
 
 ### Memory
 
