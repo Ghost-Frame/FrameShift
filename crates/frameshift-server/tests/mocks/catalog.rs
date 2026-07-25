@@ -97,6 +97,9 @@ pub struct MockState {
 
     /// Optional persistent backend failure injected into submission creation.
     pub publication_submission_error: Option<String>,
+
+    /// Whether submission creation enforces the durable intent transaction invariants.
+    pub enforce_publication_submission_invariants: bool,
 }
 
 /// In-memory [`CatalogBackend`] for integration tests.
@@ -1232,6 +1235,55 @@ impl CatalogBackend for MockCatalog {
         }
 
         let now = Utc::now();
+        if state.enforce_publication_submission_invariants {
+            let account_is_active = state
+                .accounts
+                .get(&request.intent.account_id)
+                .is_some_and(|account| account.status == AccountStatus::Active);
+            let membership_is_active_owner = state
+                .publisher_memberships
+                .get(&(request.intent.account_id, request.intent.publisher_id))
+                .is_some_and(|membership| {
+                    membership.role == PublisherRole::Owner
+                        && membership.state == MembershipState::Active
+                });
+            let key_is_active_for_publisher = state
+                .publisher_keys
+                .get(&request.intent.publisher_key_id)
+                .is_some_and(|key| {
+                    key.publisher_id == request.intent.publisher_id
+                        && key.state == PublisherKeyState::Active
+                });
+            let intent_matches = state
+                .publication_intents
+                .get(&request.intent.id)
+                .is_some_and(|intent| {
+                    intent.account_id == request.intent.account_id
+                        && intent.publisher_id == request.intent.publisher_id
+                        && intent.publisher_key_id == request.intent.publisher_key_id
+                        && intent.archive_hash == request.intent.archive_hash
+                        && intent.manifest_hash == request.intent.manifest_hash
+                        && intent.file_inventory_hash == request.intent.file_inventory_hash
+                        && intent.scan_schema_version == request.intent.scan_schema_version
+                        && intent.consumed_at.is_none()
+                        && intent.expires_at > now
+                });
+            if !account_is_active
+                || !membership_is_active_owner
+                || !key_is_active_for_publisher
+                || !intent_matches
+            {
+                return Err(CatalogError::Unauthorized {
+                    kind: "publication_submission",
+                    key: request.id.to_string(),
+                });
+            }
+            state
+                .publication_intents
+                .get_mut(&request.intent.id)
+                .expect("validated publication intent must remain present")
+                .consumed_at = Some(now);
+        }
         let record = PublicationSubmissionRecord {
             id: request.id,
             intent_id: request.intent.id,

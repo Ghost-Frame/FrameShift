@@ -4,8 +4,9 @@
 //!
 //! This crate exposes two public entry points:
 //!
-//! - [`app`] -- builds the [`axum::Router`] with all routes and middleware wired
-//!   up, suitable for use in integration tests via `tower::ServiceExt::oneshot`.
+//! - [`app`] -- builds the [`axum::Router`] with standard routes and middleware.
+//! - [`app_with_publication_admission`] -- additionally mounts signed submission
+//!   routes over an explicitly isolated quarantine service.
 //! - [`run`] -- the full server lifecycle: parse config, bind socket, serve with
 //!   graceful shutdown on SIGTERM/SIGINT.
 //!
@@ -58,7 +59,7 @@ use std::net::SocketAddr;
 
 pub use config::{LogFormat, OidcConfig, ServerConfig};
 pub use error::AppError;
-pub use router::app;
+pub use router::{app, app_with_publication_admission};
 pub use state::AppState;
 
 /// Top-level server error.
