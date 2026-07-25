@@ -100,6 +100,32 @@ Every project-scoped MCP tool accepts an optional `project_root`. Resolution fol
 
 Registry commands use `https://frameshift-api.syntheos.dev` by default. Set `FRAMESHIFT_REGISTRY_URL` to target another deployment. The `personas/` directory in this repository is a manifest-only public catalog, not a complete local pack library; install those personas from the registry unless you also have their behavioral source.
 
+## Account sessions
+
+`frameshift account login` opens the configured OIDC provider in the system
+browser and receives the Authorization Code response on an exact IP-loopback
+callback. The flow uses S256 PKCE, a random state value, and a random nonce.
+Access and refresh tokens are stored only in the operating system's native
+credential store; the owner-only JSON file under the FrameShift data directory
+contains non-secret issuer, client, registry, scope, and expiry metadata.
+
+```bash
+# Use the production registry's advertised issuer and the frameshift-cli client ID.
+frameshift account login
+
+# Confirm the server-validated account and publisher memberships.
+frameshift account status
+
+# Attempt provider revocation, then erase the exact local credential and metadata.
+frameshift account logout
+```
+
+Deployments that register a different public OAuth client set
+`FRAMESHIFT_OIDC_CLIENT_ID`. `FRAMESHIFT_OIDC_ISSUER` overrides registry issuer
+discovery, and `--redirect-uri` selects another pre-registered IP-loopback
+callback. Login never accepts a bearer token through arguments, environment
+variables, stdin, or copy/paste.
+
 ## Automate mode
 
 Automate mode lets a host integration pick the persona for you. Frameshift classifies the task, ranks installed personas against project context, and stores the mode, sensitivity, lock, preferences, and transition audit. A session hook or other host integration decides when to run selection and activate a result; `frameshift automate on` does not switch personas by itself.
@@ -428,6 +454,8 @@ cargo run -p frameshift-cli -- select --task "optimize a hot loop" --format json
 | Variable | Default | Purpose |
 |---|---|---|
 | `FRAMESHIFT_REGISTRY_URL` | `https://frameshift-api.syntheos.dev` | Registry base URL used by install, search, and telemetry endpoint derivation |
+| `FRAMESHIFT_OIDC_CLIENT_ID` | `frameshift-cli` | Public OAuth client identifier used by `frameshift account login` |
+| `FRAMESHIFT_OIDC_ISSUER` | registry-advertised issuer | Optional exact issuer override for account login |
 | `FRAMESHIFT_TELEMETRY_URL` | registry `/v1/telemetry/selection` route | Optional telemetry endpoint override; telemetry still requires project opt-in |
 | `FRAMESHIFT_VAULT_PASSPHRASE` | interactive CLI prompt | Non-interactive passphrase source for encrypted template values |
 | `FRAMESHIFT_PROJECT_ID` | hash of canonical project path | Explicit project identity override for hosts that cannot expose a stable path |

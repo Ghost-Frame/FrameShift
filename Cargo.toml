@@ -80,3 +80,4 @@ regex = "1"
 notify = { version = "6", default-features = false, features = ["macos_kqueue"] }
 # Hidden-input passphrase/value prompts for the `frameshift vault` CLI subcommand.
 rpassword = "7"
+webbrowser = "1.2.1"

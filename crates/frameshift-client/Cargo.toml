@@ -7,6 +7,7 @@ license.workspace = true
 description = "Client engine for installing and materializing frameshift packs"
 
 [dependencies]
+frameshift-catalog = { path = "../frameshift-catalog" }
 frameshift-pack = { path = "../frameshift-pack" }
 # Shared fail-closed publication policy and versioned validation reports.
 frameshift-publication = { path = "../frameshift-publication" }
@@ -63,6 +64,4 @@ libc = "0.2"
 tempfile.workspace = true
 
 [dev-dependencies]
-# Builds real PackRecord/PackVersionRecord fixtures for registry serde-pin tests.
-frameshift-catalog = { path = "../frameshift-catalog" }
 chrono.workspace = true

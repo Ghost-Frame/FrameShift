@@ -100,6 +100,10 @@ pub enum CliError {
     #[error("{0}")]
     Keys(String),
 
+    /// Interactive account session or account API error.
+    #[error("{0}")]
+    Account(String),
+
     /// `frameshift config` error: unknown key or a value that fails to parse
     /// for the requested key's type.
     #[error("{0}")]

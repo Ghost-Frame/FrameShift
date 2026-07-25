@@ -9,6 +9,7 @@ use std::fmt;
 use std::io::Read as _;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
@@ -98,15 +99,15 @@ impl fmt::Debug for AuthorizationFlow {
 /// Authenticated OAuth session returned by the configured OIDC issuer.
 pub struct OidcSession {
     /// Bearer access token used only through explicit secret accessors.
-    access_token: SecretString,
+    pub(crate) access_token: SecretString,
     /// Optional refresh token.
-    refresh_token: Option<SecretString>,
-    /// Optional OIDC ID token retained for a higher-level identity consumer.
-    id_token: Option<SecretString>,
+    pub(crate) refresh_token: Option<SecretString>,
     /// Provider-reported access-token lifetime in seconds.
-    expires_in: Option<u64>,
+    pub(crate) expires_in: Option<u64>,
     /// Granted scope string when returned by the provider.
-    scope: Option<String>,
+    pub(crate) scope: Option<String>,
+    /// Local Unix timestamp when this token response was accepted.
+    pub(crate) acquired_at: u64,
 }
 
 /// Redacted session diagnostics.
@@ -120,9 +121,9 @@ impl fmt::Debug for OidcSession {
                 "refresh_token",
                 &self.refresh_token.as_ref().map(|_| "[REDACTED]"),
             )
-            .field("id_token", &self.id_token.as_ref().map(|_| "[REDACTED]"))
             .field("expires_in", &self.expires_in)
             .field("scope", &self.scope)
+            .field("acquired_at", &self.acquired_at)
             .finish()
     }
 }
@@ -136,6 +137,10 @@ pub struct SessionSummary {
     pub expires_in: Option<u64>,
     /// Granted scope string when returned by the provider.
     pub scope: Option<String>,
+    /// Local Unix timestamp when the token response was accepted.
+    pub acquired_at: u64,
+    /// Calculated expiry timestamp when the provider supplied a lifetime.
+    pub expires_at: Option<u64>,
 }
 
 /// Provider-neutral session client.
@@ -279,8 +284,9 @@ struct TokenResponse {
     token_type: String,
     /// Optional refresh token.
     refresh_token: Option<String>,
-    /// Optional OIDC ID token.
-    id_token: Option<String>,
+    /// Optional OIDC ID token, intentionally discarded by this resource client.
+    #[serde(rename = "id_token")]
+    _id_token: Option<String>,
     /// Optional lifetime in seconds.
     expires_in: Option<u64>,
     /// Optional granted scopes.
@@ -490,9 +496,9 @@ impl SessionClient {
         Ok(OidcSession {
             access_token: SecretString::new(raw.access_token),
             refresh_token: raw.refresh_token.map(SecretString::new),
-            id_token: raw.id_token.map(SecretString::new),
             expires_in: raw.expires_in,
             scope: raw.scope,
+            acquired_at: unix_now(),
         })
     }
 }
@@ -509,17 +515,33 @@ impl OidcSession {
         self.refresh_token.as_ref()
     }
 
-    /// Borrow the optional OIDC ID token for identity-aware callers.
-    pub fn id_token(&self) -> Option<&SecretString> {
-        self.id_token.as_ref()
-    }
-
     /// Return public metadata safe for status output.
     pub fn summary(&self) -> SessionSummary {
         SessionSummary {
             refreshable: self.refresh_token.is_some(),
             expires_in: self.expires_in,
             scope: self.scope.clone(),
+            acquired_at: self.acquired_at,
+            expires_at: self
+                .expires_in
+                .and_then(|lifetime| self.acquired_at.checked_add(lifetime)),
+        }
+    }
+
+    /// Reconstruct a session from a validated native credential-store payload.
+    pub(crate) fn from_stored_parts(
+        access_token: SecretString,
+        refresh_token: Option<SecretString>,
+        expires_in: Option<u64>,
+        scope: Option<String>,
+        acquired_at: u64,
+    ) -> Self {
+        Self {
+            access_token,
+            refresh_token,
+            expires_in,
+            scope,
+            acquired_at,
         }
     }
 }
@@ -669,6 +691,14 @@ fn random_token() -> String {
     let mut bytes = [0_u8; PKCE_RANDOM_BYTES];
     OsRng.fill_bytes(&mut bytes);
     URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Return the current Unix timestamp without panicking on a bad system clock.
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 /// Decode a bounded JSON response.
@@ -899,7 +929,9 @@ mod tests {
             SessionSummary {
                 refreshable: true,
                 expires_in: Some(300),
-                scope: Some("openid profile".to_string())
+                scope: Some("openid profile".to_string()),
+                acquired_at: session.summary().acquired_at,
+                expires_at: session.summary().acquired_at.checked_add(300),
             }
         );
 

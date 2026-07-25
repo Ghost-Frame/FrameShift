@@ -3,6 +3,7 @@
 //! Each module in this directory owns one top-level subcommand group. The
 //! `Subcommand` enum in `main.rs` dispatches to the appropriate module.
 
+pub mod account;
 pub mod automate;
 pub mod config;
 pub mod diff;
