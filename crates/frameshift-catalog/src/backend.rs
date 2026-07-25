@@ -13,10 +13,11 @@ use crate::error::{CatalogError, HealthStatus};
 use crate::filters::{PackSearchFilters, PackSearchResult};
 use crate::identity::Ed25519PublicKey;
 use crate::records::{
-    AccountRecord, AuthorRecord, PackRecord, PackVersionRecord, PublicationIntentClaim,
-    PublicationIntentRecord, PublicationSubmissionRecord, PublicationSubmissionRequest,
-    PublisherAuditEventRecord, PublisherKeyRecord, PublisherMembershipRecord,
-    PublisherProfileRecord,
+    AccountRecord, AuthorRecord, PackRecord, PackVersionRecord, PlatformRoleRecord,
+    PublicationIntentClaim, PublicationIntentRecord, PublicationModerationDecisionRecord,
+    PublicationModerationDecisionRequest, PublicationSubmissionRecord,
+    PublicationSubmissionRequest, PublisherAuditEventRecord, PublisherKeyRecord,
+    PublisherMembershipRecord, PublisherProfileRecord,
 };
 use crate::status::TombstoneRecord;
 
@@ -72,10 +73,12 @@ impl PublishQuota {
 ///
 /// # Auth boundary
 ///
-/// This trait DOES NOT enforce caller identity. `set_handle_pubkey`,
-/// `tombstone_pack`, and similar mutations trust the caller. The HTTP server
-/// layer is responsible for verifying ed25519 signatures before invoking these
-/// methods.
+/// Most legacy methods do not enforce caller identity. `set_handle_pubkey`,
+/// `tombstone_pack`, and similar mutations trust the caller, so the HTTP server
+/// must verify Ed25519 signatures before invoking them. New moderation methods
+/// explicitly document and enforce their durable account-authority invariants
+/// in the backend so authorization, lifecycle mutation, and audit evidence
+/// remain atomic.
 ///
 /// # Object safety
 ///
@@ -262,6 +265,33 @@ pub trait CatalogBackend: Send + Sync {
         Err(CatalogError::NotFound {
             kind: "publication_submission",
             key: id.to_string(),
+        })
+    }
+
+    /// List an account's global platform roles in stable role order.
+    ///
+    /// The empty default fails closed for backends that have not implemented
+    /// the D4 moderation authority model.
+    async fn list_account_platform_roles(
+        &self,
+        _account_id: uuid::Uuid,
+    ) -> Result<Vec<PlatformRoleRecord>, CatalogError> {
+        Ok(Vec::new())
+    }
+
+    /// Atomically authorize and persist one publication moderation decision.
+    ///
+    /// Unsupported backends fail closed. Implementations must verify active
+    /// moderator or administrator authority, exclude active publisher owners,
+    /// update the submission state, and append immutable decision evidence in
+    /// one transaction.
+    async fn moderate_publication_submission(
+        &self,
+        request: PublicationModerationDecisionRequest,
+    ) -> Result<PublicationModerationDecisionRecord, CatalogError> {
+        Err(CatalogError::Unauthorized {
+            kind: "publication_moderation",
+            key: request.id.to_string(),
         })
     }
 

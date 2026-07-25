@@ -112,6 +112,43 @@ pub struct PublisherMembershipRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Global authority assigned independently of publisher ownership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlatformRole {
+    /// Authority to review publication submissions.
+    Moderator,
+    /// Authority to administer moderation and also review submissions.
+    Administrator,
+}
+
+/// Lifecycle state for a global platform-role assignment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlatformRoleState {
+    /// The role currently grants its authority.
+    Active,
+    /// The role no longer grants authority but remains auditable.
+    Revoked,
+}
+
+/// Durable global role assignment for one account.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PlatformRoleRecord {
+    /// Account receiving the global authority.
+    pub account_id: Uuid,
+    /// Authority assigned to the account.
+    pub role: PlatformRole,
+    /// Current assignment lifecycle state.
+    pub state: PlatformRoleState,
+    /// Account that assigned the role.
+    pub assigned_by_account_id: Uuid,
+    /// Database timestamp when the assignment was created.
+    pub created_at: DateTime<Utc>,
+    /// Database timestamp of the most recent assignment update.
+    pub updated_at: DateTime<Utc>,
+}
+
 /// Lifecycle state for an enrolled publisher signing key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -218,16 +255,75 @@ pub struct PublicationIntentClaim {
     pub scan_schema_version: u32,
 }
 
-/// Initial lifecycle state of a durable publication submission.
-///
-/// Phase 5C2 creates only quarantined records. Later additive phases may
-/// introduce reviewed or public states after their policy contracts are fixed.
+/// Non-public review lifecycle for a durable publication submission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 #[serde(rename_all = "snake_case")]
 pub enum PublicationSubmissionState {
     /// The artifact remains isolated from every public catalog read.
     Quarantined,
+    /// A moderator requested clarification or a replacement submission.
+    NeedsReview,
+    /// A moderator approved the artifact, but it is not yet publicly active.
+    Approved,
+    /// A moderator rejected the artifact while retaining its audit history.
+    Rejected,
+}
+
+/// Review action applied to a quarantined publication submission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationModerationAction {
+    /// Approve the reviewed artifact without making it public.
+    Approve,
+    /// Keep the artifact non-public while requesting follow-up.
+    RequestChanges,
+    /// Reject the reviewed artifact.
+    Reject,
+}
+
+/// Exact input for one idempotent moderation decision.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PublicationModerationDecisionRequest {
+    /// Stable decision identifier and primary idempotency key.
+    pub id: Uuid,
+    /// Submission receiving the decision.
+    pub submission_id: Uuid,
+    /// Authenticated account attempting the moderation action.
+    pub actor_account_id: Uuid,
+    /// Review action to apply.
+    pub action: PublicationModerationAction,
+    /// Stable bounded private reason code.
+    pub reason_code: String,
+    /// Optional bounded private explanation for the publisher.
+    pub private_explanation: Option<String>,
+    /// Stable request identifier used to reject replay under a different decision ID.
+    pub request_id: Uuid,
+}
+
+/// Immutable moderation evidence for one accepted review decision.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PublicationModerationDecisionRecord {
+    /// Stable decision identifier.
+    pub id: Uuid,
+    /// Submission receiving the decision.
+    pub submission_id: Uuid,
+    /// Account that exercised moderation authority.
+    pub actor_account_id: Uuid,
+    /// Review action that was applied.
+    pub action: PublicationModerationAction,
+    /// Submission state observed before the action.
+    pub from_state: PublicationSubmissionState,
+    /// Submission state committed by the action.
+    pub to_state: PublicationSubmissionState,
+    /// Stable bounded private reason code.
+    pub reason_code: String,
+    /// Optional bounded private explanation for the publisher.
+    pub private_explanation: Option<String>,
+    /// Stable request identifier retained for replay detection.
+    pub request_id: Uuid,
+    /// Database timestamp when the decision was committed.
+    pub created_at: DateTime<Utc>,
 }
 
 /// Exact input required to atomically claim an intent and create a submission.
