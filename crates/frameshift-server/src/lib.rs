@@ -6,7 +6,8 @@
 //!
 //! - [`app`] -- builds the [`axum::Router`] with standard routes and middleware.
 //! - [`app_with_publication_admission`] -- additionally mounts signed submission
-//!   routes over an explicitly isolated quarantine service.
+//!   and private reviewer-artifact routes over an explicitly isolated quarantine
+//!   service.
 //! - [`run`] -- the full server lifecycle: parse config, bind socket, serve with
 //!   graceful shutdown on SIGTERM/SIGINT.
 //!
