@@ -2438,15 +2438,18 @@ dependencies = [
 name = "frameshift-studio"
 version = "0.1.0"
 dependencies = [
+ "frameshift-pack",
  "frameshift-publication",
  "frameshift-source",
  "hex",
  "libc",
+ "semver",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
+ "toml 0.8.23",
 ]
 
 [[package]]

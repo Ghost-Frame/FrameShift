@@ -8,10 +8,11 @@ use std::fs;
 use std::io::{Read as _, Write as _};
 use std::path::{Component, Path, PathBuf};
 
+use frameshift_pack::{PackManifest, LOCAL_UNSIGNED_PUBKEY};
 use frameshift_publication::{
     is_allowed_public_path, validate_directory, PublicationReport, MAX_FILE_SIZE,
 };
-use frameshift_source::{render_to_markdown, PersonaSource, RenderTarget};
+use frameshift_source::{render_to_markdown, Author, Persona, PersonaSource, RenderTarget};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -126,6 +127,38 @@ pub struct TargetPreview {
     pub sha256: String,
 }
 
+/// Atomic built-in template selected for a new local draft.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum DraftTemplate {
+    /// Editable local-only skeleton with no publishable author identity.
+    Blank,
+    /// Valid typed skeleton populated from bounded public fields.
+    Guided(GuidedTemplateInput),
+}
+
+/// Bounded public fields collected by a guided Creator Studio flow.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuidedTemplateInput {
+    /// Stable public pack and persona name.
+    pub name: String,
+    /// Initial semantic version.
+    pub version: String,
+    /// Public author or publisher handle.
+    pub author_handle: String,
+    /// Exact lowercase Ed25519 verifying key.
+    pub author_pubkey: String,
+    /// Short public purpose statement.
+    pub description: String,
+    /// Short deterministic voice direction.
+    pub voice_tone: String,
+    /// Optional SPDX license identifier.
+    pub license: Option<String>,
+    /// Whether published bytes explicitly permit forking.
+    #[serde(default)]
+    pub forkable: bool,
+}
+
 /// Read-only accessors for an immutable draft snapshot.
 impl DraftSnapshot {
     /// Return the draft revision represented by this snapshot.
@@ -205,6 +238,15 @@ pub enum StudioError {
     /// Target preview requires valid structured persona source.
     #[error("draft preview requires valid typed persona source")]
     InvalidPreviewSource,
+    /// One guided template field violates its bounded public contract.
+    #[error("invalid guided template field: {0}")]
+    InvalidTemplateField(&'static str),
+    /// Generated typed TOML could not be serialized.
+    #[error("draft template serialization failed")]
+    TemplateSerialization(#[source] toml::ser::Error),
+    /// Generated guided content did not pass the shared publication policy.
+    #[error("guided draft template failed shared validation")]
+    InvalidGeneratedTemplate,
     /// Publication validation could not inspect the draft.
     #[error("draft validation failed: {0}")]
     Validation(#[from] frameshift_publication::PublicationIoError),
@@ -243,6 +285,50 @@ impl Studio {
         let (staging, draft) = self.prepare_staging(id, title)?;
         self.publish_staging(staging, id)?;
         Ok(draft)
+    }
+
+    /// Atomically create one editable blank or validated guided template draft.
+    pub fn create_template(
+        &self,
+        id: &str,
+        title: &str,
+        template: DraftTemplate,
+    ) -> Result<DraftStatus, StudioError> {
+        let (manifest, persona, require_publication_validity) = match template {
+            DraftTemplate::Blank => (
+                blank_template_manifest(id),
+                blank_template_persona(id),
+                false,
+            ),
+            DraftTemplate::Guided(input) => {
+                validate_guided_template(&input)?;
+                (
+                    guided_template_manifest(&input),
+                    guided_template_persona(&input),
+                    true,
+                )
+            }
+        };
+        let manifest_bytes =
+            toml::to_string(&manifest).map_err(StudioError::TemplateSerialization)?;
+        let persona_bytes =
+            toml::to_string(&persona).map_err(StudioError::TemplateSerialization)?;
+
+        let (staging, _) = self.prepare_staging(id, title)?;
+        let content = staging.path().join(CONTENT_DIRECTORY);
+        write_bytes_atomic(&content.join("pack.toml"), manifest_bytes.as_bytes(), false)?;
+        write_bytes_atomic(
+            &content.join("persona.toml"),
+            persona_bytes.as_bytes(),
+            false,
+        )?;
+        let report = validate_directory(&content)?;
+        if require_publication_validity && !report.valid {
+            return Err(StudioError::InvalidGeneratedTemplate);
+        }
+        sync_directory(&content);
+        self.publish_staging(staging, id)?;
+        self.status(id)
     }
 
     /// Import public pack files into a newly created draft.
@@ -615,6 +701,126 @@ impl Studio {
     }
 }
 
+/// Build the editable local-only manifest used by the blank template.
+fn blank_template_manifest(name: &str) -> PackManifest {
+    PackManifest {
+        schema_version: 1,
+        name: name.to_string(),
+        author_handle: "local".to_string(),
+        author_pubkey: LOCAL_UNSIGNED_PUBKEY.to_string(),
+        version: "0.1.0".to_string(),
+        parent_hash: None,
+        license: None,
+        forkable: false,
+        forked_from: None,
+        capability_manifest: None,
+        requires: None,
+        tokens_required: None,
+        extends: None,
+        mixin: Vec::new(),
+        conformance_baseline: None,
+        description: Some("Describe this persona before publishing.".to_string()),
+        tags: Vec::new(),
+    }
+}
+
+/// Build the minimal typed persona source used by the blank template.
+fn blank_template_persona(name: &str) -> Persona {
+    let mut persona = Persona::new(name);
+    persona.version = Some("0.1.0".to_string());
+    persona.description = Some("Describe this persona before publishing.".to_string());
+    persona.voice.tone = "Define this persona's voice before publishing.".to_string();
+    persona
+}
+
+/// Build a public manifest from already validated guided fields.
+fn guided_template_manifest(input: &GuidedTemplateInput) -> PackManifest {
+    PackManifest {
+        schema_version: 1,
+        name: input.name.clone(),
+        author_handle: input.author_handle.clone(),
+        author_pubkey: input.author_pubkey.clone(),
+        version: input.version.clone(),
+        parent_hash: None,
+        license: input.license.clone(),
+        forkable: input.forkable,
+        forked_from: None,
+        capability_manifest: None,
+        requires: None,
+        tokens_required: None,
+        extends: None,
+        mixin: Vec::new(),
+        conformance_baseline: None,
+        description: Some(input.description.clone()),
+        tags: Vec::new(),
+    }
+}
+
+/// Build typed persona source from already validated guided fields.
+fn guided_template_persona(input: &GuidedTemplateInput) -> Persona {
+    let mut persona = Persona::new(&input.name);
+    persona.version = Some(input.version.clone());
+    persona.description = Some(input.description.clone());
+    persona.license = input.license.clone();
+    persona.author = Some(Author {
+        handle: input.author_handle.clone(),
+        pubkey: Some(input.author_pubkey.clone()),
+    });
+    persona.voice.tone = input.voice_tone.clone();
+    persona
+}
+
+/// Validate every guided public field before any staging directory is created.
+fn validate_guided_template(input: &GuidedTemplateInput) -> Result<(), StudioError> {
+    if !valid_portable_identifier(&input.name, 64) {
+        return Err(StudioError::InvalidTemplateField("name"));
+    }
+    if semver::Version::parse(&input.version).is_err() || input.version.len() > 64 {
+        return Err(StudioError::InvalidTemplateField("version"));
+    }
+    if !valid_portable_identifier(&input.author_handle, 64) {
+        return Err(StudioError::InvalidTemplateField("author_handle"));
+    }
+    if input.author_pubkey.len() != 64
+        || !input
+            .author_pubkey
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(StudioError::InvalidTemplateField("author_pubkey"));
+    }
+    if !valid_public_text(&input.description, 500) {
+        return Err(StudioError::InvalidTemplateField("description"));
+    }
+    if !valid_public_text(&input.voice_tone, 500) {
+        return Err(StudioError::InvalidTemplateField("voice_tone"));
+    }
+    if input.license.as_ref().is_some_and(|license| {
+        !(1..=64).contains(&license.len())
+            || !license
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+'))
+    }) {
+        return Err(StudioError::InvalidTemplateField("license"));
+    }
+    Ok(())
+}
+
+/// Return whether a value is one bounded portable public identifier.
+fn valid_portable_identifier(value: &str, max_bytes: usize) -> bool {
+    (1..=max_bytes).contains(&value.len())
+        && !value.contains("..")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+/// Return whether public prose is non-empty, bounded, and control-free.
+fn valid_public_text(value: &str, max_chars: usize) -> bool {
+    let count = value.chars().count();
+    (1..=max_chars).contains(&count) && !value.chars().any(char::is_control)
+}
+
 /// Validate a draft identifier as one stable portable path component.
 fn validate_draft_id(id: &str) -> Result<(), StudioError> {
     let valid_length = (1..=64).contains(&id.len());
@@ -810,6 +1016,102 @@ mod tests {
              description = \"Preview fixture\"\n\n[voice]\ntone = \"Precise and calm.\"\n",
         )
         .unwrap();
+    }
+
+    /// Build one valid guided template input with a real public-key shape.
+    fn guided_template_input() -> GuidedTemplateInput {
+        GuidedTemplateInput {
+            name: "guided".to_string(),
+            version: "0.1.0".to_string(),
+            author_handle: "tester".to_string(),
+            author_pubkey: TEST_PUBLIC_KEY.to_string(),
+            description: "A precise guided persona.".to_string(),
+            voice_tone: "Precise, calm, and evidence-driven.".to_string(),
+            license: Some("MIT".to_string()),
+            forkable: true,
+        }
+    }
+
+    /// Blank templates are typed and previewable but remain local-only.
+    #[test]
+    fn blank_template_is_previewable_and_publication_invalid() {
+        let temporary = tempfile::tempdir().unwrap();
+        let studio = Studio::open(temporary.path().join("studio")).unwrap();
+        let status = studio
+            .create_template("blank", "Blank", DraftTemplate::Blank)
+            .unwrap();
+
+        assert!(!status.publication.valid);
+        assert!(status
+            .publication
+            .findings
+            .iter()
+            .any(|finding| finding.code == "manifest.local_unsigned"));
+        assert_eq!(studio.preview("blank").unwrap().targets.len(), 4);
+    }
+
+    /// Guided templates atomically create valid typed public source.
+    #[test]
+    fn guided_template_is_valid_and_previewable() {
+        let temporary = tempfile::tempdir().unwrap();
+        let studio = Studio::open(temporary.path().join("studio")).unwrap();
+        let status = studio
+            .create_template(
+                "guided",
+                "Guided",
+                DraftTemplate::Guided(guided_template_input()),
+            )
+            .unwrap();
+
+        assert!(status.publication.valid);
+        let preview = studio.preview("guided").unwrap();
+        assert_eq!(preview.targets.len(), 4);
+        assert!(preview.targets[0]
+            .content
+            .contains("Precise, calm, and evidence-driven."));
+        let manifest = studio.read_file("guided", "pack.toml").unwrap();
+        let parsed: PackManifest = toml::from_str(std::str::from_utf8(&manifest).unwrap()).unwrap();
+        assert!(parsed.forkable);
+        assert_eq!(parsed.license.as_deref(), Some("MIT"));
+    }
+
+    /// Invalid guided fields fail before any destination draft is published.
+    #[test]
+    fn invalid_guided_template_leaves_no_draft() {
+        let temporary = tempfile::tempdir().unwrap();
+        let studio = Studio::open(temporary.path().join("studio")).unwrap();
+        let mut input = guided_template_input();
+        input.version = "../mutable".to_string();
+
+        assert!(matches!(
+            studio.create_template("guided", "Guided", DraftTemplate::Guided(input)),
+            Err(StudioError::InvalidTemplateField("version"))
+        ));
+        assert!(matches!(
+            studio.status("guided"),
+            Err(StudioError::NotFound)
+        ));
+    }
+
+    /// Typed TOML serialization preserves quotes, backslashes, and Unicode safely.
+    #[test]
+    fn guided_template_serializes_public_text_without_injection() {
+        let temporary = tempfile::tempdir().unwrap();
+        let studio = Studio::open(temporary.path().join("studio")).unwrap();
+        let mut input = guided_template_input();
+        input.description = "Quotes \"stay\" data, and Unicode stays café.".to_string();
+        input.voice_tone = r"Literal backslashes \ remain prose.".to_string();
+        studio
+            .create_template("guided", "Guided", DraftTemplate::Guided(input.clone()))
+            .unwrap();
+
+        let persona = studio.read_file("guided", "persona.toml").unwrap();
+        let parsed: Persona = toml::from_str(std::str::from_utf8(&persona).unwrap()).unwrap();
+        assert_eq!(
+            parsed.description.as_deref(),
+            Some(input.description.as_str())
+        );
+        assert_eq!(parsed.voice.tone, input.voice_tone);
     }
 
     /// Create, reload, review, and submit a valid draft across store instances.
