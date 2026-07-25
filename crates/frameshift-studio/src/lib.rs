@@ -11,6 +11,7 @@ use std::path::{Component, Path, PathBuf};
 use frameshift_publication::{
     is_allowed_public_path, validate_directory, PublicationReport, MAX_FILE_SIZE,
 };
+use frameshift_source::{render_to_markdown, PersonaSource, RenderTarget};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -99,6 +100,32 @@ pub struct SnapshotFile {
     bytes: Vec<u8>,
 }
 
+/// Path-free deterministic renders of one exact current draft revision.
+#[derive(Serialize)]
+pub struct DraftPreview {
+    /// Draft revision whose source bytes produced these renders.
+    pub revision: u64,
+    /// Exact current public inventory hash.
+    pub inventory_hash: String,
+    /// Shared validation report for the same inventory.
+    pub publication: PublicationReport,
+    /// Supported agent targets in stable order.
+    pub targets: Vec<TargetPreview>,
+}
+
+/// One deterministic target render and its exact UTF-8 content digest.
+#[derive(Serialize)]
+pub struct TargetPreview {
+    /// Stable target identifier.
+    pub target: String,
+    /// Filename used when materializing this target.
+    pub install_filename: String,
+    /// Exact rendered Markdown.
+    pub content: String,
+    /// SHA-256 digest of the exact rendered UTF-8 bytes.
+    pub sha256: String,
+}
+
 /// Read-only accessors for an immutable draft snapshot.
 impl DraftSnapshot {
     /// Return the draft revision represented by this snapshot.
@@ -175,6 +202,9 @@ pub enum StudioError {
     /// Draft content changed while an immutable snapshot was being built.
     #[error("draft content changed while it was being frozen")]
     SnapshotChanged,
+    /// Target preview requires valid structured persona source.
+    #[error("draft preview requires valid typed persona source")]
+    InvalidPreviewSource,
     /// Publication validation could not inspect the draft.
     #[error("draft validation failed: {0}")]
     Validation(#[from] frameshift_publication::PublicationIoError),
@@ -364,6 +394,68 @@ impl Studio {
             publication,
             review_current,
             submission_intent_current,
+        })
+    }
+
+    /// Render every supported agent target from one exact current source inventory.
+    pub fn preview(&self, id: &str) -> Result<DraftPreview, StudioError> {
+        let status = self.status(id)?;
+        if !status
+            .publication
+            .inventory
+            .iter()
+            .any(|entry| entry.path == "persona.toml")
+        {
+            return Err(StudioError::InvalidPreviewSource);
+        }
+
+        let paths = self.draft_paths(id)?;
+        let staged = tempfile::TempDir::new()?;
+        for source_name in ["persona.toml", "rules.toml", "skills.toml", "patterns.toml"] {
+            let Some(entry) = status
+                .publication
+                .inventory
+                .iter()
+                .find(|entry| entry.path == source_name)
+            else {
+                continue;
+            };
+            let bytes = read_regular_nofollow(&paths.content.join(source_name), MAX_FILE_SIZE)?;
+            let digest = hex::encode(Sha256::digest(&bytes));
+            if bytes.len() as u64 != entry.size || digest != entry.sha256 {
+                return Err(StudioError::SnapshotChanged);
+            }
+            fs::write(staged.path().join(source_name), bytes)?;
+        }
+
+        let source = PersonaSource::load_from_dir(staged.path())
+            .map_err(|_| StudioError::InvalidPreviewSource)?;
+        let targets = [
+            ("claude", "CLAUDE.md", RenderTarget::Claude),
+            ("codex", "AGENTS.md", RenderTarget::Codex),
+            ("gemini", "GEMINI.md", RenderTarget::Gemini),
+            ("generic", "AGENTS.md", RenderTarget::Generic),
+        ]
+        .into_iter()
+        .map(|(target, install_filename, render_target)| {
+            let content = render_to_markdown(&source, render_target);
+            TargetPreview {
+                target: target.to_string(),
+                install_filename: install_filename.to_string(),
+                sha256: hex::encode(Sha256::digest(content.as_bytes())),
+                content,
+            }
+        })
+        .collect();
+
+        if validate_directory(&paths.content)? != status.publication {
+            return Err(StudioError::SnapshotChanged);
+        }
+        Ok(DraftPreview {
+            revision: status.draft.revision,
+            inventory_hash: status.publication.inventory_hash.clone(),
+            publication: status.publication,
+            targets,
         })
     }
 
@@ -702,6 +794,24 @@ mod tests {
         fs::write(root.join("AGENTS.md"), "# Test\n\nPrecise behavior.\n").unwrap();
     }
 
+    /// Write a minimal valid pack with structured source for target previews.
+    fn write_typed_pack(root: &Path) {
+        fs::create_dir_all(root).unwrap();
+        fs::write(
+            root.join("pack.toml"),
+            format!(
+                "schema_version = 1\nname = \"preview\"\nauthor_handle = \"tester\"\nauthor_pubkey = \"{TEST_PUBLIC_KEY}\"\nversion = \"0.1.0\"\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            root.join("persona.toml"),
+            "schema_version = 1\nname = \"preview\"\nversion = \"0.1.0\"\n\
+             description = \"Preview fixture\"\n\n[voice]\ntone = \"Precise and calm.\"\n",
+        )
+        .unwrap();
+    }
+
     /// Create, reload, review, and submit a valid draft across store instances.
     #[test]
     fn lifecycle_persists_across_restarts() {
@@ -780,6 +890,107 @@ mod tests {
                 .bytes(),
             b"# Test\n\nPrecise behavior.\n"
         );
+    }
+
+    /// Preview renders every target deterministically from one exact typed inventory.
+    #[test]
+    fn preview_renders_all_targets_with_exact_hashes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        write_typed_pack(&source);
+        let studio = Studio::open(temporary.path().join("studio")).unwrap();
+        let imported = studio.import("draft", "Draft", &source).unwrap();
+
+        let first = studio.preview("draft").unwrap();
+        let second = studio.preview("draft").unwrap();
+        assert_eq!(first.revision, imported.draft.revision);
+        assert_eq!(first.inventory_hash, imported.publication.inventory_hash);
+        assert_eq!(first.publication, imported.publication);
+        assert_eq!(first.targets.len(), 4);
+        assert_eq!(
+            first
+                .targets
+                .iter()
+                .map(|preview| preview.target.as_str())
+                .collect::<Vec<_>>(),
+            ["claude", "codex", "gemini", "generic"]
+        );
+        assert_eq!(
+            first
+                .targets
+                .iter()
+                .map(|preview| preview.install_filename.as_str())
+                .collect::<Vec<_>>(),
+            ["CLAUDE.md", "AGENTS.md", "GEMINI.md", "AGENTS.md"]
+        );
+        for (left, right) in first.targets.iter().zip(&second.targets) {
+            assert_eq!(left.target, right.target);
+            assert_eq!(left.content, right.content);
+            assert_eq!(left.sha256, right.sha256);
+            assert_eq!(
+                left.sha256,
+                hex::encode(Sha256::digest(left.content.as_bytes()))
+            );
+        }
+        let claude = &first.targets[0].content;
+        let codex = &first.targets[1].content;
+        assert_ne!(claude, codex);
+    }
+
+    /// Missing or malformed typed source fails without exposing the managed root.
+    #[test]
+    fn preview_rejects_invalid_source_without_path_leak() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        write_valid_pack(&source);
+        let studio_root = temporary.path().join("private-studio-root");
+        let studio = Studio::open(&studio_root).unwrap();
+        studio.import("draft", "Draft", &source).unwrap();
+
+        let missing = match studio.preview("draft") {
+            Ok(_) => panic!("preview without typed source must fail"),
+            Err(error) => error.to_string(),
+        };
+        assert_eq!(missing, "draft preview requires valid typed persona source");
+        assert!(!missing.contains(studio_root.to_str().unwrap()));
+
+        studio
+            .write_file("draft", "persona.toml", b"not valid typed source")
+            .unwrap();
+        let malformed = match studio.preview("draft") {
+            Ok(_) => panic!("preview with malformed typed source must fail"),
+            Err(error) => error.to_string(),
+        };
+        assert_eq!(
+            malformed,
+            "draft preview requires valid typed persona source"
+        );
+        assert!(!malformed.contains(studio_root.to_str().unwrap()));
+    }
+
+    /// Preview refuses a typed source file replaced by a symlink.
+    #[cfg(unix)]
+    #[test]
+    fn preview_rejects_source_symlink_substitution() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        write_typed_pack(&source);
+        let studio_root = temporary.path().join("studio");
+        let studio = Studio::open(&studio_root).unwrap();
+        studio.import("draft", "Draft", &source).unwrap();
+        let persona_path = studio_root
+            .join("draft")
+            .join(CONTENT_DIRECTORY)
+            .join("persona.toml");
+        fs::remove_file(&persona_path).unwrap();
+        symlink("/etc/passwd", &persona_path).unwrap();
+
+        assert!(matches!(
+            studio.preview("draft"),
+            Err(StudioError::InvalidPreviewSource)
+        ));
     }
 
     /// Any content mutation clears review and submission intent before saving.
