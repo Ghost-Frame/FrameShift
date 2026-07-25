@@ -931,15 +931,14 @@ impl CatalogBackend for PostgresCatalog {
         use diesel_async::AsyncConnection as _;
         let result = conn
             .transaction::<PublicationIntentRow, CatalogTransactionError, _>(async move |conn| {
-                let publisher_exists = publisher_profiles::table
+                let publisher_status = publisher_profiles::table
                     .find(requested.publisher_id)
                     .for_update()
-                    .select(publisher_profiles::id)
-                    .first::<uuid::Uuid>(conn)
+                    .select(publisher_profiles::moderation_status)
+                    .first::<String>(conn)
                     .await
-                    .optional()?
-                    .is_some();
-                if !publisher_exists {
+                    .optional()?;
+                if publisher_status.as_deref() != Some("approved") {
                     return Err(publication_intent_unauthorized(requested.id));
                 }
 
@@ -1054,6 +1053,11 @@ impl CatalogBackend for PostgresCatalog {
                 .filter(accounts::id.eq(claim.account_id))
                 .filter(accounts::status.eq("active")),
         );
+        let approved_publisher = diesel::dsl::exists(
+            publisher_profiles::table
+                .filter(publisher_profiles::id.eq(claim.publisher_id))
+                .filter(publisher_profiles::moderation_status.eq("approved")),
+        );
         let active_membership = diesel::dsl::exists(
             publisher_memberships::table
                 .filter(publisher_memberships::account_id.eq(claim.account_id))
@@ -1084,6 +1088,7 @@ impl CatalogBackend for PostgresCatalog {
                 .filter(publication_intents::created_at.le(database_now))
                 .filter(publication_intents::expires_at.gt(database_now))
                 .filter(active_account)
+                .filter(approved_publisher)
                 .filter(active_membership)
                 .filter(active_key),
         )
@@ -1133,6 +1138,11 @@ impl CatalogBackend for PostgresCatalog {
                             .filter(accounts::id.eq(request.intent.account_id))
                             .filter(accounts::status.eq("active")),
                     );
+                    let approved_publisher = diesel::dsl::exists(
+                        publisher_profiles::table
+                            .filter(publisher_profiles::id.eq(request.intent.publisher_id))
+                            .filter(publisher_profiles::moderation_status.eq("approved")),
+                    );
                     let active_membership = diesel::dsl::exists(
                         publisher_memberships::table
                             .filter(publisher_memberships::account_id.eq(request.intent.account_id))
@@ -1178,6 +1188,7 @@ impl CatalogBackend for PostgresCatalog {
                             .filter(publication_intents::created_at.le(database_now))
                             .filter(publication_intents::expires_at.gt(database_now))
                             .filter(active_account)
+                            .filter(approved_publisher)
                             .filter(active_membership)
                             .filter(active_key),
                     )

@@ -28,7 +28,7 @@ use frameshift_catalog::{
 };
 use frameshift_catalog_postgres::schema::{
     account_platform_roles, accounts, publication_moderation_decisions, publication_submissions,
-    publisher_audit_events, publisher_memberships,
+    publisher_audit_events, publisher_memberships, publisher_profiles,
 };
 use frameshift_catalog_postgres::{
     OwnershipBackfillApplied, OwnershipBackfillManifest, OwnershipBackfillMode,
@@ -1415,6 +1415,131 @@ async fn publication_intent_roundtrip_idempotency_and_atomic_consumption() {
         .await
         .expect("exact create retry must remain idempotent after consumption");
     assert_eq!(post_consumption_retry, consumed);
+}
+
+/// Publication transitions require the publisher to remain approved.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn publication_requires_an_approved_publisher() {
+    let (catalog, _container) = setup_catalog().await;
+    let (account_id, publisher_id, key) =
+        create_test_publisher(&catalog, "approved-admission", 108).await;
+    let now = chrono::DateTime::from_timestamp_micros(chrono::Utc::now().timestamp_micros())
+        .expect("current timestamp must fit");
+    let mut connection = catalog
+        .pool()
+        .get()
+        .await
+        .expect("publisher approval connection failed");
+
+    for status in ["pending", "suspended", "rejected"] {
+        diesel::update(publisher_profiles::table.find(publisher_id))
+            .set(publisher_profiles::moderation_status.eq(status))
+            .execute(&mut connection)
+            .await
+            .expect("set non-approved publisher status failed");
+        let intent = make_publication_submission_intent(
+            account_id,
+            publisher_id,
+            key.id,
+            109,
+            now,
+            now + chrono::Duration::minutes(10),
+        );
+        assert!(matches!(
+            catalog
+                .create_publication_intent(intent)
+                .await
+                .expect_err("non-approved publisher must not create an intent"),
+            CatalogError::Unauthorized {
+                kind: "publication_intent",
+                ..
+            }
+        ));
+    }
+
+    diesel::update(publisher_profiles::table.find(publisher_id))
+        .set(publisher_profiles::moderation_status.eq("approved"))
+        .execute(&mut connection)
+        .await
+        .expect("approve publisher for intent creation failed");
+    let intent = make_publication_submission_intent(
+        account_id,
+        publisher_id,
+        key.id,
+        112,
+        now,
+        now + chrono::Duration::minutes(10),
+    );
+    catalog
+        .create_publication_intent(intent.clone())
+        .await
+        .expect("approved publisher intent creation failed");
+
+    diesel::update(publisher_profiles::table.find(publisher_id))
+        .set(publisher_profiles::moderation_status.eq("suspended"))
+        .execute(&mut connection)
+        .await
+        .expect("suspend publisher before admission failed");
+    assert!(
+        !catalog
+            .consume_publication_intent(make_publication_claim(&intent))
+            .await
+            .expect("suspended publisher intent consumption failed"),
+        "a suspended publisher must not consume an existing intent"
+    );
+    let submission_request = make_publication_submission(&intent);
+    assert!(matches!(
+        catalog
+            .create_publication_submission(submission_request.clone())
+            .await
+            .expect_err("suspended publisher must not create a submission"),
+        CatalogError::Unauthorized {
+            kind: "publication_submission",
+            ..
+        }
+    ));
+    assert!(
+        catalog
+            .get_publication_intent(intent.id)
+            .await
+            .expect("denied intent lookup failed")
+            .consumed_at
+            .is_none(),
+        "denied submission must not consume its intent"
+    );
+    assert!(matches!(
+        catalog
+            .get_publication_submission(submission_request.id)
+            .await
+            .expect_err("denied submission must not persist"),
+        CatalogError::NotFound {
+            kind: "publication_submission",
+            ..
+        }
+    ));
+
+    diesel::update(publisher_profiles::table.find(publisher_id))
+        .set(publisher_profiles::moderation_status.eq("approved"))
+        .execute(&mut connection)
+        .await
+        .expect("restore publisher approval failed");
+    let created = catalog
+        .create_publication_submission(submission_request.clone())
+        .await
+        .expect("restored approved publisher submission failed");
+    assert_eq!(created.state, PublicationSubmissionState::Quarantined);
+
+    diesel::update(publisher_profiles::table.find(publisher_id))
+        .set(publisher_profiles::moderation_status.eq("suspended"))
+        .execute(&mut connection)
+        .await
+        .expect("suspend publisher after submission failed");
+    let retry = catalog
+        .create_publication_submission(submission_request)
+        .await
+        .expect("completed exact retry must remain idempotent after suspension");
+    assert_eq!(retry, created);
 }
 
 /// Intent consumption revalidates expiry, account, membership, and key state.
