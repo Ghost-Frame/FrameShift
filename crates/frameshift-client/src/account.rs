@@ -3,7 +3,7 @@
 //! Access tokens enter only through [`SecretString`] and are attached solely
 //! to the registry request's `Authorization` header.
 
-use frameshift_catalog::{AccountRecord, PublisherMembershipRecord};
+use frameshift_catalog::{AccountRecord, PublisherMembershipRecord, PublisherProfileRecord};
 use secrecy::SecretString;
 use serde::Deserialize;
 
@@ -27,6 +27,9 @@ pub struct AccountView {
     pub account: AccountRecord,
     /// Publisher memberships held by the account.
     pub memberships: Vec<PublisherMembershipRecord>,
+    /// Publisher profiles aligned with memberships when supplied by the registry.
+    #[serde(default)]
+    pub publishers: Vec<PublisherProfileRecord>,
 }
 
 /// Fetch the registry's non-secret account-authentication configuration.
@@ -122,6 +125,7 @@ mod tests {
         let token = SecretString::new("test-access-token".to_string());
         let view = get_account(&server, &token).expect("account response");
         assert_eq!(view.account.display_name.as_deref(), Some("Alice"));
+        assert!(view.publishers.is_empty());
         let request = handle.join().expect("test server thread");
         assert!(request.starts_with("GET /v1/account HTTP/1.1\r\n"));
         assert!(request.contains("\r\nAuthorization: Bearer test-access-token\r\n"));

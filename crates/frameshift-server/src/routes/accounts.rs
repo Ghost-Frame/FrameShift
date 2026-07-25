@@ -74,6 +74,8 @@ pub struct AccountResponse {
     pub account: AccountRecord,
     /// Publisher memberships held by the account.
     pub memberships: Vec<PublisherMembershipRecord>,
+    /// Publisher profiles aligned with memberships in the same stable order.
+    pub publishers: Vec<PublisherProfileRecord>,
 }
 
 /// Mutable account profile input.
@@ -313,9 +315,20 @@ async fn get_account(
         .list_account_memberships(auth.account.id)
         .await
         .map_err(|error| AppError::from_catalog(error, "publisher membership"))?;
+    let mut publishers = Vec::with_capacity(memberships.len());
+    for membership in &memberships {
+        publishers.push(
+            state
+                .catalog
+                .get_publisher(membership.publisher_id)
+                .await
+                .map_err(|error| AppError::from_catalog(error, "publisher"))?,
+        );
+    }
     Ok(Json(AccountResponse {
         account: auth.account,
         memberships,
+        publishers,
     }))
 }
 

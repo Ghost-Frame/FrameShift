@@ -299,6 +299,36 @@ async fn publisher_creation_rejects_legacy_handle() {
     assert!(catalog.state.read().unwrap().publishers.is_empty());
 }
 
+/// Account views fail closed when a membership cannot resolve its publisher.
+#[tokio::test]
+async fn account_view_rejects_orphaned_publisher_membership() {
+    let now = Utc::now();
+    let verifier = FakeVerifier::new();
+    verifier.allow(
+        "owner",
+        "orphaned-owner",
+        u64::try_from(now.timestamp()).unwrap(),
+    );
+    let catalog = MockCatalog::new();
+    let state = test_state(catalog.clone(), Some(verifier));
+    let account_id = provision_account(state.clone(), "owner").await;
+    let publisher_id = Uuid::new_v4();
+    catalog.state.write().unwrap().publisher_memberships.insert(
+        (account_id, publisher_id),
+        PublisherMembershipRecord {
+            account_id,
+            publisher_id,
+            role: PublisherRole::Owner,
+            state: MembershipState::Active,
+            created_at: now,
+            updated_at: now,
+        },
+    );
+
+    let response = send(state, Method::GET, "/v1/account", Some("owner"), None).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
 /// Account JIT provisioning, publisher ownership, key proof, and suspension are enforced.
 #[tokio::test]
 async fn account_and_publisher_security_workflow_is_enforced() {
@@ -360,6 +390,23 @@ async fn account_and_publisher_security_workflow_is_enforced() {
     assert_eq!(created.status(), StatusCode::OK);
     let publisher = response_json(created).await;
     let publisher_id = publisher["id"].as_str().unwrap();
+
+    let joined_account = send(
+        state.clone(),
+        Method::GET,
+        "/v1/account",
+        Some("owner"),
+        None,
+    )
+    .await;
+    assert_eq!(joined_account.status(), StatusCode::OK);
+    let joined_account = response_json(joined_account).await;
+    assert_eq!(
+        joined_account["memberships"][0]["publisher_id"],
+        publisher_id
+    );
+    assert_eq!(joined_account["publishers"][0]["id"], publisher_id);
+    assert_eq!(joined_account["publishers"][0]["handle"], "gatekeeper");
 
     let public = send(
         state.clone(),
