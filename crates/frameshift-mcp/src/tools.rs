@@ -7,10 +7,56 @@ use frameshift_orchestrator::{
     AuditLog, Embedder, Mode, ModeState, PolicyWeights, Preferences, SelectionInputs,
 };
 use frameshift_pack::{CapabilityManifest, PackManifest};
-use frameshift_studio::{DraftStatus, DraftTemplate, GuidedTemplateInput, Studio};
+use frameshift_studio::{
+    DraftStatus, DraftTemplate, ForkIdentityInput, GuidedTemplateInput, Studio,
+};
+use serde::Deserialize;
 
 use crate::context::{resolve_render_target, validate_absolute_path, with_project_root};
 use crate::protocol::{ToolContent, ToolDef, ToolResult};
+
+/// Bounded exact registry source and new identity accepted by the fork creation mode.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegistryForkInput {
+    /// Exact immutable registry pack name to fetch.
+    source_name: String,
+    /// Exact immutable semantic version to fetch.
+    source_version: String,
+    /// Stable distinct name for the derived pack.
+    name: String,
+    /// Initial semantic version for the derived pack.
+    version: String,
+    /// Public author or publisher handle for the derived pack.
+    author_handle: String,
+    /// Exact lowercase Ed25519 verifying key for the derived pack.
+    author_pubkey: String,
+    /// Whether the derived pack permits another Creator Studio fork.
+    #[serde(default)]
+    forkable: bool,
+}
+
+/// Conversion helpers for the bounded MCP registry-fork request.
+impl RegistryForkInput {
+    /// Build the exact registry resource requested by the caller.
+    fn source_spec(&self) -> PersonaSpec {
+        PersonaSpec {
+            name: self.source_name.clone(),
+            version: self.source_version.clone(),
+        }
+    }
+
+    /// Build the new public identity assigned during atomic Studio staging.
+    fn identity(&self) -> ForkIdentityInput {
+        ForkIdentityInput {
+            name: self.name.clone(),
+            version: self.version.clone(),
+            author_handle: self.author_handle.clone(),
+            author_pubkey: self.author_pubkey.clone(),
+            forkable: self.forkable,
+        }
+    }
+}
 
 /// Return the process-wide semantic embedder, loading the model once on first
 /// use. A failed load (offline, corrupt cache) is remembered as `None` so
@@ -215,7 +261,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "frameshift_draft_create".to_string(),
-            description: "Create a local Creator Studio draft as an empty workspace, atomic blank template, validated guided template, or hardened import.".to_string(),
+            description: "Create a local Creator Studio draft as an empty workspace, atomic blank template, validated guided template, verified registry fork, or hardened import.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -230,7 +276,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                     },
                     "template_mode": {
                         "type": "string",
-                        "enum": ["blank", "guided"],
+                        "enum": ["blank", "guided", "fork"],
                         "description": "Optional atomic template mode. Omit for the legacy empty draft."
                     },
                     "guided": {
@@ -285,6 +331,57 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                             "author_pubkey",
                             "description",
                             "voice_tone"
+                        ],
+                        "additionalProperties": false
+                    },
+                    "fork": {
+                        "type": "object",
+                        "description": "Required only when template_mode is fork. The source version must be exact and explicitly forkable.",
+                        "properties": {
+                            "source_name": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 64,
+                                "pattern": "^[A-Za-z0-9_-]+$"
+                            },
+                            "source_version": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 64
+                            },
+                            "name": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 64,
+                                "pattern": "^[A-Za-z0-9_-]+$"
+                            },
+                            "version": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 64
+                            },
+                            "author_handle": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 64,
+                                "pattern": "^[A-Za-z0-9_-]+$"
+                            },
+                            "author_pubkey": {
+                                "type": "string",
+                                "pattern": "^[0-9a-f]{64}$"
+                            },
+                            "forkable": {
+                                "type": "boolean",
+                                "default": false
+                            }
+                        },
+                        "required": [
+                            "source_name",
+                            "source_version",
+                            "name",
+                            "version",
+                            "author_handle",
+                            "author_pubkey"
                         ],
                         "additionalProperties": false
                     }
@@ -1342,10 +1439,12 @@ fn call_draft_create(arguments: &serde_json::Value, client: &Client) -> ToolResu
         None => None,
     };
     let guided = arguments.get("guided");
+    let fork = arguments.get("fork");
 
-    if import_path.is_some() && (template_mode.is_some() || guided.is_some()) {
+    if import_path.is_some() && (template_mode.is_some() || guided.is_some() || fork.is_some()) {
         return err_result(
-            "draft import cannot be combined with template_mode or guided fields".to_string(),
+            "draft import cannot be combined with template_mode, guided, or fork fields"
+                .to_string(),
         );
     }
 
@@ -1361,12 +1460,21 @@ fn call_draft_create(arguments: &serde_json::Value, client: &Client) -> ToolResu
     }
 
     let result = match template_mode {
-        None if guided.is_none() => studio.create(id, title).and_then(|_| studio.status(id)),
-        None => return err_result("guided fields require template_mode set to guided".to_string()),
-        Some("blank") if guided.is_some() => {
-            return err_result("blank template does not accept guided fields".to_string())
+        None if guided.is_none() && fork.is_none() => {
+            studio.create(id, title).and_then(|_| studio.status(id))
+        }
+        None => {
+            return err_result(
+                "guided or fork fields require their matching template_mode".to_string(),
+            )
+        }
+        Some("blank") if guided.is_some() || fork.is_some() => {
+            return err_result("blank template does not accept guided or fork fields".to_string())
         }
         Some("blank") => studio.create_template(id, title, DraftTemplate::Blank),
+        Some("guided") if fork.is_some() => {
+            return err_result("guided template does not accept fork fields".to_string())
+        }
         Some("guided") => {
             let guided = match guided {
                 Some(value) => match serde_json::from_value::<GuidedTemplateInput>(value.clone()) {
@@ -1383,8 +1491,32 @@ fn call_draft_create(arguments: &serde_json::Value, client: &Client) -> ToolResu
             };
             studio.create_template(id, title, DraftTemplate::Guided(guided))
         }
+        Some("fork") if guided.is_some() => {
+            return err_result("fork template does not accept guided fields".to_string())
+        }
+        Some("fork") => {
+            let fork = match fork {
+                Some(value) => match serde_json::from_value::<RegistryForkInput>(value.clone()) {
+                    Ok(input) => input,
+                    Err(error) => return err_result(format!("invalid fork fields: {error}")),
+                },
+                None => {
+                    return err_result("fork template requires the fork fields object".to_string())
+                }
+            };
+            return match client.fork_registry_draft(
+                &studio,
+                id,
+                title,
+                &fork.source_spec(),
+                fork.identity(),
+            ) {
+                Ok(status) => draft_status_result(status),
+                Err(error) => err_result(format!("draft creation failed: {error}")),
+            };
+        }
         Some(_) => {
-            return err_result("invalid template_mode: expected blank or guided".to_string())
+            return err_result("invalid template_mode: expected blank, guided, or fork".to_string())
         }
     };
 
@@ -1618,9 +1750,9 @@ mod tests {
         }
     }
 
-    /// Draft creation advertises bounded blank and guided template contracts.
+    /// Draft creation advertises bounded blank, guided, and registry-fork contracts.
     #[test]
-    fn draft_create_schema_exposes_template_modes_and_guided_bounds() {
+    fn draft_create_schema_exposes_template_modes_and_bounds() {
         let definitions = tool_definitions();
         let create = definitions
             .iter()
@@ -1630,7 +1762,7 @@ mod tests {
 
         assert_eq!(
             properties["template_mode"]["enum"],
-            serde_json::json!(["blank", "guided"])
+            serde_json::json!(["blank", "guided", "fork"])
         );
         assert_eq!(properties["guided"]["additionalProperties"], false);
         assert_eq!(
@@ -1640,6 +1772,26 @@ mod tests {
         assert_eq!(
             properties["guided"]["properties"]["description"]["maxLength"],
             500
+        );
+        assert_eq!(properties["fork"]["additionalProperties"], false);
+        assert_eq!(
+            properties["fork"]["properties"]["source_name"]["pattern"],
+            "^[A-Za-z0-9_-]+$"
+        );
+        assert_eq!(
+            properties["fork"]["properties"]["author_pubkey"]["pattern"],
+            "^[0-9a-f]{64}$"
+        );
+        assert_eq!(
+            properties["fork"]["required"],
+            serde_json::json!([
+                "source_name",
+                "source_version",
+                "name",
+                "version",
+                "author_handle",
+                "author_pubkey"
+            ])
         );
     }
 
@@ -2504,6 +2656,74 @@ mod tests {
             &client,
         );
         assert_eq!(blank_with_guided.is_error, Some(true));
+
+        let blank_with_fork = call_tool(
+            "frameshift_draft_create",
+            &serde_json::json!({
+                "id": "blank-with-fork",
+                "title": "Blank with fork",
+                "template_mode": "blank",
+                "fork": {}
+            }),
+            &client,
+        );
+        assert_eq!(blank_with_fork.is_error, Some(true));
+
+        let fork_with_guided = call_tool(
+            "frameshift_draft_create",
+            &serde_json::json!({
+                "id": "fork-with-guided",
+                "title": "Fork with guided",
+                "template_mode": "fork",
+                "guided": {},
+                "fork": {}
+            }),
+            &client,
+        );
+        assert_eq!(fork_with_guided.is_error, Some(true));
+
+        let fork_without_fields = call_tool(
+            "frameshift_draft_create",
+            &serde_json::json!({
+                "id": "fork-without-fields",
+                "title": "Fork without fields",
+                "template_mode": "fork"
+            }),
+            &client,
+        );
+        assert_eq!(fork_without_fields.is_error, Some(true));
+
+        let fork_without_mode = call_tool(
+            "frameshift_draft_create",
+            &serde_json::json!({
+                "id": "fork-without-mode",
+                "title": "Fork without mode",
+                "fork": {}
+            }),
+            &client,
+        );
+        assert_eq!(fork_without_mode.is_error, Some(true));
+
+        let fork_with_unknown_field = call_tool(
+            "frameshift_draft_create",
+            &serde_json::json!({
+                "id": "fork-with-unknown-field",
+                "title": "Fork with unknown field",
+                "template_mode": "fork",
+                "fork": {
+                    "source_name": "source",
+                    "source_version": "1.0.0",
+                    "name": "derived",
+                    "version": "0.1.0",
+                    "author_handle": "tester",
+                    "author_pubkey":
+                        "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+                    "unexpected": true
+                }
+            }),
+            &client,
+        );
+        assert_eq!(fork_with_unknown_field.is_error, Some(true));
 
         let malformed_mode = call_tool(
             "frameshift_draft_create",
