@@ -8,6 +8,8 @@ description = "Secure local draft lifecycle for the Frameshift Creator Studio"
 
 [dependencies]
 frameshift-publication = { path = "../frameshift-publication" }
+# Typed source parsing and deterministic per-agent preview rendering.
+frameshift-source = { path = "../frameshift-source" }
 hex.workspace = true
 libc = "0.2"
 serde.workspace = true

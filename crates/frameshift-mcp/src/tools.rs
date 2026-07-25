@@ -252,6 +252,17 @@ pub fn tool_definitions() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
+            name: "frameshift_draft_preview".to_string(),
+            description: "Render every supported agent target from the exact current typed draft without exposing filesystem paths.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"}
+                },
+                "required": ["id"]
+            }),
+        },
+        ToolDef {
             name: "frameshift_draft_read".to_string(),
             description: "Read one documented public file from a local Creator Studio draft.".to_string(),
             input_schema: serde_json::json!({
@@ -544,6 +555,7 @@ pub fn call_tool(name: &str, arguments: &serde_json::Value, client: &Client) -> 
         "frameshift_draft_create" => call_draft_create(arguments, client),
         "frameshift_draft_list" => call_draft_list(client),
         "frameshift_draft_status" => call_draft_status(arguments, client),
+        "frameshift_draft_preview" => call_draft_preview(arguments, client),
         "frameshift_draft_read" => call_draft_read(arguments, client),
         "frameshift_draft_write" => call_draft_write(arguments, client),
         "frameshift_draft_review" => call_draft_review(arguments, client),
@@ -1310,6 +1322,25 @@ fn call_draft_status(arguments: &serde_json::Value, client: &Client) -> ToolResu
     }
 }
 
+/// Handle deterministic path-free target previews for one current typed draft.
+fn call_draft_preview(arguments: &serde_json::Value, client: &Client) -> ToolResult {
+    let id = match required_string(arguments, "id") {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    let studio = match studio_for_client(client) {
+        Ok(studio) => studio,
+        Err(error) => return err_result(error),
+    };
+    match studio
+        .preview(id)
+        .and_then(|preview| serde_json::to_string(&preview).map_err(Into::into))
+    {
+        Ok(serialized) => ok_result(serialized),
+        Err(error) => err_result(format!("draft preview failed: {error}")),
+    }
+}
+
 /// Handle bounded UTF-8 reads of one public draft file.
 fn call_draft_read(arguments: &serde_json::Value, client: &Client) -> ToolResult {
     let id = match required_string(arguments, "id") {
@@ -1465,13 +1496,14 @@ mod tests {
 
     /// Verify that tool definitions include runtime and Creator Studio tools.
     #[test]
-    fn tool_definitions_returns_sixteen() {
+    fn tool_definitions_returns_seventeen() {
         let defs = tool_definitions();
-        assert_eq!(defs.len(), 16);
+        assert_eq!(defs.len(), 17);
         for name in [
             "frameshift_draft_create",
             "frameshift_draft_list",
             "frameshift_draft_status",
+            "frameshift_draft_preview",
             "frameshift_draft_read",
             "frameshift_draft_write",
             "frameshift_draft_review",
@@ -2203,6 +2235,63 @@ mod tests {
             parse_search_tag(&serde_json::json!({"tag": "rust"})),
             Some("rust".to_string())
         );
+    }
+
+    /// MCP preview returns all deterministic targets without managed filesystem paths.
+    #[test]
+    fn draft_preview_tool_returns_path_free_target_renders() {
+        let temporary = tempfile::tempdir().unwrap();
+        let data_root = temporary.path().join("private-data-root");
+        let client = make_client(&data_root);
+        let created = call_tool(
+            "frameshift_draft_create",
+            &serde_json::json!({"id": "preview", "title": "Preview"}),
+            &client,
+        );
+        assert!(created.is_error.is_none());
+
+        for (path, content) in [
+            (
+                "pack.toml",
+                "schema_version = 1\nname = \"preview\"\nauthor_handle = \"tester\"\nauthor_pubkey = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\nversion = \"0.1.0\"\n",
+            ),
+            (
+                "persona.toml",
+                "schema_version = 1\nname = \"preview\"\nversion = \"0.1.0\"\n\
+                 description = \"Preview fixture\"\n\n[voice]\ntone = \"Precise and calm.\"\n",
+            ),
+        ] {
+            let written = call_tool(
+                "frameshift_draft_write",
+                &serde_json::json!({
+                    "id": "preview",
+                    "path": path,
+                    "action": "write",
+                    "content": content,
+                }),
+                &client,
+            );
+            assert!(written.is_error.is_none());
+        }
+
+        let result = call_tool(
+            "frameshift_draft_preview",
+            &serde_json::json!({"id": "preview"}),
+            &client,
+        );
+        assert!(result.is_error.is_none());
+        assert!(!result.content[0].text.contains(data_root.to_str().unwrap()));
+        let preview: serde_json::Value = serde_json::from_str(&result.content[0].text).unwrap();
+        assert_eq!(preview["targets"].as_array().unwrap().len(), 4);
+        assert_eq!(preview["targets"][0]["target"], "claude");
+        assert_eq!(preview["targets"][1]["target"], "codex");
+        assert_eq!(preview["targets"][2]["target"], "gemini");
+        assert_eq!(preview["targets"][3]["target"], "generic");
+        assert!(preview["targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|target| target["sha256"].as_str().unwrap().len() == 64));
     }
 
     /// MCP draft tools complete the hash-bound create, edit, review, and submit flow.
