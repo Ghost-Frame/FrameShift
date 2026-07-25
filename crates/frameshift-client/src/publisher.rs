@@ -147,7 +147,7 @@ fn post_json<T: Serialize, R: serde::de::DeserializeOwned>(
 }
 
 /// Decode a successful response or map a bounded registry failure.
-fn send_and_decode<T: serde::de::DeserializeOwned>(
+pub(crate) fn send_and_decode<T: serde::de::DeserializeOwned>(
     result: Result<ureq::Response, ureq::Error>,
     url: &str,
 ) -> Result<T, ClientError> {

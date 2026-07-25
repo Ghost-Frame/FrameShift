@@ -2088,6 +2088,7 @@ dependencies = [
  "frameshift-pack",
  "frameshift-publication",
  "frameshift-source",
+ "frameshift-studio",
  "frameshift-template",
  "frameshift-vault",
  "frameshift-vault-local",
@@ -2438,9 +2439,11 @@ name = "frameshift-studio"
 version = "0.1.0"
 dependencies = [
  "frameshift-publication",
+ "hex",
  "libc",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
 ]

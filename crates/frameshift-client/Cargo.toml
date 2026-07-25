@@ -11,6 +11,8 @@ frameshift-catalog = { path = "../frameshift-catalog" }
 frameshift-pack = { path = "../frameshift-pack" }
 # Shared fail-closed publication policy and versioned validation reports.
 frameshift-publication = { path = "../frameshift-publication" }
+# Immutable reviewed draft snapshots consumed by the native publication bridge.
+frameshift-studio = { path = "../frameshift-studio" }
 # Persona composition (extends/mixin resolution) used at render time.
 frameshift-compose = { path = "../frameshift-compose" }
 # Typed persona source loading and deterministic markdown rendering.
