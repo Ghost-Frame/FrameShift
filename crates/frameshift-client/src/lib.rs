@@ -6,6 +6,8 @@ mod error;
 /// Versioned local publisher-key metadata and secret storage.
 pub mod identity;
 mod model;
+/// Explicit authenticated Creator Studio quarantine publication operations.
+pub mod publication;
 /// Registry publish implementation: pack, sign, and HTTP upload.
 mod publish;
 /// Bearer-authenticated publisher profile and key operations.
@@ -38,6 +40,7 @@ pub use model::{
     LockedPersona, Lockfile, MaterializeFailure, MemoryConfig, MemoryRequirementStatus,
     PersonaSpec, ProjectConfig, ProjectPaths, SyncReport, SCHEMA_VERSION,
 };
+pub use publication::{PreparedPublication, PublicationBinding};
 pub use publish::PublishOutcome;
 pub use publisher::{EnrolledPublisherKey, EnrolledPublisherKeyState};
 pub use registry::{

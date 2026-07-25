@@ -12,6 +12,7 @@ use frameshift_publication::{
     is_allowed_public_path, validate_directory, PublicationReport, MAX_FILE_SIZE,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 /// Current schema version for persisted draft metadata.
 pub const DRAFT_SCHEMA_VERSION: u32 = 1;
@@ -80,6 +81,55 @@ pub struct DraftStatus {
     pub submission_intent_current: bool,
 }
 
+/// Immutable path-free copy of one exact reviewed draft inventory.
+pub struct DraftSnapshot {
+    /// Draft revision frozen into this snapshot.
+    revision: u64,
+    /// Fresh validation report for the frozen file set.
+    publication: PublicationReport,
+    /// Exact public files in deterministic inventory order.
+    files: Vec<SnapshotFile>,
+}
+
+/// One exact public file held by an immutable draft snapshot.
+pub struct SnapshotFile {
+    /// Normalized public relative path.
+    path: String,
+    /// Exact bounded file bytes.
+    bytes: Vec<u8>,
+}
+
+/// Read-only accessors for an immutable draft snapshot.
+impl DraftSnapshot {
+    /// Return the draft revision represented by this snapshot.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Return the validation report bound to the frozen file bytes.
+    pub fn publication(&self) -> &PublicationReport {
+        &self.publication
+    }
+
+    /// Return the frozen files in deterministic inventory order.
+    pub fn files(&self) -> &[SnapshotFile] {
+        &self.files
+    }
+}
+
+/// Read-only accessors for one frozen public file.
+impl SnapshotFile {
+    /// Return the normalized public relative path.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Return the exact public file bytes.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
 /// Errors returned by the local Creator Studio draft store.
 #[derive(Debug, thiserror::Error)]
 pub enum StudioError {
@@ -119,6 +169,12 @@ pub enum StudioError {
     /// Submission intent requires a current review of the exact content.
     #[error("draft review is not current")]
     ReviewNotCurrent,
+    /// Snapshotting requires a current explicit submission intent.
+    #[error("draft submission intent is not current")]
+    SubmissionIntentNotCurrent,
+    /// Draft content changed while an immutable snapshot was being built.
+    #[error("draft content changed while it was being frozen")]
+    SnapshotChanged,
     /// Publication validation could not inspect the draft.
     #[error("draft validation failed: {0}")]
     Validation(#[from] frameshift_publication::PublicationIoError),
@@ -354,6 +410,46 @@ impl Studio {
         let paths = self.draft_paths(id)?;
         write_json_atomic(&paths.metadata, &status.draft, true)?;
         self.status(id)
+    }
+
+    /// Freeze the exact reviewed and intent-confirmed public files into memory.
+    pub fn snapshot_for_submission(
+        &self,
+        id: &str,
+        expected_inventory_hash: &str,
+    ) -> Result<DraftSnapshot, StudioError> {
+        let status = self.status(id)?;
+        if !status.submission_intent_current {
+            return Err(StudioError::SubmissionIntentNotCurrent);
+        }
+        if status.publication.inventory_hash != expected_inventory_hash {
+            return Err(StudioError::ReviewHashMismatch);
+        }
+
+        let paths = self.draft_paths(id)?;
+        let mut files = Vec::with_capacity(status.publication.inventory.len());
+        for entry in &status.publication.inventory {
+            let relative = path_from_public_string(&entry.path)?;
+            let bytes = read_regular_nofollow(&paths.content.join(relative), MAX_FILE_SIZE)?;
+            let digest = hex::encode(Sha256::digest(&bytes));
+            if bytes.len() as u64 != entry.size || digest != entry.sha256 {
+                return Err(StudioError::SnapshotChanged);
+            }
+            files.push(SnapshotFile {
+                path: entry.path.clone(),
+                bytes,
+            });
+        }
+
+        let final_report = validate_directory(&paths.content)?;
+        if final_report != status.publication {
+            return Err(StudioError::SnapshotChanged);
+        }
+        Ok(DraftSnapshot {
+            revision: status.draft.revision,
+            publication: status.publication,
+            files,
+        })
     }
 
     /// Resolve and verify the private and public paths for one draft.
@@ -644,6 +740,46 @@ mod tests {
         assert!(status.review_current);
         assert!(status.submission_intent_current);
         assert_eq!(reopened.list().unwrap()[0].title, "Test draft");
+    }
+
+    /// Snapshotting requires current intent and returns only the reviewed public bytes.
+    #[test]
+    fn snapshot_requires_current_intent_and_freezes_public_bytes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        write_valid_pack(&source);
+        let studio = Studio::open(temporary.path().join("studio")).unwrap();
+        let imported = studio.import("draft", "Draft", &source).unwrap();
+        let inventory_hash = imported.publication.inventory_hash;
+
+        let error = match studio.snapshot_for_submission("draft", &inventory_hash) {
+            Ok(_) => panic!("unreviewed draft must not freeze"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, StudioError::SubmissionIntentNotCurrent));
+        studio.confirm_review("draft", &inventory_hash).unwrap();
+        studio
+            .confirm_submission_intent("draft", &inventory_hash)
+            .unwrap();
+
+        let snapshot = studio
+            .snapshot_for_submission("draft", &inventory_hash)
+            .unwrap();
+        assert_eq!(snapshot.publication().inventory_hash, inventory_hash);
+        assert_eq!(snapshot.files().len(), 2);
+        assert!(snapshot
+            .files()
+            .iter()
+            .all(|file| !file.path().contains("draft.json")));
+        assert_eq!(
+            snapshot
+                .files()
+                .iter()
+                .find(|file| file.path() == "AGENTS.md")
+                .unwrap()
+                .bytes(),
+            b"# Test\n\nPrecise behavior.\n"
+        );
     }
 
     /// Any content mutation clears review and submission intent before saving.

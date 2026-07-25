@@ -253,6 +253,14 @@ pub enum ClientError {
         path: String,
     },
 
+    /// The Creator Studio draft could not be frozen at its reviewed boundary.
+    #[error("creator studio draft is not ready for publication: {0}")]
+    Studio(#[from] frameshift_studio::StudioError),
+
+    /// The manifest's declared author key differs from the selected signing key.
+    #[error("pack manifest author_pubkey does not match the selected publisher key")]
+    PublicationSignerMismatch,
+
     #[error("author_pubkey is not a supported ed25519 public key encoding: {0}")]
     InvalidAuthorPublicKey(String),
 

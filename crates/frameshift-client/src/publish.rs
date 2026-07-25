@@ -241,7 +241,11 @@ fn read_validated_source_file(path: &Path, relative: &str) -> Result<Vec<u8>, Cl
 /// Send a prepared signed request body, mapping non-2xx statuses to
 /// [`ClientError::RegistryRejected`] (with the status code preserved) and
 /// transport errors to [`ClientError::RegistryHttp`].
-fn send_signed(req: ureq::Request, url: &str, body: &[u8]) -> Result<ureq::Response, ClientError> {
+pub(crate) fn send_signed(
+    req: ureq::Request,
+    url: &str,
+    body: &[u8],
+) -> Result<ureq::Response, ClientError> {
     match req.send_bytes(body) {
         Ok(response) => Ok(response),
         Err(ureq::Error::Status(status, response)) => {
@@ -260,11 +264,11 @@ fn send_signed(req: ureq::Request, url: &str, body: &[u8]) -> Result<ureq::Respo
 }
 
 /// One signed-request header: a static name plus the computed value.
-struct SignedHeader {
+pub(crate) struct SignedHeader {
     /// Lowercase header name (e.g. `x-frameshift-pubkey`).
-    name: &'static str,
+    pub(crate) name: &'static str,
     /// The header value.
-    value: String,
+    pub(crate) value: String,
 }
 
 /// Build the four `X-Frameshift-*` signed-request headers for `key` over
@@ -273,7 +277,12 @@ struct SignedHeader {
 /// The signature covers `<DOMAIN>\n<METHOD>\n<PATH>\n<hex(sha256(body))>\n
 /// <TIMESTAMP>\n<NONCE>`, exactly the string `frameshift_server::auth` rebuilds
 /// and verifies.
-fn signed_headers(key: &SigningKey, method: &str, path: &str, body: &[u8]) -> Vec<SignedHeader> {
+pub(crate) fn signed_headers(
+    key: &SigningKey,
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> Vec<SignedHeader> {
     let timestamp = unix_now();
     let nonce = fresh_nonce();
     let body_hex = hex::encode(Sha256::digest(body));
