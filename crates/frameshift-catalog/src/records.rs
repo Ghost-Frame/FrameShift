@@ -7,7 +7,7 @@
 use chrono::{DateTime, Utc};
 
 use crate::identity::Ed25519PublicKey;
-use crate::status::PackStatus;
+use crate::status::{PackStatus, TombstoneReason};
 use frameshift_pack::ObjectHash;
 use uuid::Uuid;
 
@@ -270,6 +270,8 @@ pub enum PublicationSubmissionState {
     Rejected,
     /// The approved artifact is bound to one active public catalog version.
     Promoted,
+    /// The publisher owner ended the non-public workflow without deleting evidence.
+    Withdrawn,
 }
 
 /// Review action applied to a quarantined publication submission.
@@ -410,6 +412,103 @@ pub struct PublicationPromotionRecord {
     pub request_id: Uuid,
     /// Database timestamp when the promotion transaction committed.
     pub created_at: DateTime<Utc>,
+}
+
+/// Audited control applied to a publication submission, publisher, or release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationLifecycleAction {
+    /// An active publisher owner withdrew a non-public submission.
+    WithdrawSubmission,
+    /// An active administrator suspended a publisher profile.
+    SuspendPublisher,
+    /// An active administrator removed a release from public availability.
+    TombstoneRelease,
+}
+
+/// Exact input for one idempotent publisher-owner submission withdrawal.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PublicationWithdrawalRequest {
+    /// Stable lifecycle-decision identifier and primary idempotency key.
+    pub id: Uuid,
+    /// Non-public submission being withdrawn.
+    pub submission_id: Uuid,
+    /// Authenticated account attempting the withdrawal.
+    pub actor_account_id: Uuid,
+    /// Stable bounded private reason code.
+    pub reason_code: String,
+    /// Stable request identifier used to reject replay substitution.
+    pub request_id: Uuid,
+}
+
+/// Exact input for one idempotent administrator publisher suspension.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PublisherSuspensionRequest {
+    /// Stable lifecycle-decision identifier and primary idempotency key.
+    pub id: Uuid,
+    /// Publisher profile being suspended.
+    pub publisher_id: Uuid,
+    /// Authenticated account attempting the suspension.
+    pub actor_account_id: Uuid,
+    /// Stable bounded private reason code.
+    pub reason_code: String,
+    /// Stable request identifier used to reject replay substitution.
+    pub request_id: Uuid,
+}
+
+/// Exact input for one idempotent administrator release tombstone.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PublicationTombstoneRequest {
+    /// Stable lifecycle-decision identifier and primary idempotency key.
+    pub id: Uuid,
+    /// Public pack containing the release.
+    pub pack_name: String,
+    /// Public semantic version being tombstoned.
+    pub version: String,
+    /// Authenticated account attempting the tombstone.
+    pub actor_account_id: Uuid,
+    /// Bounded public tombstone reason category.
+    pub reason: TombstoneReason,
+    /// Stable request identifier used to reject replay substitution.
+    pub request_id: Uuid,
+}
+
+/// Immutable evidence for one accepted publication lifecycle control.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PublicationLifecycleDecisionRecord {
+    /// Stable lifecycle-decision identifier.
+    pub id: Uuid,
+    /// Control action that was committed.
+    pub action: PublicationLifecycleAction,
+    /// Account that exercised owner or administrator authority.
+    pub actor_account_id: Uuid,
+    /// Affected publisher when the target has current publisher ownership.
+    pub publisher_id: Option<Uuid>,
+    /// Affected submission for a withdrawal.
+    pub submission_id: Option<Uuid>,
+    /// Affected public pack for a release tombstone.
+    pub pack_name: Option<String>,
+    /// Affected public semantic version for a release tombstone.
+    pub version: Option<String>,
+    /// Stable state observed before the control.
+    pub from_state: String,
+    /// Stable state committed by the control.
+    pub to_state: String,
+    /// Stable bounded reason code or public tombstone category.
+    pub reason_code: String,
+    /// Stable request identifier retained for replay detection.
+    pub request_id: Uuid,
+    /// Database timestamp when the control committed.
+    pub created_at: DateTime<Utc>,
+}
+
+/// Stable keyset cursor for newest-first publication lifecycle audit reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PublicationLifecycleCursor {
+    /// Timestamp of the last decision returned by the preceding page.
+    pub created_at: DateTime<Utc>,
+    /// Identifier used to order decisions that share the same timestamp.
+    pub id: Uuid,
 }
 
 /// A registered marketplace author.

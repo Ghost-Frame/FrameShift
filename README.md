@@ -196,7 +196,7 @@ On registry install, the client verifies the pack signature against the exact ke
 
 ### Admin
 
-The registry server exposes one operator endpoint: `POST /v1/admin/packs/{name}/{version}/tombstone`, which marks a published version as removed from public availability. Like registration and publishing, it requires a signed request; the signer's key must also appear on `FRAMESHIFT_ADMIN_PUBKEYS`, a separate comma-separated allowlist of Ed25519 public keys. An empty allowlist disables the endpoint outright (`404`, indistinguishable from an unmapped route); a signed request from a key not on the list gets `403`. No CLI or client command calls this endpoint today -- it is reached directly.
+The registry server exposes account-authenticated lifecycle controls. Publisher owners can withdraw eligible non-public submissions with `POST /v1/publication-submissions/{id}/withdraw`. Active administrators can suspend a publisher with `POST /v1/admin/publishers/{publisher_id}/suspend` or tombstone an active release with `POST /v1/admin/packs/{name}/{version}/tombstone`. Each accepted transition and its reason are committed atomically to immutable audit evidence. Publisher owners can read their scoped evidence at `GET /v1/publishers/{handle}/publication-decisions`; administrators can read the global stream at `GET /v1/admin/publication-decisions`.
 
 ### Registry safety controls
 
@@ -433,7 +433,7 @@ cargo run -p frameshift-cli -- select --task "optimize a hot loop" --format json
 
 ### Server
 
-Most variables are read with no prefix (e.g. `BIND_ADDR`, not `FRAMESHIFT_BIND_ADDR`). Publisher and administrator admission lists deliberately use `FRAMESHIFT_PUBLISHER_PUBKEYS` and `FRAMESHIFT_ADMIN_PUBKEYS`; see `crates/frameshift-server/src/config.rs` for the authoritative parser.
+Most variables are read with no prefix (e.g. `BIND_ADDR`, not `FRAMESHIFT_BIND_ADDR`). Publisher admission deliberately uses `FRAMESHIFT_PUBLISHER_PUBKEYS`. The old `FRAMESHIFT_ADMIN_PUBKEYS` value is parsed only for configuration compatibility and is ignored by account-role administrator routes.
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -465,7 +465,7 @@ Most variables are read with no prefix (e.g. `BIND_ADDR`, not `FRAMESHIFT_BIND_A
 | `R2_SECRET_ACCESS_KEY` | `""` | Secret access key |
 | `TRUST_FORWARDED_FOR` | `false` | Trust `X-Forwarded-For` for rate-limit key extraction; set `true` only behind a trusted proxy |
 | `SIGNED_REQUEST_MAX_SKEW_SECS` | `300` | Max clock skew (seconds) allowed between a signed write request's timestamp and server time |
-| `FRAMESHIFT_ADMIN_PUBKEYS` | `""` | Comma-separated base64url-no-pad Ed25519 public keys allowed to call `/v1/admin/*` endpoints; empty disables all admin endpoints (404) |
+| `FRAMESHIFT_ADMIN_PUBKEYS` | `""` | Deprecated compatibility value; account-role administrator routes ignore it |
 | `PUBLISHER_OWNERSHIP_READS` | `true` | Add publisher-preferred identity and historical key state to pack responses; set `false` to restore the exact legacy response shape |
 | `MEMORY_BACKEND` | `none` | `none`, `http`, or `sqlite` |
 | `MEMORY_HTTP_ENDPOINT` | `""` | Base URL for the HTTP memory endpoint; used when `MEMORY_BACKEND=http` |

@@ -23,11 +23,13 @@ use frameshift_catalog::identity::Ed25519PublicKey;
 use frameshift_catalog::records::{
     AccountRecord, AccountStatus, AuthorRecord, MembershipState, PackRecord, PackVersionRecord,
     PlatformRole, PlatformRoleRecord, PlatformRoleState, PublicationIntentRecord,
+    PublicationLifecycleAction, PublicationLifecycleCursor, PublicationLifecycleDecisionRecord,
     PublicationModerationAction, PublicationModerationDecisionRecord,
     PublicationModerationDecisionRequest, PublicationPromotionRecord, PublicationPromotionRequest,
     PublicationSubmissionRecord, PublicationSubmissionRequest, PublicationSubmissionState,
-    PublisherAuditEventRecord, PublisherKeyRecord, PublisherKeyState, PublisherMembershipRecord,
-    PublisherModerationStatus, PublisherProfileRecord, PublisherRole,
+    PublicationTombstoneRequest, PublicationWithdrawalRequest, PublisherAuditEventRecord,
+    PublisherKeyRecord, PublisherKeyState, PublisherMembershipRecord, PublisherModerationStatus,
+    PublisherProfileRecord, PublisherRole, PublisherSuspensionRequest,
 };
 use frameshift_catalog::status::{PackStatus, TombstoneRecord};
 // Reuse the exact same version-precedence comparator the Postgres adapter
@@ -106,6 +108,9 @@ pub struct MockState {
 
     /// Immutable successful promotions keyed by stable identifier.
     pub publication_promotions: HashMap<uuid::Uuid, PublicationPromotionRecord>,
+
+    /// Immutable publication lifecycle decisions keyed by stable identifier.
+    pub publication_lifecycle_decisions: HashMap<uuid::Uuid, PublicationLifecycleDecisionRecord>,
 
     /// Optional persistent backend failure injected into submission creation.
     pub publication_submission_error: Option<String>,
@@ -1639,6 +1644,434 @@ impl CatalogBackend for MockCatalog {
             .insert(promotion.id, promotion.clone());
         Ok(promotion)
     }
+
+    /// Withdraw one non-public submission under active owner authority.
+    async fn withdraw_publication_submission(
+        &self,
+        request: PublicationWithdrawalRequest,
+    ) -> Result<PublicationLifecycleDecisionRecord, CatalogError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        if let Some(existing) = state
+            .publication_lifecycle_decisions
+            .values()
+            .find(|record| {
+                record.id == request.id
+                    || record.submission_id == Some(request.submission_id)
+                    || record.request_id == request.request_id
+            })
+        {
+            let exact = existing.id == request.id
+                && existing.action == PublicationLifecycleAction::WithdrawSubmission
+                && existing.actor_account_id == request.actor_account_id
+                && existing.submission_id == Some(request.submission_id)
+                && existing.reason_code == request.reason_code
+                && existing.request_id == request.request_id;
+            return if exact {
+                Ok(existing.clone())
+            } else {
+                Err(CatalogError::Conflict {
+                    kind: "publication_lifecycle_decision",
+                    key: request.id.to_string(),
+                })
+            };
+        }
+        let submission = state
+            .publication_submissions
+            .get(&request.submission_id)
+            .cloned()
+            .ok_or_else(|| CatalogError::NotFound {
+                kind: "publication_submission",
+                key: request.submission_id.to_string(),
+            })?;
+        let actor_active = state
+            .accounts
+            .get(&request.actor_account_id)
+            .is_some_and(|account| account.status == AccountStatus::Active);
+        let owner_active = state.publisher_memberships.values().any(|membership| {
+            membership.account_id == request.actor_account_id
+                && membership.publisher_id == submission.publisher_id
+                && membership.role == PublisherRole::Owner
+                && membership.state == MembershipState::Active
+        });
+        if !actor_active || !owner_active {
+            return Err(CatalogError::Unauthorized {
+                kind: "publication_withdrawal",
+                key: request.id.to_string(),
+            });
+        }
+        if !matches!(
+            submission.state,
+            PublicationSubmissionState::Quarantined
+                | PublicationSubmissionState::NeedsReview
+                | PublicationSubmissionState::Approved
+        ) {
+            return Err(CatalogError::Conflict {
+                kind: "publication_submission",
+                key: request.submission_id.to_string(),
+            });
+        }
+        let now = Utc::now();
+        let decision = PublicationLifecycleDecisionRecord {
+            id: request.id,
+            action: PublicationLifecycleAction::WithdrawSubmission,
+            actor_account_id: request.actor_account_id,
+            publisher_id: Some(submission.publisher_id),
+            submission_id: Some(request.submission_id),
+            pack_name: None,
+            version: None,
+            from_state: lifecycle_submission_state(submission.state),
+            to_state: "withdrawn".to_string(),
+            reason_code: request.reason_code,
+            request_id: request.request_id,
+            created_at: now,
+        };
+        let stored = state
+            .publication_submissions
+            .get_mut(&request.submission_id)
+            .expect("validated withdrawal submission must remain present");
+        stored.state = PublicationSubmissionState::Withdrawn;
+        stored.updated_at = now;
+        state
+            .publication_lifecycle_decisions
+            .insert(decision.id, decision.clone());
+        Ok(decision)
+    }
+
+    /// Suspend one publisher under active administrator authority.
+    async fn suspend_publisher(
+        &self,
+        request: PublisherSuspensionRequest,
+    ) -> Result<PublicationLifecycleDecisionRecord, CatalogError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        if let Some(existing) = state
+            .publication_lifecycle_decisions
+            .values()
+            .find(|record| {
+                record.id == request.id
+                    || (record.action == PublicationLifecycleAction::SuspendPublisher
+                        && record.publisher_id == Some(request.publisher_id))
+                    || record.request_id == request.request_id
+            })
+        {
+            let exact = existing.id == request.id
+                && existing.action == PublicationLifecycleAction::SuspendPublisher
+                && existing.actor_account_id == request.actor_account_id
+                && existing.publisher_id == Some(request.publisher_id)
+                && existing.reason_code == request.reason_code
+                && existing.request_id == request.request_id;
+            return if exact {
+                Ok(existing.clone())
+            } else {
+                Err(CatalogError::Conflict {
+                    kind: "publication_lifecycle_decision",
+                    key: request.id.to_string(),
+                })
+            };
+        }
+        if !mock_active_administrator(&state, request.actor_account_id) {
+            return Err(CatalogError::Unauthorized {
+                kind: "publisher_suspension",
+                key: request.id.to_string(),
+            });
+        }
+        let publisher = state
+            .publishers
+            .get(&request.publisher_id)
+            .cloned()
+            .ok_or_else(|| CatalogError::NotFound {
+                kind: "publisher",
+                key: request.publisher_id.to_string(),
+            })?;
+        if !matches!(
+            publisher.moderation_status,
+            PublisherModerationStatus::Pending | PublisherModerationStatus::Approved
+        ) {
+            return Err(CatalogError::Conflict {
+                kind: "publisher",
+                key: request.publisher_id.to_string(),
+            });
+        }
+        let now = Utc::now();
+        let decision = PublicationLifecycleDecisionRecord {
+            id: request.id,
+            action: PublicationLifecycleAction::SuspendPublisher,
+            actor_account_id: request.actor_account_id,
+            publisher_id: Some(request.publisher_id),
+            submission_id: None,
+            pack_name: None,
+            version: None,
+            from_state: lifecycle_publisher_state(publisher.moderation_status),
+            to_state: "suspended".to_string(),
+            reason_code: request.reason_code,
+            request_id: request.request_id,
+            created_at: now,
+        };
+        let stored = state
+            .publishers
+            .get_mut(&request.publisher_id)
+            .expect("validated suspension publisher must remain present");
+        stored.moderation_status = PublisherModerationStatus::Suspended;
+        stored.updated_at = now;
+        state
+            .publication_lifecycle_decisions
+            .insert(decision.id, decision.clone());
+        Ok(decision)
+    }
+
+    /// Tombstone one active release under active administrator authority.
+    async fn tombstone_publication_release(
+        &self,
+        request: PublicationTombstoneRequest,
+    ) -> Result<PublicationLifecycleDecisionRecord, CatalogError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        if let Some(existing) = state
+            .publication_lifecycle_decisions
+            .values()
+            .find(|record| {
+                record.id == request.id
+                    || (record.action == PublicationLifecycleAction::TombstoneRelease
+                        && record.pack_name.as_deref() == Some(&request.pack_name)
+                        && record.version.as_deref() == Some(&request.version))
+                    || record.request_id == request.request_id
+            })
+        {
+            let reason_code = lifecycle_tombstone_reason(&request.reason);
+            let exact = existing.id == request.id
+                && existing.action == PublicationLifecycleAction::TombstoneRelease
+                && existing.actor_account_id == request.actor_account_id
+                && existing.pack_name.as_deref() == Some(&request.pack_name)
+                && existing.version.as_deref() == Some(&request.version)
+                && existing.reason_code == reason_code
+                && existing.request_id == request.request_id;
+            return if exact {
+                Ok(existing.clone())
+            } else {
+                Err(CatalogError::Conflict {
+                    kind: "publication_lifecycle_decision",
+                    key: request.id.to_string(),
+                })
+            };
+        }
+        if !mock_active_administrator(&state, request.actor_account_id) {
+            return Err(CatalogError::Unauthorized {
+                kind: "publication_tombstone",
+                key: request.id.to_string(),
+            });
+        }
+        let key = (request.pack_name.clone(), request.version.clone());
+        let version = state
+            .versions
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| CatalogError::NotFound {
+                kind: "pack_version",
+                key: format!("{}@{}", request.pack_name, request.version),
+            })?;
+        if !matches!(version.status, PackStatus::Active) {
+            return Err(CatalogError::Conflict {
+                kind: "pack_version",
+                key: format!("{}@{}", request.pack_name, request.version),
+            });
+        }
+        let now = Utc::now();
+        let reason_code = lifecycle_tombstone_reason(&request.reason);
+        let decision = PublicationLifecycleDecisionRecord {
+            id: request.id,
+            action: PublicationLifecycleAction::TombstoneRelease,
+            actor_account_id: request.actor_account_id,
+            publisher_id: state
+                .packs
+                .get(&request.pack_name)
+                .and_then(|pack| pack.publisher_id),
+            submission_id: None,
+            pack_name: Some(request.pack_name.clone()),
+            version: Some(request.version.clone()),
+            from_state: "active".to_string(),
+            to_state: "tombstone".to_string(),
+            reason_code,
+            request_id: request.request_id,
+            created_at: now,
+        };
+        state
+            .versions
+            .get_mut(&key)
+            .expect("validated tombstone version must remain present")
+            .status = PackStatus::Tombstone {
+            reason: request.reason,
+            recorded_at: now,
+        };
+        let newest_active = state
+            .versions
+            .iter()
+            .filter(|((pack_name, _), version)| {
+                pack_name == &request.pack_name && matches!(version.status, PackStatus::Active)
+            })
+            .map(|((_, version), _)| version.clone())
+            .fold(None::<String>, |best, candidate| match best {
+                None => Some(candidate),
+                Some(current) if semver_gt(&candidate, &current) => Some(candidate),
+                Some(current) => Some(current),
+            });
+        if let Some(pack) = state.packs.get_mut(&request.pack_name) {
+            pack.latest_version = newest_active;
+        }
+        state
+            .publication_lifecycle_decisions
+            .insert(decision.id, decision.clone());
+        Ok(decision)
+    }
+
+    /// List publisher lifecycle evidence for an active owner or administrator.
+    async fn list_publisher_lifecycle_decisions(
+        &self,
+        actor_account_id: uuid::Uuid,
+        publisher_id: uuid::Uuid,
+        before: Option<PublicationLifecycleCursor>,
+        limit: u32,
+    ) -> Result<Vec<PublicationLifecycleDecisionRecord>, CatalogError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        let owner = state.publisher_memberships.values().any(|membership| {
+            membership.account_id == actor_account_id
+                && membership.publisher_id == publisher_id
+                && membership.role == PublisherRole::Owner
+                && membership.state == MembershipState::Active
+        });
+        if !mock_active_account(&state, actor_account_id)
+            || (!owner && !mock_active_administrator(&state, actor_account_id))
+        {
+            return Err(CatalogError::Unauthorized {
+                kind: "publication_lifecycle_audit",
+                key: format!("{actor_account_id}:{publisher_id}"),
+            });
+        }
+        Ok(mock_lifecycle_page(
+            state
+                .publication_lifecycle_decisions
+                .values()
+                .filter(|record| record.publisher_id == Some(publisher_id))
+                .cloned()
+                .collect(),
+            before,
+            limit,
+        ))
+    }
+
+    /// List global lifecycle evidence for an active administrator.
+    async fn list_administrator_lifecycle_decisions(
+        &self,
+        actor_account_id: uuid::Uuid,
+        before: Option<PublicationLifecycleCursor>,
+        limit: u32,
+    ) -> Result<Vec<PublicationLifecycleDecisionRecord>, CatalogError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        if !mock_active_administrator(&state, actor_account_id) {
+            return Err(CatalogError::Unauthorized {
+                kind: "publication_lifecycle_audit",
+                key: actor_account_id.to_string(),
+            });
+        }
+        Ok(mock_lifecycle_page(
+            state
+                .publication_lifecycle_decisions
+                .values()
+                .cloned()
+                .collect(),
+            before,
+            limit,
+        ))
+    }
+}
+
+/// Return whether one mock account is active.
+fn mock_active_account(state: &MockState, account_id: uuid::Uuid) -> bool {
+    state
+        .accounts
+        .get(&account_id)
+        .is_some_and(|account| account.status == AccountStatus::Active)
+}
+
+/// Return whether one mock account holds an active administrator role.
+fn mock_active_administrator(state: &MockState, account_id: uuid::Uuid) -> bool {
+    mock_active_account(state, account_id)
+        && state.platform_roles.iter().any(|role| {
+            role.account_id == account_id
+                && role.role == PlatformRole::Administrator
+                && role.state == PlatformRoleState::Active
+        })
+}
+
+/// Encode one submission state as its stable database-style value.
+fn lifecycle_submission_state(state: PublicationSubmissionState) -> String {
+    match state {
+        PublicationSubmissionState::Quarantined => "quarantined",
+        PublicationSubmissionState::NeedsReview => "needs_review",
+        PublicationSubmissionState::Approved => "approved",
+        PublicationSubmissionState::Rejected => "rejected",
+        PublicationSubmissionState::Promoted => "promoted",
+        PublicationSubmissionState::Withdrawn => "withdrawn",
+        _ => "unknown",
+    }
+    .to_string()
+}
+
+/// Encode one publisher moderation state as its stable database-style value.
+fn lifecycle_publisher_state(state: PublisherModerationStatus) -> String {
+    match state {
+        PublisherModerationStatus::Pending => "pending",
+        PublisherModerationStatus::Approved => "approved",
+        PublisherModerationStatus::Suspended => "suspended",
+        PublisherModerationStatus::Rejected => "rejected",
+    }
+    .to_string()
+}
+
+/// Encode one tombstone reason as its stable public value.
+fn lifecycle_tombstone_reason(reason: &frameshift_catalog::TombstoneReason) -> String {
+    match reason {
+        frameshift_catalog::TombstoneReason::AuthorRequest => "author-request",
+        frameshift_catalog::TombstoneReason::TosViolation => "tos-violation",
+        frameshift_catalog::TombstoneReason::Dmca => "dmca",
+    }
+    .to_string()
+}
+
+/// Sort, keyset-filter, and bound one mock lifecycle audit page.
+fn mock_lifecycle_page(
+    mut records: Vec<PublicationLifecycleDecisionRecord>,
+    before: Option<PublicationLifecycleCursor>,
+    limit: u32,
+) -> Vec<PublicationLifecycleDecisionRecord> {
+    records.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| right.id.cmp(&left.id))
+    });
+    records
+        .into_iter()
+        .filter(|record| {
+            before.is_none_or(|cursor| {
+                record.created_at < cursor.created_at
+                    || (record.created_at == cursor.created_at && record.id < cursor.id)
+            })
+        })
+        .take(limit.min(100) as usize)
+        .collect()
 }
 
 /// Helper: build a minimal [`AuthorRecord`] for test setup.

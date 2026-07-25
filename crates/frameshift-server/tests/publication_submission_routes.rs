@@ -237,6 +237,9 @@ fn route_fixture() -> RouteFixture {
         let mut state = catalog.state.write().unwrap();
         seed_account(&mut state, owner_account_id, "owner-subject");
         seed_account(&mut state, foreign_account_id, "foreign-subject");
+        state
+            .publisher_handles
+            .insert("submission-publisher".to_string(), publisher_id);
         state.publishers.insert(
             publisher_id,
             PublisherProfileRecord {
@@ -942,4 +945,115 @@ async fn submission_get_is_account_scoped() {
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     assert_eq!(response_json(foreign).await, response_json(missing).await);
     assert_ne!(fixture.owner_account_id, fixture.foreign_account_id);
+}
+
+/// Owner withdrawal is account-bound, header-bound, atomic, and exactly retryable.
+#[tokio::test]
+async fn submission_withdrawal_enforces_owner_and_idempotency() {
+    let fixture = route_fixture();
+    let submission_id = Uuid::new_v4();
+    let created = send_submission(
+        &fixture,
+        Some("owner-token"),
+        &fixture.signing_key,
+        submission_id,
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::OK);
+    let lifecycle_router = app(test_state(&fixture.catalog, &fixture.public_objects));
+    let decision_id = Uuid::new_v4();
+    let request_id = Uuid::new_v4();
+    let path = format!("/v1/publication-submissions/{submission_id}/withdraw");
+    let body = serde_json::json!({
+        "id": decision_id,
+        "reason_code": "owner.cancelled"
+    })
+    .to_string();
+
+    let foreign = lifecycle_router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(&path)
+                .header("authorization", "Bearer foreign-token")
+                .header("content-type", "application/json")
+                .header("x-request-id", Uuid::new_v4().to_string())
+                .body(Body::from(body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(foreign.status(), StatusCode::FORBIDDEN);
+
+    let owner = lifecycle_router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(&path)
+                .header("authorization", "Bearer owner-token")
+                .header("content-type", "application/json")
+                .header("x-request-id", request_id.to_string())
+                .body(Body::from(body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(owner.status(), StatusCode::OK);
+    assert_eq!(response_json(owner).await["action"], "withdraw_submission");
+    assert_eq!(
+        fixture
+            .catalog
+            .state
+            .read()
+            .unwrap()
+            .publication_submissions
+            .get(&submission_id)
+            .unwrap()
+            .state,
+        PublicationSubmissionState::Withdrawn
+    );
+
+    let retry = lifecycle_router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(path)
+                .header("authorization", "Bearer owner-token")
+                .header("content-type", "application/json")
+                .header("x-request-id", request_id.to_string())
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retry.status(), StatusCode::OK);
+    assert_eq!(
+        fixture
+            .catalog
+            .state
+            .read()
+            .unwrap()
+            .publication_lifecycle_decisions
+            .len(),
+        1
+    );
+    let audit = fixture
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/publishers/submission-publisher/publication-decisions?limit=50")
+                .header("authorization", "Bearer owner-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(audit.status(), StatusCode::OK);
+    let audit_json = response_json(audit).await;
+    assert_eq!(audit_json.as_array().unwrap().len(), 1);
+    assert_eq!(audit_json[0]["id"], decision_id.to_string());
 }

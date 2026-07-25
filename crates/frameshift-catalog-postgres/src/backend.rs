@@ -17,7 +17,7 @@
 //! Pool checkout failures are mapped by [`crate::errors::map_pool_error`].
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 use diesel_migrations::{embed_migrations, EmbeddedMigrations, MigrationHarness as _};
@@ -27,11 +27,13 @@ use frameshift_catalog::{
     AccountRecord, AuthorRecord, CatalogBackend, CatalogError, Ed25519PublicKey, HealthStatus,
     MembershipState, PackRecord, PackSearchFilters, PackSearchResult, PackStatus,
     PackVersionRecord, PlatformRoleRecord, PublicationIntentClaim, PublicationIntentRecord,
+    PublicationLifecycleAction, PublicationLifecycleCursor, PublicationLifecycleDecisionRecord,
     PublicationModerationAction, PublicationModerationDecisionRecord,
     PublicationModerationDecisionRequest, PublicationPromotionRecord, PublicationPromotionRequest,
     PublicationSubmissionRecord, PublicationSubmissionRequest, PublicationSubmissionState,
-    PublishQuota, PublisherAuditEventRecord, PublisherKeyRecord, PublisherMembershipRecord,
-    PublisherProfileRecord, SortMode, TombstoneRecord,
+    PublicationTombstoneRequest, PublicationWithdrawalRequest, PublishQuota,
+    PublisherAuditEventRecord, PublisherKeyRecord, PublisherMembershipRecord,
+    PublisherProfileRecord, PublisherSuspensionRequest, SortMode, TombstoneRecord,
 };
 use frameshift_publication::{inventory_hash, FindingSeverity, REPORT_SCHEMA_VERSION};
 
@@ -40,18 +42,19 @@ use crate::errors::{map_diesel_error, map_migration_error, map_pool_error};
 use crate::models::{
     encode_text_enum, vec_to_pubkey, AccountRow, AuthorRow, HandleRow, NewAccountRow, NewAuthorRow,
     NewHandleRow, NewPackDownloadRow, NewPackRow, NewPackVersionRow, NewPublicationIntentRow,
-    NewPublicationModerationDecisionRow, NewPublicationPromotionRow, NewPublicationSubmissionRow,
-    NewPublisherAuditEventRow, NewPublisherKeyRow, NewPublisherMembershipRow,
-    NewPublisherProfileRow, PackRow, PackVersionRow, PlatformRoleRow, PublicationIntentRow,
+    NewPublicationLifecycleDecisionRow, NewPublicationModerationDecisionRow,
+    NewPublicationPromotionRow, NewPublicationSubmissionRow, NewPublisherAuditEventRow,
+    NewPublisherKeyRow, NewPublisherMembershipRow, NewPublisherProfileRow, PackRow, PackVersionRow,
+    PlatformRoleRow, PublicationIntentRow, PublicationLifecycleDecisionRow,
     PublicationModerationDecisionRow, PublicationPromotionRow, PublicationSubmissionRow,
     PublisherKeyRow, PublisherMembershipRow, PublisherProfileRow,
 };
 use crate::pool::{build_pool, PgPool};
 use crate::schema::{
     account_platform_roles, accounts, authors, handles, pack_downloads, pack_versions, packs,
-    publication_intents, publication_moderation_decisions, publication_promotions,
-    publication_submissions, publisher_audit_events, publisher_keys, publisher_memberships,
-    publisher_profiles, signed_request_nonces,
+    publication_intents, publication_lifecycle_decisions, publication_moderation_decisions,
+    publication_promotions, publication_submissions, publisher_audit_events, publisher_keys,
+    publisher_memberships, publisher_profiles, signed_request_nonces,
 };
 
 /// Embedded migration files compiled into the binary at build time.
@@ -353,6 +356,91 @@ fn validate_publication_moderation_request(
         ));
     }
     Ok(())
+}
+
+/// Validate a stable bounded lifecycle reason code.
+fn validate_publication_lifecycle_reason(reason_code: &str) -> Result<(), CatalogError> {
+    let reason = reason_code.as_bytes();
+    let valid_head = !reason.is_empty()
+        && reason.len() <= 64
+        && reason
+            .first()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit());
+    let valid_tail = reason.iter().skip(1).all(|byte| {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'.' | b'-')
+    });
+    if !valid_head || !valid_tail {
+        return Err(CatalogError::InvalidArgument(
+            "publication lifecycle reason_code must use 1-64 lowercase ASCII letters, digits, '.', '_', or '-'"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Return an idempotency conflict for a lifecycle request.
+fn publication_lifecycle_conflict(id: uuid::Uuid) -> CatalogTransactionError {
+    CatalogTransactionError::Catalog(CatalogError::Conflict {
+        kind: "publication_lifecycle_decision",
+        key: id.to_string(),
+    })
+}
+
+/// Exact immutable fields supplied by one lifecycle request.
+struct ExpectedPublicationLifecycleDecision<'a> {
+    /// Stable decision identifier.
+    id: uuid::Uuid,
+    /// Lifecycle action being retried.
+    action: PublicationLifecycleAction,
+    /// Account that originally exercised authority.
+    actor_account_id: uuid::Uuid,
+    /// Optional affected publisher.
+    publisher_id: Option<uuid::Uuid>,
+    /// Optional affected submission.
+    submission_id: Option<uuid::Uuid>,
+    /// Optional affected pack.
+    pack_name: Option<&'a str>,
+    /// Optional affected pack version.
+    version: Option<&'a str>,
+    /// Stable reason code.
+    reason_code: &'a str,
+    /// Stable request correlation identifier.
+    request_id: uuid::Uuid,
+}
+
+/// Resolve one completed lifecycle retry or reject identifier substitution.
+fn resolve_publication_lifecycle_retry(
+    row: PublicationLifecycleDecisionRow,
+    expected: ExpectedPublicationLifecycleDecision<'_>,
+) -> Result<PublicationLifecycleDecisionRow, CatalogTransactionError> {
+    let record = row
+        .clone()
+        .into_record()
+        .map_err(CatalogTransactionError::Catalog)?;
+    let matches = record.id == expected.id
+        && record.action == expected.action
+        && record.actor_account_id == expected.actor_account_id
+        && record.publisher_id == expected.publisher_id
+        && record.submission_id == expected.submission_id
+        && record.pack_name.as_deref() == expected.pack_name
+        && record.version.as_deref() == expected.version
+        && record.reason_code == expected.reason_code
+        && record.request_id == expected.request_id;
+    if matches {
+        Ok(row)
+    } else {
+        Err(publication_lifecycle_conflict(expected.id))
+    }
+}
+
+/// Validate a bounded lifecycle audit page size.
+fn publication_lifecycle_limit(limit: u32) -> Result<i64, CatalogError> {
+    if !(1..=100).contains(&limit) {
+        return Err(CatalogError::InvalidArgument(
+            "publication lifecycle audit limit must be between 1 and 100".to_string(),
+        ));
+    }
+    Ok(i64::from(limit))
 }
 
 /// Return the non-public submission state produced by one moderation action.
@@ -2105,6 +2193,645 @@ impl CatalogBackend for PostgresCatalog {
                 error,
                 "publication_promotion",
                 format!("{promotion_id}:{submission_id}:{pack_name}@{version}"),
+            )),
+        }
+    }
+
+    /// Atomically withdraw one eligible non-public publication submission.
+    async fn withdraw_publication_submission(
+        &self,
+        request: PublicationWithdrawalRequest,
+    ) -> Result<PublicationLifecycleDecisionRecord, CatalogError> {
+        validate_publication_lifecycle_reason(&request.reason_code)?;
+        let decision_id = request.id;
+        let submission_id = request.submission_id;
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        use diesel_async::AsyncConnection as _;
+        let result = conn
+            .transaction::<PublicationLifecycleDecisionRow, CatalogTransactionError, _>(
+                async move |conn| {
+                    let submission = publication_submissions::table
+                        .find(request.submission_id)
+                        .for_update()
+                        .select(PublicationSubmissionRow::as_select())
+                        .first(conn)
+                        .await
+                        .optional()?
+                        .ok_or_else(|| {
+                            CatalogTransactionError::Catalog(CatalogError::NotFound {
+                                kind: "publication_submission",
+                                key: request.submission_id.to_string(),
+                            })
+                        })?;
+                    let submission_record = submission
+                        .clone()
+                        .into_record()
+                        .map_err(CatalogTransactionError::Catalog)?;
+                    let existing = publication_lifecycle_decisions::table
+                        .filter(publication_lifecycle_decisions::action.eq("withdraw_submission"))
+                        .filter(
+                            publication_lifecycle_decisions::submission_id
+                                .eq(request.submission_id),
+                        )
+                        .or_filter(publication_lifecycle_decisions::id.eq(request.id))
+                        .or_filter(
+                            publication_lifecycle_decisions::request_id.eq(request.request_id),
+                        )
+                        .select(PublicationLifecycleDecisionRow::as_select())
+                        .first(conn)
+                        .await
+                        .optional()?;
+                    if let Some(existing) = existing {
+                        return resolve_publication_lifecycle_retry(
+                            existing,
+                            ExpectedPublicationLifecycleDecision {
+                                id: request.id,
+                                action: PublicationLifecycleAction::WithdrawSubmission,
+                                actor_account_id: request.actor_account_id,
+                                publisher_id: Some(submission_record.publisher_id),
+                                submission_id: Some(request.submission_id),
+                                pack_name: None,
+                                version: None,
+                                reason_code: &request.reason_code,
+                                request_id: request.request_id,
+                            },
+                        );
+                    }
+
+                    let actor_status = accounts::table
+                        .find(request.actor_account_id)
+                        .for_update()
+                        .select(accounts::status)
+                        .first::<String>(conn)
+                        .await
+                        .optional()?;
+                    let active_owner = publisher_memberships::table
+                        .filter(publisher_memberships::account_id.eq(request.actor_account_id))
+                        .filter(
+                            publisher_memberships::publisher_id.eq(submission_record.publisher_id),
+                        )
+                        .filter(publisher_memberships::role.eq("owner"))
+                        .filter(publisher_memberships::state.eq("active"))
+                        .for_update()
+                        .select(PublisherMembershipRow::as_select())
+                        .first(conn)
+                        .await
+                        .optional()?;
+                    if actor_status.as_deref() != Some("active") || active_owner.is_none() {
+                        return Err(CatalogTransactionError::Catalog(
+                            CatalogError::Unauthorized {
+                                kind: "publication_withdrawal",
+                                key: request.id.to_string(),
+                            },
+                        ));
+                    }
+                    if !matches!(
+                        submission_record.state,
+                        PublicationSubmissionState::Quarantined
+                            | PublicationSubmissionState::NeedsReview
+                            | PublicationSubmissionState::Approved
+                    ) {
+                        return Err(CatalogTransactionError::Catalog(CatalogError::Conflict {
+                            kind: "publication_submission",
+                            key: request.submission_id.to_string(),
+                        }));
+                    }
+
+                    let from_state = encode_text_enum(submission_record.state)
+                        .map_err(CatalogTransactionError::Catalog)?;
+                    let created_at = diesel::select(diesel::dsl::sql::<
+                        diesel::sql_types::Timestamptz,
+                    >("CURRENT_TIMESTAMP"))
+                    .get_result::<DateTime<Utc>>(conn)
+                    .await?;
+                    let decision = diesel::insert_into(publication_lifecycle_decisions::table)
+                        .values(NewPublicationLifecycleDecisionRow {
+                            id: request.id,
+                            action: "withdraw_submission".to_string(),
+                            actor_account_id: request.actor_account_id,
+                            publisher_id: Some(submission_record.publisher_id),
+                            submission_id: Some(request.submission_id),
+                            pack_name: None,
+                            version: None,
+                            from_state,
+                            to_state: "withdrawn".to_string(),
+                            reason_code: request.reason_code,
+                            request_id: request.request_id,
+                            created_at,
+                        })
+                        .returning(PublicationLifecycleDecisionRow::as_returning())
+                        .get_result(conn)
+                        .await?;
+                    let changed = diesel::update(
+                        publication_submissions::table
+                            .find(request.submission_id)
+                            .filter(publication_submissions::state.ne_all([
+                                "rejected",
+                                "promoted",
+                                "withdrawn",
+                            ])),
+                    )
+                    .set((
+                        publication_submissions::state.eq("withdrawn"),
+                        publication_submissions::updated_at.eq(created_at),
+                    ))
+                    .execute(conn)
+                    .await?;
+                    if changed != 1 {
+                        return Err(CatalogTransactionError::Catalog(CatalogError::Conflict {
+                            kind: "publication_submission",
+                            key: request.submission_id.to_string(),
+                        }));
+                    }
+                    Ok(decision)
+                },
+            )
+            .await;
+        match result {
+            Ok(row) => row.into_record(),
+            Err(CatalogTransactionError::Catalog(error)) => Err(error),
+            Err(CatalogTransactionError::Diesel(error)) => Err(map_diesel_error(
+                error,
+                "publication_withdrawal",
+                format!("{decision_id}:{submission_id}"),
+            )),
+        }
+    }
+
+    /// Atomically suspend one publisher under active administrator authority.
+    async fn suspend_publisher(
+        &self,
+        request: PublisherSuspensionRequest,
+    ) -> Result<PublicationLifecycleDecisionRecord, CatalogError> {
+        validate_publication_lifecycle_reason(&request.reason_code)?;
+        let decision_id = request.id;
+        let publisher_id = request.publisher_id;
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        use diesel_async::AsyncConnection as _;
+        let result = conn
+            .transaction::<PublicationLifecycleDecisionRow, CatalogTransactionError, _>(
+                async move |conn| {
+                    let from_state = publisher_profiles::table
+                        .find(request.publisher_id)
+                        .for_update()
+                        .select(publisher_profiles::moderation_status)
+                        .first::<String>(conn)
+                        .await
+                        .optional()?
+                        .ok_or_else(|| {
+                            CatalogTransactionError::Catalog(CatalogError::NotFound {
+                                kind: "publisher",
+                                key: request.publisher_id.to_string(),
+                            })
+                        })?;
+                    let existing = publication_lifecycle_decisions::table
+                        .filter(publication_lifecycle_decisions::action.eq("suspend_publisher"))
+                        .filter(
+                            publication_lifecycle_decisions::publisher_id.eq(request.publisher_id),
+                        )
+                        .or_filter(publication_lifecycle_decisions::id.eq(request.id))
+                        .or_filter(
+                            publication_lifecycle_decisions::request_id.eq(request.request_id),
+                        )
+                        .select(PublicationLifecycleDecisionRow::as_select())
+                        .first(conn)
+                        .await
+                        .optional()?;
+                    if let Some(existing) = existing {
+                        return resolve_publication_lifecycle_retry(
+                            existing,
+                            ExpectedPublicationLifecycleDecision {
+                                id: request.id,
+                                action: PublicationLifecycleAction::SuspendPublisher,
+                                actor_account_id: request.actor_account_id,
+                                publisher_id: Some(request.publisher_id),
+                                submission_id: None,
+                                pack_name: None,
+                                version: None,
+                                reason_code: &request.reason_code,
+                                request_id: request.request_id,
+                            },
+                        );
+                    }
+
+                    let actor_status = accounts::table
+                        .find(request.actor_account_id)
+                        .for_update()
+                        .select(accounts::status)
+                        .first::<String>(conn)
+                        .await
+                        .optional()?;
+                    let active_admin = account_platform_roles::table
+                        .filter(account_platform_roles::account_id.eq(request.actor_account_id))
+                        .filter(account_platform_roles::role.eq("administrator"))
+                        .filter(account_platform_roles::state.eq("active"))
+                        .for_update()
+                        .select(PlatformRoleRow::as_select())
+                        .first(conn)
+                        .await
+                        .optional()?;
+                    if actor_status.as_deref() != Some("active") || active_admin.is_none() {
+                        return Err(CatalogTransactionError::Catalog(
+                            CatalogError::Unauthorized {
+                                kind: "publisher_suspension",
+                                key: request.id.to_string(),
+                            },
+                        ));
+                    }
+                    if !matches!(from_state.as_str(), "pending" | "approved") {
+                        return Err(CatalogTransactionError::Catalog(CatalogError::Conflict {
+                            kind: "publisher",
+                            key: request.publisher_id.to_string(),
+                        }));
+                    }
+                    let created_at = diesel::select(diesel::dsl::sql::<
+                        diesel::sql_types::Timestamptz,
+                    >("CURRENT_TIMESTAMP"))
+                    .get_result::<DateTime<Utc>>(conn)
+                    .await?;
+                    let decision = diesel::insert_into(publication_lifecycle_decisions::table)
+                        .values(NewPublicationLifecycleDecisionRow {
+                            id: request.id,
+                            action: "suspend_publisher".to_string(),
+                            actor_account_id: request.actor_account_id,
+                            publisher_id: Some(request.publisher_id),
+                            submission_id: None,
+                            pack_name: None,
+                            version: None,
+                            from_state,
+                            to_state: "suspended".to_string(),
+                            reason_code: request.reason_code,
+                            request_id: request.request_id,
+                            created_at,
+                        })
+                        .returning(PublicationLifecycleDecisionRow::as_returning())
+                        .get_result(conn)
+                        .await?;
+                    let changed = diesel::update(
+                        publisher_profiles::table
+                            .find(request.publisher_id)
+                            .filter(publisher_profiles::moderation_status.ne("suspended")),
+                    )
+                    .set((
+                        publisher_profiles::moderation_status.eq("suspended"),
+                        publisher_profiles::updated_at.eq(created_at),
+                    ))
+                    .execute(conn)
+                    .await?;
+                    if changed != 1 {
+                        return Err(CatalogTransactionError::Catalog(CatalogError::Conflict {
+                            kind: "publisher",
+                            key: request.publisher_id.to_string(),
+                        }));
+                    }
+                    Ok(decision)
+                },
+            )
+            .await;
+        match result {
+            Ok(row) => row.into_record(),
+            Err(CatalogTransactionError::Catalog(error)) => Err(error),
+            Err(CatalogTransactionError::Diesel(error)) => Err(map_diesel_error(
+                error,
+                "publisher_suspension",
+                format!("{decision_id}:{publisher_id}"),
+            )),
+        }
+    }
+
+    /// Atomically tombstone one active release under administrator authority.
+    async fn tombstone_publication_release(
+        &self,
+        request: PublicationTombstoneRequest,
+    ) -> Result<PublicationLifecycleDecisionRecord, CatalogError> {
+        let reason_code = encode_text_enum(request.reason.clone())?;
+        validate_publication_lifecycle_reason(&reason_code)?;
+        let decision_id = request.id;
+        let release_key = format!("{}@{}", request.pack_name, request.version);
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        use diesel_async::AsyncConnection as _;
+        let result = conn
+            .transaction::<PublicationLifecycleDecisionRow, CatalogTransactionError, _>(
+                async move |conn| {
+                    let status_json = pack_versions::table
+                        .find((&request.pack_name, &request.version))
+                        .for_update()
+                        .select(pack_versions::status)
+                        .first::<serde_json::Value>(conn)
+                        .await
+                        .optional()?
+                        .ok_or_else(|| {
+                            CatalogTransactionError::Catalog(CatalogError::NotFound {
+                                kind: "pack_version",
+                                key: format!("{}@{}", request.pack_name, request.version),
+                            })
+                        })?;
+                    let publisher_id = packs::table
+                        .find(&request.pack_name)
+                        .for_update()
+                        .select(packs::publisher_id)
+                        .first::<Option<uuid::Uuid>>(conn)
+                        .await
+                        .optional()?
+                        .flatten();
+                    let existing = publication_lifecycle_decisions::table
+                        .filter(publication_lifecycle_decisions::action.eq("tombstone_release"))
+                        .filter(publication_lifecycle_decisions::pack_name.eq(&request.pack_name))
+                        .filter(publication_lifecycle_decisions::version.eq(&request.version))
+                        .or_filter(publication_lifecycle_decisions::id.eq(request.id))
+                        .or_filter(
+                            publication_lifecycle_decisions::request_id.eq(request.request_id),
+                        )
+                        .select(PublicationLifecycleDecisionRow::as_select())
+                        .first(conn)
+                        .await
+                        .optional()?;
+                    if let Some(existing) = existing {
+                        return resolve_publication_lifecycle_retry(
+                            existing,
+                            ExpectedPublicationLifecycleDecision {
+                                id: request.id,
+                                action: PublicationLifecycleAction::TombstoneRelease,
+                                actor_account_id: request.actor_account_id,
+                                publisher_id,
+                                submission_id: None,
+                                pack_name: Some(&request.pack_name),
+                                version: Some(&request.version),
+                                reason_code: &reason_code,
+                                request_id: request.request_id,
+                            },
+                        );
+                    }
+
+                    let actor_status = accounts::table
+                        .find(request.actor_account_id)
+                        .for_update()
+                        .select(accounts::status)
+                        .first::<String>(conn)
+                        .await
+                        .optional()?;
+                    let active_admin = account_platform_roles::table
+                        .filter(account_platform_roles::account_id.eq(request.actor_account_id))
+                        .filter(account_platform_roles::role.eq("administrator"))
+                        .filter(account_platform_roles::state.eq("active"))
+                        .for_update()
+                        .select(PlatformRoleRow::as_select())
+                        .first(conn)
+                        .await
+                        .optional()?;
+                    if actor_status.as_deref() != Some("active") || active_admin.is_none() {
+                        return Err(CatalogTransactionError::Catalog(
+                            CatalogError::Unauthorized {
+                                kind: "publication_tombstone",
+                                key: request.id.to_string(),
+                            },
+                        ));
+                    }
+                    let status: PackStatus =
+                        serde_json::from_value(status_json).map_err(|error| {
+                            CatalogTransactionError::Catalog(CatalogError::BackendError(Box::new(
+                                error,
+                            )))
+                        })?;
+                    if !matches!(status, PackStatus::Active) {
+                        return Err(CatalogTransactionError::Catalog(CatalogError::Conflict {
+                            kind: "pack_version",
+                            key: format!("{}@{}", request.pack_name, request.version),
+                        }));
+                    }
+
+                    let created_at = diesel::select(diesel::dsl::sql::<
+                        diesel::sql_types::Timestamptz,
+                    >("CURRENT_TIMESTAMP"))
+                    .get_result::<DateTime<Utc>>(conn)
+                    .await?;
+                    let tombstone_status = serde_json::to_value(PackStatus::Tombstone {
+                        reason: request.reason,
+                        recorded_at: created_at,
+                    })
+                    .map_err(|error| {
+                        CatalogTransactionError::Catalog(CatalogError::BackendError(Box::new(
+                            error,
+                        )))
+                    })?;
+                    let decision = diesel::insert_into(publication_lifecycle_decisions::table)
+                        .values(NewPublicationLifecycleDecisionRow {
+                            id: request.id,
+                            action: "tombstone_release".to_string(),
+                            actor_account_id: request.actor_account_id,
+                            publisher_id,
+                            submission_id: None,
+                            pack_name: Some(request.pack_name.clone()),
+                            version: Some(request.version.clone()),
+                            from_state: "active".to_string(),
+                            to_state: "tombstone".to_string(),
+                            reason_code,
+                            request_id: request.request_id,
+                            created_at,
+                        })
+                        .returning(PublicationLifecycleDecisionRow::as_returning())
+                        .get_result(conn)
+                        .await?;
+                    let changed = diesel::update(
+                        pack_versions::table.find((&request.pack_name, &request.version)),
+                    )
+                    .set(pack_versions::status.eq(tombstone_status))
+                    .execute(conn)
+                    .await?;
+                    if changed != 1 {
+                        return Err(CatalogTransactionError::Catalog(CatalogError::Conflict {
+                            kind: "pack_version",
+                            key: format!("{}@{}", request.pack_name, request.version),
+                        }));
+                    }
+                    let versions = pack_versions::table
+                        .filter(pack_versions::pack_name.eq(&request.pack_name))
+                        .select((pack_versions::version, pack_versions::status))
+                        .load::<(String, serde_json::Value)>(conn)
+                        .await?;
+                    let newest_active = versions
+                        .into_iter()
+                        .filter_map(|(version, status_json)| {
+                            let status = serde_json::from_value::<PackStatus>(status_json).ok()?;
+                            matches!(status, PackStatus::Active).then_some(version)
+                        })
+                        .fold(None::<String>, |best, candidate| match best {
+                            None => Some(candidate),
+                            Some(current) if semver_gt(&candidate, &current) => Some(candidate),
+                            Some(current) => Some(current),
+                        });
+                    diesel::update(packs::table.find(&request.pack_name))
+                        .set(packs::latest_version.eq(newest_active))
+                        .execute(conn)
+                        .await?;
+                    Ok(decision)
+                },
+            )
+            .await;
+        match result {
+            Ok(row) => row.into_record(),
+            Err(CatalogTransactionError::Catalog(error)) => Err(error),
+            Err(CatalogTransactionError::Diesel(error)) => Err(map_diesel_error(
+                error,
+                "publication_tombstone",
+                format!("{decision_id}:{release_key}"),
+            )),
+        }
+    }
+
+    /// List one publisher's lifecycle evidence for an owner or administrator.
+    async fn list_publisher_lifecycle_decisions(
+        &self,
+        actor_account_id: uuid::Uuid,
+        publisher_id: uuid::Uuid,
+        before: Option<PublicationLifecycleCursor>,
+        limit: u32,
+    ) -> Result<Vec<PublicationLifecycleDecisionRecord>, CatalogError> {
+        let limit = publication_lifecycle_limit(limit)?;
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        use diesel_async::AsyncConnection as _;
+        let result = conn
+            .transaction::<Vec<PublicationLifecycleDecisionRow>, CatalogTransactionError, _>(
+                async move |conn| {
+                    let actor_status = accounts::table
+                        .find(actor_account_id)
+                        .for_update()
+                        .select(accounts::status)
+                        .first::<String>(conn)
+                        .await
+                        .optional()?;
+                    let active_admin = account_platform_roles::table
+                        .filter(account_platform_roles::account_id.eq(actor_account_id))
+                        .filter(account_platform_roles::role.eq("administrator"))
+                        .filter(account_platform_roles::state.eq("active"))
+                        .for_update()
+                        .select(PlatformRoleRow::as_select())
+                        .first(conn)
+                        .await
+                        .optional()?;
+                    let active_owner = publisher_memberships::table
+                        .filter(publisher_memberships::account_id.eq(actor_account_id))
+                        .filter(publisher_memberships::publisher_id.eq(publisher_id))
+                        .filter(publisher_memberships::role.eq("owner"))
+                        .filter(publisher_memberships::state.eq("active"))
+                        .for_update()
+                        .select(PublisherMembershipRow::as_select())
+                        .first(conn)
+                        .await
+                        .optional()?;
+                    if actor_status.as_deref() != Some("active")
+                        || (active_admin.is_none() && active_owner.is_none())
+                    {
+                        return Err(CatalogTransactionError::Catalog(
+                            CatalogError::Unauthorized {
+                                kind: "publication_lifecycle_audit",
+                                key: format!("{actor_account_id}:{publisher_id}"),
+                            },
+                        ));
+                    }
+                    let mut query = publication_lifecycle_decisions::table
+                        .filter(publication_lifecycle_decisions::publisher_id.eq(publisher_id))
+                        .into_boxed();
+                    if let Some(cursor) = before {
+                        query = query.filter(
+                            publication_lifecycle_decisions::created_at
+                                .lt(cursor.created_at)
+                                .or(publication_lifecycle_decisions::created_at
+                                    .eq(cursor.created_at)
+                                    .and(publication_lifecycle_decisions::id.lt(cursor.id))),
+                        );
+                    }
+                    query
+                        .order((
+                            publication_lifecycle_decisions::created_at.desc(),
+                            publication_lifecycle_decisions::id.desc(),
+                        ))
+                        .limit(limit)
+                        .select(PublicationLifecycleDecisionRow::as_select())
+                        .load(conn)
+                        .await
+                        .map_err(CatalogTransactionError::Diesel)
+                },
+            )
+            .await;
+        match result {
+            Ok(rows) => rows.into_iter().map(|row| row.into_record()).collect(),
+            Err(CatalogTransactionError::Catalog(error)) => Err(error),
+            Err(CatalogTransactionError::Diesel(error)) => Err(map_diesel_error(
+                error,
+                "publication_lifecycle_audit",
+                publisher_id.to_string(),
+            )),
+        }
+    }
+
+    /// List global lifecycle evidence for an active administrator.
+    async fn list_administrator_lifecycle_decisions(
+        &self,
+        actor_account_id: uuid::Uuid,
+        before: Option<PublicationLifecycleCursor>,
+        limit: u32,
+    ) -> Result<Vec<PublicationLifecycleDecisionRecord>, CatalogError> {
+        let limit = publication_lifecycle_limit(limit)?;
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        use diesel_async::AsyncConnection as _;
+        let result = conn
+            .transaction::<Vec<PublicationLifecycleDecisionRow>, CatalogTransactionError, _>(
+                async move |conn| {
+                    let actor_status = accounts::table
+                        .find(actor_account_id)
+                        .for_update()
+                        .select(accounts::status)
+                        .first::<String>(conn)
+                        .await
+                        .optional()?;
+                    let active_admin = account_platform_roles::table
+                        .filter(account_platform_roles::account_id.eq(actor_account_id))
+                        .filter(account_platform_roles::role.eq("administrator"))
+                        .filter(account_platform_roles::state.eq("active"))
+                        .for_update()
+                        .select(PlatformRoleRow::as_select())
+                        .first(conn)
+                        .await
+                        .optional()?;
+                    if actor_status.as_deref() != Some("active") || active_admin.is_none() {
+                        return Err(CatalogTransactionError::Catalog(
+                            CatalogError::Unauthorized {
+                                kind: "publication_lifecycle_audit",
+                                key: actor_account_id.to_string(),
+                            },
+                        ));
+                    }
+                    let mut query = publication_lifecycle_decisions::table.into_boxed();
+                    if let Some(cursor) = before {
+                        query = query.filter(
+                            publication_lifecycle_decisions::created_at
+                                .lt(cursor.created_at)
+                                .or(publication_lifecycle_decisions::created_at
+                                    .eq(cursor.created_at)
+                                    .and(publication_lifecycle_decisions::id.lt(cursor.id))),
+                        );
+                    }
+                    query
+                        .order((
+                            publication_lifecycle_decisions::created_at.desc(),
+                            publication_lifecycle_decisions::id.desc(),
+                        ))
+                        .limit(limit)
+                        .select(PublicationLifecycleDecisionRow::as_select())
+                        .load(conn)
+                        .await
+                        .map_err(CatalogTransactionError::Diesel)
+                },
+            )
+            .await;
+        match result {
+            Ok(rows) => rows.into_iter().map(|row| row.into_record()).collect(),
+            Err(CatalogTransactionError::Catalog(error)) => Err(error),
+            Err(CatalogTransactionError::Diesel(error)) => Err(map_diesel_error(
+                error,
+                "publication_lifecycle_audit",
+                actor_account_id.to_string(),
             )),
         }
     }

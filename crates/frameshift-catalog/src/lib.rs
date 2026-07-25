@@ -63,10 +63,13 @@ pub use identity::Ed25519PublicKey;
 pub use records::{
     AccountRecord, AccountStatus, AuthorRecord, MembershipState, OauthLink, PackRecord,
     PackVersionRecord, PlatformRole, PlatformRoleRecord, PlatformRoleState, PublicationIntentClaim,
-    PublicationIntentRecord, PublicationModerationAction, PublicationModerationDecisionRecord,
-    PublicationModerationDecisionRequest, PublicationPromotionRecord, PublicationPromotionRequest,
-    PublicationSubmissionRecord, PublicationSubmissionRequest, PublicationSubmissionState,
-    PublisherAuditEventRecord, PublisherKeyRecord, PublisherKeyState, PublisherMembershipRecord,
-    PublisherModerationStatus, PublisherProfileRecord, PublisherRole,
+    PublicationIntentRecord, PublicationLifecycleAction, PublicationLifecycleCursor,
+    PublicationLifecycleDecisionRecord, PublicationModerationAction,
+    PublicationModerationDecisionRecord, PublicationModerationDecisionRequest,
+    PublicationPromotionRecord, PublicationPromotionRequest, PublicationSubmissionRecord,
+    PublicationSubmissionRequest, PublicationSubmissionState, PublicationTombstoneRequest,
+    PublicationWithdrawalRequest, PublisherAuditEventRecord, PublisherKeyRecord, PublisherKeyState,
+    PublisherMembershipRecord, PublisherModerationStatus, PublisherProfileRecord, PublisherRole,
+    PublisherSuspensionRequest,
 };
 pub use status::{PackStatus, TombstoneReason, TombstoneRecord};

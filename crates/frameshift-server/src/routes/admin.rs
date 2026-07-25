@@ -1,153 +1,155 @@
-//! Administrative endpoints under `/v1/admin`.
-//!
-//! # Endpoints
-//!
-//! | Method | Path | Handler |
-//! |---|---|---|
-//! | POST | `/v1/admin/packs/{name}/{version}/tombstone` | [`tombstone_pack_route`] |
-//!
-//! # Authentication and authorization
-//!
-//! Every route in this module carries the Ed25519 signed-request layer
-//! ([`crate::middleware::auth::require_signed_request`]), wired in
-//! [`crate::router::app`] exactly like the other mutating routers. That layer
-//! proves the request was produced by the holder of *some* Ed25519 key, but it
-//! does not by itself grant admin authority --
-//! [`CatalogBackend`](frameshift_catalog::CatalogBackend) deliberately does
-//! not know about callers, so this module is the only place that enforces
-//! the admin allowlist:
-//!
-//! - `state.config.admin_pubkeys` empty -- the admin surface is administratively
-//!   disabled. Every request (even a validly signed one) gets a plain `404`, the
-//!   same status an unmapped path would produce, so the route's existence is
-//!   never disclosed while the allowlist is empty.
-//! - Allowlist non-empty but the verified signer is not a member -- `403` with a
-//!   fixed, generic body. The allowlist contents are never echoed anywhere.
-//! - Allowlist non-empty and the verified signer is a member -- the request
-//!   proceeds to the catalog call.
+//! Account-authenticated administrator publication lifecycle endpoints.
 
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::extract::{Path, Query, State};
+use axum::http::HeaderMap;
+use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
-use chrono::Utc;
-use frameshift_catalog::{TombstoneReason, TombstoneRecord};
-use serde::{Deserialize, Serialize};
+use chrono::{DateTime, Utc};
+use frameshift_catalog::{
+    PublicationLifecycleCursor, PublicationLifecycleDecisionRecord, PublicationTombstoneRequest,
+    PublisherSuspensionRequest, TombstoneReason,
+};
+use serde::Deserialize;
+use uuid::Uuid;
 
-use crate::auth::VerifiedSigner;
 use crate::error::AppError;
+use crate::middleware::account::AuthenticatedAccount;
 use crate::routes::packs::{validate_pack_name, validate_pack_version};
 use crate::state::AppState;
 
-/// Build the admin sub-router, mounted at `/v1/admin`.
-///
-/// Returned without any auth layer; [`crate::router::app`] applies the
-/// signed-request `route_layer` before nesting this router, mirroring
-/// [`crate::routes::authors::authors_write_router`].
-///
-/// Routes:
-/// - `POST /packs/{name}/{version}/tombstone` -> [`tombstone_pack_route`]
+/// Build account-authenticated administrator lifecycle routes.
 pub fn admin_router() -> Router<AppState> {
-    Router::new().route(
-        "/packs/{name}/{version}/tombstone",
-        post(tombstone_pack_route),
-    )
+    Router::new()
+        .route(
+            "/packs/{name}/{version}/tombstone",
+            post(tombstone_pack_route),
+        )
+        .route(
+            "/publishers/{publisher_id}/suspend",
+            post(suspend_publisher_route),
+        )
+        .route(
+            "/publication-decisions",
+            get(list_publication_decisions_route),
+        )
 }
 
-/// Request body for `POST /v1/admin/packs/{name}/{version}/tombstone`.
+/// Caller-controlled fields for one administrator release tombstone.
 #[derive(Debug, Deserialize)]
-pub struct TombstoneRequest {
-    /// Why this version is being taken down. Serialized/deserialized as one of
-    /// `"author-request"`, `"tos-violation"`, `"dmca"` (see
-    /// [`TombstoneReason`]).
-    pub reason: TombstoneReason,
+#[serde(deny_unknown_fields)]
+struct TombstoneRequestBody {
+    /// Stable caller-generated lifecycle decision identifier.
+    id: Uuid,
+    /// Bounded public tombstone reason.
+    reason: TombstoneReason,
 }
 
-/// Response body for a successful tombstone.
-#[derive(Debug, Serialize)]
-pub struct TombstoneResponse {
-    /// The pack name that was tombstoned.
-    pub name: String,
-    /// The version string that was tombstoned.
-    pub version: String,
-    /// Always the fixed string `"tombstoned"` on success.
-    pub status: String,
+/// Caller-controlled fields for one administrator publisher suspension.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SuspendPublisherRequestBody {
+    /// Stable caller-generated lifecycle decision identifier.
+    id: Uuid,
+    /// Stable bounded private reason code.
+    reason_code: String,
 }
 
-/// `POST /v1/admin/packs/{name}/{version}/tombstone`
-///
-/// Mark a pack version as tombstoned (removed from public availability). This
-/// is a one-way transition (`Active` -> `Tombstone`); see
-/// [`frameshift_catalog::CatalogBackend::tombstone_pack`] for the trait-level
-/// contract. Re-tombstoning an already-tombstoned version is accepted as
-/// idempotent (last-writer-wins on `reason`/`recorded_at`), matching the
-/// Postgres adapter's documented choice -- this endpoint never surfaces a
-/// `409` from the tombstone operation itself.
-///
-/// # Authorization
-///
-/// The signed-request middleware has already verified the caller controls
-/// `signer.pubkey` by the time this handler runs. This handler additionally
-/// checks that key against `state.config.admin_pubkeys` -- see the module
-/// documentation for the exact disable/forbid/allow semantics.
-///
-/// # Response
-///
-/// `200 OK` with body [`TombstoneResponse`].
-///
-/// # Errors
-///
-/// - `404 Not Found` -- the admin allowlist is empty (endpoint disabled), or
-///   the pack version does not exist.
-/// - `403 Forbidden` -- the verified signer is not on the admin allowlist.
-/// - `400 Bad Request` -- `name`/`version` fail path validation.
-/// - `500 Internal Server Error` -- catalog backend failure.
-pub async fn tombstone_pack_route(
+/// Query parameters for deterministic lifecycle audit pagination.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublicationDecisionQuery {
+    /// Timestamp component of the exclusive keyset cursor.
+    before_created_at: Option<DateTime<Utc>>,
+    /// Identifier component of the exclusive keyset cursor.
+    before_id: Option<Uuid>,
+    /// Bounded result count, defaulting to fifty.
+    limit: Option<u32>,
+}
+
+/// Tombstone one active release under atomic account administrator authority.
+async fn tombstone_pack_route(
     State(state): State<AppState>,
-    Extension(signer): Extension<VerifiedSigner>,
+    Extension(auth): Extension<AuthenticatedAccount>,
     Path((name, version)): Path<(String, String)>,
-    Json(body): Json<TombstoneRequest>,
-) -> Result<Response, AppError> {
+    headers: HeaderMap,
+    Json(body): Json<TombstoneRequestBody>,
+) -> Result<Json<PublicationLifecycleDecisionRecord>, AppError> {
     validate_pack_name(&name)?;
     validate_pack_version(&version)?;
-
-    // Disabled surface: an empty allowlist must be indistinguishable from a
-    // route that does not exist, so this check comes before anything else and
-    // always returns 404, never 403.
-    if state.config.admin_pubkeys.is_empty() {
-        return Err(AppError::NotFound("not found".to_string()));
-    }
-
-    // Compare in the same base64url-no-pad string representation the config
-    // was parsed into; `VerifiedSigner::pubkey`'s `Display` impl produces the
-    // identical encoding.
-    let signer_b64 = signer.pubkey.to_string();
-    if !state.config.admin_pubkeys.iter().any(|k| k == &signer_b64) {
-        tracing::warn!(
-            signer = %signer.pubkey,
-            "tombstone attempt by a verified key that is not on the admin allowlist"
-        );
-        return Err(AppError::Forbidden(
-            "signer is not an authorized admin".to_string(),
-        ));
-    }
-
-    let record = TombstoneRecord {
-        reason: body.reason,
-        recorded_at: Utc::now(),
-    };
-
     state
         .catalog
-        .tombstone_pack(&name, &version, record)
+        .tombstone_publication_release(PublicationTombstoneRequest {
+            id: body.id,
+            pack_name: name,
+            version,
+            actor_account_id: auth.account.id,
+            reason: body.reason,
+            request_id: request_id(&headers)?,
+        })
         .await
-        .map_err(|e| AppError::from_catalog(e, "pack_version"))?;
+        .map(Json)
+        .map_err(|error| AppError::from_catalog(error, "publication tombstone"))
+}
 
-    let resp = TombstoneResponse {
-        name,
-        version,
-        status: "tombstoned".to_string(),
-    };
-    Ok((StatusCode::OK, Json(resp)).into_response())
+/// Suspend one publisher under atomic account administrator authority.
+async fn suspend_publisher_route(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthenticatedAccount>,
+    Path(publisher_id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(body): Json<SuspendPublisherRequestBody>,
+) -> Result<Json<PublicationLifecycleDecisionRecord>, AppError> {
+    state
+        .catalog
+        .suspend_publisher(PublisherSuspensionRequest {
+            id: body.id,
+            publisher_id,
+            actor_account_id: auth.account.id,
+            reason_code: body.reason_code,
+            request_id: request_id(&headers)?,
+        })
+        .await
+        .map(Json)
+        .map_err(|error| AppError::from_catalog(error, "publisher suspension"))
+}
+
+/// List global immutable lifecycle evidence for an active administrator.
+async fn list_publication_decisions_route(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthenticatedAccount>,
+    Query(query): Query<PublicationDecisionQuery>,
+) -> Result<Json<Vec<PublicationLifecycleDecisionRecord>>, AppError> {
+    state
+        .catalog
+        .list_administrator_lifecycle_decisions(
+            auth.account.id,
+            lifecycle_cursor(query.before_created_at, query.before_id)?,
+            query.limit.unwrap_or(50),
+        )
+        .await
+        .map(Json)
+        .map_err(|error| AppError::from_catalog(error, "publication lifecycle audit"))
+}
+
+/// Require both components of a keyset cursor or neither component.
+fn lifecycle_cursor(
+    created_at: Option<DateTime<Utc>>,
+    id: Option<Uuid>,
+) -> Result<Option<PublicationLifecycleCursor>, AppError> {
+    match (created_at, id) {
+        (None, None) => Ok(None),
+        (Some(created_at), Some(id)) => Ok(Some(PublicationLifecycleCursor { created_at, id })),
+        _ => Err(AppError::BadRequest(
+            "before_created_at and before_id must be supplied together".to_string(),
+        )),
+    }
+}
+
+/// Parse the mandatory request correlation header as a stable UUID.
+fn request_id(headers: &HeaderMap) -> Result<Uuid, AppError> {
+    headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .ok_or_else(|| AppError::BadRequest("x-request-id must be a UUID".to_string()))
 }

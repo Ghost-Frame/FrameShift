@@ -36,13 +36,12 @@
 //! the verifier is configured; public auth metadata and publisher reads remain
 //! available without bearer credentials.
 //!
-//! The mutating endpoints -- `POST /v1/packs`, `POST /v1/authors`, and
-//! `POST /v1/admin/packs/{name}/{version}/tombstone` -- carry the Ed25519
+//! The legacy mutating endpoints `POST /v1/packs` and `POST /v1/authors` carry the Ed25519
 //! signed-request `route_layer` ([`crate::middleware::auth::require_signed_request`]).
 //! It is applied only to those method-routers, so anonymous reads on the same
 //! paths (e.g. `GET /v1/packs`) never buffer a body or require a signature.
-//! The admin router additionally enforces an allowlist on top of signature
-//! verification -- see [`crate::routes::admin`].
+//! Administrator lifecycle routes instead require an OIDC account and enforce
+//! an active administrator role atomically in the catalog.
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -102,7 +101,7 @@ use crate::state::AppState;
 ///     /moderation/publication-submissions -- role-gated review, decisions, and promotion
 ///     /telemetry -- POST /selection opt-in selection telemetry sink
 ///     /memory   -- GET /health read-only memory backend health
-///     /admin    -- POST /packs/{name}/{version}/tombstone (signed + allowlist)
+///     /admin    -- account-authenticated administrator lifecycle controls
 ///   /mcp        -- MCP placeholder (501 for all methods)
 /// ```
 ///
@@ -195,11 +194,6 @@ fn build_app(
     let author_writes = apply_ip_rate_limit(author_writes, &state, state.config.abuse_rate_per_min);
     let authors = authors_router().merge(author_writes);
 
-    // Admin: every route in this sub-router is mutating and allowlist-gated,
-    // so the whole router carries the signed-request layer (unlike `packs`
-    // and `authors`, there is no anonymous-read counterpart to merge with).
-    let admin = admin_router().route_layer(signed.clone());
-    let admin = apply_ip_rate_limit(admin, &state, state.config.abuse_rate_per_min);
     let telemetry =
         apply_ip_rate_limit(telemetry_router(), &state, state.config.abuse_rate_per_min);
 
@@ -210,13 +204,17 @@ fn build_app(
         .nest("/auth", auth_config_router())
         .nest("/publishers", publisher_read_router())
         .nest("/telemetry", telemetry)
-        .nest("/memory", memory_router())
-        .nest("/admin", admin);
+        .nest("/memory", memory_router());
 
     if state.account_auth.is_some() {
         let account_layer = axum::middleware::from_fn_with_state(state.clone(), require_account);
         let mut account_routes = account_write_router()
+            .merge(Router::new().nest("/admin", admin_router()))
             .merge(Router::new().nest("/publish-intents", publication_intent_router()))
+            .merge(Router::new().nest(
+                "/publication-submissions",
+                publication_submission_read_router(),
+            ))
             .merge(Router::new().nest(
                 "/moderation/publication-submissions",
                 moderation_router(quarantine_review, publication_promotion),
@@ -226,9 +224,8 @@ fn build_app(
                 publication_submission_write_router(admission).route_layer(signed.clone());
             let submission_writes =
                 apply_ip_rate_limit(submission_writes, &state, state.config.abuse_rate_per_min);
-            let submissions = publication_submission_read_router().merge(submission_writes);
-            account_routes =
-                account_routes.merge(Router::new().nest("/publication-submissions", submissions));
+            account_routes = account_routes
+                .merge(Router::new().nest("/publication-submissions", submission_writes));
         }
         let account_routes = account_routes.route_layer(account_layer);
         v1 = v1.merge(account_routes);

@@ -19,7 +19,8 @@ use serde_json::Value as JsonValue;
 use frameshift_catalog::{
     AccountRecord, AccountStatus, AuthorRecord, CatalogError, Ed25519PublicKey, MembershipState,
     OauthLink, ObjectHash, PackRecord, PackStatus, PackVersionRecord, PlatformRole,
-    PlatformRoleRecord, PlatformRoleState, PublicationIntentRecord, PublicationModerationAction,
+    PlatformRoleRecord, PlatformRoleState, PublicationIntentRecord, PublicationLifecycleAction,
+    PublicationLifecycleDecisionRecord, PublicationModerationAction,
     PublicationModerationDecisionRecord, PublicationPromotionRecord, PublicationSubmissionRecord,
     PublicationSubmissionState, PublisherKeyRecord, PublisherKeyState, PublisherMembershipRecord,
     PublisherModerationStatus, PublisherProfileRecord, PublisherRole,
@@ -28,9 +29,9 @@ use uuid::Uuid;
 
 use crate::schema::{
     account_platform_roles, accounts, authors, handles, pack_downloads, pack_versions, packs,
-    publication_intents, publication_moderation_decisions, publication_promotions,
-    publication_submissions, publisher_audit_events, publisher_keys, publisher_memberships,
-    publisher_profiles,
+    publication_intents, publication_lifecycle_decisions, publication_moderation_decisions,
+    publication_promotions, publication_submissions, publisher_audit_events, publisher_keys,
+    publisher_memberships, publisher_profiles,
 };
 
 /// Queryable account row mapped from the `accounts` table.
@@ -464,6 +465,67 @@ pub(crate) struct NewPublicationPromotionRow {
     pub created_at: DateTime<Utc>,
 }
 
+/// Queryable immutable publication lifecycle decision row.
+#[derive(Debug, Clone, Queryable, Selectable)]
+#[diesel(table_name = publication_lifecycle_decisions)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub(crate) struct PublicationLifecycleDecisionRow {
+    /// Stable lifecycle-decision identifier.
+    pub id: Uuid,
+    /// Stable control action string.
+    pub action: String,
+    /// Account that exercised owner or administrator authority.
+    pub actor_account_id: Uuid,
+    /// Affected publisher when linked to current ownership.
+    pub publisher_id: Option<Uuid>,
+    /// Affected non-public submission for withdrawals.
+    pub submission_id: Option<Uuid>,
+    /// Affected public pack for tombstones.
+    pub pack_name: Option<String>,
+    /// Affected public semantic version for tombstones.
+    pub version: Option<String>,
+    /// Stable state observed before the control.
+    pub from_state: String,
+    /// Stable state committed by the control.
+    pub to_state: String,
+    /// Bounded reason code or public tombstone category.
+    pub reason_code: String,
+    /// Stable request identifier used for replay detection.
+    pub request_id: Uuid,
+    /// Decision commit timestamp.
+    pub created_at: DateTime<Utc>,
+}
+
+/// Insertable immutable publication lifecycle decision row.
+#[derive(Debug, Insertable)]
+#[diesel(table_name = publication_lifecycle_decisions)]
+pub(crate) struct NewPublicationLifecycleDecisionRow {
+    /// Stable lifecycle-decision identifier.
+    pub id: Uuid,
+    /// Stable control action string.
+    pub action: String,
+    /// Account that exercised owner or administrator authority.
+    pub actor_account_id: Uuid,
+    /// Affected publisher when linked to current ownership.
+    pub publisher_id: Option<Uuid>,
+    /// Affected non-public submission for withdrawals.
+    pub submission_id: Option<Uuid>,
+    /// Affected public pack for tombstones.
+    pub pack_name: Option<String>,
+    /// Affected public semantic version for tombstones.
+    pub version: Option<String>,
+    /// Stable state observed before the control.
+    pub from_state: String,
+    /// Stable state committed by the control.
+    pub to_state: String,
+    /// Bounded reason code or public tombstone category.
+    pub reason_code: String,
+    /// Stable request identifier used for replay detection.
+    pub request_id: Uuid,
+    /// Decision commit timestamp.
+    pub created_at: DateTime<Utc>,
+}
+
 /// Row struct for the `authors` table.
 ///
 /// All BYTEA columns are `Vec<u8>`; JSON columns are `serde_json::Value`.
@@ -845,6 +907,7 @@ impl PublicationSubmissionRow {
             "approved" => PublicationSubmissionState::Approved,
             "rejected" => PublicationSubmissionState::Rejected,
             "promoted" => PublicationSubmissionState::Promoted,
+            "withdrawn" => PublicationSubmissionState::Withdrawn,
             value => {
                 return Err(CatalogError::BackendError(Box::new(std::io::Error::other(
                     format!(
@@ -889,6 +952,30 @@ impl PublicationPromotionRow {
             pack_name: self.pack_name,
             version: self.version,
             content_hash: vec_to_hash(self.content_hash)?,
+            request_id: self.request_id,
+            created_at: self.created_at,
+        })
+    }
+}
+
+/// Conversion helpers for immutable publication lifecycle rows.
+impl PublicationLifecycleDecisionRow {
+    /// Convert this database row into typed lifecycle evidence.
+    pub(crate) fn into_record(self) -> Result<PublicationLifecycleDecisionRecord, CatalogError> {
+        Ok(PublicationLifecycleDecisionRecord {
+            id: self.id,
+            action: parse_text_enum::<PublicationLifecycleAction>(
+                self.action,
+                "publication lifecycle action",
+            )?,
+            actor_account_id: self.actor_account_id,
+            publisher_id: self.publisher_id,
+            submission_id: self.submission_id,
+            pack_name: self.pack_name,
+            version: self.version,
+            from_state: self.from_state,
+            to_state: self.to_state,
+            reason_code: self.reason_code,
             request_id: self.request_id,
             created_at: self.created_at,
         })
