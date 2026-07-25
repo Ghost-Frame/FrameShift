@@ -1,3 +1,5 @@
+/// Bearer-authenticated account profile operations.
+pub mod account;
 /// Cache-backed resolver for `extends`/`mixin` persona specs at render time.
 mod compose_support;
 mod error;
@@ -14,6 +16,8 @@ mod registry;
 mod selection;
 /// Provider-neutral OIDC session establishment and lifecycle operations.
 pub mod session;
+/// Native secret storage and metadata persistence for authenticated sessions.
+pub mod session_store;
 
 pub use error::ClientError;
 /// Re-exported so callers of [`InstallReport::conformance_upgrade`] can match
@@ -37,8 +41,9 @@ pub use model::{
 pub use publish::PublishOutcome;
 pub use publisher::{EnrolledPublisherKey, EnrolledPublisherKeyState};
 pub use registry::{
-    RegistryLegacyAuthorSummary, RegistryPackSummary, RegistryPublisherKeySummary,
-    RegistryPublisherSummary, RegistrySearchQuery, RegistrySearchResult, RegistryVersionDetails,
+    registry_base_url, RegistryLegacyAuthorSummary, RegistryPackSummary,
+    RegistryPublisherKeySummary, RegistryPublisherSummary, RegistrySearchQuery,
+    RegistrySearchResult, RegistryVersionDetails,
 };
 pub use selection::{
     SelectionEvent, SelectionTelemetry, SELECTION_HISTORY_FILENAME, TELEMETRY_URL_ENV,

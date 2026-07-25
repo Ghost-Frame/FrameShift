@@ -15,6 +15,7 @@ use tracing_subscriber::EnvFilter;
 
 use frameshift_client::{Client, InstallRequest, InstallSource, PersonaSpec};
 
+use cmd::account::AccountArgs;
 use cmd::automate::AutomateArgs;
 use cmd::config::ConfigArgs;
 use cmd::diff::DiffArgs;
@@ -47,6 +48,9 @@ struct Cli {
 /// All top-level subcommands.
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Log in, inspect, or end the current FrameShift account session.
+    Account(AccountArgs),
+
     // ------------------------------------------------------------------
     // M0 subcommands -- original install/activate/sync/gc/project-id
     // ------------------------------------------------------------------
@@ -260,6 +264,8 @@ fn run() -> Result<(), RunError> {
     let cli = Cli::parse();
 
     match cli.command {
+        Command::Account(args) => cmd::account::run_account(args).map_err(RunError::from),
+
         // ------------------------------------------------------------------
         // M0 -- install
         // ------------------------------------------------------------------
