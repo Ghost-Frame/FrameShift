@@ -16,7 +16,7 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 bytes = "1"
-object_store = { version = "0.13", features = ["aws"] }
+object_store = { version = "0.14", features = ["aws"] }
 secrecy = { workspace = true }
 futures = "0.3"
 url = { workspace = true }
