@@ -50,6 +50,7 @@ use std::sync::Arc;
 use axum::http::{header, HeaderName, HeaderValue, Method};
 use axum::routing::post;
 use axum::Router;
+use frameshift_objects::PackStore;
 use tower_governor::governor::GovernorConfigBuilder;
 use tower_governor::key_extractor::{PeerIpKeyExtractor, SmartIpKeyExtractor};
 use tower_governor::GovernorLayer;
@@ -65,6 +66,7 @@ use crate::middleware::auth::require_signed_request;
 use crate::middleware::metrics::MetricsLayer;
 use crate::middleware::request_id::RequestIdGenerator;
 use crate::middleware::tracing::make_trace_layer;
+use crate::publication::PublicationAdmissionService;
 use crate::routes::accounts::{account_write_router, auth_config_router, publisher_read_router};
 use crate::routes::admin::admin_router;
 use crate::routes::authors::{authors_router, authors_write_router};
@@ -74,6 +76,9 @@ use crate::routes::memory::memory_router;
 use crate::routes::ops::ops_router;
 use crate::routes::packs::{packs_router, publish_pack};
 use crate::routes::publication_intents::publication_intent_router;
+use crate::routes::publication_submissions::{
+    publication_submission_read_router, publication_submission_write_router,
+};
 use crate::routes::telemetry::telemetry_router;
 use crate::state::AppState;
 
@@ -114,6 +119,29 @@ use crate::state::AppState;
 /// An `axum::Router` with `AppState` already wired in via `.with_state(state)`.
 /// The caller passes this directly to `axum::serve`.
 pub fn app(state: AppState) -> Router {
+    build_app(state, None)
+}
+
+/// Build the complete router with explicit publication-quarantine admission.
+///
+/// The caller must supply `quarantine` as a store isolated from the public
+/// object store. The admission service is constructed with `state.catalog`, so
+/// authorization and atomic intent consumption share one catalog authority.
+/// Keeping this separate from [`app`] prevents accidental quarantine writes
+/// into publicly downloadable storage.
+pub fn app_with_publication_admission(state: AppState, quarantine: Arc<dyn PackStore>) -> Router {
+    let admission = Arc::new(PublicationAdmissionService::new(
+        Arc::clone(&state.catalog),
+        quarantine,
+    ));
+    build_app(state, Some(admission))
+}
+
+/// Compose the complete router with optional explicit quarantine admission.
+fn build_app(
+    state: AppState,
+    publication_admission: Option<Arc<PublicationAdmissionService>>,
+) -> Router {
     let max_body = state.config.max_request_bytes;
     let cors = build_cors_layer(&state);
 
@@ -167,9 +195,18 @@ pub fn app(state: AppState) -> Router {
 
     if state.account_auth.is_some() {
         let account_layer = axum::middleware::from_fn_with_state(state.clone(), require_account);
-        let account_routes = account_write_router()
-            .merge(Router::new().nest("/publish-intents", publication_intent_router()))
-            .route_layer(account_layer);
+        let mut account_routes = account_write_router()
+            .merge(Router::new().nest("/publish-intents", publication_intent_router()));
+        if let Some(admission) = publication_admission {
+            let submission_writes =
+                publication_submission_write_router(admission).route_layer(signed.clone());
+            let submission_writes =
+                apply_ip_rate_limit(submission_writes, &state, state.config.abuse_rate_per_min);
+            let submissions = publication_submission_read_router().merge(submission_writes);
+            account_routes =
+                account_routes.merge(Router::new().nest("/publication-submissions", submissions));
+        }
+        let account_routes = account_routes.route_layer(account_layer);
         v1 = v1.merge(account_routes);
     }
 
