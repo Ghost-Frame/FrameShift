@@ -1,8 +1,8 @@
 //! Entry point for the `frameshift-server` binary.
 //!
 //! Parses configuration from environment variables, initializes tracing, wires
-//! up the Postgres catalog adapter and filesystem object store, and calls
-//! [`frameshift_server::run`] to serve until SIGTERM/SIGINT.
+//! the selected catalog and object-store adapters, and serves either the standard
+//! route surface or explicitly enabled isolated publication admission.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -150,6 +150,159 @@ async fn build_object_store(config: &ServerConfig) -> Result<Arc<dyn PackStore>,
     }
 }
 
+/// Resolved quarantine-store mode after fail-closed startup validation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QuarantineMode {
+    /// Publication admission is not mounted.
+    Disabled,
+    /// Quarantined archives use an isolated filesystem root.
+    Fs,
+    /// Quarantined archives use an isolated S3-compatible location.
+    R2,
+}
+
+/// Validate the quarantine selector and its account-authentication prerequisite.
+fn quarantine_mode(
+    backend: &str,
+    account_auth_enabled: bool,
+) -> Result<QuarantineMode, ServerError> {
+    let mode = match backend {
+        "disabled" => return Ok(QuarantineMode::Disabled),
+        "fs" => QuarantineMode::Fs,
+        "r2" => QuarantineMode::R2,
+        other => {
+            return Err(ServerError::Startup(format!(
+                "unknown QUARANTINE_OBJECT_STORE_BACKEND={other:?}; expected \"disabled\", \"fs\", or \"r2\""
+            )));
+        }
+    };
+
+    if !account_auth_enabled {
+        return Err(ServerError::Startup(
+            "publication quarantine requires valid OIDC configuration".to_string(),
+        ));
+    }
+
+    Ok(mode)
+}
+
+/// Normalize one S3-compatible location component for identity comparison.
+fn normalized_store_component(raw: &str) -> &str {
+    raw.trim().trim_matches('/')
+}
+
+/// Normalize an S3-compatible endpoint while preserving any case-sensitive path.
+fn normalized_store_endpoint(raw: &str) -> String {
+    url::Url::parse(raw.trim())
+        .map(|parsed| parsed.as_str().trim_end_matches('/').to_string())
+        .unwrap_or_else(|_| raw.trim().trim_end_matches('/').to_string())
+}
+
+/// Return whether two S3-compatible configurations resolve to the same location.
+fn same_r2_location(public: [&str; 3], quarantine: [&str; 3]) -> bool {
+    normalized_store_endpoint(public[0]) == normalized_store_endpoint(quarantine[0])
+        && public[1..]
+            .iter()
+            .zip(&quarantine[1..])
+            .all(|(left, right)| {
+                normalized_store_component(left) == normalized_store_component(right)
+            })
+}
+
+/// Reject filesystem roots that canonicalize to the same directory.
+async fn ensure_distinct_fs_roots(
+    public_root: &std::path::Path,
+    quarantine_root: &std::path::Path,
+) -> Result<(), ServerError> {
+    let public = tokio::fs::canonicalize(public_root)
+        .await
+        .map_err(|e| ServerError::Startup(format!("public object-store root: {e}")))?;
+    let quarantine = tokio::fs::canonicalize(quarantine_root)
+        .await
+        .map_err(|e| ServerError::Startup(format!("quarantine object-store root: {e}")))?;
+
+    if public == quarantine {
+        return Err(ServerError::Startup(
+            "quarantine filesystem root must differ from the public object-store root".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Construct an explicitly configured and isolated publication quarantine store.
+async fn build_quarantine_store(
+    config: &ServerConfig,
+    account_auth_enabled: bool,
+) -> Result<Option<Arc<dyn PackStore>>, ServerError> {
+    match quarantine_mode(
+        &config.quarantine_object_store_backend,
+        account_auth_enabled,
+    )? {
+        QuarantineMode::Disabled => Ok(None),
+        QuarantineMode::Fs => {
+            let fs_config = FsPackStoreConfig {
+                root: config.quarantine_object_store_root.clone(),
+                verify_on_read: true,
+                max_bytes: None,
+                fsync_on_put: true,
+            };
+            let quarantine = FsPackStore::new(fs_config)
+                .await
+                .map_err(|e| ServerError::Startup(format!("quarantine FsPackStore: {e}")))?;
+
+            if config.object_store_backend == "fs" {
+                ensure_distinct_fs_roots(
+                    &config.object_store_root,
+                    &config.quarantine_object_store_root,
+                )
+                .await?;
+            }
+
+            tracing::info!(
+                root = %config.quarantine_object_store_root.display(),
+                "filesystem publication quarantine configured"
+            );
+            Ok(Some(Arc::new(quarantine)))
+        }
+        QuarantineMode::R2 => {
+            if config.object_store_backend == "r2"
+                && same_r2_location(
+                    [&config.r2_endpoint, &config.r2_bucket, &config.r2_prefix],
+                    [
+                        &config.quarantine_r2_endpoint,
+                        &config.quarantine_r2_bucket,
+                        &config.quarantine_r2_prefix,
+                    ],
+                )
+            {
+                return Err(ServerError::Startup(
+                    "quarantine R2 location must differ from the public object-store location"
+                        .to_string(),
+                ));
+            }
+
+            let r2_config = R2PackStoreConfig {
+                endpoint: config.quarantine_r2_endpoint.clone(),
+                bucket: config.quarantine_r2_bucket.clone(),
+                prefix: config.quarantine_r2_prefix.clone(),
+                region: config.quarantine_r2_region.clone(),
+                access_key_id: config.quarantine_r2_access_key_id.clone(),
+                secret_access_key: config.quarantine_r2_secret_access_key.clone(),
+            };
+            let quarantine = R2PackStore::new(r2_config)
+                .map_err(|e| ServerError::Startup(format!("quarantine R2: {e}")))?;
+            tracing::info!(
+                bucket = %config.quarantine_r2_bucket,
+                prefix = %config.quarantine_r2_prefix,
+                endpoint = %config.quarantine_r2_endpoint,
+                "R2 publication quarantine configured"
+            );
+            Ok(Some(Arc::new(quarantine)))
+        }
+    }
+}
+
 /// Construct the configured memory adapter based on `MEMORY_BACKEND`.
 ///
 /// - `"none"` (default): returns `None` -- no memory adapter.
@@ -264,7 +417,20 @@ async fn main() {
         }
     };
 
-    if let Err(e) = frameshift_server::run(state).await {
+    let quarantine = match build_quarantine_store(&config, state.account_auth.is_some()).await {
+        Ok(store) => store,
+        Err(e) => {
+            tracing::error!("startup failed: {e}");
+            std::process::exit(3);
+        }
+    };
+
+    let server_result = match quarantine {
+        Some(store) => frameshift_server::run_with_publication_admission(state, store).await,
+        None => frameshift_server::run(state).await,
+    };
+
+    if let Err(e) = server_result {
         tracing::error!("server error: {e}");
         let code = match e {
             ServerError::Bind(_) => 2,
@@ -272,5 +438,84 @@ async fn main() {
             ServerError::Shutdown(_) => 1,
         };
         std::process::exit(code);
+    }
+}
+
+#[cfg(test)]
+/// Unit tests for fail-closed publication quarantine configuration.
+mod tests {
+    use super::*;
+
+    #[test]
+    /// The default selector keeps publication admission disabled without OIDC.
+    fn quarantine_mode_accepts_disabled_without_account_auth() {
+        assert_eq!(
+            quarantine_mode("disabled", false).expect("disabled mode"),
+            QuarantineMode::Disabled
+        );
+    }
+
+    #[test]
+    /// Both supported quarantine backends require account authentication.
+    fn quarantine_mode_requires_account_auth() {
+        assert!(matches!(
+            quarantine_mode("fs", false),
+            Err(ServerError::Startup(message)) if message.contains("OIDC")
+        ));
+        assert!(matches!(
+            quarantine_mode("r2", false),
+            Err(ServerError::Startup(message)) if message.contains("OIDC")
+        ));
+    }
+
+    #[test]
+    /// Both supported quarantine backends resolve when account authentication exists.
+    fn quarantine_mode_accepts_supported_backends() {
+        assert_eq!(
+            quarantine_mode("fs", true).expect("filesystem mode"),
+            QuarantineMode::Fs
+        );
+        assert_eq!(
+            quarantine_mode("r2", true).expect("R2 mode"),
+            QuarantineMode::R2
+        );
+    }
+
+    #[test]
+    /// Unknown quarantine selectors fail startup instead of silently disabling writes.
+    fn quarantine_mode_rejects_unknown_backend() {
+        assert!(matches!(
+            quarantine_mode("typo", true),
+            Err(ServerError::Startup(message))
+                if message.contains("QUARANTINE_OBJECT_STORE_BACKEND")
+        ));
+    }
+
+    #[test]
+    /// R2 location comparison ignores harmless surrounding separators and whitespace.
+    fn r2_location_comparison_normalizes_components() {
+        assert!(same_r2_location(
+            [" HTTPS://R2.EXAMPLE/ ", " packs ", "/public/"],
+            ["https://r2.example", "packs", "public"],
+        ));
+        assert!(!same_r2_location(
+            ["https://r2.example", "packs", "public"],
+            ["https://r2.example", "packs", "quarantine"],
+        ));
+    }
+
+    #[tokio::test]
+    /// Filesystem location comparison rejects one canonical root and accepts two.
+    async fn filesystem_location_comparison_enforces_separation() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let public = temp.path().join("public");
+        let quarantine = temp.path().join("quarantine");
+        std::fs::create_dir_all(&public).expect("public directory");
+        std::fs::create_dir_all(&quarantine).expect("quarantine directory");
+
+        ensure_distinct_fs_roots(&public, &quarantine)
+            .await
+            .expect("distinct roots");
+        assert!(ensure_distinct_fs_roots(&public, &public).await.is_err());
     }
 }
