@@ -394,6 +394,53 @@ fn parse_memory_http_auth(raw: &str) -> Result<frameshift_memory_http::HttpAuth,
     )))
 }
 
+#[tokio::main]
+/// Resolve configuration, initialize backends, and run the HTTP server.
+async fn main() {
+    let config = match ServerConfig::from_env() {
+        Ok(c) => Arc::new(c),
+        Err(e) => {
+            eprintln!("configuration error: {e}");
+            std::process::exit(2);
+        }
+    };
+    // Note: `from_env` returns `Box<figment::Error>` to avoid large Err variants.
+
+    init_tracing(&config);
+    tracing::debug!(?config, "resolved server configuration");
+
+    let state = match build_state(Arc::clone(&config)).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("startup failed: {e}");
+            std::process::exit(3);
+        }
+    };
+
+    let quarantine = match build_quarantine_store(&config, state.account_auth.is_some()).await {
+        Ok(store) => store,
+        Err(e) => {
+            tracing::error!("startup failed: {e}");
+            std::process::exit(3);
+        }
+    };
+
+    let server_result = match quarantine {
+        Some(store) => frameshift_server::run_with_publication_admission(state, store).await,
+        None => frameshift_server::run(state).await,
+    };
+
+    if let Err(e) = server_result {
+        tracing::error!("server error: {e}");
+        let code = match e {
+            ServerError::Bind(_) => 2,
+            ServerError::Startup(_) => 3,
+            ServerError::Shutdown(_) => 1,
+        };
+        std::process::exit(code);
+    }
+}
+
 #[cfg(test)]
 /// Unit tests for fail-closed publication quarantine configuration.
 mod tests {
@@ -470,52 +517,5 @@ mod tests {
             .await
             .expect("distinct roots");
         assert!(ensure_distinct_fs_roots(&public, &public).await.is_err());
-    }
-}
-
-#[tokio::main]
-/// Resolve configuration, initialize backends, and run the HTTP server.
-async fn main() {
-    let config = match ServerConfig::from_env() {
-        Ok(c) => Arc::new(c),
-        Err(e) => {
-            eprintln!("configuration error: {e}");
-            std::process::exit(2);
-        }
-    };
-    // Note: `from_env` returns `Box<figment::Error>` to avoid large Err variants.
-
-    init_tracing(&config);
-    tracing::debug!(?config, "resolved server configuration");
-
-    let state = match build_state(Arc::clone(&config)).await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!("startup failed: {e}");
-            std::process::exit(3);
-        }
-    };
-
-    let quarantine = match build_quarantine_store(&config, state.account_auth.is_some()).await {
-        Ok(store) => store,
-        Err(e) => {
-            tracing::error!("startup failed: {e}");
-            std::process::exit(3);
-        }
-    };
-
-    let server_result = match quarantine {
-        Some(store) => frameshift_server::run_with_publication_admission(state, store).await,
-        None => frameshift_server::run(state).await,
-    };
-
-    if let Err(e) = server_result {
-        tracing::error!("server error: {e}");
-        let code = match e {
-            ServerError::Bind(_) => 2,
-            ServerError::Startup(_) => 3,
-            ServerError::Shutdown(_) => 1,
-        };
-        std::process::exit(code);
     }
 }
