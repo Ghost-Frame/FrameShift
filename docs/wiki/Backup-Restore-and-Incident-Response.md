@@ -170,8 +170,13 @@ OIDC account surface and should be verified during containment.
 
 ### Moderator misuse
 
-1. Remove or revoke the affected platform role through the approved role
-   administration mechanism and preserve its assignment history.
+1. Revoke the affected platform role with
+   `DELETE /v1/admin/accounts/{account_id}/platform-roles/{role}` as another
+   active administrator. Revocation retains the assignment as auditable
+   history. If the account itself is compromised rather than merely misused,
+   also suspend it with `PATCH /v1/admin/accounts/{account_id}/status`. Neither
+   call can remove the last active administrator, so promote a replacement
+   administrator first when containing the only one.
 2. Disable promotion writes if the role change cannot be enforced immediately.
 3. Query moderation decisions, promotions, lifecycle actions, and appeal
    resolutions by actor account and time window.

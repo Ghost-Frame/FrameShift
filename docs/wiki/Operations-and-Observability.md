@@ -145,6 +145,65 @@ bounded per verified signing key.
 Set `TRUST_FORWARDED_FOR=true` only behind a proxy that rewrites
 `X-Forwarded-For`; it affects the per-address plane alone.
 
+## Platform roles and account status
+
+Moderation authority comes from the `moderator` and `administrator` platform
+roles held by an account. Every moderation read, decision, quarantine artifact
+review, promotion, tombstone, publisher suspension, lifecycle audit query, and
+appeal resolution requires an active role, verified inside the same database
+transaction as the write it authorizes.
+
+### One-time administrator bootstrap
+
+A fresh deployment has no administrator, and there is deliberately no
+configuration setting that grants one: authority lives in the database so it is
+auditable and revocable. Insert the first administrator once, directly, after
+that account has signed in at least once so its row exists:
+
+```sql
+INSERT INTO account_platform_roles
+    (account_id, role, state, assigned_by_account_id)
+VALUES
+    ('<account-uuid>', 'administrator', 'active', '<account-uuid>');
+```
+
+The bootstrap row records itself as its own assigner, which is the marker of an
+out-of-band grant. Every later change should go through the routes below so it
+carries a real assigning account. Until at least one administrator exists,
+submissions stay quarantined and `publication_moderation_reviewers_available`
+reads `0`; that is the intended fail-closed behavior, not an outage.
+
+### Administrator-managed roles
+
+| Route | Effect |
+|---|---|
+| `POST /v1/admin/accounts/{account_id}/platform-roles` | Grant `moderator` or `administrator` |
+| `DELETE /v1/admin/accounts/{account_id}/platform-roles/{role}` | Revoke a role, retaining it as auditable history |
+| `PATCH /v1/admin/accounts/{account_id}/status` | Set `active`, `suspended`, or `disabled` |
+
+All three require an active administrator and return `403` with a fixed body to
+anyone else, including for a target account that does not exist, so the routes
+cannot be used to test whether an account is present.
+
+Revocation never deletes an assignment. The row is marked `revoked` and keeps
+its original grant time and assigning account. Granting a revoked role again
+reactivates that same row rather than creating a second one, so a role's full
+history stays in one place. Repeating any of the three operations is a no-op.
+
+### Last-administrator protection
+
+The last account providing administrator authority can be neither revoked nor
+suspended nor disabled. Authority requires an active role **and** an active
+account, so suspending an administrator removes their coverage: with two
+administrators, suspending one then leaves the other protected.
+
+This exists because there is no in-application path back from zero
+administrators. Recovery would require the SQL bootstrap above, which is why
+the invariant is enforced rather than left to operator care.
+
+Account suspension takes effect on the account's next request and preserves its
+publisher memberships, keys, submissions, and audit history.
+
 ## Ownership reconciliation
 
 Legacy ownership reconciliation is intentionally not represented as a server

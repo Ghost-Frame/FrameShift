@@ -21,8 +21,9 @@ use frameshift_catalog::error::{CatalogError, HealthStatus};
 use frameshift_catalog::filters::{PackSearchFilters, PackSearchResult};
 use frameshift_catalog::identity::Ed25519PublicKey;
 use frameshift_catalog::records::{
-    AccountRecord, AccountStatus, AuthorRecord, MembershipState, PackRecord, PackVersionRecord,
-    PlatformRole, PlatformRoleRecord, PlatformRoleState, PublicationAppealCaseRecord,
+    AccountRecord, AccountStatus, AccountStatusChangeRequest, AuthorRecord, MembershipState,
+    PackRecord, PackVersionRecord, PlatformRole, PlatformRoleAssignmentRequest, PlatformRoleRecord,
+    PlatformRoleRevocationRequest, PlatformRoleState, PublicationAppealCaseRecord,
     PublicationAppealCursor, PublicationAppealDisposition, PublicationAppealRecord,
     PublicationAppealRequest, PublicationAppealResolutionRecord,
     PublicationAppealResolutionRequest, PublicationIntentRecord, PublicationLifecycleAction,
@@ -1387,6 +1388,130 @@ impl CatalogBackend for MockCatalog {
         Ok(roles)
     }
 
+    /// Grant or reactivate one platform role under administrator authority.
+    async fn assign_account_platform_role(
+        &self,
+        request: PlatformRoleAssignmentRequest,
+    ) -> Result<PlatformRoleRecord, CatalogError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        require_mock_administrator(&state, request.actor_account_id, "platform_role")?;
+        if !state.accounts.contains_key(&request.account_id) {
+            return Err(CatalogError::NotFound {
+                kind: "account",
+                key: request.account_id.to_string(),
+            });
+        }
+        let now = Utc::now();
+        if let Some(existing) = state
+            .platform_roles
+            .iter_mut()
+            .find(|record| record.account_id == request.account_id && record.role == request.role)
+        {
+            if existing.state == PlatformRoleState::Active {
+                return Ok(existing.clone());
+            }
+            existing.state = PlatformRoleState::Active;
+            existing.assigned_by_account_id = request.actor_account_id;
+            existing.updated_at = now;
+            return Ok(existing.clone());
+        }
+        let record = PlatformRoleRecord {
+            account_id: request.account_id,
+            role: request.role,
+            state: PlatformRoleState::Active,
+            assigned_by_account_id: request.actor_account_id,
+            created_at: now,
+            updated_at: now,
+        };
+        state.platform_roles.push(record.clone());
+        Ok(record)
+    }
+
+    /// Revoke one platform role, preserving the assignment for audit.
+    async fn revoke_account_platform_role(
+        &self,
+        request: PlatformRoleRevocationRequest,
+    ) -> Result<PlatformRoleRecord, CatalogError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        require_mock_administrator(&state, request.actor_account_id, "platform_role")?;
+        let coverage = mock_administrator_coverage(&state);
+        let existing_state = state
+            .platform_roles
+            .iter()
+            .find(|record| record.account_id == request.account_id && record.role == request.role)
+            .map(|record| record.state)
+            .ok_or_else(|| CatalogError::NotFound {
+                kind: "platform_role",
+                key: request.account_id.to_string(),
+            })?;
+        if existing_state == PlatformRoleState::Revoked {
+            return Ok(state
+                .platform_roles
+                .iter()
+                .find(|record| {
+                    record.account_id == request.account_id && record.role == request.role
+                })
+                .cloned()
+                .expect("revoked role was located above"));
+        }
+        if request.role == PlatformRole::Administrator && coverage <= 1 {
+            return Err(CatalogError::Validation(
+                "cannot revoke the last active administrator".to_string(),
+            ));
+        }
+        let record = state
+            .platform_roles
+            .iter_mut()
+            .find(|record| record.account_id == request.account_id && record.role == request.role)
+            .expect("active role was located above");
+        record.state = PlatformRoleState::Revoked;
+        record.updated_at = Utc::now();
+        Ok(record.clone())
+    }
+
+    /// Transition one account's status under administrator authority.
+    async fn set_account_status(
+        &self,
+        request: AccountStatusChangeRequest,
+    ) -> Result<AccountRecord, CatalogError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        require_mock_administrator(&state, request.actor_account_id, "account_status")?;
+        let coverage = mock_administrator_coverage(&state);
+        let holds_administrator = state.platform_roles.iter().any(|record| {
+            record.account_id == request.account_id
+                && record.role == PlatformRole::Administrator
+                && record.state == PlatformRoleState::Active
+        });
+        let account =
+            state
+                .accounts
+                .get_mut(&request.account_id)
+                .ok_or_else(|| CatalogError::NotFound {
+                    kind: "account",
+                    key: request.account_id.to_string(),
+                })?;
+        if account.status == request.status {
+            return Ok(account.clone());
+        }
+        if request.status != AccountStatus::Active && holds_administrator && coverage <= 1 {
+            return Err(CatalogError::Validation(
+                "cannot suspend or disable the last active administrator".to_string(),
+            ));
+        }
+        account.status = request.status;
+        account.updated_at = Utc::now();
+        Ok(account.clone())
+    }
+
     /// Authorize and atomically apply one publication moderation decision.
     async fn moderate_publication_submission(
         &self,
@@ -2381,6 +2506,46 @@ fn mock_lifecycle_page(
         })
         .take(limit.min(100) as usize)
         .collect()
+}
+
+/// Require an active mock account holding an active administrator role.
+fn require_mock_administrator(
+    state: &MockState,
+    actor_account_id: uuid::Uuid,
+    kind: &'static str,
+) -> Result<(), CatalogError> {
+    let actor_is_active = state
+        .accounts
+        .get(&actor_account_id)
+        .is_some_and(|account| account.status == AccountStatus::Active);
+    let holds_administrator = state.platform_roles.iter().any(|record| {
+        record.account_id == actor_account_id
+            && record.role == PlatformRole::Administrator
+            && record.state == PlatformRoleState::Active
+    });
+    if actor_is_active && holds_administrator {
+        return Ok(());
+    }
+    Err(CatalogError::Unauthorized {
+        kind,
+        key: actor_account_id.to_string(),
+    })
+}
+
+/// Count mock accounts that currently provide administrator authority.
+fn mock_administrator_coverage(state: &MockState) -> usize {
+    state
+        .platform_roles
+        .iter()
+        .filter(|record| {
+            record.role == PlatformRole::Administrator
+                && record.state == PlatformRoleState::Active
+                && state
+                    .accounts
+                    .get(&record.account_id)
+                    .is_some_and(|account| account.status == AccountStatus::Active)
+        })
+        .count()
 }
 
 /// Sort, keyset-filter, bound, and resolve one mock appeal page.

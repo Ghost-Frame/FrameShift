@@ -26,19 +26,21 @@ use diesel_migrations::{embed_migrations, EmbeddedMigrations, MigrationHarness a
 use tracing::{debug, error, instrument};
 
 use frameshift_catalog::{
-    AccountRecord, AuthorRecord, CatalogBackend, CatalogError, Ed25519PublicKey, HealthStatus,
-    MembershipState, PackRecord, PackSearchFilters, PackSearchResult, PackStatus,
-    PackVersionRecord, PlatformRoleRecord, PublicationAppealCaseRecord, PublicationAppealCursor,
-    PublicationAppealDisposition, PublicationAppealRecord, PublicationAppealRequest,
-    PublicationAppealResolutionRecord, PublicationAppealResolutionRequest, PublicationIntentClaim,
-    PublicationIntentRecord, PublicationLifecycleAction, PublicationLifecycleCursor,
-    PublicationLifecycleDecisionRecord, PublicationModerationAction,
-    PublicationModerationDecisionRecord, PublicationModerationDecisionRequest,
-    PublicationModerationSnapshot, PublicationPromotionRecord, PublicationPromotionRequest,
-    PublicationSubmissionRecord, PublicationSubmissionRequest, PublicationSubmissionState,
-    PublicationTombstoneRequest, PublicationWithdrawalRequest, PublishQuota,
-    PublisherAuditEventRecord, PublisherKeyRecord, PublisherMembershipRecord,
-    PublisherProfileRecord, PublisherSuspensionRequest, SortMode, TombstoneRecord,
+    AccountRecord, AccountStatusChangeRequest, AuthorRecord, CatalogBackend, CatalogError,
+    Ed25519PublicKey, HealthStatus, MembershipState, PackRecord, PackSearchFilters,
+    PackSearchResult, PackStatus, PackVersionRecord, PlatformRole, PlatformRoleAssignmentRequest,
+    PlatformRoleRecord, PlatformRoleRevocationRequest, PublicationAppealCaseRecord,
+    PublicationAppealCursor, PublicationAppealDisposition, PublicationAppealRecord,
+    PublicationAppealRequest, PublicationAppealResolutionRecord,
+    PublicationAppealResolutionRequest, PublicationIntentClaim, PublicationIntentRecord,
+    PublicationLifecycleAction, PublicationLifecycleCursor, PublicationLifecycleDecisionRecord,
+    PublicationModerationAction, PublicationModerationDecisionRecord,
+    PublicationModerationDecisionRequest, PublicationModerationSnapshot,
+    PublicationPromotionRecord, PublicationPromotionRequest, PublicationSubmissionRecord,
+    PublicationSubmissionRequest, PublicationSubmissionState, PublicationTombstoneRequest,
+    PublicationWithdrawalRequest, PublishQuota, PublisherAuditEventRecord, PublisherKeyRecord,
+    PublisherMembershipRecord, PublisherProfileRecord, PublisherSuspensionRequest, SortMode,
+    TombstoneRecord,
 };
 use frameshift_publication::{inventory_hash, FindingSeverity, REPORT_SCHEMA_VERSION};
 
@@ -704,6 +706,136 @@ impl PostgresCatalog {
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
+}
+
+/// Serialize platform-role mutations so coverage checks cannot race.
+///
+/// Every administrator-coverage decision reads the whole role table and then
+/// writes, so the read must not be able to go stale before the write commits.
+/// The actor row locks taken by [`require_active_administrator`] already
+/// serialize or deadlock the concurrent pairs reachable through these routes
+/// today, so this lock is defense in depth rather than the sole guarantee: it
+/// keeps the count-then-write atomic for any future caller that does not
+/// happen to lock an overlapping row, including bulk or operator paths.
+async fn lock_platform_roles(
+    conn: &mut diesel_async::AsyncPgConnection,
+) -> Result<(), CatalogTransactionError> {
+    diesel::sql_query("LOCK TABLE account_platform_roles IN SHARE ROW EXCLUSIVE MODE")
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+/// Require that the actor is an active account holding an active administrator role.
+///
+/// Both the account row and the role row are locked so the authority cannot be
+/// revoked between this check and the write it authorizes.
+async fn require_active_administrator(
+    conn: &mut diesel_async::AsyncPgConnection,
+    actor_account_id: uuid::Uuid,
+    kind: &'static str,
+) -> Result<(), CatalogTransactionError> {
+    let actor_status = accounts::table
+        .find(actor_account_id)
+        .for_update()
+        .select(accounts::status)
+        .first::<String>(conn)
+        .await
+        .optional()?;
+    let active_admin = account_platform_roles::table
+        .filter(account_platform_roles::account_id.eq(actor_account_id))
+        .filter(account_platform_roles::role.eq("administrator"))
+        .filter(account_platform_roles::state.eq("active"))
+        .for_update()
+        .select(PlatformRoleRow::as_select())
+        .first(conn)
+        .await
+        .optional()?;
+    if actor_status.as_deref() != Some("active") || active_admin.is_none() {
+        return Err(CatalogTransactionError::Catalog(
+            CatalogError::Unauthorized {
+                kind,
+                key: actor_account_id.to_string(),
+            },
+        ));
+    }
+    Ok(())
+}
+
+/// Reject a role grant for an account that does not exist.
+///
+/// The foreign key would also reject it, but an explicit check keeps the error
+/// specific instead of surfacing a constraint violation.
+async fn require_existing_account(
+    conn: &mut diesel_async::AsyncPgConnection,
+    account_id: uuid::Uuid,
+) -> Result<(), CatalogTransactionError> {
+    let exists = accounts::table
+        .find(account_id)
+        .select(accounts::id)
+        .first::<uuid::Uuid>(conn)
+        .await
+        .optional()?;
+    if exists.is_none() {
+        return Err(CatalogTransactionError::Catalog(CatalogError::NotFound {
+            kind: "account",
+            key: account_id.to_string(),
+        }));
+    }
+    Ok(())
+}
+
+/// Load one role assignment in any state, locked for update.
+async fn active_or_revoked_role(
+    conn: &mut diesel_async::AsyncPgConnection,
+    account_id: uuid::Uuid,
+    role_text: &str,
+) -> Result<Option<PlatformRoleRow>, CatalogTransactionError> {
+    account_platform_roles::table
+        .filter(account_platform_roles::account_id.eq(account_id))
+        .filter(account_platform_roles::role.eq(role_text))
+        .for_update()
+        .select(PlatformRoleRow::as_select())
+        .first(conn)
+        .await
+        .optional()
+        .map_err(CatalogTransactionError::from)
+}
+
+/// Count accounts that currently provide administrator authority.
+///
+/// Authority requires both an active administrator role and an active account,
+/// so a suspended administrator does not count toward coverage.
+async fn administrator_coverage(
+    conn: &mut diesel_async::AsyncPgConnection,
+) -> Result<i64, CatalogTransactionError> {
+    accounts::table
+        .inner_join(
+            account_platform_roles::table.on(account_platform_roles::account_id.eq(accounts::id)),
+        )
+        .filter(accounts::status.eq("active"))
+        .filter(account_platform_roles::role.eq("administrator"))
+        .filter(account_platform_roles::state.eq("active"))
+        .select(diesel::dsl::count_star())
+        .first::<i64>(conn)
+        .await
+        .map_err(CatalogTransactionError::from)
+}
+
+/// Report whether one account currently holds an active administrator role.
+async fn account_holds_active_administrator(
+    conn: &mut diesel_async::AsyncPgConnection,
+    account_id: uuid::Uuid,
+) -> Result<bool, CatalogTransactionError> {
+    let held = account_platform_roles::table
+        .filter(account_platform_roles::account_id.eq(account_id))
+        .filter(account_platform_roles::role.eq("administrator"))
+        .filter(account_platform_roles::state.eq("active"))
+        .select(account_platform_roles::account_id)
+        .first::<uuid::Uuid>(conn)
+        .await
+        .optional()?;
+    Ok(held.is_some())
 }
 
 /// Owned inputs required by one version-registration transaction.
@@ -1989,6 +2121,202 @@ impl CatalogBackend for PostgresCatalog {
             .into_iter()
             .map(PlatformRoleRow::into_record)
             .collect()
+    }
+
+    /// Atomically grant or reactivate one platform role under administrator authority.
+    async fn assign_account_platform_role(
+        &self,
+        request: PlatformRoleAssignmentRequest,
+    ) -> Result<PlatformRoleRecord, CatalogError> {
+        let role_text = encode_text_enum(request.role)?;
+        let target_account_id = request.account_id;
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        use diesel_async::AsyncConnection as _;
+        let result = conn
+            .transaction::<PlatformRoleRow, CatalogTransactionError, _>(async move |conn| {
+                lock_platform_roles(conn).await?;
+                require_active_administrator(conn, request.actor_account_id, "platform_role")
+                    .await?;
+                require_existing_account(conn, request.account_id).await?;
+                let existing = active_or_revoked_role(conn, request.account_id, &role_text).await?;
+                let now = Utc::now();
+                if let Some(existing) = existing {
+                    // An already active assignment is returned untouched so a
+                    // repeated grant cannot rewrite its assigning account or
+                    // its original grant time.
+                    if existing.state == "active" {
+                        return Ok(existing);
+                    }
+                    // Reactivation reuses the retained row, so `created_at` and
+                    // the revoked assignment's history are preserved.
+                    return diesel::update(
+                        account_platform_roles::table
+                            .filter(account_platform_roles::account_id.eq(request.account_id))
+                            .filter(account_platform_roles::role.eq(&role_text)),
+                    )
+                    .set((
+                        account_platform_roles::state.eq("active"),
+                        account_platform_roles::assigned_by_account_id.eq(request.actor_account_id),
+                        account_platform_roles::updated_at.eq(now),
+                    ))
+                    .returning(PlatformRoleRow::as_returning())
+                    .get_result(conn)
+                    .await
+                    .map_err(CatalogTransactionError::from);
+                }
+                diesel::insert_into(account_platform_roles::table)
+                    .values((
+                        account_platform_roles::account_id.eq(request.account_id),
+                        account_platform_roles::role.eq(&role_text),
+                        account_platform_roles::state.eq("active"),
+                        account_platform_roles::assigned_by_account_id.eq(request.actor_account_id),
+                        account_platform_roles::created_at.eq(now),
+                        account_platform_roles::updated_at.eq(now),
+                    ))
+                    .returning(PlatformRoleRow::as_returning())
+                    .get_result(conn)
+                    .await
+                    .map_err(CatalogTransactionError::from)
+            })
+            .await;
+        match result {
+            Ok(row) => row.into_record(),
+            Err(CatalogTransactionError::Catalog(error)) => Err(error),
+            Err(CatalogTransactionError::Diesel(error)) => Err(map_diesel_error(
+                error,
+                "platform_role",
+                target_account_id.to_string(),
+            )),
+        }
+    }
+
+    /// Atomically revoke one platform role while preserving its assignment history.
+    async fn revoke_account_platform_role(
+        &self,
+        request: PlatformRoleRevocationRequest,
+    ) -> Result<PlatformRoleRecord, CatalogError> {
+        let role_text = encode_text_enum(request.role)?;
+        let target_account_id = request.account_id;
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        use diesel_async::AsyncConnection as _;
+        let result = conn
+            .transaction::<PlatformRoleRow, CatalogTransactionError, _>(async move |conn| {
+                lock_platform_roles(conn).await?;
+                require_active_administrator(conn, request.actor_account_id, "platform_role")
+                    .await?;
+                let existing = active_or_revoked_role(conn, request.account_id, &role_text)
+                    .await?
+                    .ok_or_else(|| {
+                        CatalogTransactionError::Catalog(CatalogError::NotFound {
+                            kind: "platform_role",
+                            key: request.account_id.to_string(),
+                        })
+                    })?;
+                // An already revoked assignment is returned untouched.
+                if existing.state == "revoked" {
+                    return Ok(existing);
+                }
+                // Losing every administrator would permanently remove the
+                // ability to moderate, promote, or restore authority, and no
+                // in-application path could recover it.
+                if request.role == PlatformRole::Administrator
+                    && administrator_coverage(conn).await? <= 1
+                {
+                    return Err(CatalogTransactionError::Catalog(CatalogError::Validation(
+                        "cannot revoke the last active administrator".to_string(),
+                    )));
+                }
+                diesel::update(
+                    account_platform_roles::table
+                        .filter(account_platform_roles::account_id.eq(request.account_id))
+                        .filter(account_platform_roles::role.eq(&role_text)),
+                )
+                .set((
+                    account_platform_roles::state.eq("revoked"),
+                    account_platform_roles::updated_at.eq(Utc::now()),
+                ))
+                .returning(PlatformRoleRow::as_returning())
+                .get_result(conn)
+                .await
+                .map_err(CatalogTransactionError::from)
+            })
+            .await;
+        match result {
+            Ok(row) => row.into_record(),
+            Err(CatalogTransactionError::Catalog(error)) => Err(error),
+            Err(CatalogTransactionError::Diesel(error)) => Err(map_diesel_error(
+                error,
+                "platform_role",
+                target_account_id.to_string(),
+            )),
+        }
+    }
+
+    /// Atomically transition one account's status under administrator authority.
+    async fn set_account_status(
+        &self,
+        request: AccountStatusChangeRequest,
+    ) -> Result<AccountRecord, CatalogError> {
+        let status_text = encode_text_enum(request.status)?;
+        let target_account_id = request.account_id;
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        use diesel_async::AsyncConnection as _;
+        let result = conn
+            .transaction::<AccountRow, CatalogTransactionError, _>(async move |conn| {
+                // Administrator coverage is computed from role rows, so this
+                // transaction takes the same lock as role mutation to keep the
+                // two paths from racing each other to zero administrators.
+                lock_platform_roles(conn).await?;
+                require_active_administrator(conn, request.actor_account_id, "account_status")
+                    .await?;
+                let target = accounts::table
+                    .find(request.account_id)
+                    .for_update()
+                    .select(AccountRow::as_select())
+                    .first(conn)
+                    .await
+                    .optional()?
+                    .ok_or_else(|| {
+                        CatalogTransactionError::Catalog(CatalogError::NotFound {
+                            kind: "account",
+                            key: request.account_id.to_string(),
+                        })
+                    })?;
+                // Setting the status an account already holds is a no-op.
+                if target.status == status_text {
+                    return Ok(target);
+                }
+                // A non-active account grants no authority, so suspending the
+                // sole administrator would strand the platform exactly as
+                // revoking their role would.
+                if status_text != "active"
+                    && administrator_coverage(conn).await? <= 1
+                    && account_holds_active_administrator(conn, request.account_id).await?
+                {
+                    return Err(CatalogTransactionError::Catalog(CatalogError::Validation(
+                        "cannot suspend or disable the last active administrator".to_string(),
+                    )));
+                }
+                diesel::update(accounts::table.find(request.account_id))
+                    .set((
+                        accounts::status.eq(&status_text),
+                        accounts::updated_at.eq(Utc::now()),
+                    ))
+                    .returning(AccountRow::as_returning())
+                    .get_result(conn)
+                    .await
+                    .map_err(CatalogTransactionError::from)
+            })
+            .await;
+        match result {
+            Ok(row) => row.into_record(),
+            Err(CatalogTransactionError::Catalog(error)) => Err(error),
+            Err(CatalogTransactionError::Diesel(error)) => Err(map_diesel_error(
+                error,
+                "account_status",
+                target_account_id.to_string(),
+            )),
+        }
     }
 
     /// Atomically authorize, record, and apply one non-public moderation decision.
