@@ -28,6 +28,7 @@
 - [[Memory Integration]]
 - [[Architecture]]
 - [[Operations and Observability]]
+- [[Backup Restore and Incident Response]]
 
 **Safety and support**
 
