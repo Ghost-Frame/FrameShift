@@ -29,6 +29,10 @@ the product claims and all other content were preserved.
 | `Growth-System.md` | `crates/frameshift-growth/src` |
 | `Memory-Integration.md` | `crates/frameshift-memory*/src` |
 | `Architecture.md` | workspace manifest and public crate entry points |
+| `Trust-and-Security.md` | pack, registry, client, capability, publication, and Studio trust boundaries |
+| `Local-Data-and-Privacy.md` | client state model, session store, selection telemetry, vault, and CLI data operations |
+| `Security-Reporting-and-Known-Limits.md` | repository security policy, release workflow, and public artifact notices |
+| `Troubleshooting.md` | CLI handlers, client errors, MCP runtime, and validation failures |
 | `_Sidebar.md` | Canonical page inventory in this directory |
 | `_Footer.md` | Public repository identity |
 | `SOURCES.md` | This documentation supply-chain contract |
