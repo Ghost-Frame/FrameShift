@@ -32,6 +32,7 @@ the product claims and all other content were preserved.
 | `Growth-System.md` | `crates/frameshift-growth/src` |
 | `Memory-Integration.md` | `crates/frameshift-memory*/src` |
 | `Architecture.md` | workspace manifest and public crate entry points |
+| `Operations-and-Observability.md` | server metrics registry, metrics middleware, operational routes, and ownership backfill contract |
 | `Trust-and-Security.md` | pack, registry, client, capability, publication, and Studio trust boundaries |
 | `Local-Data-and-Privacy.md` | client state model, session store, selection telemetry, vault, and CLI data operations |
 | `Security-Reporting-and-Known-Limits.md` | repository security policy, release workflow, and public artifact notices |

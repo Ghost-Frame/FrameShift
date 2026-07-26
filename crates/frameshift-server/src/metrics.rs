@@ -13,6 +13,7 @@
 //! | `packs_published_total` | IntCounter | -- | Pack publish success count |
 //! | `pack_downloads_total` | IntCounter | -- | Pack download success count |
 //! | `searches_total` | IntCounter | -- | Catalog search invocations |
+//! | `creator_workflow_outcomes_total` | IntCounterVec | stage, outcome | Bounded account and publication workflow outcomes |
 //!
 //! # Cardinality note
 //!
@@ -59,8 +60,16 @@ pub struct Metrics {
 
     /// Number of catalog search invocations via `GET /v1/packs`.
     pub searches_total: IntCounter,
+
+    /// Account and publication workflow responses grouped by bounded stage and outcome.
+    ///
+    /// Both labels come from fixed vocabularies in the metrics middleware.
+    /// User-controlled identifiers, raw paths, request IDs, and error text are
+    /// never used as label values.
+    pub creator_workflow_outcomes_total: IntCounterVec,
 }
 
+/// Builds, updates, and encodes the server's private Prometheus registry.
 impl Metrics {
     /// Construct and register all collectors against a new private registry.
     ///
@@ -117,6 +126,15 @@ impl Metrics {
         )
         .expect("searches_total metric creation must not fail");
 
+        let creator_workflow_outcomes_total = IntCounterVec::new(
+            Opts::new(
+                "creator_workflow_outcomes_total",
+                "Creator account and publication workflow responses by bounded stage and outcome.",
+            ),
+            &["stage", "outcome"],
+        )
+        .expect("creator_workflow_outcomes_total metric creation must not fail");
+
         // Register all collectors -- panics on duplicate or incompatible desc.
         registry
             .register(Box::new(http_requests_total.clone()))
@@ -133,6 +151,9 @@ impl Metrics {
         registry
             .register(Box::new(searches_total.clone()))
             .expect("register searches_total");
+        registry
+            .register(Box::new(creator_workflow_outcomes_total.clone()))
+            .expect("register creator_workflow_outcomes_total");
 
         Self {
             registry,
@@ -141,6 +162,7 @@ impl Metrics {
             packs_published_total,
             pack_downloads_total,
             searches_total,
+            creator_workflow_outcomes_total,
         }
     }
 
@@ -224,5 +246,20 @@ mod tests {
             text.contains("packs_published_total 3"),
             "expected 'packs_published_total 3'; got: {text:?}"
         );
+    }
+
+    /// Workflow counters encode only their fixed stage and outcome labels.
+    #[test]
+    fn creator_workflow_counter_encodes_bounded_labels() {
+        let metrics = Metrics::new();
+        metrics
+            .creator_workflow_outcomes_total
+            .with_label_values(&["publisher_key", "client_error"])
+            .inc();
+
+        let text = metrics.encode_text();
+        assert!(text.contains(
+            "creator_workflow_outcomes_total{outcome=\"client_error\",stage=\"publisher_key\"} 1"
+        ));
     }
 }
