@@ -57,6 +57,9 @@ pub mod routes;
 pub mod state;
 
 use std::net::SocketAddr;
+use std::sync::Arc;
+
+use frameshift_objects::PackStore;
 
 pub use config::{LogFormat, OidcConfig, ServerConfig};
 pub use error::AppError;
@@ -86,24 +89,36 @@ pub enum ServerError {
     Shutdown(String),
 }
 
-/// Run the frameshift HTTP server until SIGTERM or SIGINT.
+/// Run the standard FrameShift HTTP surface until SIGTERM or SIGINT.
 ///
-/// Constructs an [`AppState`] from the provided `config`, binds to
-/// `config.bind_addr`, and begins serving HTTP requests. On receipt of
+/// Uses the provided [`AppState`], binds to its configured address, and begins
+/// serving HTTP requests without publication-admission writes. On receipt of
 /// SIGTERM or SIGINT, initiates graceful shutdown: in-flight requests are
 /// given `config.shutdown_grace` to complete before the server exits.
 ///
 /// # Errors
 ///
 /// - [`ServerError::Bind`] if the socket cannot be bound.
-/// - [`ServerError::Startup`] if a backend cannot be initialized (placeholder;
-///   concrete checks are deferred to milestone 2).
+/// - [`ServerError::Startup`] if a backend cannot be initialized.
 /// - [`ServerError::Shutdown`] if the graceful shutdown sequence fails.
 pub async fn run(state: AppState) -> Result<(), ServerError> {
+    let router = app(state.clone());
+    serve(state, router).await
+}
+
+/// Run the HTTP surface with isolated publication admission enabled.
+pub async fn run_with_publication_admission(
+    state: AppState,
+    quarantine: Arc<dyn PackStore>,
+) -> Result<(), ServerError> {
+    let router = app_with_publication_admission(state.clone(), quarantine);
+    serve(state, router).await
+}
+
+/// Serve one fully constructed router.
+async fn serve(state: AppState, router: axum::Router) -> Result<(), ServerError> {
     let addr: SocketAddr = state.config.bind_addr;
     let shutdown_grace = state.config.shutdown_grace;
-
-    let router = app(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("listening on {addr}");

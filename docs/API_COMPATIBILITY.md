@@ -150,9 +150,15 @@ a failed apply and uses the restore procedure proven before the transaction.
 ## Publication admission and promotion
 
 The account-backed publication workflow is an additive API surface. The standard
-application router does not mount publication-submission or promotion writes.
-Operators must explicitly construct the publication-enabled router with an
-isolated quarantine store before these endpoints exist.
+server configuration does not mount publication-submission or promotion writes.
+The shipped `frameshift-server` binary mounts the publication-enabled router only
+when `QUARANTINE_OBJECT_STORE_BACKEND` is explicitly set to `fs` or `r2` and
+valid OIDC account authentication is active. Filesystem mode rejects a quarantine
+root that canonicalizes to the public object-store root. R2 mode rejects the same
+normalized endpoint, bucket, and prefix as the public object store. Invalid,
+missing, or shared-store configuration fails startup instead of exposing a weaker
+route surface. Setting the quarantine backend to `disabled` restores the standard
+router without altering stored publication evidence.
 
 Publication archives submitted to `POST /v1/publication-submissions` must contain
 the manifest-declared files plus `signature.sig`. FrameShift verifies the detached

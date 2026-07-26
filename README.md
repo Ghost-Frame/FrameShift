@@ -518,6 +518,23 @@ Most variables are read with no prefix (e.g. `BIND_ADDR`, not `FRAMESHIFT_BIND_A
 | `R2_REGION` | `auto` | S3 region (R2 always uses `auto`) |
 | `R2_ACCESS_KEY_ID` | `""` | Access key ID for the bucket |
 | `R2_SECRET_ACCESS_KEY` | `""` | Secret access key |
+| `QUARANTINE_OBJECT_STORE_BACKEND` | `disabled` | `disabled`, `fs`, or `r2`; any enabled value mounts account-backed publication admission |
+| `QUARANTINE_OBJECT_STORE_ROOT` | `/tmp/frameshift-quarantine` | Isolated filesystem root for quarantined publication archives |
+| `QUARANTINE_R2_ENDPOINT` | `""` | S3-compatible endpoint used only by the quarantine store |
+| `QUARANTINE_R2_BUCKET` | `""` | Bucket used only by the quarantine store |
+| `QUARANTINE_R2_PREFIX` | `quarantine` | Key prefix used only by the quarantine store |
+| `QUARANTINE_R2_REGION` | `auto` | S3-compatible region used by the quarantine store |
+| `QUARANTINE_R2_ACCESS_KEY_ID` | `""` | Access key ID used only by the quarantine store |
+| `QUARANTINE_R2_SECRET_ACCESS_KEY` | `""` | Secret access key used only by the quarantine store |
+| `OIDC_ENABLED` | `false` | Enable account authentication when the remaining OIDC configuration is valid |
+| `OIDC_ISSUER` | `""` | Exact OIDC issuer URL |
+| `OIDC_AUDIENCE` | `""` | Required access-token audience |
+| `OIDC_JWKS_URL` | `""` | Optional explicit JWKS URL; empty uses issuer discovery |
+| `OIDC_ALLOWED_ALGORITHMS` | `RS256` | Comma-separated asymmetric JWT algorithms |
+| `OIDC_JWKS_CACHE_SECS` | `300` | Fresh JWKS cache lifetime |
+| `OIDC_JWKS_STALE_SECS` | `900` | Additional stale-key window during provider outages |
+| `OIDC_CLOCK_SKEW_SECS` | `30` | Token-validation clock skew allowance |
+| `OIDC_FRESH_AUTH_SECS` | `300` | Maximum `auth_time` age for sensitive key operations |
 | `TRUST_FORWARDED_FOR` | `false` | Trust `X-Forwarded-For` for rate-limit key extraction; set `true` only behind a trusted proxy |
 | `SIGNED_REQUEST_MAX_SKEW_SECS` | `300` | Max clock skew (seconds) allowed between a signed write request's timestamp and server time |
 | `FRAMESHIFT_ADMIN_PUBKEYS` | `""` | Deprecated compatibility value; account-role administrator routes ignore it |

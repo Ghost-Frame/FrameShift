@@ -34,6 +34,14 @@
 //! | `R2_REGION` | `auto` | S3 region (R2 always uses `auto`) |
 //! | `R2_ACCESS_KEY_ID` | `""` | Access key ID for the bucket |
 //! | `R2_SECRET_ACCESS_KEY` | `""` | Secret access key (supplied via a secrets manager in production) |
+//! | `QUARANTINE_OBJECT_STORE_BACKEND` | `disabled` | `disabled`, `fs`, or `r2`; enables account-backed submission routes only when explicitly configured |
+//! | `QUARANTINE_OBJECT_STORE_ROOT` | `/tmp/frameshift-quarantine` | Root directory for the filesystem quarantine store |
+//! | `QUARANTINE_R2_ENDPOINT` | `""` | S3 endpoint URL for the quarantine store |
+//! | `QUARANTINE_R2_BUCKET` | `""` | Quarantine bucket name |
+//! | `QUARANTINE_R2_PREFIX` | `quarantine` | Key prefix for quarantined archives |
+//! | `QUARANTINE_R2_REGION` | `auto` | S3 region for the quarantine store |
+//! | `QUARANTINE_R2_ACCESS_KEY_ID` | `""` | Quarantine-store access key ID |
+//! | `QUARANTINE_R2_SECRET_ACCESS_KEY` | `""` | Quarantine-store secret access key |
 //! | `TRUST_FORWARDED_FOR` | `false` | Trust `X-Forwarded-For` for rate-limit key extraction; set `true` only behind a trusted proxy |
 //! | `SIGNED_REQUEST_MAX_SKEW_SECS` | `300` | Max allowed clock skew (seconds) between a signed write request's timestamp and server time; also bounds the replay-nonce retention window |
 //! | `FRAMESHIFT_ADMIN_PUBKEYS` | `""` | Deprecated compatibility setting; account-role administrator routes ignore it |
@@ -272,6 +280,33 @@ pub struct ServerConfig {
     /// appear in `Debug` output. Supplied via a secrets manager in production.
     pub r2_secret_access_key: SecretString,
 
+    /// Quarantine object-store backend: `"disabled"`, `"fs"`, or `"r2"`.
+    ///
+    /// The default is `"disabled"` so an upgrade never exposes account-backed
+    /// publication writes without an explicit isolated-store decision.
+    pub quarantine_object_store_backend: String,
+
+    /// Filesystem root used only by the quarantine store.
+    pub quarantine_object_store_root: PathBuf,
+
+    /// S3-compatible endpoint used only by the quarantine store.
+    pub quarantine_r2_endpoint: String,
+
+    /// S3-compatible bucket used only by the quarantine store.
+    pub quarantine_r2_bucket: String,
+
+    /// Object-key prefix used only by the quarantine store.
+    pub quarantine_r2_prefix: String,
+
+    /// S3-compatible region used only by the quarantine store.
+    pub quarantine_r2_region: String,
+
+    /// Access key ID used only by the quarantine store.
+    pub quarantine_r2_access_key_id: String,
+
+    /// Secret access key used only by the quarantine store.
+    pub quarantine_r2_secret_access_key: SecretString,
+
     /// Whether to trust the `X-Forwarded-For` header for rate-limit key extraction.
     ///
     /// Set `true` only when a trusted reverse proxy
@@ -424,6 +459,23 @@ impl std::fmt::Debug for ServerConfig {
             .field("r2_region", &self.r2_region)
             .field("r2_access_key_id", &self.r2_access_key_id)
             .field("r2_secret_access_key", &"[REDACTED]")
+            .field(
+                "quarantine_object_store_backend",
+                &self.quarantine_object_store_backend,
+            )
+            .field(
+                "quarantine_object_store_root",
+                &self.quarantine_object_store_root,
+            )
+            .field("quarantine_r2_endpoint", &self.quarantine_r2_endpoint)
+            .field("quarantine_r2_bucket", &self.quarantine_r2_bucket)
+            .field("quarantine_r2_prefix", &self.quarantine_r2_prefix)
+            .field("quarantine_r2_region", &self.quarantine_r2_region)
+            .field(
+                "quarantine_r2_access_key_id",
+                &self.quarantine_r2_access_key_id,
+            )
+            .field("quarantine_r2_secret_access_key", &"[REDACTED]")
             .field("trust_forwarded_for", &self.trust_forwarded_for)
             .field("signed_request_max_skew", &self.signed_request_max_skew)
             .field(
@@ -524,6 +576,23 @@ struct RawConfig {
     /// R2 secret access key (raw string, wrapped in `SecretString` on convert).
     r2_secret_access_key: String,
 
+    /// Quarantine object-store backend selector (`disabled` | `fs` | `r2`).
+    quarantine_object_store_backend: String,
+    /// Filesystem root for quarantined archives.
+    quarantine_object_store_root: PathBuf,
+    /// S3-compatible quarantine endpoint URL.
+    quarantine_r2_endpoint: String,
+    /// S3-compatible quarantine bucket name.
+    quarantine_r2_bucket: String,
+    /// S3-compatible quarantine key prefix.
+    quarantine_r2_prefix: String,
+    /// S3-compatible quarantine region.
+    quarantine_r2_region: String,
+    /// S3-compatible quarantine access key ID.
+    quarantine_r2_access_key_id: String,
+    /// S3-compatible quarantine secret access key.
+    quarantine_r2_secret_access_key: String,
+
     /// Whether to trust XFF for rate limiting (maps to `TRUST_FORWARDED_FOR`).
     trust_forwarded_for: bool,
 
@@ -617,6 +686,16 @@ impl RawConfig {
             r2_region: self.r2_region,
             r2_access_key_id: self.r2_access_key_id,
             r2_secret_access_key: SecretString::new(self.r2_secret_access_key),
+            quarantine_object_store_backend: self.quarantine_object_store_backend,
+            quarantine_object_store_root: self.quarantine_object_store_root,
+            quarantine_r2_endpoint: self.quarantine_r2_endpoint,
+            quarantine_r2_bucket: self.quarantine_r2_bucket,
+            quarantine_r2_prefix: self.quarantine_r2_prefix,
+            quarantine_r2_region: self.quarantine_r2_region,
+            quarantine_r2_access_key_id: self.quarantine_r2_access_key_id,
+            quarantine_r2_secret_access_key: SecretString::new(
+                self.quarantine_r2_secret_access_key,
+            ),
             trust_forwarded_for: self.trust_forwarded_for,
             signed_request_max_skew: Duration::from_secs(self.signed_request_max_skew_secs),
             admin_pubkeys: split_comma_list(&self.admin_pubkeys),
@@ -673,6 +752,14 @@ fn default_raw_config() -> RawConfig {
         r2_region: "auto".to_string(),
         r2_access_key_id: String::new(),
         r2_secret_access_key: String::new(),
+        quarantine_object_store_backend: "disabled".to_string(),
+        quarantine_object_store_root: PathBuf::from("/tmp/frameshift-quarantine"),
+        quarantine_r2_endpoint: String::new(),
+        quarantine_r2_bucket: String::new(),
+        quarantine_r2_prefix: "quarantine".to_string(),
+        quarantine_r2_region: "auto".to_string(),
+        quarantine_r2_access_key_id: String::new(),
+        quarantine_r2_secret_access_key: String::new(),
         trust_forwarded_for: false,
         signed_request_max_skew_secs: 300,
         admin_pubkeys: String::new(),
@@ -762,6 +849,16 @@ mod tests {
             r2_region: "auto".to_string(),
             r2_access_key_id: String::new(),
             r2_secret_access_key: SecretString::new(String::new()),
+            quarantine_object_store_backend: "disabled".to_string(),
+            quarantine_object_store_root: PathBuf::from("/tmp/frameshift-quarantine-test"),
+            quarantine_r2_endpoint: String::new(),
+            quarantine_r2_bucket: String::new(),
+            quarantine_r2_prefix: "quarantine".to_string(),
+            quarantine_r2_region: "auto".to_string(),
+            quarantine_r2_access_key_id: String::new(),
+            quarantine_r2_secret_access_key: SecretString::new(
+                "RAW_QUARANTINE_CREDENTIAL".to_string(),
+            ),
             trust_forwarded_for: false,
             signed_request_max_skew: Duration::from_secs(300),
             admin_pubkeys: Vec::new(),
@@ -777,6 +874,10 @@ mod tests {
         assert!(
             !debug.contains("RAW_PG_CREDENTIAL"),
             "Debug must not expose postgres_url credential: {debug}"
+        );
+        assert!(
+            !debug.contains("RAW_QUARANTINE_CREDENTIAL"),
+            "Debug must not expose quarantine-store credentials: {debug}"
         );
         assert!(debug.contains("[REDACTED]"), "Debug must show [REDACTED]");
     }
@@ -811,6 +912,14 @@ mod tests {
             r2_region: "auto".to_string(),
             r2_access_key_id: String::new(),
             r2_secret_access_key: SecretString::new(String::new()),
+            quarantine_object_store_backend: "disabled".to_string(),
+            quarantine_object_store_root: PathBuf::from("/tmp/frameshift-quarantine-test"),
+            quarantine_r2_endpoint: String::new(),
+            quarantine_r2_bucket: String::new(),
+            quarantine_r2_prefix: "quarantine".to_string(),
+            quarantine_r2_region: "auto".to_string(),
+            quarantine_r2_access_key_id: String::new(),
+            quarantine_r2_secret_access_key: SecretString::new(String::new()),
             trust_forwarded_for: false,
             signed_request_max_skew: Duration::from_secs(300),
             admin_pubkeys: Vec::new(),
@@ -856,6 +965,14 @@ mod tests {
             r2_region: "auto".to_string(),
             r2_access_key_id: String::new(),
             r2_secret_access_key: SecretString::new(String::new()),
+            quarantine_object_store_backend: "disabled".to_string(),
+            quarantine_object_store_root: PathBuf::from("/tmp/frameshift-quarantine-test"),
+            quarantine_r2_endpoint: String::new(),
+            quarantine_r2_bucket: String::new(),
+            quarantine_r2_prefix: "quarantine".to_string(),
+            quarantine_r2_region: "auto".to_string(),
+            quarantine_r2_access_key_id: String::new(),
+            quarantine_r2_secret_access_key: SecretString::new(String::new()),
             trust_forwarded_for: false,
             signed_request_max_skew: Duration::from_secs(300),
             admin_pubkeys: Vec::new(),
@@ -912,6 +1029,17 @@ mod tests {
         assert!(!raw.into_server_config().publisher_ownership_reads);
     }
 
+    #[test]
+    /// Publication quarantine remains disabled until an operator selects a backend.
+    fn publication_quarantine_defaults_disabled() {
+        let config = default_raw_config().into_server_config();
+        assert_eq!(config.quarantine_object_store_backend, "disabled");
+        assert_eq!(
+            config.quarantine_object_store_root,
+            PathBuf::from("/tmp/frameshift-quarantine")
+        );
+    }
+
     /// Build a [`ServerConfig`] populated with test-friendly defaults and the
     /// given `download_secret`.
     fn make_test_cfg(secret: &str) -> ServerConfig {
@@ -942,6 +1070,14 @@ mod tests {
             r2_region: "auto".to_string(),
             r2_access_key_id: String::new(),
             r2_secret_access_key: SecretString::new(String::new()),
+            quarantine_object_store_backend: "disabled".to_string(),
+            quarantine_object_store_root: PathBuf::from("/tmp/frameshift-quarantine-test"),
+            quarantine_r2_endpoint: String::new(),
+            quarantine_r2_bucket: String::new(),
+            quarantine_r2_prefix: "quarantine".to_string(),
+            quarantine_r2_region: "auto".to_string(),
+            quarantine_r2_access_key_id: String::new(),
+            quarantine_r2_secret_access_key: SecretString::new(String::new()),
             trust_forwarded_for: false,
             signed_request_max_skew: Duration::from_secs(300),
             admin_pubkeys: Vec::new(),
