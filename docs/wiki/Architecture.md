@@ -1,8 +1,8 @@
 # Architecture
 
-Frameshift is a Rust workspace of 25 crates organized in layers. Each layer has a clear role, and crates within a layer depend only on lower layers.
+Frameshift is a Rust workspace of 28 packages organized in layers. Each layer has a clear role, and crates within a layer depend only on lower layers.
 
-## Layer diagram
+## Simplified layer diagram
 
 ```
                           ┌─────────────────┐
@@ -68,12 +68,15 @@ Frameshift is a Rust workspace of 25 crates organized in layers. Each layer has 
 | `frameshift-growth` | Dual-format growth log: append to `growth.md` (legacy markdown) or `growth.jsonl` (structured JSONL). Summarization with Jaccard deduplication. Migration between formats. |
 | `frameshift-capabilities` | Runtime capability sandbox. Filters tool access against pack manifests. Tracks usage and reports unused/undeclared capability invocations. |
 | `frameshift-conformance` | Test bundle schema, runner trait, multi-strategy scoring (substring, regex, JSON shape, custom caller), and upgrade regression gate. |
+| `frameshift-publication` | Deterministic, fail-closed validation for public persona directories. Produces versioned reports and a stable inventory hash for exact-artifact review. |
+| `frameshift-studio` | Secure local Creator Studio draft lifecycle. Keeps private metadata outside publishable content and invalidates review or submission intent after mutations. |
 
 ### Orchestration
 
 | Crate | Role |
 |---|---|
 | `frameshift-orchestrator` | Automate mode: context sensing (language detection, framework markers, task tokenization with domain cluster expansion), intent classification (10 categories), four-component persona ranking (language F1, IDF-weighted lexical, intent relatedness, capability heuristic), hysteresis switch controller (z-score + gap tests + debounce), preference learning with time decay, audit logging. |
+| `frameshift-embed-candle` | Optional local semantic embeddings for persona selection. Pins the model revision and degrades to lexical ranking when the model or cache is unavailable. |
 | `frameshift-daemon` | Background daemon with JSON-RPC 2.0 IPC over Unix socket. File watcher drives orchestrator evaluation on project changes. Methods: project_id, install, activate, sync, gc, grow.append, shutdown. |
 
 ### Memory
@@ -106,15 +109,15 @@ Frameshift is a Rust workspace of 25 crates organized in layers. Each layer has 
 | `frameshift-objects` | `PackStore` async trait. Content-addressed put/get/delete/list with verify-on-write (SHA-256 of bytes must match declared hash). |
 | `frameshift-objects-fs` | Filesystem backend. Two-level sharded directory tree (`aa/bb/hash`), atomic rename, optional quota counter (atomic u64), optional verify-on-read, fsync-on-put for durability. |
 | `frameshift-objects-r2` | Cloudflare R2 (S3-compatible) backend. Flat key layout (no sharding needed). |
-| `frameshift-server` | Axum HTTP API. Routes: pack search/list/download, author/handle lookup, signed download tokens (HMAC-SHA256 with configurable TTL), health, metrics. Middleware: request ID propagation, tracing, gzip compression, body size limits, CORS, IP-based rate limiting on download minting. Publish flow: multipart upload, tar.gz extraction (16 MiB decompressed limit), Ed25519 signature verification, catalog registration. |
+| `frameshift-server` | Axum HTTP API. Routes cover pack discovery and download, accounts and publishers, publication intents and submissions, moderation and administration, health, and metrics. Legacy author and pack publication routes remain available. Middleware includes request IDs, tracing, compression, body limits, CORS, and rate limiting. |
 | `frameshift-seed` | One-shot seeder binary for bulk-ingesting persona directories into catalog and object store. |
 
 ### Entry points (binaries)
 
 | Crate | Role |
 |---|---|
-| `frameshift-cli` | CLI dispatch via clap. Persona name validation (rejects path traversal, symlink escapes). Subcommands: install, activate, sync, gc, project-id, use, select, automate, feedback, prefs, grow, render, diff, rule, skill, migrate, verify, publish. |
-| `frameshift-mcp` | Stdio MCP server for any MCP-capable agent. Eight tools and three prompts for persona operations. JSON-RPC 2.0, protocol version 2024-11-05. |
+| `frameshift-cli` | CLI dispatch via clap. Persona name validation rejects path traversal and symlink escapes. Its 26 top-level commands cover accounts, persona lifecycle, source authoring, conformance, publishing, selection, Automate, configuration, and vault operations. |
+| `frameshift-mcp` | Local stdio MCP server with sixteen tools and three prompts for persona runtime and bounded Creator Studio draft operations. Supports MCP revisions 2025-11-25, 2025-06-18, and 2024-11-05. |
 
 ## Design patterns
 

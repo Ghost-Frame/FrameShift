@@ -1,6 +1,6 @@
 # Persona Catalog
 
-37 personas ship with Frameshift. Each is a `pack.toml` manifest declaring identity, capabilities, and behavioral scope.
+41 personas ship with Frameshift. Each is backed by a `pack.toml` manifest declaring identity, capabilities, and behavioral scope.
 
 ## Domain engineering
 
@@ -19,6 +19,7 @@
 | `unreal/` | Unreal developer. Blueprint plus C++ hybrid. Verifies API names before using them |
 | `cryptographic/` | Cryptographer. Spec-anchored, constant-time aware, never invents primitives |
 | `bots/` | Discord bot personality engineer. Character fidelity across thousands of turns |
+| `accessibility-engineer/` | Accessibility engineer. Inclusive interaction, semantic structure, assistive-technology compatibility |
 
 ## Architecture and design
 
@@ -29,6 +30,8 @@
 | `memory/` | Memory architect. Vector search, embedding pipelines, recall fidelity over latency |
 | `creative/` | Creative coder. Aesthetic judgment over convention |
 | `api-integrator/` | API glue engineer. REST, GraphQL, webhooks, OAuth, rate limits, idempotency keys |
+| `product-strategist/` | Product strategist. Converts evidence and constraints into coherent product decisions |
+| `visual-director/` | Visual director. Art direction, visual systems, composition, and collection coherence |
 
 ## Operations and security
 
@@ -39,6 +42,7 @@
 | `security/` | Security analyst. Opsec-first, classifies by noise level |
 | `gatekeeper/` | Paranoid gatekeeper. Classifies before it lets anything cross the public boundary |
 | `performance/` | Performance analyst. Profiles before optimizing, benchmarks before claiming |
+| `incident-commander/` | Incident commander. Establishes control, coordinates responders, and protects recovery |
 
 ## Developer workflow
 
@@ -78,6 +82,9 @@ Exceptions:
 | Persona | Capability difference |
 |---|---|
 | `api-integrator/` | `network_egress = true` |
+| `incident-commander/` | `network_egress = true`; `memory_required = "soft"` (search, store) |
+| `product-strategist/` | `network_egress = true`; `memory_required = "soft"` (search, store) |
+| `visual-director/` | `network_egress = true`; `memory_required = "soft"` (search, store) |
 | `security/` | `filesystem_scope = "system"` |
 | `orchestrator/` | `filesystem_scope = "system"` |
 | `daily-planner/` | `memory_required = "soft"` (search, recall) |

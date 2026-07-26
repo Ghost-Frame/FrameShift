@@ -1,143 +1,209 @@
 # CLI Reference
 
+This page documents the FrameShift `0.10.0` command surface. Run
+`frameshift --version` to check the binary on your path and
+`frameshift <command> --help` for the complete option set accepted by that
+binary.
+
 ## Installation
+
+Build the CLI from this workspace:
 
 ```bash
 cargo build --release -p frameshift-cli
-# Binary: target/release/frameshift-cli
 ```
 
-## Commands
+The binary is named `frameshift`.
 
-### Core operations
+## Command index
 
-#### `frameshift use <name> [--from <library>]`
+| Command | Purpose |
+|---|---|
+| `account` | Log in, inspect, or end an account session |
+| `install` | Install a persona pack into the central store |
+| `activate` | Activate an installed persona for the current project |
+| `uninstall` | Remove an installed persona from the current project |
+| `list` | List personas installed for the current project |
+| `sync` | Reconcile the central store with the project lockfile |
+| `gc` | Remove unreferenced central-cache entries |
+| `project-id` | Print the current project's stable ID |
+| `rule` | Add or remove a typed rule in persona source |
+| `skill` | Add or remove a typed skill in persona source |
+| `diff` | Compare two persona sources semantically |
+| `render` | Render persona source for an agent target |
+| `migrate` | Move legacy project files into the central store |
+| `grow` | Append, inspect, or summarize local growth |
+| `verify` | Run persona conformance checks |
+| `publish` | Package a persona locally or publish it to a registry |
+| `register` | Register this machine's author key under a registry handle |
+| `keys` | Manage local and account-enrolled publisher keys |
+| `search` | Search the registry pack catalog |
+| `select` | Rank personas without activating one |
+| `use` | Activate a persona and print its rendered output |
+| `automate` | Manage per-project Automate policy |
+| `prefs` | Inspect or adjust selection preference biases |
+| `feedback` | Record a selection override for preference learning |
+| `config` | Get or set current-project configuration |
+| `vault` | Manage encrypted template-token values |
 
-Install, activate, and print the rendered persona in one call.
+## Persona lifecycle
 
-```bash
-frameshift use cryptographic --from ./personas
-```
+### `frameshift account <ACTION>`
 
-#### `frameshift install <spec> [--from-path <dir>]`
+Use `login`, `status`, or `logout` to manage the current account session.
 
-Install a persona pack into the central cache. Spec format: `name@version`.
+### `frameshift install [OPTIONS] <SPEC>`
+
+Install a persona by `name@version`. Use `--from-path <PATH>` to install from a
+local pack directory instead of the registry.
 
 ```bash
 frameshift install cryptographic@0.1.0 --from-path ./personas/cryptographic
 ```
 
-#### `frameshift activate <name>`
+### `frameshift activate <PERSONA>`
 
-Set the active persona for the current project.
+Activate an installed persona for the current project.
+
+### `frameshift uninstall <PERSONA>`
+
+Remove an installed persona from the current project.
+
+### `frameshift list`
+
+List the personas installed for the current project.
+
+### `frameshift sync`
+
+Reconcile installed content with the project lockfile and report any
+materialization failures.
+
+### `frameshift gc`
+
+Remove central-cache entries that no project lockfile references.
+
+### `frameshift use [OPTIONS] <NAME>`
+
+Activate a persona and print its rendered content. `--from <DIR>` installs
+`<DIR>/<NAME>` first if the persona is not already installed. `--target`
+selects `claude`, `codex`, `gemini`, or `generic`; the default is `generic`.
 
 ```bash
-frameshift activate cryptographic
+frameshift use cryptographic --from ./personas --target codex
 ```
 
-#### `frameshift sync`
+### `frameshift project-id`
 
-Reconcile the central store with the project lockfile. Reports installed personas and whether anything is out of date.
+Print the SHA-256 project ID derived from the canonical project-root path.
 
-#### `frameshift gc`
+## Discovery and Automate
 
-Remove unreferenced cache entries. Safe to run at any time.
+### `frameshift search [QUERY] [--tag <TAG>] [--limit <COUNT>]`
 
-#### `frameshift project-id`
+Search the registry catalog by text and optional tag.
 
-Print the SHA-256 project ID for the current directory. The project ID is `sha256(realpath(project_root))`.
+### `frameshift select [--task <TEXT>] [--library <DIR>] [--format table|json]`
 
-### Selection and automate mode
-
-#### `frameshift select [--task TEXT] [--library DIR] [--format table|json]`
-
-Score and rank personas without activating. Read-only inspection of the selection pipeline.
+Rank personas without changing active state. Table output is the default. JSON
+output includes the context snapshot, component scores, matches, and rationale.
 
 ```bash
-# Table output (default):
 frameshift select --task "debug a rust compilation error"
-
-# JSON output with full context snapshot:
 frameshift select --task "debug a rust compilation error" --format json
 ```
 
-JSON output includes: context snapshot (detected languages, frameworks, inferred intent), per-candidate component scores (language, lexical, intent, capability), matched tokens, anti-matched tokens, and rationale.
+### `frameshift automate <ACTION>`
 
-#### `frameshift automate on [--sensitivity 0.0-1.0]`
+Actions are `on`, `off`, `status`, `lock`, and `unlock`. `on` accepts an
+optional sensitivity from `0.0` to `1.0`.
 
-Enable automate mode for the current project. Sensitivity controls switching aggressiveness (default 0.5).
+Enabling Automate stores project policy. It does not independently select or
+activate a persona. A connected host or the FrameShift daemon must run the
+selection and activation loop. `lock` pins the current persona; `unlock`
+allows the host loop to switch again.
 
-#### `frameshift automate off`
+### `frameshift prefs <ACTION>`
 
-Disable automate mode.
+Actions are `show`, `bump`, `decay`, and `reset`. The mutation actions operate
+on per-persona preference biases used by selection.
 
-#### `frameshift automate status`
+### `frameshift feedback --chosen <PERSONA> [OPTIONS]`
 
-Print mode state: on/off, sensitivity, currently active persona.
-
-#### `frameshift automate lock`
-
-Pin the current persona. Automate mode will not switch while locked.
-
-#### `frameshift automate unlock`
-
-Release the pin. Automate mode resumes switching.
-
-#### `frameshift feedback --chosen <name> [--auto-pick <name>] [--intent <intent>] [--reason <text>]`
-
-Record a selection override for preference learning. The engine bumps the chosen persona's bias (+0.05) and decays the auto-picked persona's bias (-0.03).
+Record a manual selection override. Optional fields include the automatic
+pick, task, inferred intent, and reason.
 
 ```bash
-frameshift feedback --auto-pick web-designer --chosen rust --intent debugging
+frameshift feedback --auto-pick frontend --chosen rust --intent debugging
 ```
 
-#### `frameshift prefs [show|reset]`
+## Source authoring and growth
 
-View or reset per-persona preference biases.
+### `frameshift rule add|remove`
 
-### Growth
+Modify typed rules in a persona's `rules.toml`.
 
-#### `frameshift grow append <persona> <text>`
+### `frameshift skill add|remove`
 
-Append an entry to a persona's growth log (JSONL format).
+Modify typed skills in a persona's `skills.toml`.
+
+### `frameshift diff [--json] <PERSONA_A> <PERSONA_B>`
+
+Compare two persona sources. The report covers rule, skill, voice, and anchor
+changes; `--json` emits machine-readable output.
+
+### `frameshift render [--target <TARGET>] <PERSONA>`
+
+Render source for `claude`, `codex`, `gemini`, or `generic`.
+
+### `frameshift migrate`
+
+Move supported legacy project files into the central FrameShift store.
+
+### `frameshift grow <ACTION>`
+
+`append` records a local observation, `log` reads growth history, and `summary`
+produces the deduplicated summary.
 
 ```bash
-frameshift grow append rust "orphan rules prevent implementing foreign traits on foreign types"
+frameshift grow append --persona rust --text "Prefer a newtype when trait coherence blocks a direct implementation."
 ```
 
-### Source manipulation
+## Verification, identity, and publishing
 
-#### `frameshift render <persona> [--target claude|codex|gemini|generic]`
+### `frameshift verify [OPTIONS]`
 
-Render persona source to per-agent markdown and print to stdout. Targets control which sections are included:
+Run conformance checks. Exactly one of `--persona <PERSONA>` or
+`--bundle <DIR>` is required. Optional controls include `--canned-response`,
+`--threshold`, `--runner mock|cli`, and `--model`. The `cli` runner requires
+`--persona`.
 
-- **claude** -- Full output including design notes and safety layer
-- **codex** -- Omits design notes and safety layer
-- **gemini** -- Omits design notes
-- **generic** -- Full output (same as claude)
+```bash
+frameshift verify --persona rust --runner mock
+```
 
-#### `frameshift diff <a> <b>`
+### `frameshift register --server <URL> --handle <HANDLE> [--display-name <NAME>]`
 
-Semantic diff between two persona sources. Reports added/removed/modified rules, added/removed skills, voice changes, and anchor similarity (Jaccard coefficient).
+Register this machine's author key under a registry handle.
 
-#### `frameshift rule add|remove`
+### `frameshift keys <ACTION>`
 
-Patch rules in persona TOML source. Operates on typed `rules.toml`, not rendered markdown.
+Manage publisher keys. Available actions are `init`, `list`, `create`, `label`,
+`select`, `enroll`, `remote-list`, `rotate`, `revoke`, `remote-revoke`,
+`recover`, `export`, and `import`. Use the action-specific `--help` before a
+mutation.
 
-#### `frameshift skill add|remove`
+### `frameshift publish --persona <PERSONA> [OPTIONS]`
 
-Patch skills in persona TOML source.
+Package a persona into `--out <DIR>` or publish it through `--server <URL>`
+under `--handle <HANDLE>`.
 
-#### `frameshift migrate`
+## Project configuration and vault
 
-Move legacy files (`frameshift.toml`, `frameshift.lock`, `growth.md`) from the project root into the central store.
+### `frameshift config get|set`
 
-### Verification and publishing
+Read or update a key in the current project's central `config.toml`.
 
-#### `frameshift verify <persona> [--bundle <path>] [--threshold <score>] [--canned-response <text>]`
+### `frameshift vault <ACTION>`
 
-Run conformance checks against a persona. Loads the test bundle, runs each test case, computes scores, and checks against the threshold.
-
-#### `frameshift publish <persona> [--out <dir>]`
-
-Package a persona for distribution. Loads the source, writes it to the output directory, and renders AGENTS.md.
+Actions are `init`, `set`, `get`, `rm`, and `list`. The vault holds encrypted
+values used to resolve persona template tokens.
