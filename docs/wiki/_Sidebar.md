@@ -27,6 +27,7 @@
 - [[Growth System]]
 - [[Memory Integration]]
 - [[Architecture]]
+- [[Operations and Observability]]
 
 **Safety and support**
 

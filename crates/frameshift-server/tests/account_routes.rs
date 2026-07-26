@@ -337,6 +337,20 @@ async fn account_view_rejects_orphaned_publisher_membership() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
+/// Account authentication failures increment the bounded workflow metric.
+#[tokio::test]
+async fn account_auth_rejection_records_creator_workflow_outcome() {
+    let state = test_state(MockCatalog::new(), Some(FakeVerifier::new()));
+    let metrics = Arc::clone(&state.metrics);
+
+    let response = send(state, Method::GET, "/v1/account", None, None).await;
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(metrics
+        .encode_text()
+        .contains("creator_workflow_outcomes_total{outcome=\"client_error\",stage=\"account\"} 1"));
+}
+
 /// Account JIT provisioning, publisher ownership, key proof, and suspension are enforced.
 #[tokio::test]
 async fn account_and_publisher_security_workflow_is_enforced() {
