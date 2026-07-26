@@ -40,7 +40,7 @@ pub use model::{
     LockedPersona, Lockfile, MaterializeFailure, MemoryConfig, MemoryRequirementStatus,
     PersonaSpec, ProjectConfig, ProjectPaths, SyncReport, SCHEMA_VERSION,
 };
-pub use publication::{PreparedPublication, PublicationBinding};
+pub use publication::{PreparedPublication, PublicationBinding, PublicationReviewBinding};
 pub use publish::PublishOutcome;
 pub use publisher::{EnrolledPublisherKey, EnrolledPublisherKeyState};
 pub use registry::{

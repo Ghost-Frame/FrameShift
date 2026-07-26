@@ -261,6 +261,10 @@ pub enum ClientError {
     #[error("pack manifest author_pubkey does not match the selected publisher key")]
     PublicationSignerMismatch,
 
+    /// The reviewed artifact differs from the prepared publication.
+    #[error("publication review binding does not match the prepared artifact")]
+    PublicationReviewBindingMismatch,
+
     #[error("author_pubkey is not a supported ed25519 public key encoding: {0}")]
     InvalidAuthorPublicKey(String),
 

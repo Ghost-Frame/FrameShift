@@ -451,25 +451,6 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                 "required": ["id", "path", "action"]
             }),
         },
-        ToolDef {
-            name: "frameshift_draft_review".to_string(),
-            description: "Confirm exact-file human review or explicit submission intent using the inventory hash returned by frameshift_draft_status.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "id": {"type": "string"},
-                    "action": {
-                        "type": "string",
-                        "enum": ["confirm_review", "confirm_submission"]
-                    },
-                    "inventory_hash": {
-                        "type": "string",
-                        "description": "Exact current inventory hash previously shown for review."
-                    }
-                },
-                "required": ["id", "action", "inventory_hash"]
-            }),
-        },
     ]
 }
 
@@ -715,7 +696,6 @@ pub fn call_tool(name: &str, arguments: &serde_json::Value, client: &Client) -> 
         "frameshift_draft_preview" => call_draft_preview(arguments, client),
         "frameshift_draft_read" => call_draft_read(arguments, client),
         "frameshift_draft_write" => call_draft_write(arguments, client),
-        "frameshift_draft_review" => call_draft_review(arguments, client),
         _ => err_result(format!("unknown tool: {name}")),
     }
 }
@@ -1640,40 +1620,6 @@ fn call_draft_write(arguments: &serde_json::Value, client: &Client) -> ToolResul
     }
 }
 
-/// Handle hash-bound review confirmation and explicit submission intent.
-fn call_draft_review(arguments: &serde_json::Value, client: &Client) -> ToolResult {
-    let id = match required_string(arguments, "id") {
-        Ok(value) => value,
-        Err(result) => return result,
-    };
-    let action = match required_string(arguments, "action") {
-        Ok(value) => value,
-        Err(result) => return result,
-    };
-    let inventory_hash = match required_string(arguments, "inventory_hash") {
-        Ok(value) => value,
-        Err(result) => return result,
-    };
-    let studio = match studio_for_client(client) {
-        Ok(studio) => studio,
-        Err(error) => return err_result(error),
-    };
-    let result = match action {
-        "confirm_review" => studio.confirm_review(id, inventory_hash),
-        "confirm_submission" => studio.confirm_submission_intent(id, inventory_hash),
-        _ => {
-            return err_result(
-                "invalid draft review action: expected confirm_review or confirm_submission"
-                    .to_string(),
-            )
-        }
-    };
-    match result {
-        Ok(status) => draft_status_result(status),
-        Err(error) => err_result(format!("draft review failed: {error}")),
-    }
-}
-
 #[cfg(test)]
 /// Unit and integration tests for every published MCP tool.
 mod tests {
@@ -1731,9 +1677,9 @@ mod tests {
 
     /// Verify that tool definitions include runtime and Creator Studio tools.
     #[test]
-    fn tool_definitions_returns_seventeen() {
+    fn tool_definitions_returns_sixteen_without_review_authority() {
         let defs = tool_definitions();
-        assert_eq!(defs.len(), 17);
+        assert_eq!(defs.len(), 16);
         for name in [
             "frameshift_draft_create",
             "frameshift_draft_list",
@@ -1741,13 +1687,15 @@ mod tests {
             "frameshift_draft_preview",
             "frameshift_draft_read",
             "frameshift_draft_write",
-            "frameshift_draft_review",
         ] {
             assert!(
                 defs.iter().any(|definition| definition.name == name),
                 "missing Creator Studio tool {name}"
             );
         }
+        assert!(!defs
+            .iter()
+            .any(|definition| definition.name == "frameshift_draft_review"));
     }
 
     /// Draft creation advertises bounded blank, guided, and registry-fork contracts.
@@ -2740,9 +2688,9 @@ mod tests {
         assert!(studio.list().unwrap().is_empty());
     }
 
-    /// MCP draft tools complete the hash-bound create, edit, review, and submit flow.
+    /// MCP draft tools author and inspect valid content without acquiring review authority.
     #[test]
-    fn draft_tools_complete_review_workflow() {
+    fn draft_tools_complete_authoring_without_review_authority() {
         let temporary = tempfile::tempdir().unwrap();
         let client = make_client(&temporary.path().join("data"));
 
@@ -2784,26 +2732,29 @@ mod tests {
         );
         let status_json: serde_json::Value = serde_json::from_str(&status.content[0].text).unwrap();
         assert_eq!(status_json["publication"]["valid"], true);
-        let inventory_hash = status_json["publication"]["inventory_hash"]
-            .as_str()
-            .unwrap();
+        let reviewed = call_tool(
+            "frameshift_draft_review",
+            &serde_json::json!({
+                "id": "mcp-draft",
+                "action": "confirm_review",
+                "inventory_hash": status_json["publication"]["inventory_hash"],
+            }),
+            &client,
+        );
+        assert_eq!(reviewed.is_error, Some(true));
+        assert!(reviewed.content[0]
+            .text
+            .contains("unknown tool: frameshift_draft_review"));
 
-        for action in ["confirm_review", "confirm_submission"] {
-            let reviewed = call_tool(
-                "frameshift_draft_review",
-                &serde_json::json!({
-                    "id": "mcp-draft",
-                    "action": action,
-                    "inventory_hash": inventory_hash,
-                }),
-                &client,
-            );
-            assert!(
-                reviewed.is_error.is_none(),
-                "unexpected review error: {}",
-                reviewed.content[0].text
-            );
-        }
+        let unchanged = call_tool(
+            "frameshift_draft_status",
+            &serde_json::json!({"id": "mcp-draft"}),
+            &client,
+        );
+        let unchanged_json: serde_json::Value =
+            serde_json::from_str(&unchanged.content[0].text).unwrap();
+        assert_eq!(unchanged_json["review_current"], false);
+        assert_eq!(unchanged_json["submission_intent_current"], false);
 
         let listed = call_tool("frameshift_draft_list", &serde_json::json!({}), &client);
         assert!(listed.content[0].text.contains("\"id\":\"mcp-draft\""));

@@ -12,24 +12,12 @@ use flate2::{Compression, GzBuilder};
 use frameshift_catalog::{PublicationIntentRecord, PublicationSubmissionRecord};
 use frameshift_pack::{ObjectHash, Pack};
 use frameshift_studio::DraftSnapshot;
+pub use frameshift_studio::{PublicationBinding, PublicationReviewBinding};
 use secrecy::SecretString;
 use serde::Serialize;
 use uuid::Uuid;
 
 use crate::error::ClientError;
-
-/// Public non-secret hashes that bind one exact prepared publication.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct PublicationBinding {
-    /// SHA-256 digest of the exact deterministic gzip-tar bytes.
-    pub archive_hash: ObjectHash,
-    /// SHA-256 digest of the exact `pack.toml` bytes.
-    pub manifest_hash: ObjectHash,
-    /// SHA-256 digest of the normalized public file inventory.
-    pub file_inventory_hash: ObjectHash,
-    /// Version of the shared publication scanner contract.
-    pub scan_schema_version: u32,
-}
 
 /// Exact signed archive retained privately until explicit submission.
 pub struct PreparedPublication {
@@ -123,15 +111,17 @@ pub fn create_publication_intent(
     server_url: &str,
     access_token: &SecretString,
     intent_id: Uuid,
-    publisher_id: Uuid,
-    publisher_key_id: Uuid,
+    review_binding: PublicationReviewBinding,
     prepared: &PreparedPublication,
 ) -> Result<PublicationIntentRecord, ClientError> {
+    if review_binding.artifact != prepared.binding {
+        return Err(ClientError::PublicationReviewBindingMismatch);
+    }
     let binding = prepared.binding;
     let body = serde_json::to_vec(&CreatePublicationIntentRequest {
         id: intent_id,
-        publisher_id,
-        publisher_key_id,
+        publisher_id: review_binding.publisher_id,
+        publisher_key_id: review_binding.publisher_key_id,
         archive_hash: binding.archive_hash,
         manifest_hash: binding.manifest_hash,
         file_inventory_hash: binding.file_inventory_hash,
@@ -293,7 +283,7 @@ mod tests {
         SigningKey::from_bytes(&[17_u8; 32])
     }
 
-    /// Build a reviewed and intent-confirmed snapshot using the fixture key.
+    /// Build a valid exact pre-review snapshot using the fixture key.
     fn ready_snapshot(root: &std::path::Path) -> DraftSnapshot {
         let source = root.join("source");
         fs::create_dir_all(&source).unwrap();
@@ -310,12 +300,8 @@ mod tests {
         let studio = Studio::open(root.join("studio")).unwrap();
         let status = studio.import("fixture", "Fixture", &source).unwrap();
         let inventory_hash = status.publication.inventory_hash;
-        studio.confirm_review("fixture", &inventory_hash).unwrap();
         studio
-            .confirm_submission_intent("fixture", &inventory_hash)
-            .unwrap();
-        studio
-            .snapshot_for_submission("fixture", &inventory_hash)
+            .snapshot_for_review("fixture", &inventory_hash)
             .unwrap()
     }
 
@@ -352,7 +338,7 @@ mod tests {
         assert!(matches!(error, ClientError::PublicationSignerMismatch));
     }
 
-    /// Intent JSON carries every exact hash and caller-selected idempotency identifier.
+    /// Intent JSON carries every reviewed identity, exact hash, and idempotency identifier.
     #[test]
     fn intent_request_serializes_exact_binding() {
         let temporary = tempfile::tempdir().unwrap();
@@ -369,6 +355,8 @@ mod tests {
         };
         let value = serde_json::to_value(request).unwrap();
         assert_eq!(value["id"], Uuid::from_u128(1).to_string());
+        assert_eq!(value["publisher_id"], Uuid::from_u128(2).to_string());
+        assert_eq!(value["publisher_key_id"], Uuid::from_u128(3).to_string());
         assert_eq!(
             value["archive_hash"],
             prepared.binding.archive_hash.to_hex()
@@ -385,6 +373,59 @@ mod tests {
             value["scan_schema_version"],
             prepared.binding.scan_schema_version
         );
+    }
+
+    /// Final review, intent confirmation, and submission snapshot share one exact binding.
+    #[test]
+    fn artifact_first_review_flow_preserves_one_binding() {
+        let temporary = tempfile::tempdir().unwrap();
+        let snapshot = ready_snapshot(temporary.path());
+        let prepared = prepare_publication(&snapshot, &signing_key()).unwrap();
+        let studio = Studio::open(temporary.path().join("studio")).unwrap();
+        let binding = PublicationReviewBinding {
+            artifact: prepared.binding(),
+            publisher_id: Uuid::from_u128(2),
+            publisher_key_id: Uuid::from_u128(3),
+        };
+
+        let review = studio.review_report("fixture", binding).unwrap();
+        assert_eq!(review.binding, binding);
+        studio.confirm_review("fixture", binding).unwrap();
+        studio
+            .confirm_submission_intent("fixture", binding)
+            .unwrap();
+        let submission = studio.snapshot_for_submission("fixture", binding).unwrap();
+        assert_eq!(
+            submission.publication().inventory_hash,
+            snapshot.publication().inventory_hash
+        );
+    }
+
+    /// Intent creation rejects a prepared archive substituted after final review.
+    #[test]
+    fn intent_creation_rejects_reviewed_artifact_substitution() {
+        let temporary = tempfile::tempdir().unwrap();
+        let snapshot = ready_snapshot(temporary.path());
+        let prepared = prepare_publication(&snapshot, &signing_key()).unwrap();
+        let mut binding = PublicationReviewBinding {
+            artifact: prepared.binding(),
+            publisher_id: Uuid::from_u128(2),
+            publisher_key_id: Uuid::from_u128(3),
+        };
+        binding.artifact.archive_hash = ObjectHash::of(b"substituted archive");
+
+        let error = create_publication_intent(
+            "https://registry.example",
+            &SecretString::from(String::from("token")),
+            Uuid::from_u128(1),
+            binding,
+            &prepared,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ClientError::PublicationReviewBindingMismatch
+        ));
     }
 
     /// Submission multipart includes both stable IDs and the exact archive bytes.

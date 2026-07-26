@@ -11,13 +11,14 @@ use std::path::{Component, Path, PathBuf};
 use frameshift_conformance::{
     bundle_hash, run_bundle, ConformanceError, ConformanceTestResult, Runner, TestBundle,
 };
-use frameshift_pack::{ForkOrigin, PackManifest, LOCAL_UNSIGNED_PUBKEY};
+use frameshift_pack::{ForkOrigin, ObjectHash, PackManifest, LOCAL_UNSIGNED_PUBKEY};
 use frameshift_publication::{
     is_allowed_public_path, validate_directory, FindingSeverity, PublicationReport, MAX_FILE_SIZE,
 };
 use frameshift_source::{render_to_markdown, Author, Persona, PersonaSource, RenderTarget};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+use uuid::Uuid;
 
 /// Current schema version for persisted draft metadata.
 pub const DRAFT_SCHEMA_VERSION: u32 = 1;
@@ -65,6 +66,9 @@ pub struct ReviewConfirmation {
     pub revision: u64,
     /// Deterministic hash of every reviewed public file.
     pub inventory_hash: String,
+    /// Exact prepared artifact and publisher selection shown during review.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<PublicationReviewBinding>,
 }
 
 /// Explicit intent to submit a previously reviewed inventory.
@@ -74,6 +78,33 @@ pub struct SubmissionIntent {
     pub revision: u64,
     /// Deterministic hash of the approved public files.
     pub inventory_hash: String,
+    /// Exact reviewed artifact and publisher selection approved for submission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<PublicationReviewBinding>,
+}
+
+/// Public non-secret hashes that identify one exact prepared publication artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicationBinding {
+    /// SHA-256 digest of the exact deterministic gzip-tar bytes.
+    pub archive_hash: ObjectHash,
+    /// SHA-256 digest of the exact `pack.toml` bytes.
+    pub manifest_hash: ObjectHash,
+    /// SHA-256 digest of the normalized public file inventory.
+    pub file_inventory_hash: ObjectHash,
+    /// Version of the shared publication scanner contract.
+    pub scan_schema_version: u32,
+}
+
+/// Exact artifact and account-owned publisher identity presented for human review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicationReviewBinding {
+    /// Public hashes of the exact prepared signed artifact.
+    pub artifact: PublicationBinding,
+    /// Server-assigned publisher selected for the release.
+    pub publisher_id: Uuid,
+    /// Active publisher key selected to sign the release.
+    pub publisher_key_id: Uuid,
 }
 
 /// Current draft metadata paired with fresh deterministic validation.
@@ -104,6 +135,19 @@ pub struct DraftValidationReport {
     pub valid: bool,
     /// Path-free conformance result for the exact frozen bundle.
     pub conformance: DraftConformanceReport,
+}
+
+/// Path-free final review data for one exact prepared publication.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DraftReviewReport {
+    /// Draft revision whose exact bytes produced the prepared artifact.
+    pub revision: u64,
+    /// Shared scanner report containing exact files, hashes, and warnings.
+    pub publication: PublicationReport,
+    /// Full typed public manifest containing identity, license, and capabilities.
+    pub manifest: PackManifest,
+    /// Exact artifact hashes and publisher selection requiring human approval.
+    pub binding: PublicationReviewBinding,
 }
 
 /// Path-free conformance result for one exact frozen draft inventory.
@@ -309,6 +353,9 @@ pub enum StudioError {
     /// Confirmation did not match the exact inventory presented for review.
     #[error("review inventory hash does not match current content")]
     ReviewHashMismatch,
+    /// Prepared artifact or publisher selection does not match the exact current draft.
+    #[error("publication review binding does not match current content")]
+    ReviewBindingMismatch,
     /// Submission intent requires a current review of the exact content.
     #[error("draft review is not current")]
     ReviewNotCurrent,
@@ -665,11 +712,7 @@ impl Studio {
         let draft = self.load(id)?;
         let publication = validate_directory(&paths.content)?;
         let review_current = review_matches(&draft, &publication);
-        let submission_intent_current = review_current
-            && draft.submission_intent.as_ref().is_some_and(|intent| {
-                intent.revision == draft.revision
-                    && intent.inventory_hash == publication.inventory_hash
-            });
+        let submission_intent_current = review_current && submission_matches(&draft, &publication);
         Ok(DraftStatus {
             draft,
             publication,
@@ -740,22 +783,63 @@ impl Studio {
         })
     }
 
-    /// Confirm human review of the exact current valid file inventory.
-    pub fn confirm_review(
+    /// Freeze one exact valid inventory so a client can prepare it before review.
+    pub fn snapshot_for_review(
         &self,
         id: &str,
         expected_inventory_hash: &str,
-    ) -> Result<DraftStatus, StudioError> {
-        let mut status = self.status(id)?;
+    ) -> Result<DraftSnapshot, StudioError> {
+        let status = self.status(id)?;
         if !status.publication.valid {
             return Err(StudioError::InvalidForReview);
         }
         if status.publication.inventory_hash != expected_inventory_hash {
             return Err(StudioError::ReviewHashMismatch);
         }
+        self.freeze_status(id, status)
+    }
+
+    /// Build path-free final review data for one exact prepared artifact.
+    pub fn review_report(
+        &self,
+        id: &str,
+        binding: PublicationReviewBinding,
+    ) -> Result<DraftReviewReport, StudioError> {
+        let status = self.status(id)?;
+        validate_review_binding(&status.publication, &binding)?;
+        let snapshot = self.freeze_status(id, status)?;
+        let manifest_file = snapshot
+            .files
+            .iter()
+            .find(|file| file.path == "pack.toml")
+            .ok_or(StudioError::SnapshotChanged)?;
+        let manifest = std::str::from_utf8(&manifest_file.bytes)
+            .ok()
+            .and_then(|raw| toml::from_str::<PackManifest>(raw).ok())
+            .ok_or(StudioError::SnapshotChanged)?;
+        Ok(DraftReviewReport {
+            revision: snapshot.revision,
+            publication: snapshot.publication,
+            manifest,
+            binding,
+        })
+    }
+
+    /// Confirm human review of the exact prepared artifact and publisher selection.
+    pub fn confirm_review(
+        &self,
+        id: &str,
+        binding: PublicationReviewBinding,
+    ) -> Result<DraftStatus, StudioError> {
+        let mut status = self.status(id)?;
+        if !status.publication.valid {
+            return Err(StudioError::InvalidForReview);
+        }
+        validate_review_binding(&status.publication, &binding)?;
         status.draft.review = Some(ReviewConfirmation {
             revision: status.draft.revision,
             inventory_hash: status.publication.inventory_hash.clone(),
+            binding: Some(binding),
         });
         status.draft.submission_intent = None;
         let paths = self.draft_paths(id)?;
@@ -767,18 +851,25 @@ impl Studio {
     pub fn confirm_submission_intent(
         &self,
         id: &str,
-        expected_inventory_hash: &str,
+        binding: PublicationReviewBinding,
     ) -> Result<DraftStatus, StudioError> {
         let mut status = self.status(id)?;
         if !status.review_current {
             return Err(StudioError::ReviewNotCurrent);
         }
-        if status.publication.inventory_hash != expected_inventory_hash {
-            return Err(StudioError::ReviewHashMismatch);
+        if status
+            .draft
+            .review
+            .as_ref()
+            .and_then(|review| review.binding)
+            != Some(binding)
+        {
+            return Err(StudioError::ReviewBindingMismatch);
         }
         status.draft.submission_intent = Some(SubmissionIntent {
             revision: status.draft.revision,
             inventory_hash: status.publication.inventory_hash.clone(),
+            binding: Some(binding),
         });
         let paths = self.draft_paths(id)?;
         write_json_atomic(&paths.metadata, &status.draft, true)?;
@@ -789,14 +880,20 @@ impl Studio {
     pub fn snapshot_for_submission(
         &self,
         id: &str,
-        expected_inventory_hash: &str,
+        binding: PublicationReviewBinding,
     ) -> Result<DraftSnapshot, StudioError> {
         let status = self.status(id)?;
         if !status.submission_intent_current {
             return Err(StudioError::SubmissionIntentNotCurrent);
         }
-        if status.publication.inventory_hash != expected_inventory_hash {
-            return Err(StudioError::ReviewHashMismatch);
+        if status
+            .draft
+            .submission_intent
+            .as_ref()
+            .and_then(|intent| intent.binding)
+            != Some(binding)
+        {
+            return Err(StudioError::ReviewBindingMismatch);
         }
 
         self.freeze_status(id, status)
@@ -1352,8 +1449,49 @@ fn invalidate_before_mutation(draft: &mut Draft) -> Result<(), StudioError> {
 fn review_matches(draft: &Draft, report: &PublicationReport) -> bool {
     report.valid
         && draft.review.as_ref().is_some_and(|review| {
-            review.revision == draft.revision && review.inventory_hash == report.inventory_hash
+            review.revision == draft.revision
+                && review.inventory_hash == report.inventory_hash
+                && review
+                    .binding
+                    .as_ref()
+                    .is_some_and(|binding| validate_review_binding(report, binding).is_ok())
         })
+}
+
+/// Return whether submission metadata exactly repeats the current reviewed binding.
+fn submission_matches(draft: &Draft, report: &PublicationReport) -> bool {
+    let Some(review) = draft.review.as_ref() else {
+        return false;
+    };
+    draft.submission_intent.as_ref().is_some_and(|intent| {
+        intent.revision == draft.revision
+            && intent.inventory_hash == report.inventory_hash
+            && intent.binding.is_some()
+            && intent.binding == review.binding
+    })
+}
+
+/// Validate non-secret prepared hashes and publisher selection against a scanner report.
+fn validate_review_binding(
+    report: &PublicationReport,
+    binding: &PublicationReviewBinding,
+) -> Result<(), StudioError> {
+    let manifest_hash = report
+        .inventory
+        .iter()
+        .find(|entry| entry.path == "pack.toml")
+        .and_then(|entry| ObjectHash::from_hex(&entry.sha256).ok());
+    let inventory_hash = ObjectHash::from_hex(&report.inventory_hash).ok();
+    if !report.valid
+        || binding.publisher_id.is_nil()
+        || binding.publisher_key_id.is_nil()
+        || manifest_hash != Some(binding.artifact.manifest_hash)
+        || inventory_hash != Some(binding.artifact.file_inventory_hash)
+        || report.schema_version != binding.artifact.scan_schema_version
+    {
+        return Err(StudioError::ReviewBindingMismatch);
+    }
+    Ok(())
 }
 
 /// Read a bounded regular file without following a final symlink on Unix.
@@ -1459,6 +1597,25 @@ mod tests {
         )
         .unwrap();
         fs::write(root.join("AGENTS.md"), "# Test\n\nPrecise behavior.\n").unwrap();
+    }
+
+    /// Build a deterministic prepared-artifact and publisher selection for one report.
+    fn review_binding(report: &PublicationReport) -> PublicationReviewBinding {
+        let manifest = report
+            .inventory
+            .iter()
+            .find(|entry| entry.path == "pack.toml")
+            .unwrap();
+        PublicationReviewBinding {
+            artifact: PublicationBinding {
+                archive_hash: ObjectHash::of(b"prepared signed archive"),
+                manifest_hash: ObjectHash::from_hex(&manifest.sha256).unwrap(),
+                file_inventory_hash: ObjectHash::from_hex(&report.inventory_hash).unwrap(),
+                scan_schema_version: report.schema_version,
+            },
+            publisher_id: Uuid::from_u128(1),
+            publisher_key_id: Uuid::from_u128(2),
+        }
     }
 
     /// Write one valid pack with a single built-in conformance test.
@@ -1972,17 +2129,12 @@ mod tests {
         studio
             .write_file("test-draft", "AGENTS.md", b"# Test\n\nPrecise behavior.\n")
             .unwrap();
-        let inventory_hash = studio
-            .status("test-draft")
-            .unwrap()
-            .publication
-            .inventory_hash;
-        let reviewed = studio
-            .confirm_review("test-draft", &inventory_hash)
-            .unwrap();
+        let status = studio.status("test-draft").unwrap();
+        let binding = review_binding(&status.publication);
+        let reviewed = studio.confirm_review("test-draft", binding).unwrap();
         assert!(reviewed.review_current);
         let intended = studio
-            .confirm_submission_intent("test-draft", &inventory_hash)
+            .confirm_submission_intent("test-draft", binding)
             .unwrap();
         assert!(intended.submission_intent_current);
 
@@ -1993,6 +2145,148 @@ mod tests {
         assert_eq!(reopened.list().unwrap()[0].title, "Test draft");
     }
 
+    /// Final review data exposes the full public manifest and exact artifact without local paths.
+    #[test]
+    fn review_report_exposes_path_free_exact_artifact_details() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        write_valid_pack(&source);
+        fs::write(
+            source.join("pack.toml"),
+            format!(
+                "schema_version = 1\nname = \"test\"\nauthor_handle = \"tester\"\n\
+                 author_pubkey = \"{TEST_PUBLIC_KEY}\"\nversion = \"0.1.0\"\n\
+                 license = \"MIT\"\n\n[capability_manifest]\n\
+                 required_tools = [\"Read\"]\nnetwork_egress = false\n"
+            ),
+        )
+        .unwrap();
+        let studio_root = temporary.path().join("private-studio-root");
+        let studio = Studio::open(&studio_root).unwrap();
+        let imported = studio.import("draft", "Draft", &source).unwrap();
+        let binding = review_binding(&imported.publication);
+        let snapshot = studio
+            .snapshot_for_review("draft", &imported.publication.inventory_hash)
+            .unwrap();
+        assert_eq!(
+            snapshot.publication().inventory_hash,
+            imported.publication.inventory_hash
+        );
+
+        let report = studio.review_report("draft", binding).unwrap();
+        assert_eq!(report.revision, imported.draft.revision);
+        assert_eq!(report.publication, imported.publication);
+        assert_eq!(report.manifest.license.as_deref(), Some("MIT"));
+        assert_eq!(
+            report
+                .manifest
+                .capability_manifest
+                .as_ref()
+                .unwrap()
+                .required_tools,
+            ["Read"]
+        );
+        assert_eq!(report.binding, binding);
+        let serialized = serde_json::to_string(&report).unwrap();
+        assert!(!serialized.contains(studio_root.to_str().unwrap()));
+    }
+
+    /// Submission intent and snapshots reject any artifact or publisher substitution.
+    #[test]
+    fn reviewed_binding_rejects_artifact_and_publisher_substitution() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        write_valid_pack(&source);
+        let studio = Studio::open(temporary.path().join("studio")).unwrap();
+        let imported = studio.import("draft", "Draft", &source).unwrap();
+        let binding = review_binding(&imported.publication);
+        studio.confirm_review("draft", binding).unwrap();
+
+        let mut changed_archive = binding;
+        changed_archive.artifact.archive_hash = ObjectHash::of(b"substituted archive");
+        assert!(matches!(
+            studio.confirm_submission_intent("draft", changed_archive),
+            Err(StudioError::ReviewBindingMismatch)
+        ));
+
+        let mut changed_publisher = binding;
+        changed_publisher.publisher_id = Uuid::from_u128(99);
+        assert!(matches!(
+            studio.confirm_submission_intent("draft", changed_publisher),
+            Err(StudioError::ReviewBindingMismatch)
+        ));
+
+        let mut changed_key = binding;
+        changed_key.publisher_key_id = Uuid::from_u128(100);
+        assert!(matches!(
+            studio.confirm_submission_intent("draft", changed_key),
+            Err(StudioError::ReviewBindingMismatch)
+        ));
+
+        studio.confirm_submission_intent("draft", binding).unwrap();
+        assert!(matches!(
+            studio.snapshot_for_submission("draft", changed_archive),
+            Err(StudioError::ReviewBindingMismatch)
+        ));
+    }
+
+    /// Legacy inventory-only confirmations load safely but never count as current authority.
+    #[test]
+    fn legacy_inventory_only_confirmation_is_stale() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        write_valid_pack(&source);
+        let studio_root = temporary.path().join("studio");
+        let studio = Studio::open(&studio_root).unwrap();
+        let imported = studio.import("draft", "Draft", &source).unwrap();
+        let binding = review_binding(&imported.publication);
+        studio.confirm_review("draft", binding).unwrap();
+        studio.confirm_submission_intent("draft", binding).unwrap();
+
+        let metadata = studio_root.join("draft").join(METADATA_FILENAME);
+        let mut persisted: serde_json::Value =
+            serde_json::from_slice(&fs::read(&metadata).unwrap()).unwrap();
+        persisted["review"]
+            .as_object_mut()
+            .unwrap()
+            .remove("binding");
+        persisted["submission_intent"]
+            .as_object_mut()
+            .unwrap()
+            .remove("binding");
+        fs::write(&metadata, serde_json::to_vec_pretty(&persisted).unwrap()).unwrap();
+
+        let reopened = Studio::open(&studio_root).unwrap();
+        let status = reopened.status("draft").unwrap();
+        assert!(status.draft.review.is_some());
+        assert!(status.draft.submission_intent.is_some());
+        assert!(!status.review_current);
+        assert!(!status.submission_intent_current);
+    }
+
+    /// Nil publisher identities cannot be presented as a valid final review selection.
+    #[test]
+    fn review_rejects_nil_publisher_identifiers() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        write_valid_pack(&source);
+        let studio = Studio::open(temporary.path().join("studio")).unwrap();
+        let imported = studio.import("draft", "Draft", &source).unwrap();
+        let mut binding = review_binding(&imported.publication);
+        binding.publisher_id = Uuid::nil();
+        assert!(matches!(
+            studio.review_report("draft", binding),
+            Err(StudioError::ReviewBindingMismatch)
+        ));
+
+        binding = review_binding(&imported.publication);
+        binding.publisher_key_id = Uuid::nil();
+        assert!(matches!(
+            studio.confirm_review("draft", binding),
+            Err(StudioError::ReviewBindingMismatch)
+        ));
+    }
+
     /// Snapshotting requires current intent and returns only the reviewed public bytes.
     #[test]
     fn snapshot_requires_current_intent_and_freezes_public_bytes() {
@@ -2001,21 +2295,18 @@ mod tests {
         write_valid_pack(&source);
         let studio = Studio::open(temporary.path().join("studio")).unwrap();
         let imported = studio.import("draft", "Draft", &source).unwrap();
+        let binding = review_binding(&imported.publication);
         let inventory_hash = imported.publication.inventory_hash;
 
-        let error = match studio.snapshot_for_submission("draft", &inventory_hash) {
+        let error = match studio.snapshot_for_submission("draft", binding) {
             Ok(_) => panic!("unreviewed draft must not freeze"),
             Err(error) => error,
         };
         assert!(matches!(error, StudioError::SubmissionIntentNotCurrent));
-        studio.confirm_review("draft", &inventory_hash).unwrap();
-        studio
-            .confirm_submission_intent("draft", &inventory_hash)
-            .unwrap();
+        studio.confirm_review("draft", binding).unwrap();
+        studio.confirm_submission_intent("draft", binding).unwrap();
 
-        let snapshot = studio
-            .snapshot_for_submission("draft", &inventory_hash)
-            .unwrap();
+        let snapshot = studio.snapshot_for_submission("draft", binding).unwrap();
         assert_eq!(snapshot.publication().inventory_hash, inventory_hash);
         assert_eq!(snapshot.files().len(), 2);
         assert!(snapshot
@@ -2141,12 +2432,10 @@ mod tests {
         let source = temporary.path().join("source");
         write_valid_pack(&source);
         let studio = Studio::open(temporary.path().join("studio")).unwrap();
-        studio.import("draft", "Draft", &source).unwrap();
-        let inventory_hash = studio.status("draft").unwrap().publication.inventory_hash;
-        studio.confirm_review("draft", &inventory_hash).unwrap();
-        studio
-            .confirm_submission_intent("draft", &inventory_hash)
-            .unwrap();
+        let imported = studio.import("draft", "Draft", &source).unwrap();
+        let binding = review_binding(&imported.publication);
+        studio.confirm_review("draft", binding).unwrap();
+        studio.confirm_submission_intent("draft", binding).unwrap();
 
         let status = studio
             .write_file("draft", "AGENTS.md", b"# Changed\n")
@@ -2232,9 +2521,9 @@ mod tests {
         ));
     }
 
-    /// Review confirmation fails if content changed after the inventory was shown.
+    /// Review confirmation fails if content changed after preparation.
     #[test]
-    fn review_requires_the_presented_inventory_hash() {
+    fn review_requires_the_prepared_artifact_binding() {
         let temporary = tempfile::tempdir().unwrap();
         let source = temporary.path().join("source");
         write_valid_pack(&source);
@@ -2245,8 +2534,8 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            studio.confirm_review("draft", &imported.publication.inventory_hash),
-            Err(StudioError::ReviewHashMismatch)
+            studio.confirm_review("draft", review_binding(&imported.publication)),
+            Err(StudioError::ReviewBindingMismatch)
         ));
     }
 }
