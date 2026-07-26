@@ -99,7 +99,7 @@ The bundle hash is the SHA-256 of the canonical TOML serialization of the test b
 ## Verification
 
 ```bash
-frameshift verify <persona>
+frameshift verify --persona <persona> --runner mock
 ```
 
 Runs conformance checks against an installed persona and reports the score. Supports `--bundle` to specify a test bundle path, `--threshold` to set a score floor, and `--canned-response` for quick smoke tests with a fixed response.
