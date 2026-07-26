@@ -1,33 +1,60 @@
 # MCP Server
 
-Frameshift includes a stdio-based [Model Context Protocol](https://modelcontextprotocol.io/) server for integration with any MCP-capable agent -- Claude Code, Gemini CLI, Cline, opencode, Goose, IDE plugins, and anything else that speaks MCP.
-
-No agent-specific knowledge lives in the MCP server. Every MCP-speaking agent that implements the protocol surfaces these tools and prompts the same way.
+FrameShift `0.10.0` includes a local stdio
+[Model Context Protocol](https://modelcontextprotocol.io/) server. Any
+MCP-capable host can expose the same tools and prompts without agent-specific
+logic inside FrameShift.
 
 ## Running
 
 ```bash
 cargo run -p frameshift-mcp
-# or if installed:
+# or, if installed:
 frameshift-mcp
 ```
 
-The server communicates over stdin/stdout using JSON-RPC 2.0 (protocol version `2024-11-05`). Tracing output goes to stderr. Server name: `frameshift-mcp`, version `0.9.9`.
+The server exchanges JSON-RPC 2.0 messages over stdin and stdout. Diagnostic
+tracing goes to stderr so it cannot corrupt the protocol stream. The maximum
+input line is 8 MiB.
+
+The newest implemented MCP protocol revision is `2025-11-25`. Initialization
+also negotiates the supported `2025-06-18` and `2024-11-05` revisions for
+compatible hosts.
 
 ## Tools
 
-Eight tools are exposed:
+Sixteen tools are exposed:
 
 | Tool | Description |
 |---|---|
-| `frameshift_install` | Install a persona pack from a local path or marketplace |
-| `frameshift_activate` | Set the active persona for the current project |
-| `frameshift_list` | List installed personas and their status |
-| `frameshift_grow_append` | Append an observation to a persona's growth log |
-| `frameshift_select` | Score and rank personas for the current context and task |
-| `frameshift_use` | Install, activate, and return the rendered persona in one call |
-| `frameshift_automate` | Enable, disable, or query automate mode (on/off/status/lock/unlock) |
-| `frameshift_prefs` | View or reset per-persona preference biases |
+| `frameshift_install` | Install a persona pack for a project |
+| `frameshift_activate` | Activate an installed persona |
+| `frameshift_list` | List installed personas |
+| `frameshift_grow_append` | Append a local growth observation |
+| `frameshift_select` | Rank personas without changing active state |
+| `frameshift_use` | Activate a persona and return its rendered content |
+| `frameshift_automate` | Manage Automate policy with `on`, `off`, `status`, `lock`, or `unlock` |
+| `frameshift_capabilities` | Report declared capabilities and annotate candidate agent tools |
+| `frameshift_prefs` | Show, bump, decay, or reset preference biases |
+| `frameshift_search` | Search the registry pack catalog |
+| `frameshift_draft_create` | Create a private Creator Studio draft from a template, local source, or registry pack |
+| `frameshift_draft_list` | List private Creator Studio drafts |
+| `frameshift_draft_status` | Report a draft's lifecycle status and next valid actions |
+| `frameshift_draft_preview` | Render a draft preview without granting publication authority |
+| `frameshift_draft_read` | Read a bounded editable draft file |
+| `frameshift_draft_write` | Replace a bounded editable draft file and invalidate stale review state |
+
+`frameshift_automate` stores policy only. The connected host or FrameShift
+daemon must invoke selection and activation.
+
+### Creator Studio trust boundary
+
+MCP can create, inspect, preview, and edit private drafts. It cannot perform
+final artifact review or authorize a registry submission. Those actions bind
+human intent to an exact artifact, publisher identity, and key, so they remain
+available only through an interactive human-facing client.
+
+There is intentionally no `frameshift_draft_review` MCP tool.
 
 ## Prompts
 
@@ -36,12 +63,12 @@ Three prompts provide context-aware persona management:
 | Prompt | Purpose |
 |---|---|
 | `active_persona` | Load the currently active persona into the conversation |
-| `select_persona` | Rank all installed personas and return a scored table |
-| `automate_status` | Report automate mode state: on/off, active persona, recent transitions |
+| `select_persona` | Rank available personas and return a scored table |
+| `automate_status` | Report Automate state, active persona, and recent transitions |
 
 ## Configuration
 
-Add the MCP server to any agent that supports MCP servers via stdio transport:
+Add FrameShift to the host's stdio MCP server configuration:
 
 ```json
 {
@@ -54,13 +81,20 @@ Add the MCP server to any agent that supports MCP servers via stdio transport:
 }
 ```
 
-The exact configuration file depends on your agent:
+Use the configuration location documented by your MCP host.
 
-- **Claude Code** -- `.mcp.json` in the project root or `~/.claude/mcp.json` globally
-- **Gemini CLI** -- `settings.json` under `mcpServers`
-- **Cline / opencode / Goose** -- See each agent's MCP server configuration docs
-- **IDE plugins** -- VS Code, JetBrains, and others that support MCP have their own config format
+`FRAMESHIFT_PROJECT_ROOT` sets the default project root. A tool call's
+`project_root` takes precedence; when neither is present, the server checks
+Claude Code's `CLAUDE_PROJECT_DIR` and then the current working directory.
+`FRAMESHIFT_TARGET` sets the default render target.
 
-## How it works internally
+Start discovery workflows with `frameshift_search`. Start authoring workflows
+with `frameshift_draft_create`, then query `frameshift_draft_status` before
+choosing the next action.
 
-The MCP server is a thin stdio wrapper. It reads newline-delimited JSON-RPC requests from stdin, dispatches them to the same `frameshift-client` engine that the CLI uses, and writes JSON-RPC responses to stdout. There is no HTTP, no daemon dependency, and no background state -- each tool call is a standalone operation against the local project store.
+## Runtime model
+
+The MCP server is a thin local stdio wrapper around the same FrameShift engine
+used by the CLI. It has no HTTP listener and does not require a background
+daemon. Persistent project, persona, preference, and draft state remains in
+the local FrameShift stores used by the underlying engine.
