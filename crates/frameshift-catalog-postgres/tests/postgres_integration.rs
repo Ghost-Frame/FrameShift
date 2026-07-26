@@ -1847,6 +1847,58 @@ async fn publication_submission_is_atomic_idempotent_and_concurrency_safe() {
     ));
 }
 
+/// Moderation snapshots aggregate unresolved work and distinct active reviewers.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn publication_moderation_snapshot_is_bounded_and_distinct() {
+    let (catalog, _container) = setup_catalog().await;
+    let (_, _, quarantined_id) =
+        create_test_publication_submission(&catalog, "snapshot-quarantined", 165).await;
+    let (_, _, needs_review_id) =
+        create_test_publication_submission(&catalog, "snapshot-needs-review", 168).await;
+    let quarantined = catalog
+        .get_publication_submission(quarantined_id)
+        .await
+        .expect("quarantined snapshot fixture lookup failed");
+    let needs_review = catalog
+        .get_publication_submission(needs_review_id)
+        .await
+        .expect("needs-review snapshot fixture lookup failed");
+
+    let reviewer = make_account(uuid::Uuid::new_v4(), "snapshot-reviewer");
+    catalog
+        .create_account(reviewer.clone())
+        .await
+        .expect("create snapshot reviewer failed");
+    assign_test_platform_role(&catalog, reviewer.id, "moderator").await;
+    assign_test_platform_role(&catalog, reviewer.id, "administrator").await;
+    catalog
+        .moderate_publication_submission(make_moderation_request(
+            needs_review_id,
+            reviewer.id,
+            PublicationModerationAction::RequestChanges,
+        ))
+        .await
+        .expect("move snapshot fixture to needs-review failed");
+
+    let snapshot = catalog
+        .publication_moderation_snapshot()
+        .await
+        .expect("moderation snapshot query failed")
+        .expect("Postgres must support moderation snapshots");
+    assert_eq!(snapshot.quarantined_submissions, 1);
+    assert_eq!(snapshot.oldest_quarantined_at, Some(quarantined.created_at));
+    assert_eq!(snapshot.queued_submissions, 2);
+    assert_eq!(
+        snapshot.oldest_queued_at,
+        Some(quarantined.created_at.min(needs_review.created_at))
+    );
+    assert_eq!(
+        snapshot.active_reviewers, 1,
+        "one account with two active roles must count once"
+    );
+}
+
 /// Submission admission rejects report drift and inactive authorization chains.
 #[tokio::test]
 #[ignore = "requires Docker"]

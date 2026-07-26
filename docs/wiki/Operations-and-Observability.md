@@ -35,6 +35,14 @@ The registry includes:
   catalog activity.
 - `creator_workflow_outcomes_total{stage,outcome}` for account and controlled
   publication workflows.
+- `publication_moderation_snapshot_available` for the catalog snapshot status.
+- `publication_quarantine_submissions` and
+  `publication_quarantine_oldest_age_seconds` for initial quarantine state.
+- `publication_moderation_queue_submissions` and
+  `publication_moderation_queue_oldest_age_seconds` for all unresolved review
+  work.
+- `publication_moderation_reviewers_available` for distinct accounts holding
+  at least one active moderator or administrator role.
 
 HTTP paths use Axum's matched route templates. A path such as
 `/v1/publishers/{handle}/keys/{key_id}` remains a single bounded label value;
@@ -71,6 +79,36 @@ sum by (stage) (
 Alert thresholds depend on deployment traffic and service objectives. Establish
 a normal baseline before treating client errors as an incident; authentication,
 validation, and authorization rejections are expected client-error outcomes.
+
+## Moderation queue
+
+The moderation gauges are refreshed from the catalog during an authenticated
+metrics scrape. They contain no labels and no account, publisher, key,
+submission, or artifact identifiers.
+
+`publication_moderation_snapshot_available` is `1` only after a successful
+snapshot. It is `0` for unsupported catalog backends and catalog query failures.
+When it is `0`, every dependent moderation gauge resets to zero so stale values
+cannot look current. Alert on snapshot unavailability before interpreting a
+zero queue as empty.
+
+The quarantine count and age cover submissions still in the initial
+`quarantined` state. The moderation queue count and age cover both
+`quarantined` and `needs_review`, so requested changes remain visible until the
+submission leaves unresolved review.
+
+A queued submission is never automatically approved because no reviewer is
+available. This invariant can be monitored with:
+
+```promql
+(publication_moderation_queue_submissions > 0)
+and on() (publication_moderation_reviewers_available == 0)
+and on() (publication_moderation_snapshot_available == 1)
+```
+
+Age thresholds depend on the deployment's published review commitment. A
+growing oldest-age gauge with a nonzero reviewer count indicates backlog; a
+nonzero queue with zero reviewers indicates an authority coverage failure.
 
 ## Ownership reconciliation
 

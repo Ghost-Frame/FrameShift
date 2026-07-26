@@ -14,6 +14,12 @@
 //! | `pack_downloads_total` | IntCounter | -- | Pack download success count |
 //! | `searches_total` | IntCounter | -- | Catalog search invocations |
 //! | `creator_workflow_outcomes_total` | IntCounterVec | stage, outcome | Bounded account and publication workflow outcomes |
+//! | `publication_moderation_snapshot_available` | IntGauge | -- | Whether queue gauges reflect a successful catalog snapshot |
+//! | `publication_quarantine_submissions` | IntGauge | -- | Submissions still in initial quarantine |
+//! | `publication_quarantine_oldest_age_seconds` | Gauge | -- | Age of the oldest initially quarantined submission |
+//! | `publication_moderation_queue_submissions` | IntGauge | -- | Unresolved submissions awaiting review |
+//! | `publication_moderation_queue_oldest_age_seconds` | Gauge | -- | Age of the oldest unresolved submission |
+//! | `publication_moderation_reviewers_available` | IntGauge | -- | Distinct accounts with active review authority |
 //!
 //! # Cardinality note
 //!
@@ -23,8 +29,11 @@
 //! series. Use `axum::extract::MatchedPath` (which carries the template) when
 //! recording labels.
 
+use chrono::{DateTime, Utc};
+use frameshift_catalog::PublicationModerationSnapshot;
 use prometheus::{
-    Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, Opts, Registry, TextEncoder,
+    Encoder, Gauge, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Opts,
+    Registry, TextEncoder,
 };
 
 /// All Prometheus collectors owned by this server instance.
@@ -67,6 +76,24 @@ pub struct Metrics {
     /// User-controlled identifiers, raw paths, request IDs, and error text are
     /// never used as label values.
     pub creator_workflow_outcomes_total: IntCounterVec,
+
+    /// Whether the publication moderation gauges reflect a successful catalog snapshot.
+    pub publication_moderation_snapshot_available: IntGauge,
+
+    /// Number of submissions still in the initial quarantine state.
+    pub publication_quarantine_submissions: IntGauge,
+
+    /// Age in seconds of the oldest initially quarantined submission.
+    pub publication_quarantine_oldest_age_seconds: Gauge,
+
+    /// Number of unresolved submissions awaiting review or requested changes.
+    pub publication_moderation_queue_submissions: IntGauge,
+
+    /// Age in seconds of the oldest unresolved moderation submission.
+    pub publication_moderation_queue_oldest_age_seconds: Gauge,
+
+    /// Distinct accounts holding at least one active moderation role.
+    pub publication_moderation_reviewers_available: IntGauge,
 }
 
 /// Builds, updates, and encodes the server's private Prometheus registry.
@@ -135,6 +162,37 @@ impl Metrics {
         )
         .expect("creator_workflow_outcomes_total metric creation must not fail");
 
+        let publication_moderation_snapshot_available = IntGauge::new(
+            "publication_moderation_snapshot_available",
+            "Whether publication moderation gauges reflect a successful catalog snapshot.",
+        )
+        .expect("publication_moderation_snapshot_available metric creation must not fail");
+        let publication_quarantine_submissions = IntGauge::new(
+            "publication_quarantine_submissions",
+            "Submissions still in the initial publication quarantine state.",
+        )
+        .expect("publication_quarantine_submissions metric creation must not fail");
+        let publication_quarantine_oldest_age_seconds = Gauge::new(
+            "publication_quarantine_oldest_age_seconds",
+            "Age in seconds of the oldest initially quarantined publication submission.",
+        )
+        .expect("publication_quarantine_oldest_age_seconds metric creation must not fail");
+        let publication_moderation_queue_submissions = IntGauge::new(
+            "publication_moderation_queue_submissions",
+            "Unresolved publication submissions awaiting review or requested changes.",
+        )
+        .expect("publication_moderation_queue_submissions metric creation must not fail");
+        let publication_moderation_queue_oldest_age_seconds = Gauge::new(
+            "publication_moderation_queue_oldest_age_seconds",
+            "Age in seconds of the oldest unresolved publication submission.",
+        )
+        .expect("publication_moderation_queue_oldest_age_seconds metric creation must not fail");
+        let publication_moderation_reviewers_available = IntGauge::new(
+            "publication_moderation_reviewers_available",
+            "Distinct accounts holding an active moderator or administrator role.",
+        )
+        .expect("publication_moderation_reviewers_available metric creation must not fail");
+
         // Register all collectors -- panics on duplicate or incompatible desc.
         registry
             .register(Box::new(http_requests_total.clone()))
@@ -154,6 +212,26 @@ impl Metrics {
         registry
             .register(Box::new(creator_workflow_outcomes_total.clone()))
             .expect("register creator_workflow_outcomes_total");
+        registry
+            .register(Box::new(publication_moderation_snapshot_available.clone()))
+            .expect("register publication_moderation_snapshot_available");
+        registry
+            .register(Box::new(publication_quarantine_submissions.clone()))
+            .expect("register publication_quarantine_submissions");
+        registry
+            .register(Box::new(publication_quarantine_oldest_age_seconds.clone()))
+            .expect("register publication_quarantine_oldest_age_seconds");
+        registry
+            .register(Box::new(publication_moderation_queue_submissions.clone()))
+            .expect("register publication_moderation_queue_submissions");
+        registry
+            .register(Box::new(
+                publication_moderation_queue_oldest_age_seconds.clone(),
+            ))
+            .expect("register publication_moderation_queue_oldest_age_seconds");
+        registry
+            .register(Box::new(publication_moderation_reviewers_available.clone()))
+            .expect("register publication_moderation_reviewers_available");
 
         Self {
             registry,
@@ -163,7 +241,46 @@ impl Metrics {
             pack_downloads_total,
             searches_total,
             creator_workflow_outcomes_total,
+            publication_moderation_snapshot_available,
+            publication_quarantine_submissions,
+            publication_quarantine_oldest_age_seconds,
+            publication_moderation_queue_submissions,
+            publication_moderation_queue_oldest_age_seconds,
+            publication_moderation_reviewers_available,
         }
+    }
+
+    /// Refresh publication moderation gauges from one bounded catalog snapshot.
+    ///
+    /// `None` marks the snapshot unavailable and resets every dependent gauge,
+    /// so stale or unsupported data cannot masquerade as a verified queue state.
+    pub fn update_publication_moderation_snapshot(
+        &self,
+        snapshot: Option<&PublicationModerationSnapshot>,
+        observed_at: DateTime<Utc>,
+    ) {
+        let Some(snapshot) = snapshot else {
+            self.publication_moderation_snapshot_available.set(0);
+            self.publication_quarantine_submissions.set(0);
+            self.publication_quarantine_oldest_age_seconds.set(0.0);
+            self.publication_moderation_queue_submissions.set(0);
+            self.publication_moderation_queue_oldest_age_seconds
+                .set(0.0);
+            self.publication_moderation_reviewers_available.set(0);
+            return;
+        };
+
+        self.publication_moderation_snapshot_available.set(1);
+        self.publication_quarantine_submissions
+            .set(saturating_i64(snapshot.quarantined_submissions));
+        self.publication_quarantine_oldest_age_seconds
+            .set(age_seconds(snapshot.oldest_quarantined_at, observed_at));
+        self.publication_moderation_queue_submissions
+            .set(saturating_i64(snapshot.queued_submissions));
+        self.publication_moderation_queue_oldest_age_seconds
+            .set(age_seconds(snapshot.oldest_queued_at, observed_at));
+        self.publication_moderation_reviewers_available
+            .set(saturating_i64(snapshot.active_reviewers));
     }
 
     /// Encode all registered metrics as Prometheus text exposition format
@@ -184,6 +301,24 @@ impl Metrics {
         // The TextEncoder always produces valid UTF-8 per the Prometheus spec.
         String::from_utf8(buf).unwrap_or_default()
     }
+}
+
+/// Convert an unsigned catalog count into Prometheus's signed gauge domain.
+fn saturating_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+/// Return a non-negative age in seconds for an optional queue timestamp.
+fn age_seconds(timestamp: Option<DateTime<Utc>>, observed_at: DateTime<Utc>) -> f64 {
+    timestamp
+        .map(|timestamp| {
+            observed_at
+                .signed_duration_since(timestamp)
+                .num_milliseconds()
+                .max(0) as f64
+                / 1000.0
+        })
+        .unwrap_or(0.0)
 }
 
 /// Default impl delegates to [`Metrics::new`].
@@ -261,5 +396,53 @@ mod tests {
         assert!(text.contains(
             "creator_workflow_outcomes_total{outcome=\"client_error\",stage=\"publisher_key\"} 1"
         ));
+    }
+
+    /// Moderation snapshot gauges encode exact aggregate counts and clamped ages.
+    #[test]
+    fn moderation_snapshot_gauges_encode_bounded_current_state() {
+        let metrics = Metrics::new();
+        let observed_at = DateTime::parse_from_rfc3339("2026-07-26T12:00:00Z")
+            .expect("fixture timestamp must parse")
+            .with_timezone(&Utc);
+        let snapshot = PublicationModerationSnapshot {
+            quarantined_submissions: 2,
+            oldest_quarantined_at: Some(observed_at - chrono::Duration::seconds(90)),
+            queued_submissions: 3,
+            oldest_queued_at: Some(observed_at + chrono::Duration::seconds(10)),
+            active_reviewers: 1,
+        };
+
+        metrics.update_publication_moderation_snapshot(Some(&snapshot), observed_at);
+        let text = metrics.encode_text();
+
+        assert!(text.contains("publication_moderation_snapshot_available 1"));
+        assert!(text.contains("publication_quarantine_submissions 2"));
+        assert!(text.contains("publication_quarantine_oldest_age_seconds 90"));
+        assert!(text.contains("publication_moderation_queue_submissions 3"));
+        assert!(text.contains("publication_moderation_queue_oldest_age_seconds 0"));
+        assert!(text.contains("publication_moderation_reviewers_available 1"));
+    }
+
+    /// An unavailable snapshot clears every dependent gauge and marks it unavailable.
+    #[test]
+    fn unavailable_moderation_snapshot_resets_dependent_gauges() {
+        let metrics = Metrics::new();
+        let observed_at = Utc::now();
+        let snapshot = PublicationModerationSnapshot {
+            quarantined_submissions: 2,
+            oldest_quarantined_at: Some(observed_at),
+            queued_submissions: 3,
+            oldest_queued_at: Some(observed_at),
+            active_reviewers: 1,
+        };
+        metrics.update_publication_moderation_snapshot(Some(&snapshot), observed_at);
+        metrics.update_publication_moderation_snapshot(None, observed_at);
+        let text = metrics.encode_text();
+
+        assert!(text.contains("publication_moderation_snapshot_available 0"));
+        assert!(text.contains("publication_quarantine_submissions 0"));
+        assert!(text.contains("publication_moderation_queue_submissions 0"));
+        assert!(text.contains("publication_moderation_reviewers_available 0"));
     }
 }

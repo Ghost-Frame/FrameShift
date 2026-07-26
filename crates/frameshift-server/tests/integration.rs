@@ -39,8 +39,8 @@ use tower::ServiceExt as _;
 
 use frameshift_catalog::identity::Ed25519PublicKey;
 use frameshift_catalog::records::{
-    PackRecord, PackVersionRecord, PublisherKeyRecord, PublisherKeyState,
-    PublisherModerationStatus, PublisherProfileRecord,
+    PackRecord, PackVersionRecord, PublicationModerationSnapshot, PublisherKeyRecord,
+    PublisherKeyState, PublisherModerationStatus, PublisherProfileRecord,
 };
 use frameshift_catalog::status::PackStatus;
 use frameshift_objects::ObjectHash;
@@ -1079,6 +1079,49 @@ async fn metrics_requires_configured_bearer_token() {
         .to_str()
         .unwrap()
         .starts_with("text/plain"));
+}
+
+/// An authenticated metrics scrape refreshes bounded moderation queue gauges.
+#[tokio::test]
+async fn metrics_refreshes_publication_moderation_snapshot() {
+    let catalog = MockCatalog::new();
+    let observed_at = chrono::Utc::now();
+    catalog
+        .state
+        .write()
+        .expect("mock catalog lock poisoned")
+        .publication_moderation_snapshot = Some(PublicationModerationSnapshot {
+        quarantined_submissions: 2,
+        oldest_quarantined_at: Some(observed_at - chrono::Duration::seconds(60)),
+        queued_submissions: 4,
+        oldest_queued_at: Some(observed_at - chrono::Duration::seconds(120)),
+        active_reviewers: 0,
+    });
+    let mut state = make_state(catalog, MockPackStore::new());
+    let mut config = (*state.config).clone();
+    config.metrics_bearer_token = SecretString::new("metrics-test-secret".to_string());
+    state.config = Arc::new(config);
+
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .header("authorization", "Bearer metrics-test-secret")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let text = String::from_utf8(body_bytes(response).await).expect("metrics body must be UTF-8");
+
+    assert!(text.contains("publication_moderation_snapshot_available 1"));
+    assert!(text.contains("publication_quarantine_submissions 2"));
+    assert!(text.contains("publication_moderation_queue_submissions 4"));
+    assert!(text.contains("publication_moderation_reviewers_available 0"));
+    assert!(!text.contains("account_id"));
+    assert!(!text.contains("publisher_id"));
+    assert!(!text.contains("submission_id"));
 }
 
 // ---------------------------------------------------------------------------

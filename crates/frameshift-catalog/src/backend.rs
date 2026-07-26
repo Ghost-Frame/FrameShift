@@ -19,10 +19,10 @@ use crate::records::{
     PublicationAppealResolutionRequest, PublicationIntentClaim, PublicationIntentRecord,
     PublicationLifecycleCursor, PublicationLifecycleDecisionRecord,
     PublicationModerationDecisionRecord, PublicationModerationDecisionRequest,
-    PublicationPromotionRecord, PublicationPromotionRequest, PublicationSubmissionRecord,
-    PublicationSubmissionRequest, PublicationTombstoneRequest, PublicationWithdrawalRequest,
-    PublisherAuditEventRecord, PublisherKeyRecord, PublisherMembershipRecord,
-    PublisherProfileRecord, PublisherSuspensionRequest,
+    PublicationModerationSnapshot, PublicationPromotionRecord, PublicationPromotionRequest,
+    PublicationSubmissionRecord, PublicationSubmissionRequest, PublicationTombstoneRequest,
+    PublicationWithdrawalRequest, PublisherAuditEventRecord, PublisherKeyRecord,
+    PublisherMembershipRecord, PublisherProfileRecord, PublisherSuspensionRequest,
 };
 use crate::status::TombstoneRecord;
 
@@ -271,6 +271,17 @@ pub trait CatalogBackend: Send + Sync {
             kind: "publication_submission",
             key: id.to_string(),
         })
+    }
+
+    /// Return an aggregate snapshot of unresolved publication review work.
+    ///
+    /// `None` preserves source compatibility for backends without operational
+    /// queue support while preventing zero values from masquerading as a
+    /// verified empty queue.
+    async fn publication_moderation_snapshot(
+        &self,
+    ) -> Result<Option<PublicationModerationSnapshot>, CatalogError> {
+        Ok(None)
     }
 
     /// List an account's global platform roles in stable role order.

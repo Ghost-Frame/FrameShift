@@ -294,6 +294,17 @@ pub async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> impl 
         )
             .into_response();
     }
+    match state.catalog.publication_moderation_snapshot().await {
+        Ok(snapshot) => state
+            .metrics
+            .update_publication_moderation_snapshot(snapshot.as_ref(), chrono::Utc::now()),
+        Err(error) => {
+            tracing::warn!(error = %error, "publication moderation metrics snapshot failed");
+            state
+                .metrics
+                .update_publication_moderation_snapshot(None, chrono::Utc::now());
+        }
+    }
     (
         StatusCode::OK,
         [(
