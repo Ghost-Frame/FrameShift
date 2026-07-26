@@ -295,11 +295,17 @@ before the draft becomes visible.
 
 The local MCP server exposes `frameshift_draft_create`,
 `frameshift_draft_list`, `frameshift_draft_status`,
-`frameshift_draft_read`, `frameshift_draft_write`, and
-`frameshift_draft_review`. Status returns the deterministic validation report
-and exact public file inventory. Review and submission confirmation must echo
-that report's inventory hash. Any later file write or removal clears both
-confirmations before changing content, so interrupted edits fail closed.
+`frameshift_draft_preview`, `frameshift_draft_read`, and
+`frameshift_draft_write`. Status returns the deterministic validation report
+and exact public file inventory. MCP intentionally cannot confirm human review
+or submission intent.
+
+A human-facing client freezes the valid inventory, prepares its deterministic
+signed archive, and presents a path-free final report containing the full
+manifest, scanner findings, archive hash, manifest hash, inventory hash,
+scanner schema, publisher ID, and publisher-key ID. Review and submission
+intent must repeat that exact binding. Any later file write or removal clears
+both confirmations before changing content, so interrupted edits fail closed.
 
 ### Memory
 

@@ -14,7 +14,7 @@ const SUPPORTED_PROTOCOL_VERSIONS: [&str; 3] =
     [LATEST_PROTOCOL_VERSION, "2025-06-18", "2024-11-05"];
 
 /// Human-readable setup guidance returned to MCP hosts during initialization.
-const SERVER_INSTRUCTIONS: &str = "FrameShift manages project-scoped agent personas and local Creator Studio drafts. Set FRAMESHIFT_PROJECT_ROOT in this server's environment once, or pass project_root per call. When neither is provided, Claude Code's CLAUDE_PROJECT_DIR is used when available, followed by the server working directory. Set FRAMESHIFT_TARGET to claude, codex, gemini, or generic, or pass target to frameshift_use and active_persona; generic is the default. Start persona discovery with frameshift_search. Start authoring with frameshift_draft_create, inspect exact files with frameshift_draft_status, then confirm the returned inventory hash with frameshift_draft_review.";
+const SERVER_INSTRUCTIONS: &str = "FrameShift manages project-scoped agent personas and local Creator Studio drafts. Set FRAMESHIFT_PROJECT_ROOT in this server's environment once, or pass project_root per call. When neither is provided, Claude Code's CLAUDE_PROJECT_DIR is used when available, followed by the server working directory. Set FRAMESHIFT_TARGET to claude, codex, gemini, or generic, or pass target to frameshift_use and active_persona; generic is the default. Start persona discovery with frameshift_search. Start authoring with frameshift_draft_create and inspect exact files with frameshift_draft_status. Final artifact review and submission authorization require an interactive human-facing client and are intentionally unavailable through MCP.";
 
 /// Main entry point. Initializes tracing, creates the client, then
 /// runs the stdin JSON-RPC read loop writing responses to stdout.
@@ -334,17 +334,20 @@ mod tests {
 
     /// Verify that tools/list returns the complete runtime and Studio surface.
     #[test]
-    fn tools_list_returns_seventeen_tools() {
+    fn tools_list_returns_sixteen_tools_without_review_authority() {
         let tmp = tempfile::tempdir().unwrap();
         let client = make_client(tmp.path());
         let line = r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#;
         let response = handle_message(line, &client).expect("should produce a response");
         let serialized = serde_json::to_value(&response).unwrap();
         let tools = serialized["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 17);
+        assert_eq!(tools.len(), 16);
         assert!(tools
             .iter()
             .any(|tool| tool["name"] == "frameshift_draft_preview"));
+        assert!(!tools
+            .iter()
+            .any(|tool| tool["name"] == "frameshift_draft_review"));
     }
 
     /// Verify tools/call with frameshift_install succeeds end-to-end.
