@@ -67,6 +67,14 @@ pub enum AppError {
     #[error("forbidden: {0}")]
     Forbidden(String),
 
+    /// The verified identity exhausted its configured request budget.
+    ///
+    /// Maps to `429 Too Many Requests`. Only the fixed string
+    /// `"rate limit exceeded"` is returned so the response never reveals
+    /// which identity dimension (account, signing key, or publisher) tripped.
+    #[error("rate limited")]
+    RateLimited,
+
     /// A required external provider is temporarily unavailable.
     ///
     /// Maps to `503 Service Unavailable` without exposing upstream details.
@@ -173,6 +181,10 @@ impl IntoResponse for AppError {
             AppError::Conflict(m) => (StatusCode::CONFLICT, m),
             AppError::Unauthorized(m) => (StatusCode::UNAUTHORIZED, m),
             AppError::Forbidden(_) => (StatusCode::FORBIDDEN, "forbidden".to_string()),
+            AppError::RateLimited => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate limit exceeded".to_string(),
+            ),
             AppError::ServiceUnavailable(_) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "service unavailable".to_string(),

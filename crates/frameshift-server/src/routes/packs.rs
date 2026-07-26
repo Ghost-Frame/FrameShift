@@ -44,6 +44,7 @@ use uuid::Uuid;
 use crate::auth::VerifiedSigner;
 use crate::error::AppError;
 use crate::middleware::account::AuthenticatedAccount;
+use crate::middleware::identity_limit::IdentityRateLimits;
 use crate::publication::{
     enforce_publication_report, inspect_publication_archive, PublicationAdmissionError,
 };
@@ -502,6 +503,7 @@ async fn collect_multipart(mut multipart: Multipart) -> Result<PublishFields, Ap
 pub async fn publish_pack(
     State(state): State<AppState>,
     Extension(signer): Extension<VerifiedSigner>,
+    Extension(identity_limits): Extension<std::sync::Arc<IdentityRateLimits>>,
     authenticated: Option<Extension<AuthenticatedAccount>>,
     multipart: Multipart,
 ) -> Result<Response, AppError> {
@@ -542,6 +544,12 @@ pub async fn publish_pack(
         authenticated.as_ref().map(|extension| &extension.0),
     )
     .await?;
+    // Spend the publisher budget only after ownership and key authorization
+    // succeed, so unauthorized callers can never exhaust a publisher's limit.
+    // Legacy author publishes have no publisher and stay signer/IP bounded.
+    if let Some(publisher) = authority.publisher.as_ref() {
+        identity_limits.check_publisher(publisher.id)?;
+    }
     let pubkey = authority.pubkey;
 
     let verifying_key = VerifyingKey::from_bytes(&pubkey.0)

@@ -64,6 +64,9 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use crate::mcp::mcp_router;
 use crate::middleware::account::{require_account, resolve_optional_account};
 use crate::middleware::auth::require_signed_request;
+use crate::middleware::identity_limit::{
+    enforce_account_rate_limit, enforce_signer_rate_limit, IdentityRateLimits,
+};
 use crate::middleware::metrics::MetricsLayer;
 use crate::middleware::request_id::{capture_client_request_id, RequestIdGenerator};
 use crate::middleware::tracing::make_trace_layer;
@@ -172,11 +175,21 @@ fn build_app(
     // `state.clone()` keeps the original `state` available for `.with_state`.
     let signed = axum::middleware::from_fn_with_state(state.clone(), require_signed_request);
 
+    // Identity-keyed limiters complementing the per-IP governor layers. The
+    // Arc is exposed through a request Extension (added as a global layer
+    // below) so both the middleware fns and the authorized publisher check in
+    // the publish handler share one set of token buckets.
+    let identity_limits = IdentityRateLimits::from_config(&state.config);
+    let signer_limit = axum::middleware::from_fn(enforce_signer_rate_limit);
+    let account_limit = axum::middleware::from_fn(enforce_account_rate_limit);
+
     // Publish (`POST /v1/packs`) carries the signed-request layer. It is merged
     // with the anonymous read router so GET (search) and POST (publish) share
-    // the `/` path with only the POST gated by auth.
+    // the `/` path with only the POST gated by auth. The signer limit is added
+    // first so it runs strictly inside (after) signature verification.
     let publish = Router::new()
         .route("/", post(publish_pack))
+        .route_layer(signer_limit.clone())
         .route_layer(signed.clone());
     let publish = if state.account_auth.is_some() {
         let optional_account =
@@ -192,7 +205,10 @@ fn build_app(
         .nest("/{name}/versions/{version}/download-url", mint_router);
 
     // Authors: anonymous reads merged with signed-request-gated registration.
-    let author_writes = authors_write_router().route_layer(signed.clone());
+    // Signer limit inside the signed layer, mirroring the publish router.
+    let author_writes = authors_write_router()
+        .route_layer(signer_limit.clone())
+        .route_layer(signed.clone());
     let author_writes = apply_ip_rate_limit(author_writes, &state, state.config.abuse_rate_per_min);
     let authors = authors_router().merge(author_writes);
 
@@ -222,14 +238,19 @@ fn build_app(
                 moderation_router(quarantine_review, publication_promotion),
             ));
         if let Some(admission) = publication_admission {
-            let submission_writes =
-                publication_submission_write_router(admission).route_layer(signed.clone());
+            let submission_writes = publication_submission_write_router(admission)
+                .route_layer(signer_limit.clone())
+                .route_layer(signed.clone());
             let submission_writes =
                 apply_ip_rate_limit(submission_writes, &state, state.config.abuse_rate_per_min);
             account_routes = account_routes
                 .merge(Router::new().nest("/publication-submissions", submission_writes));
         }
-        let account_routes = account_routes.route_layer(account_layer);
+        // Account limit inside the account layer so the authenticated account
+        // extension is always present when the limiter runs.
+        let account_routes = account_routes
+            .route_layer(account_limit)
+            .route_layer(account_layer);
         v1 = v1.merge(account_routes);
     }
 
@@ -270,6 +291,7 @@ fn build_app(
         .layer(hdr_xfo)
         .layer(hdr_rp)
         .layer(metrics_layer)
+        .layer(axum::Extension(identity_limits))
         .layer(axum::middleware::from_fn(capture_client_request_id));
 
     if let Some(cors) = cors {

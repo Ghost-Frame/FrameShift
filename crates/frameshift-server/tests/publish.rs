@@ -121,6 +121,9 @@ fn test_config_with_abuse_rate(
         download_max_token_ttl: Duration::from_secs(1800),
         download_rate_per_min: 0,
         abuse_rate_per_min,
+        account_rate_per_min: 0,
+        signer_rate_per_min: 0,
+        publisher_rate_per_min: 0,
         metrics_bearer_token: SecretString::new(String::new()),
         publisher_pubkeys: vec!["*".to_string()],
         max_versions_per_author: 0,
@@ -1442,4 +1445,139 @@ async fn publish_duplicate_archive_path_returns_400_without_storage_writes() {
     assert_eq!(body["error"], "pack archive contains duplicate paths");
     assert!(objects.blobs.read().unwrap().is_empty());
     assert!(catalog.state.read().unwrap().versions.is_empty());
+}
+
+/// Send one signed publish through a shared router so limiter state persists.
+async fn publish_on_router(
+    router: &axum::Router,
+    pack_bytes: &[u8],
+    signature: &[u8],
+    author_handle: &str,
+    request_key: &SigningKey,
+    bearer: Option<&str>,
+) -> axum::http::Response<Body> {
+    let boundary = "frameshifttestboundary";
+    let body = build_multipart(boundary, pack_bytes, signature, author_handle);
+    let mut req = Request::builder().method("POST").uri("/v1/packs").header(
+        "content-type",
+        format!("multipart/form-data; boundary={boundary}"),
+    );
+    for h in mocks::signing::signed_headers(request_key, "POST", "/v1/packs", &body) {
+        req = req.header(h.name, h.value);
+    }
+    if let Some(token) = bearer {
+        req = req.header("authorization", format!("Bearer {token}"));
+    }
+    router
+        .clone()
+        .oneshot(req.body(Body::from(body)).unwrap())
+        .await
+        .unwrap()
+}
+
+/// A signing key exhausting its budget is rejected while another key proceeds.
+#[tokio::test]
+async fn publish_signer_rate_limit_bounds_each_key() {
+    let signing_a = SigningKey::from_bytes(&[21u8; 32]);
+    let signing_b = SigningKey::from_bytes(&[22u8; 32]);
+    let (catalog, _pubkey_a) = catalog_with_author(&signing_a, "alice");
+    let pubkey_b = Ed25519PublicKey(signing_b.verifying_key().to_bytes());
+    catalog.state.write().unwrap().authors.insert(
+        pubkey_b.to_string(),
+        AuthorRecord {
+            pubkey: pubkey_b,
+            handle: "bob".to_string(),
+            display_name: None,
+            created_at: Utc::now(),
+            oauth_links: vec![],
+        },
+    );
+    // The per-IP abuse limiter stays disabled so only key identity can trip.
+    let mut config = (*test_config()).clone();
+    config.signer_rate_per_min = 1;
+    let state = make_state_with_config(catalog, MockPackStore::new(), Arc::new(config));
+    let router = app(state);
+
+    let prepared_a = prepare_pack("demo-pack", "0.1.0", "alice", &signing_a);
+    let prepared_b = prepare_pack("bob-pack", "0.1.0", "bob", &signing_b);
+
+    let first = publish_on_router(
+        &router,
+        &prepared_a.targz,
+        &prepared_a.signature,
+        "alice",
+        &signing_a,
+        None,
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let second = publish_on_router(
+        &router,
+        &prepared_a.targz,
+        &prepared_a.signature,
+        "alice",
+        &signing_a,
+        None,
+    )
+    .await;
+    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    let other = publish_on_router(
+        &router,
+        &prepared_b.targz,
+        &prepared_b.signature,
+        "bob",
+        &signing_b,
+        None,
+    )
+    .await;
+    assert_eq!(
+        other.status(),
+        StatusCode::OK,
+        "an unrelated signing key must not be affected by another key's budget"
+    );
+}
+
+/// An authorized publisher exhausting its budget is rejected on the next publish.
+#[tokio::test]
+async fn publish_publisher_rate_limit_bounds_authorized_writes() {
+    let signing = SigningKey::from_bytes(&[71u8; 32]);
+    let (catalog, _publisher_id, _key_id) =
+        catalog_with_publisher(&signing, "account-publisher", PublisherKeyState::Active);
+    let verifier = FakeVerifier::owner("owner-token", "publisher-owner");
+    let mut state = make_state_with_auth(catalog, MockPackStore::new(), verifier);
+    let mut config = (*state.config).clone();
+    config.publisher_rate_per_min = 1;
+    state.config = Arc::new(config);
+    let router = app(state);
+    let prepared = prepare_pack(
+        "account-publisher-pack",
+        "1.0.0",
+        "account-publisher",
+        &signing,
+    );
+
+    let first = publish_on_router(
+        &router,
+        &prepared.targz,
+        &prepared.signature,
+        "account-publisher",
+        &signing,
+        Some("owner-token"),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let second = publish_on_router(
+        &router,
+        &prepared.targz,
+        &prepared.signature,
+        "account-publisher",
+        &signing,
+        Some("owner-token"),
+    )
+    .await;
+    assert_eq!(
+        second.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "the publisher budget must trip before duplicate-version conflict handling"
+    );
 }
