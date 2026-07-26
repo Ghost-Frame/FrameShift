@@ -110,6 +110,41 @@ Age thresholds depend on the deployment's published review commitment. A
 growing oldest-age gauge with a nonzero reviewer count indicates backlog; a
 nonzero queue with zero reviewers indicates an authority coverage failure.
 
+## Abuse limits
+
+Two complementary rate-limit planes bound abusive traffic. Each knob counts
+requests per minute with burst capacity equal to the rate, and `0` disables
+that knob. Rejections return `429` with the fixed body
+`{"error":"rate limit exceeded"}` and never reveal which limit tripped.
+
+The per-address plane runs before authentication and bounds unauthenticated
+pressure:
+
+| Variable | Default | Scope |
+|---|---|---|
+| `ABUSE_RATE_PER_MIN` | `60` | Per-IP limit on signed writes and telemetry |
+| `DOWNLOAD_RATE_PER_MIN` | `10` | Per-IP limit on download-URL minting |
+
+The identity plane runs strictly after authentication, so a verified identity
+stays bounded while rotating addresses, identities sharing one address stay
+individually bounded, and an unauthenticated caller can never spend another
+identity's budget:
+
+| Variable | Default | Scope |
+|---|---|---|
+| `ACCOUNT_RATE_PER_MIN` | `120` | Per verified account across all account-authenticated routes |
+| `SIGNER_RATE_PER_MIN` | `60` | Per verified Ed25519 signing key across signed writes |
+| `PUBLISHER_RATE_PER_MIN` | `60` | Per publisher, spent only after ownership and key authorization succeed |
+
+Publication intent creation carries no publisher budget on purpose: the
+publisher named in an intent is not yet authorized at creation time, so a
+publisher-keyed limit there would let any account drain a victim publisher's
+budget. Intents are bounded per account, and quarantine submissions are
+bounded per verified signing key.
+
+Set `TRUST_FORWARDED_FOR=true` only behind a proxy that rewrites
+`X-Forwarded-For`; it affects the per-address plane alone.
+
 ## Ownership reconciliation
 
 Legacy ownership reconciliation is intentionally not represented as a server

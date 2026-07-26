@@ -23,6 +23,7 @@
 
 pub mod account;
 pub mod auth;
+pub mod identity_limit;
 pub mod metrics;
 pub mod request_id;
 pub mod tracing;

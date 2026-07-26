@@ -99,6 +99,9 @@ fn test_config() -> Arc<ServerConfig> {
         download_max_token_ttl: Duration::from_secs(1800),
         download_rate_per_min: 0,
         abuse_rate_per_min: 0,
+        account_rate_per_min: 0,
+        signer_rate_per_min: 0,
+        publisher_rate_per_min: 0,
         metrics_bearer_token: SecretString::new(String::new()),
         publisher_pubkeys: vec!["*".to_string()],
         max_versions_per_author: 0,
@@ -777,4 +780,76 @@ async fn publication_intent_creation_rejects_invalid_or_unauthorized_bindings() 
     )
     .await;
     assert_eq!(unauthorized.status(), StatusCode::FORBIDDEN);
+}
+
+/// Send one request through a shared router so limiter state persists.
+async fn send_on_router(
+    router: &axum::Router,
+    path: &str,
+    token: &str,
+) -> axum::http::Response<axum::body::Body> {
+    router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(path)
+                .header("authorization", format!("Bearer {token}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+/// One account exhausting its identity budget is rejected while another proceeds.
+#[tokio::test]
+async fn account_rate_limit_bounds_each_account_independently() {
+    let now = Utc::now();
+    let verifier = FakeVerifier::new();
+    verifier.allow(
+        "token-a",
+        "rate-limit-subject-a",
+        u64::try_from(now.timestamp()).unwrap(),
+    );
+    verifier.allow(
+        "token-b",
+        "rate-limit-subject-b",
+        u64::try_from(now.timestamp()).unwrap(),
+    );
+    let mut state = test_state(MockCatalog::new(), Some(verifier));
+    let mut config = (*state.config).clone();
+    config.account_rate_per_min = 1;
+    state.config = Arc::new(config);
+    let router = app(state);
+
+    let first = send_on_router(&router, "/v1/account", "token-a").await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let second = send_on_router(&router, "/v1/account", "token-a").await;
+    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    let other = send_on_router(&router, "/v1/account", "token-b").await;
+    assert_eq!(
+        other.status(),
+        StatusCode::OK,
+        "an unrelated account must not be affected by another account's budget"
+    );
+}
+
+/// A zero account rate disables the identity limiter entirely.
+#[tokio::test]
+async fn account_rate_limit_zero_disables_the_limiter() {
+    let now = Utc::now();
+    let verifier = FakeVerifier::new();
+    verifier.allow(
+        "token-a",
+        "rate-limit-disabled-subject",
+        u64::try_from(now.timestamp()).unwrap(),
+    );
+    let state = test_state(MockCatalog::new(), Some(verifier));
+    let router = app(state);
+
+    for _ in 0..5 {
+        let response = send_on_router(&router, "/v1/account", "token-a").await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 }

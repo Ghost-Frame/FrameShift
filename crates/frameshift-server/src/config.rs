@@ -23,6 +23,9 @@
 //! | `DOWNLOAD_MAX_TOKEN_TTL` | `1800` | Hard cap on token TTL accepted by the verifier (30 minutes) |
 //! | `DOWNLOAD_RATE_PER_MIN` | `10` | Per-IP rate limit on the mint endpoint (requests/minute); 0 disables |
 //! | `ABUSE_RATE_PER_MIN` | `60` | Per-IP limit on signed writes and telemetry (requests/minute); 0 disables |
+//! | `ACCOUNT_RATE_PER_MIN` | `120` | Per-account limit on authenticated account routes (requests/minute); 0 disables |
+//! | `SIGNER_RATE_PER_MIN` | `60` | Per-signing-key limit on verified signed writes (requests/minute); 0 disables |
+//! | `PUBLISHER_RATE_PER_MIN` | `60` | Per-publisher limit on authorized publisher writes (requests/minute); 0 disables |
 //! | `METRICS_BEARER_TOKEN` | `""` | Bearer token required by `/metrics`; empty disables the endpoint |
 //! | `FRAMESHIFT_PUBLISHER_PUBKEYS` | `""` | Admitted publisher keys; empty disables registration and publishing |
 //! | `MAX_VERSIONS_PER_AUTHOR` | `100` | Maximum retained versions per admitted author; 0 disables |
@@ -229,6 +232,27 @@ pub struct ServerConfig {
     /// This bounds nonce-cache and log-amplification abuse before expensive
     /// authentication or handler work. `0` disables the limit. Default: 60.
     pub abuse_rate_per_min: u32,
+
+    /// Per-account rate limit for authenticated account routes.
+    ///
+    /// Keyed by the verified durable account ID, so one account rotating
+    /// source addresses stays bounded and accounts sharing one address stay
+    /// individually bounded. `0` disables the limit. Default: 120.
+    pub account_rate_per_min: u32,
+
+    /// Per-signing-key rate limit for verified signed writes.
+    ///
+    /// Keyed by the Ed25519 key whose request signature already verified, so
+    /// forged requests naming a victim key can never spend its budget. `0`
+    /// disables the limit. Default: 60.
+    pub signer_rate_per_min: u32,
+
+    /// Per-publisher rate limit for authorized publisher-bound writes.
+    ///
+    /// Keyed by the publisher ID only after active ownership and key
+    /// authorization succeed, so unauthorized callers cannot exhaust a
+    /// publisher's budget. `0` disables the limit. Default: 60.
+    pub publisher_rate_per_min: u32,
 
     /// Bearer token required to read `/metrics`.
     ///
@@ -444,6 +468,9 @@ impl std::fmt::Debug for ServerConfig {
             .field("download_max_token_ttl", &self.download_max_token_ttl)
             .field("download_rate_per_min", &self.download_rate_per_min)
             .field("abuse_rate_per_min", &self.abuse_rate_per_min)
+            .field("account_rate_per_min", &self.account_rate_per_min)
+            .field("signer_rate_per_min", &self.signer_rate_per_min)
+            .field("publisher_rate_per_min", &self.publisher_rate_per_min)
             .field("metrics_bearer_token", &"[REDACTED]")
             .field(
                 "publisher_pubkeys",
@@ -545,6 +572,15 @@ struct RawConfig {
 
     /// Per-IP signed-write and telemetry rate limit (requests / minute).
     abuse_rate_per_min: u32,
+
+    /// Per-account authenticated-route rate limit (requests / minute).
+    account_rate_per_min: u32,
+
+    /// Per-signing-key verified-write rate limit (requests / minute).
+    signer_rate_per_min: u32,
+
+    /// Per-publisher authorized-write rate limit (requests / minute).
+    publisher_rate_per_min: u32,
 
     /// Raw metrics bearer token, wrapped in [`SecretString`] during conversion.
     metrics_bearer_token: String,
@@ -674,6 +710,9 @@ impl RawConfig {
             download_max_token_ttl: Duration::from_secs(self.download_max_token_ttl),
             download_rate_per_min: self.download_rate_per_min,
             abuse_rate_per_min: self.abuse_rate_per_min,
+            account_rate_per_min: self.account_rate_per_min,
+            signer_rate_per_min: self.signer_rate_per_min,
+            publisher_rate_per_min: self.publisher_rate_per_min,
             metrics_bearer_token: SecretString::new(self.metrics_bearer_token),
             publisher_pubkeys: split_comma_list(&self.publisher_pubkeys),
             max_versions_per_author: self.max_versions_per_author,
@@ -740,6 +779,9 @@ fn default_raw_config() -> RawConfig {
         download_max_token_ttl: 1800,
         download_rate_per_min: 10,
         abuse_rate_per_min: 60,
+        account_rate_per_min: 120,
+        signer_rate_per_min: 60,
+        publisher_rate_per_min: 60,
         metrics_bearer_token: String::new(),
         publisher_pubkeys: String::new(),
         max_versions_per_author: 100,
@@ -810,6 +852,17 @@ impl ServerConfig {
 }
 
 #[cfg(test)]
+/// Test-only helpers for constructing resolved configurations.
+pub(crate) mod test_support {
+    use super::*;
+
+    /// Return the default resolved configuration for unit tests.
+    pub(crate) fn minimal_test_config() -> ServerConfig {
+        default_raw_config().into_server_config()
+    }
+}
+
+#[cfg(test)]
 /// Unit tests for configuration parsing and secret redaction.
 mod tests {
     use super::*;
@@ -837,6 +890,9 @@ mod tests {
             download_max_token_ttl: Duration::from_secs(1800),
             download_rate_per_min: 0,
             abuse_rate_per_min: 0,
+            account_rate_per_min: 0,
+            signer_rate_per_min: 0,
+            publisher_rate_per_min: 0,
             metrics_bearer_token: SecretString::new(String::new()),
             publisher_pubkeys: vec!["*".to_string()],
             max_versions_per_author: 0,
@@ -900,6 +956,9 @@ mod tests {
             download_max_token_ttl: Duration::from_secs(1800),
             download_rate_per_min: 0,
             abuse_rate_per_min: 0,
+            account_rate_per_min: 0,
+            signer_rate_per_min: 0,
+            publisher_rate_per_min: 0,
             metrics_bearer_token: SecretString::new(String::new()),
             publisher_pubkeys: vec!["*".to_string()],
             max_versions_per_author: 0,
@@ -953,6 +1012,9 @@ mod tests {
             download_max_token_ttl: Duration::from_secs(1800),
             download_rate_per_min: 0,
             abuse_rate_per_min: 0,
+            account_rate_per_min: 0,
+            signer_rate_per_min: 0,
+            publisher_rate_per_min: 0,
             metrics_bearer_token: SecretString::new(String::new()),
             publisher_pubkeys: vec!["*".to_string()],
             max_versions_per_author: 0,
@@ -1058,6 +1120,9 @@ mod tests {
             download_max_token_ttl: Duration::from_secs(1800),
             download_rate_per_min: 0,
             abuse_rate_per_min: 0,
+            account_rate_per_min: 0,
+            signer_rate_per_min: 0,
+            publisher_rate_per_min: 0,
             metrics_bearer_token: SecretString::new(String::new()),
             publisher_pubkeys: vec!["*".to_string()],
             max_versions_per_author: 0,
