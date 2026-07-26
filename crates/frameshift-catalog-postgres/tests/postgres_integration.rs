@@ -4674,3 +4674,133 @@ async fn concurrent_administrator_revocations_preserve_coverage() {
         "the platform must retain exactly one active administrator"
     );
 }
+
+/// Walk the complete production path from a cold database to a public pack.
+///
+/// Every other test seeds moderation authority with the direct-SQL fixture, so
+/// none of them prove the shipped surfaces compose. This drill starts with no
+/// authority at all, performs the documented one-time administrator bootstrap,
+/// and then uses only the real APIs an operator and reviewer would call. It is
+/// the acceptance evidence that the authority origin added in PR #76 actually
+/// unblocks publishing.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn cold_deployment_drill_reaches_a_public_pack() {
+    let (catalog, _container) = setup_catalog().await;
+
+    // Stage 1: a fresh deployment has no reviewers, and the queue gauges say so.
+    let empty = catalog
+        .publication_moderation_snapshot()
+        .await
+        .expect("cold snapshot failed")
+        .expect("Postgres must support moderation snapshots");
+    assert_eq!(
+        empty.active_reviewers, 0,
+        "a fresh deployment must report zero reviewers"
+    );
+
+    // Stage 2: a submission arrives and is stranded, because nobody can review
+    // it. This is the exact production state the missing authority origin
+    // created, and it must remain the behavior until an administrator exists.
+    let (owner_id, _publisher_id, submission_id) =
+        create_test_publication_submission(&catalog, "drill-publisher", 211).await;
+    let would_be_reviewer = make_account(uuid::Uuid::new_v4(), "drill-reviewer");
+    let promoter = make_account(uuid::Uuid::new_v4(), "drill-administrator");
+    for account in [&would_be_reviewer, &promoter] {
+        catalog
+            .create_account(account.clone())
+            .await
+            .expect("create drill account failed");
+    }
+    let stranded = catalog
+        .moderate_publication_submission(make_moderation_request(
+            submission_id,
+            would_be_reviewer.id,
+            PublicationModerationAction::Approve,
+        ))
+        .await
+        .expect_err("an account with no role must not be able to approve");
+    assert!(matches!(stranded, CatalogError::Unauthorized { .. }));
+    let queued = catalog
+        .publication_moderation_snapshot()
+        .await
+        .expect("stranded snapshot failed")
+        .expect("Postgres must support moderation snapshots");
+    assert_eq!(queued.queued_submissions, 1);
+    assert_eq!(
+        queued.active_reviewers, 0,
+        "queue > 0 with reviewers = 0 is the documented fail-closed alert state"
+    );
+
+    // Stage 3: the documented one-time bootstrap, recorded as self-assigned.
+    assign_test_platform_role(&catalog, promoter.id, "administrator").await;
+
+    // Stage 4: from here on, only the shipped administrator API is used.
+    let granted = catalog
+        .assign_account_platform_role(PlatformRoleAssignmentRequest {
+            account_id: would_be_reviewer.id,
+            role: PlatformRole::Moderator,
+            actor_account_id: promoter.id,
+        })
+        .await
+        .expect("bootstrapped administrator must be able to grant a moderator role");
+    assert_eq!(granted.state, PlatformRoleState::Active);
+    let staffed = catalog
+        .publication_moderation_snapshot()
+        .await
+        .expect("staffed snapshot failed")
+        .expect("Postgres must support moderation snapshots");
+    assert_eq!(
+        staffed.active_reviewers, 2,
+        "the bootstrapped administrator and the granted moderator both count"
+    );
+
+    // Stage 5: the newly granted moderator can now clear the stranded queue.
+    catalog
+        .moderate_publication_submission(make_moderation_request(
+            submission_id,
+            would_be_reviewer.id,
+            PublicationModerationAction::Approve,
+        ))
+        .await
+        .expect("the granted moderator must be able to approve");
+
+    // Stage 6: an administrator independent of the publisher owner promotes the
+    // approved bytes into the public catalog.
+    assert_ne!(
+        promoter.id, owner_id,
+        "the promoting administrator must be independent of the publisher owner"
+    );
+    let promotion = make_promotion_request(&catalog, submission_id, promoter.id).await;
+    catalog
+        .promote_publication_submission(promotion.clone(), PublishQuota::unlimited())
+        .await
+        .expect("independent administrator promotion failed");
+
+    // Stage 7: the pack is publicly readable and the queue has drained.
+    let published = catalog
+        .get_pack_version(&promotion.version.pack_name, &promotion.version.version)
+        .await
+        .expect("promoted pack must be publicly readable");
+    assert_eq!(published.content_hash, promotion.version.content_hash);
+    assert_eq!(published.status, PackStatus::Active);
+    assert_eq!(
+        catalog
+            .get_publication_submission(submission_id)
+            .await
+            .expect("promoted submission lookup failed")
+            .state,
+        PublicationSubmissionState::Promoted
+    );
+    let drained = catalog
+        .publication_moderation_snapshot()
+        .await
+        .expect("drained snapshot failed")
+        .expect("Postgres must support moderation snapshots");
+    assert_eq!(
+        drained.queued_submissions, 0,
+        "promotion must clear the unresolved review queue"
+    );
+    assert_eq!(drained.oldest_queued_at, None);
+    assert_eq!(drained.active_reviewers, 2);
+}
