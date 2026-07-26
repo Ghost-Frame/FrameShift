@@ -28,11 +28,11 @@ use frameshift_catalog::records::{
     PublicationAppealResolutionRequest, PublicationIntentRecord, PublicationLifecycleAction,
     PublicationLifecycleCursor, PublicationLifecycleDecisionRecord, PublicationModerationAction,
     PublicationModerationDecisionRecord, PublicationModerationDecisionRequest,
-    PublicationPromotionRecord, PublicationPromotionRequest, PublicationSubmissionRecord,
-    PublicationSubmissionRequest, PublicationSubmissionState, PublicationTombstoneRequest,
-    PublicationWithdrawalRequest, PublisherAuditEventRecord, PublisherKeyRecord, PublisherKeyState,
-    PublisherMembershipRecord, PublisherModerationStatus, PublisherProfileRecord, PublisherRole,
-    PublisherSuspensionRequest,
+    PublicationModerationSnapshot, PublicationPromotionRecord, PublicationPromotionRequest,
+    PublicationSubmissionRecord, PublicationSubmissionRequest, PublicationSubmissionState,
+    PublicationTombstoneRequest, PublicationWithdrawalRequest, PublisherAuditEventRecord,
+    PublisherKeyRecord, PublisherKeyState, PublisherMembershipRecord, PublisherModerationStatus,
+    PublisherProfileRecord, PublisherRole, PublisherSuspensionRequest,
 };
 use frameshift_catalog::status::{PackStatus, TombstoneRecord};
 // Reuse the exact same version-precedence comparator the Postgres adapter
@@ -102,6 +102,9 @@ pub struct MockState {
 
     /// Quarantined publication submissions keyed by stable identifier.
     pub publication_submissions: HashMap<uuid::Uuid, PublicationSubmissionRecord>,
+
+    /// Optional aggregate moderation snapshot returned to operations tests.
+    pub publication_moderation_snapshot: Option<PublicationModerationSnapshot>,
 
     /// Global platform-role assignments retained for authorization tests.
     pub platform_roles: Vec<PlatformRoleRecord>,
@@ -1349,6 +1352,17 @@ impl CatalogBackend for MockCatalog {
                 kind: "publication_submission",
                 key: id.to_string(),
             })
+    }
+
+    /// Return the configured bounded moderation snapshot for operations tests.
+    async fn publication_moderation_snapshot(
+        &self,
+    ) -> Result<Option<PublicationModerationSnapshot>, CatalogError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        Ok(state.publication_moderation_snapshot.clone())
     }
 
     /// List an account's global platform roles in stable role order.

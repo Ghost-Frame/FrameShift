@@ -478,6 +478,24 @@ pub struct PublicationSubmissionRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Bounded operational snapshot of unresolved publication review work.
+///
+/// Counts and timestamps describe aggregate queue state only. No account,
+/// publisher, key, submission, or artifact identifiers cross this boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicationModerationSnapshot {
+    /// Submissions still in the initial quarantine state.
+    pub quarantined_submissions: u64,
+    /// Creation time of the oldest initially quarantined submission.
+    pub oldest_quarantined_at: Option<DateTime<Utc>>,
+    /// All unresolved submissions awaiting review or requested changes.
+    pub queued_submissions: u64,
+    /// Creation time of the oldest unresolved submission.
+    pub oldest_queued_at: Option<DateTime<Utc>>,
+    /// Distinct accounts holding at least one active moderation role.
+    pub active_reviewers: u64,
+}
+
 /// Exact input for one idempotent approved-submission promotion.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PublicationPromotionRequest {

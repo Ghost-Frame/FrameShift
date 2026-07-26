@@ -34,11 +34,11 @@ use frameshift_catalog::{
     PublicationIntentRecord, PublicationLifecycleAction, PublicationLifecycleCursor,
     PublicationLifecycleDecisionRecord, PublicationModerationAction,
     PublicationModerationDecisionRecord, PublicationModerationDecisionRequest,
-    PublicationPromotionRecord, PublicationPromotionRequest, PublicationSubmissionRecord,
-    PublicationSubmissionRequest, PublicationSubmissionState, PublicationTombstoneRequest,
-    PublicationWithdrawalRequest, PublishQuota, PublisherAuditEventRecord, PublisherKeyRecord,
-    PublisherMembershipRecord, PublisherProfileRecord, PublisherSuspensionRequest, SortMode,
-    TombstoneRecord,
+    PublicationModerationSnapshot, PublicationPromotionRecord, PublicationPromotionRequest,
+    PublicationSubmissionRecord, PublicationSubmissionRequest, PublicationSubmissionState,
+    PublicationTombstoneRequest, PublicationWithdrawalRequest, PublishQuota,
+    PublisherAuditEventRecord, PublisherKeyRecord, PublisherMembershipRecord,
+    PublisherProfileRecord, PublisherSuspensionRequest, SortMode, TombstoneRecord,
 };
 use frameshift_publication::{inventory_hash, FindingSeverity, REPORT_SCHEMA_VERSION};
 
@@ -94,6 +94,23 @@ struct TotalBytesRow {
     /// Total bytes represented by all published pack versions.
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     total: i64,
+}
+
+/// Bounded result row for the unresolved moderation queue aggregates.
+#[derive(QueryableByName)]
+struct ModerationQueueRow {
+    /// Submissions still in the initial quarantine state.
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    quarantined: i64,
+    /// Creation time of the oldest initially quarantined submission.
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
+    oldest_quarantined_at: Option<DateTime<Utc>>,
+    /// All unresolved submissions awaiting review or requested changes.
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    queued: i64,
+    /// Creation time of the oldest unresolved submission.
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
+    oldest_queued_at: Option<DateTime<Utc>>,
 }
 
 /// Transaction error preserving catalog policy failures across Diesel rollbacks.
@@ -1900,6 +1917,60 @@ impl CatalogBackend for PostgresCatalog {
             .await
             .map_err(|error| map_diesel_error(error, "publication_submission", id.to_string()))?
             .into_record()
+    }
+
+    /// Aggregate unresolved review work and distinct active reviewer accounts.
+    ///
+    /// One statement produces every submission aggregate so the quarantine and
+    /// queue gauges always describe the same MVCC snapshot, and the reviewer
+    /// count stays inside SQL so no account identifiers cross into this path.
+    async fn publication_moderation_snapshot(
+        &self,
+    ) -> Result<Option<PublicationModerationSnapshot>, CatalogError> {
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        let queue_row: ModerationQueueRow = diesel::sql_query(
+            "SELECT COUNT(*) FILTER (WHERE state = 'quarantined') AS quarantined, \
+             MIN(created_at) FILTER (WHERE state = 'quarantined') AS oldest_quarantined_at, \
+             COUNT(*) AS queued, \
+             MIN(created_at) AS oldest_queued_at \
+             FROM publication_submissions \
+             WHERE state IN ('quarantined', 'needs_review')",
+        )
+        .get_result(&mut conn)
+        .await
+        .map_err(|error| {
+            map_diesel_error(
+                error,
+                "publication_moderation_snapshot",
+                "queue".to_string(),
+            )
+        })?;
+        let active_reviewers = account_platform_roles::table
+            .filter(account_platform_roles::state.eq("active"))
+            .filter(account_platform_roles::role.eq_any(["moderator", "administrator"]))
+            .select({
+                use diesel::expression_methods::AggregateExpressionMethods as _;
+                diesel::dsl::count(account_platform_roles::account_id).aggregate_distinct()
+            })
+            .first::<i64>(&mut conn)
+            .await
+            .map_err(|error| {
+                map_diesel_error(
+                    error,
+                    "publication_moderation_snapshot",
+                    "reviewers".to_string(),
+                )
+            })?;
+
+        // COUNT aggregates cannot be negative; zero is also the fail-closed
+        // alerting direction for the reviewer availability gauge.
+        Ok(Some(PublicationModerationSnapshot {
+            quarantined_submissions: u64::try_from(queue_row.quarantined).unwrap_or_default(),
+            oldest_quarantined_at: queue_row.oldest_quarantined_at,
+            queued_submissions: u64::try_from(queue_row.queued).unwrap_or_default(),
+            oldest_queued_at: queue_row.oldest_queued_at,
+            active_reviewers: u64::try_from(active_reviewers).unwrap_or_default(),
+        }))
     }
 
     /// List an account's global platform roles in stable role order.
