@@ -3,7 +3,8 @@
 //! Private seeds never enter command arguments or output. Native platform
 //! credential storage is preferred, with an age-encrypted fallback unlocked by
 //! `FRAMESHIFT_KEY_PASSPHRASE` or a hidden terminal prompt. Account bearer
-//! tokens use the same environment-or-hidden-prompt rule.
+//! tokens prefer an explicit environment override, then the secure account
+//! session for the exact registry, then a hidden terminal prompt.
 
 use std::io::IsTerminal as _;
 use std::path::PathBuf;
@@ -15,6 +16,7 @@ use frameshift_client::{
 };
 use secrecy::{ExposeSecret as _, SecretString};
 
+use crate::cmd::account;
 use crate::util::{validate_server_url, CliError};
 
 /// Environment variable containing a bearer token for account-owned key operations.
@@ -250,7 +252,7 @@ fn enroll(
         Some(key_id) => key_id.to_string(),
         None => selected_key(client)?.id,
     };
-    let token = resolve_access_token()?;
+    let token = resolve_access_token(server)?;
     let (remote, _) = with_key_passphrase(|passphrase| {
         client.enroll_publisher_key(server, publisher, &key_id, &token, passphrase)
     })?;
@@ -264,7 +266,7 @@ fn enroll(
 /// List public server-side key records for one publisher.
 fn list_remote(client: &Client, server: &str, publisher: &str) -> Result<(), CliError> {
     validate_server_url(server)?;
-    let token = resolve_access_token()?;
+    let token = resolve_access_token(server)?;
     let keys = client.list_publisher_keys(server, publisher, &token)?;
     if keys.is_empty() {
         println!("no enrolled publisher keys");
@@ -283,7 +285,7 @@ fn list_remote(client: &Client, server: &str, publisher: &str) -> Result<(), Cli
 fn rotate(client: &Client, server: &str, publisher: &str, label: &str) -> Result<(), CliError> {
     validate_server_url(server)?;
     let old = selected_key(client)?;
-    let token = resolve_access_token()?;
+    let token = resolve_access_token(server)?;
     let remote_keys = client.list_publisher_keys(server, publisher, &token)?;
     let old_remote = active_remote_key(&remote_keys, &old.public_key)?.clone();
 
@@ -348,7 +350,7 @@ fn revoke(client: &Client, server: &str, publisher: &str, key_id: &str) -> Resul
             "local publisher key {key_id} is already revoked"
         )));
     }
-    let token = resolve_access_token()?;
+    let token = resolve_access_token(server)?;
     let remote_keys = client.list_publisher_keys(server, publisher, &token)?;
     let remote = remote_key_for_public_key(&remote_keys, &local.public_key)?;
     let store = client.publisher_key_store();
@@ -399,7 +401,7 @@ fn revoke_remote(
     remote_key_id: &str,
 ) -> Result<(), CliError> {
     validate_server_url(server)?;
-    let token = resolve_access_token()?;
+    let token = resolve_access_token(server)?;
     let revoked = client.revoke_publisher_key(server, publisher, remote_key_id, &token)?;
     println!(
         "revoked remote key {} ({}) for {}",
@@ -411,7 +413,7 @@ fn revoke_remote(
 /// Create and enroll a replacement key after account recovery on a new device.
 fn recover(client: &Client, server: &str, publisher: &str, label: &str) -> Result<(), CliError> {
     validate_server_url(server)?;
-    let token = resolve_access_token()?;
+    let token = resolve_access_token(server)?;
     let store = client.publisher_key_store();
     let (replacement, passphrase) =
         with_key_passphrase(|passphrase| store.create_key(label, passphrase))?;
@@ -585,12 +587,30 @@ pub(crate) fn access_token_from_env() -> Result<Option<SecretString>, CliError> 
     secret_from_env(ACCESS_TOKEN_ENV)
 }
 
-/// Resolve a bearer token from the environment or a hidden interactive prompt.
-fn resolve_access_token() -> Result<SecretString, CliError> {
-    match access_token_from_env()? {
-        Some(token) => Ok(token),
-        None => prompt_secret("account access token: ", ACCESS_TOKEN_ENV),
+/// Resolve a bearer token from explicit, stored-session, or interactive input.
+fn resolve_access_token(server: &str) -> Result<SecretString, CliError> {
+    resolve_access_token_with(
+        server,
+        access_token_from_env(),
+        account::access_token_for_registry,
+        || prompt_secret("account access token: ", ACCESS_TOKEN_ENV),
+    )
+}
+
+/// Apply token-source precedence with injectable secure-session boundaries.
+fn resolve_access_token_with(
+    server: &str,
+    environment: Result<Option<SecretString>, CliError>,
+    stored_session: impl FnOnce(&str) -> Result<Option<SecretString>, CliError>,
+    prompt: impl FnOnce() -> Result<SecretString, CliError>,
+) -> Result<SecretString, CliError> {
+    if let Some(token) = environment? {
+        return Ok(token);
     }
+    if let Some(token) = stored_session(server)? {
+        return Ok(token);
+    }
+    prompt()
 }
 
 /// Resolve a recovery passphrase, requiring confirmation for newly written packages.
@@ -656,6 +676,61 @@ fn needs_storage_passphrase(error: &ClientError) -> bool {
 /// Publisher-key CLI helper tests.
 mod tests {
     use super::*;
+
+    /// Explicit environment tokens take precedence without consulting other sources.
+    #[test]
+    fn access_token_environment_override_has_highest_precedence() {
+        let token = resolve_access_token_with(
+            "https://registry.example",
+            Ok(Some(SecretString::new("environment".to_string()))),
+            |_| panic!("stored session must not be consulted"),
+            || panic!("prompt must not be consulted"),
+        )
+        .expect("environment token");
+        assert_eq!(token.expose_secret(), "environment");
+    }
+
+    /// A matching stored account session is reused before interactive input.
+    #[test]
+    fn access_token_reuses_matching_stored_session() {
+        let token = resolve_access_token_with(
+            "https://registry.example",
+            Ok(None),
+            |server| {
+                assert_eq!(server, "https://registry.example");
+                Ok(Some(SecretString::new("stored".to_string())))
+            },
+            || panic!("prompt must not be consulted"),
+        )
+        .expect("stored token");
+        assert_eq!(token.expose_secret(), "stored");
+    }
+
+    /// Missing or registry-mismatched stored sessions fall back to hidden input.
+    #[test]
+    fn access_token_prompts_when_no_matching_session_exists() {
+        let token = resolve_access_token_with(
+            "https://other.example",
+            Ok(None),
+            |_| Ok(None),
+            || Ok(SecretString::new("prompted".to_string())),
+        )
+        .expect("prompted token");
+        assert_eq!(token.expose_secret(), "prompted");
+    }
+
+    /// Stored-session failures are surfaced instead of being masked by a prompt.
+    #[test]
+    fn access_token_preserves_stored_session_errors() {
+        let error = resolve_access_token_with(
+            "https://registry.example",
+            Ok(None),
+            |_| Err(CliError::Account("session unavailable".to_string())),
+            || panic!("prompt must not be consulted"),
+        )
+        .expect_err("stored session error");
+        assert!(error.to_string().contains("session unavailable"));
+    }
 
     /// Build one public remote-key fixture.
     fn remote_key(public_key: &str, state: EnrolledPublisherKeyState) -> EnrolledPublisherKey {
