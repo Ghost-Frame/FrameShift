@@ -15,6 +15,9 @@
 
 - [[Persona Catalog]]
 - [[Writing Personas]]
+- [[Creator Studio]]
+- [[Accounts and Publisher Identity]]
+- [[Publishing and Moderation]]
 - [[Composition]]
 - [[Pack Format]]
 - [[Conformance]]

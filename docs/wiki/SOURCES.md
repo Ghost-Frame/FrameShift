@@ -23,6 +23,9 @@ the product claims and all other content were preserved.
 | `Configuration.md` | server, daemon, client, and vault configuration types |
 | `Persona-Catalog.md` | public persona manifests and capability declarations |
 | `Writing-Personas.md` | `crates/frameshift-source/src`, `crates/frameshift-pack/src` |
+| `Creator-Studio.md` | `crates/frameshift-studio/src`, MCP draft tools, and publication bindings |
+| `Accounts-and-Publisher-Identity.md` | account session, publisher membership, and local and remote key lifecycle code |
+| `Publishing-and-Moderation.md` | Studio submission snapshots, publication client, catalog states, and moderation routes |
 | `Composition.md` | `crates/frameshift-compose/src` |
 | `Pack-Format.md` | `crates/frameshift-pack/src` |
 | `Conformance.md` | `crates/frameshift-conformance/src` |
