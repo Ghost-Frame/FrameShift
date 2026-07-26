@@ -2,10 +2,12 @@
 
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, patch, post};
 use axum::{Extension, Json, Router};
 use chrono::{DateTime, Utc};
 use frameshift_catalog::{
+    AccountRecord, AccountStatus, AccountStatusChangeRequest, PlatformRole,
+    PlatformRoleAssignmentRequest, PlatformRoleRecord, PlatformRoleRevocationRequest,
     PublicationAppealCaseRecord, PublicationAppealCursor, PublicationAppealDisposition,
     PublicationAppealResolutionRecord, PublicationAppealResolutionRequest,
     PublicationLifecycleCursor, PublicationLifecycleDecisionRecord, PublicationTombstoneRequest,
@@ -40,6 +42,18 @@ pub fn admin_router() -> Router<AppState> {
             "/publication-appeals/{appeal_id}/resolution",
             post(resolve_publication_appeal_route),
         )
+        .route(
+            "/accounts/{account_id}/platform-roles",
+            post(assign_platform_role_route),
+        )
+        .route(
+            "/accounts/{account_id}/platform-roles/{role}",
+            delete(revoke_platform_role_route),
+        )
+        .route(
+            "/accounts/{account_id}/status",
+            patch(set_account_status_route),
+        )
 }
 
 /// Caller-controlled fields for one administrator release tombstone.
@@ -72,6 +86,22 @@ struct PublicationDecisionQuery {
     before_id: Option<Uuid>,
     /// Bounded result count, defaulting to fifty.
     limit: Option<u32>,
+}
+
+/// Caller-controlled field for one administrator platform-role grant.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AssignPlatformRoleRequestBody {
+    /// Global authority being granted to the target account.
+    role: PlatformRole,
+}
+
+/// Caller-controlled field for one administrator account status transition.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetAccountStatusRequestBody {
+    /// Status the target account must hold after the transition.
+    status: AccountStatus,
 }
 
 /// Caller-controlled fields for one administrator appeal resolution.
@@ -175,6 +205,72 @@ async fn resolve_publication_appeal_route(
         .await
         .map(Json)
         .map_err(|error| AppError::from_catalog(error, "publication appeal resolution"))
+}
+
+/// Grant one platform role under atomic account administrator authority.
+///
+/// The catalog verifies the actor's active administrator authority before it
+/// looks at the target account, so an unauthorized caller receives the same
+/// fixed `403` whether or not the target exists.
+async fn assign_platform_role_route(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthenticatedAccount>,
+    Path(account_id): Path<Uuid>,
+    Json(body): Json<AssignPlatformRoleRequestBody>,
+) -> Result<Json<PlatformRoleRecord>, AppError> {
+    state
+        .catalog
+        .assign_account_platform_role(PlatformRoleAssignmentRequest {
+            account_id,
+            role: body.role,
+            actor_account_id: auth.account.id,
+        })
+        .await
+        .map(Json)
+        .map_err(|error| AppError::from_catalog(error, "platform role"))
+}
+
+/// Revoke one platform role under atomic account administrator authority.
+///
+/// The assignment is retained in the revoked state, and revoking the last
+/// active administrator is rejected.
+async fn revoke_platform_role_route(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthenticatedAccount>,
+    Path((account_id, role)): Path<(Uuid, PlatformRole)>,
+) -> Result<Json<PlatformRoleRecord>, AppError> {
+    state
+        .catalog
+        .revoke_account_platform_role(PlatformRoleRevocationRequest {
+            account_id,
+            role,
+            actor_account_id: auth.account.id,
+        })
+        .await
+        .map(Json)
+        .map_err(|error| AppError::from_catalog(error, "platform role"))
+}
+
+/// Transition one account's status under atomic account administrator authority.
+///
+/// Suspending or disabling an account takes effect on that account's next
+/// request, because the account middleware rejects any non-active account.
+async fn set_account_status_route(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthenticatedAccount>,
+    Path(account_id): Path<Uuid>,
+    Json(body): Json<SetAccountStatusRequestBody>,
+) -> Result<Json<AccountRecord>, AppError> {
+    state
+        .catalog
+        .set_account_status(AccountStatusChangeRequest {
+            account_id,
+            status: body.status,
+            actor_account_id: auth.account.id,
+        })
+        .await
+        .map(Json)
+        .map_err(|error| AppError::from_catalog(error, "account status"))
 }
 
 /// List global private appeal cases for an active administrator.

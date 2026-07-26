@@ -149,6 +149,47 @@ pub struct PlatformRoleRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Exact input for one administrator-authorized platform role grant.
+///
+/// Granting a role that is already active is idempotent, and granting a
+/// previously revoked role reactivates that same assignment row rather than
+/// creating a second one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlatformRoleAssignmentRequest {
+    /// Account receiving the authority.
+    pub account_id: Uuid,
+    /// Authority being granted.
+    pub role: PlatformRole,
+    /// Account performing the grant, which must hold an active administrator role.
+    pub actor_account_id: Uuid,
+}
+
+/// Exact input for one administrator-authorized platform role revocation.
+///
+/// Revocation marks the assignment revoked and never deletes it, so the
+/// original grant, its assigning account, and its creation time remain
+/// auditable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlatformRoleRevocationRequest {
+    /// Account losing the authority.
+    pub account_id: Uuid,
+    /// Authority being revoked.
+    pub role: PlatformRole,
+    /// Account performing the revocation, which must hold an active administrator role.
+    pub actor_account_id: Uuid,
+}
+
+/// Exact input for one administrator-authorized account status transition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountStatusChangeRequest {
+    /// Account whose status is changing.
+    pub account_id: Uuid,
+    /// Status the account must hold after the transition.
+    pub status: AccountStatus,
+    /// Account performing the transition, which must hold an active administrator role.
+    pub actor_account_id: Uuid,
+}
+
 /// Lifecycle state for an enrolled publisher signing key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]

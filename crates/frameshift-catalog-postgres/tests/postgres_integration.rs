@@ -17,8 +17,9 @@ use std::time::Duration;
 use diesel::{ExpressionMethods as _, QueryDsl as _};
 use diesel_async::{RunQueryDsl as _, SimpleAsyncConnection as _};
 use frameshift_catalog::{
-    AccountRecord, AccountStatus, AuthorRecord, CatalogBackend, CatalogError, Ed25519PublicKey,
-    MembershipState, ObjectHash, PackSearchFilters, PackStatus, PackVersionRecord, PlatformRole,
+    AccountRecord, AccountStatus, AccountStatusChangeRequest, AuthorRecord, CatalogBackend,
+    CatalogError, Ed25519PublicKey, MembershipState, ObjectHash, PackSearchFilters, PackStatus,
+    PackVersionRecord, PlatformRole, PlatformRoleAssignmentRequest, PlatformRoleRevocationRequest,
     PlatformRoleState, PublicationAppealDisposition, PublicationAppealRequest,
     PublicationAppealResolutionRequest, PublicationIntentClaim, PublicationIntentRecord,
     PublicationLifecycleAction, PublicationLifecycleCursor, PublicationModerationAction,
@@ -4423,4 +4424,253 @@ async fn publication_tombstone_is_atomic_and_retry_safe() {
         .await
         .expect("exact tombstone retry must survive authority revocation");
     assert_eq!(retry, first);
+}
+
+/// Role administration authorizes the actor and keeps assignments auditable.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn platform_role_administration_is_authorized_idempotent_and_auditable() {
+    let (catalog, _container) = setup_catalog().await;
+    let administrator = make_account(uuid::Uuid::new_v4(), "role-admin");
+    let target = make_account(uuid::Uuid::new_v4(), "role-target");
+    let outsider = make_account(uuid::Uuid::new_v4(), "role-outsider");
+    for account in [&administrator, &target, &outsider] {
+        catalog
+            .create_account(account.clone())
+            .await
+            .expect("create role fixture account failed");
+    }
+    // The documented one-time bootstrap is the only out-of-band grant.
+    assign_test_platform_role(&catalog, administrator.id, "administrator").await;
+
+    // A non-administrator cannot grant authority.
+    let unauthorized = catalog
+        .assign_account_platform_role(PlatformRoleAssignmentRequest {
+            account_id: target.id,
+            role: PlatformRole::Moderator,
+            actor_account_id: outsider.id,
+        })
+        .await
+        .expect_err("a non-administrator must not grant a platform role");
+    assert!(
+        matches!(unauthorized, CatalogError::Unauthorized { .. }),
+        "expected unauthorized, got {unauthorized:?}"
+    );
+
+    // Granting to an account that does not exist is a specific not-found.
+    let missing = catalog
+        .assign_account_platform_role(PlatformRoleAssignmentRequest {
+            account_id: uuid::Uuid::new_v4(),
+            role: PlatformRole::Moderator,
+            actor_account_id: administrator.id,
+        })
+        .await
+        .expect_err("granting to a missing account must fail");
+    assert!(matches!(missing, CatalogError::NotFound { .. }));
+
+    let granted = catalog
+        .assign_account_platform_role(PlatformRoleAssignmentRequest {
+            account_id: target.id,
+            role: PlatformRole::Moderator,
+            actor_account_id: administrator.id,
+        })
+        .await
+        .expect("administrator grant failed");
+    assert_eq!(granted.state, PlatformRoleState::Active);
+    assert_eq!(granted.assigned_by_account_id, administrator.id);
+
+    // Repeating the grant returns the identical assignment unchanged.
+    let repeated = catalog
+        .assign_account_platform_role(PlatformRoleAssignmentRequest {
+            account_id: target.id,
+            role: PlatformRole::Moderator,
+            actor_account_id: administrator.id,
+        })
+        .await
+        .expect("idempotent grant failed");
+    assert_eq!(repeated, granted);
+
+    let revoked = catalog
+        .revoke_account_platform_role(PlatformRoleRevocationRequest {
+            account_id: target.id,
+            role: PlatformRole::Moderator,
+            actor_account_id: administrator.id,
+        })
+        .await
+        .expect("administrator revocation failed");
+    assert_eq!(revoked.state, PlatformRoleState::Revoked);
+    assert_eq!(
+        revoked.created_at, granted.created_at,
+        "revocation must retain the original grant time"
+    );
+
+    // Repeating the revocation is a no-op.
+    let repeated_revoke = catalog
+        .revoke_account_platform_role(PlatformRoleRevocationRequest {
+            account_id: target.id,
+            role: PlatformRole::Moderator,
+            actor_account_id: administrator.id,
+        })
+        .await
+        .expect("idempotent revocation failed");
+    assert_eq!(repeated_revoke, revoked);
+
+    // Reactivation reuses the retained row rather than creating a second one.
+    let reactivated = catalog
+        .assign_account_platform_role(PlatformRoleAssignmentRequest {
+            account_id: target.id,
+            role: PlatformRole::Moderator,
+            actor_account_id: administrator.id,
+        })
+        .await
+        .expect("reactivation failed");
+    assert_eq!(reactivated.state, PlatformRoleState::Active);
+    assert_eq!(reactivated.created_at, granted.created_at);
+    assert_eq!(
+        catalog
+            .list_account_platform_roles(target.id)
+            .await
+            .expect("role listing failed")
+            .len(),
+        1,
+        "reactivation must not duplicate the assignment row"
+    );
+}
+
+/// Administrator coverage survives revocation and suspension attempts.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn last_administrator_authority_is_protected() {
+    let (catalog, _container) = setup_catalog().await;
+    let first = make_account(uuid::Uuid::new_v4(), "coverage-first");
+    let second = make_account(uuid::Uuid::new_v4(), "coverage-second");
+    for account in [&first, &second] {
+        catalog
+            .create_account(account.clone())
+            .await
+            .expect("create coverage fixture account failed");
+    }
+    assign_test_platform_role(&catalog, first.id, "administrator").await;
+
+    // The sole administrator cannot drop their own authority either way.
+    let revoke_error = catalog
+        .revoke_account_platform_role(PlatformRoleRevocationRequest {
+            account_id: first.id,
+            role: PlatformRole::Administrator,
+            actor_account_id: first.id,
+        })
+        .await
+        .expect_err("revoking the last administrator must fail");
+    assert!(matches!(revoke_error, CatalogError::Validation(_)));
+    let suspend_error = catalog
+        .set_account_status(AccountStatusChangeRequest {
+            account_id: first.id,
+            status: AccountStatus::Suspended,
+            actor_account_id: first.id,
+        })
+        .await
+        .expect_err("suspending the last administrator must fail");
+    assert!(matches!(suspend_error, CatalogError::Validation(_)));
+
+    // A second administrator provides coverage.
+    catalog
+        .assign_account_platform_role(PlatformRoleAssignmentRequest {
+            account_id: second.id,
+            role: PlatformRole::Administrator,
+            actor_account_id: first.id,
+        })
+        .await
+        .expect("second administrator grant failed");
+
+    // Suspending the second administrator is now permitted.
+    let suspended = catalog
+        .set_account_status(AccountStatusChangeRequest {
+            account_id: second.id,
+            status: AccountStatus::Suspended,
+            actor_account_id: first.id,
+        })
+        .await
+        .expect("suspending a covered administrator failed");
+    assert_eq!(suspended.status, AccountStatus::Suspended);
+
+    // A suspended administrator grants no authority, so coverage is back to one
+    // and the remaining administrator is protected again.
+    let protected_again = catalog
+        .revoke_account_platform_role(PlatformRoleRevocationRequest {
+            account_id: first.id,
+            role: PlatformRole::Administrator,
+            actor_account_id: first.id,
+        })
+        .await
+        .expect_err("a suspended administrator must not count toward coverage");
+    assert!(matches!(protected_again, CatalogError::Validation(_)));
+}
+
+/// Concurrent revocations cannot race the platform down to zero administrators.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn concurrent_administrator_revocations_preserve_coverage() {
+    let (catalog, _container) = setup_catalog().await;
+    let first = make_account(uuid::Uuid::new_v4(), "race-first");
+    let second = make_account(uuid::Uuid::new_v4(), "race-second");
+    for account in [&first, &second] {
+        catalog
+            .create_account(account.clone())
+            .await
+            .expect("create race fixture account failed");
+    }
+    assign_test_platform_role(&catalog, first.id, "administrator").await;
+    catalog
+        .assign_account_platform_role(PlatformRoleAssignmentRequest {
+            account_id: second.id,
+            role: PlatformRole::Administrator,
+            actor_account_id: first.id,
+        })
+        .await
+        .expect("second administrator grant failed");
+
+    // Each administrator revokes the other. This asserts the outcome only: the
+    // pair must never both commit. It does not attribute the guarantee to any
+    // one mechanism, and it still passes with the table lock removed, because
+    // the two transactions request each other's already-locked rows and
+    // PostgreSQL aborts one on deadlock detection. The table lock, the actor
+    // row locks, and deadlock detection are each sufficient here; the invariant
+    // under test is coverage, not which layer enforced it.
+    let (revoke_first, revoke_second) = tokio::join!(
+        catalog.revoke_account_platform_role(PlatformRoleRevocationRequest {
+            account_id: first.id,
+            role: PlatformRole::Administrator,
+            actor_account_id: second.id,
+        }),
+        catalog.revoke_account_platform_role(PlatformRoleRevocationRequest {
+            account_id: second.id,
+            role: PlatformRole::Administrator,
+            actor_account_id: first.id,
+        }),
+    );
+    let succeeded = usize::from(revoke_first.is_ok()) + usize::from(revoke_second.is_ok());
+    assert_eq!(
+        succeeded, 1,
+        "exactly one concurrent revocation may succeed, got first={revoke_first:?} second={revoke_second:?}"
+    );
+
+    // The surviving administrator must still hold active authority.
+    let mut remaining = 0;
+    for account in [&first, &second] {
+        let roles = catalog
+            .list_account_platform_roles(account.id)
+            .await
+            .expect("role listing failed");
+        remaining += roles
+            .iter()
+            .filter(|record| {
+                record.role == PlatformRole::Administrator
+                    && record.state == PlatformRoleState::Active
+            })
+            .count();
+    }
+    assert_eq!(
+        remaining, 1,
+        "the platform must retain exactly one active administrator"
+    );
 }

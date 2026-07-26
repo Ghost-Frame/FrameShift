@@ -13,7 +13,8 @@ use crate::error::{CatalogError, HealthStatus};
 use crate::filters::{PackSearchFilters, PackSearchResult};
 use crate::identity::Ed25519PublicKey;
 use crate::records::{
-    AccountRecord, AuthorRecord, PackRecord, PackVersionRecord, PlatformRoleRecord,
+    AccountRecord, AccountStatusChangeRequest, AuthorRecord, PackRecord, PackVersionRecord,
+    PlatformRoleAssignmentRequest, PlatformRoleRecord, PlatformRoleRevocationRequest,
     PublicationAppealCaseRecord, PublicationAppealCursor, PublicationAppealRecord,
     PublicationAppealRequest, PublicationAppealResolutionRecord,
     PublicationAppealResolutionRequest, PublicationIntentClaim, PublicationIntentRecord,
@@ -293,6 +294,61 @@ pub trait CatalogBackend: Send + Sync {
         _account_id: uuid::Uuid,
     ) -> Result<Vec<PlatformRoleRecord>, CatalogError> {
         Ok(Vec::new())
+    }
+
+    /// Grant or reactivate one platform role under administrator authority.
+    ///
+    /// The actor must be an active account holding an active administrator
+    /// role, verified atomically with the write. Granting an already active
+    /// role is idempotent, and granting a revoked role reactivates that same
+    /// assignment rather than creating a duplicate.
+    ///
+    /// The denying default fails closed so a backend without an implemented
+    /// authority model can never appear to grant platform authority.
+    async fn assign_account_platform_role(
+        &self,
+        request: PlatformRoleAssignmentRequest,
+    ) -> Result<PlatformRoleRecord, CatalogError> {
+        Err(CatalogError::Unauthorized {
+            kind: "platform_role",
+            key: request.account_id.to_string(),
+        })
+    }
+
+    /// Revoke one platform role under administrator authority.
+    ///
+    /// The assignment row is retained in the revoked state so the original
+    /// grant remains auditable. Revoking the last active administrator is
+    /// rejected, because losing every administrator would permanently remove
+    /// the platform's ability to moderate, promote, or restore authority.
+    ///
+    /// The denying default fails closed for unimplemented backends.
+    async fn revoke_account_platform_role(
+        &self,
+        request: PlatformRoleRevocationRequest,
+    ) -> Result<PlatformRoleRecord, CatalogError> {
+        Err(CatalogError::Unauthorized {
+            kind: "platform_role",
+            key: request.account_id.to_string(),
+        })
+    }
+
+    /// Transition one account's status under administrator authority.
+    ///
+    /// Suspending or disabling the account that holds the last active
+    /// administrator role is rejected for the same coverage reason as role
+    /// revocation. Status changes never delete memberships, keys, submissions,
+    /// or audit history.
+    ///
+    /// The denying default fails closed for unimplemented backends.
+    async fn set_account_status(
+        &self,
+        request: AccountStatusChangeRequest,
+    ) -> Result<AccountRecord, CatalogError> {
+        Err(CatalogError::Unauthorized {
+            kind: "account_status",
+            key: request.account_id.to_string(),
+        })
     }
 
     /// Atomically authorize and persist one publication moderation decision.

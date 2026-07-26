@@ -84,6 +84,8 @@ struct Fixture {
     state: AppState,
     /// Active administrator account identifier.
     administrator_id: Uuid,
+    /// Ordinary account holding no platform role.
+    ordinary_id: Uuid,
     /// Approved publisher available for suspension tests.
     publisher_id: Uuid,
 }
@@ -92,8 +94,9 @@ struct Fixture {
 fn fixture() -> Fixture {
     let catalog = MockCatalog::new();
     let administrator_id = Uuid::new_v4();
+    let ordinary_id = Uuid::new_v4();
     seed_account(&catalog, administrator_id, "administrator");
-    seed_account(&catalog, Uuid::new_v4(), "ordinary");
+    seed_account(&catalog, ordinary_id, "ordinary");
     seed_role(&catalog, administrator_id, PlatformRole::Administrator);
     seed_active_release(&catalog, "my-pack", "1.0.0");
     let publisher_id = seed_publisher(&catalog, "admin-target");
@@ -130,6 +133,7 @@ fn fixture() -> Fixture {
         catalog,
         state,
         administrator_id,
+        ordinary_id,
         publisher_id,
     }
 }
@@ -416,4 +420,283 @@ async fn administrator_can_suspend_publisher() {
             .moderation_status,
         PublisherModerationStatus::Suspended
     );
+}
+
+/// The role and status routes reject an account without administrator authority.
+#[tokio::test]
+async fn platform_role_and_status_routes_require_administrator() {
+    let fixture = fixture();
+    let target = fixture.administrator_id;
+    let grant = send(
+        fixture.state.clone(),
+        Method::POST,
+        &format!("/v1/admin/accounts/{target}/platform-roles"),
+        Some("ordinary-token"),
+        Some(Uuid::new_v4()),
+        Some(serde_json::json!({"role": "moderator"})),
+    )
+    .await;
+    assert_eq!(grant.status(), StatusCode::FORBIDDEN);
+
+    let revoke = send(
+        fixture.state.clone(),
+        Method::DELETE,
+        &format!("/v1/admin/accounts/{target}/platform-roles/administrator"),
+        Some("ordinary-token"),
+        Some(Uuid::new_v4()),
+        None,
+    )
+    .await;
+    assert_eq!(revoke.status(), StatusCode::FORBIDDEN);
+
+    let status = send(
+        fixture.state,
+        Method::PATCH,
+        &format!("/v1/admin/accounts/{target}/status"),
+        Some("ordinary-token"),
+        Some(Uuid::new_v4()),
+        Some(serde_json::json!({"status": "suspended"})),
+    )
+    .await;
+    assert_eq!(status.status(), StatusCode::FORBIDDEN);
+    // The sole administrator must still hold authority after the failed calls.
+    assert_eq!(
+        fixture
+            .catalog
+            .state
+            .read()
+            .unwrap()
+            .platform_roles
+            .iter()
+            .filter(|record| record.state == PlatformRoleState::Active)
+            .count(),
+        1
+    );
+}
+
+/// An unauthorized caller cannot distinguish a missing target account.
+#[tokio::test]
+async fn unauthorized_role_grant_does_not_reveal_target_existence() {
+    let fixture = fixture();
+    let missing = Uuid::new_v4();
+    let existing = send(
+        fixture.state.clone(),
+        Method::POST,
+        &format!("/v1/admin/accounts/{}/platform-roles", fixture.ordinary_id),
+        Some("ordinary-token"),
+        Some(Uuid::new_v4()),
+        Some(serde_json::json!({"role": "moderator"})),
+    )
+    .await;
+    let absent = send(
+        fixture.state,
+        Method::POST,
+        &format!("/v1/admin/accounts/{missing}/platform-roles"),
+        Some("ordinary-token"),
+        Some(Uuid::new_v4()),
+        Some(serde_json::json!({"role": "moderator"})),
+    )
+    .await;
+    assert_eq!(existing.status(), StatusCode::FORBIDDEN);
+    assert_eq!(absent.status(), absent.status());
+    assert_eq!(
+        existing.status(),
+        absent.status(),
+        "target existence must not change the rejection an unauthorized caller sees"
+    );
+}
+
+/// An administrator grants a moderator role idempotently and revokes it auditably.
+#[tokio::test]
+async fn administrator_grants_then_revokes_moderator_role() {
+    let fixture = fixture();
+    let target = fixture.ordinary_id;
+    let path = format!("/v1/admin/accounts/{target}/platform-roles");
+
+    let granted = send(
+        fixture.state.clone(),
+        Method::POST,
+        &path,
+        Some("administrator-token"),
+        Some(Uuid::new_v4()),
+        Some(serde_json::json!({"role": "moderator"})),
+    )
+    .await;
+    assert_eq!(granted.status(), StatusCode::OK);
+    let body = response_json(granted).await;
+    assert_eq!(body["role"], "moderator");
+    assert_eq!(body["state"], "active");
+    assert_eq!(
+        body["assigned_by_account_id"],
+        fixture.administrator_id.to_string()
+    );
+    let first_created_at = body["created_at"].clone();
+
+    // Repeating the grant must not rewrite the original assignment.
+    let repeated = send(
+        fixture.state.clone(),
+        Method::POST,
+        &path,
+        Some("administrator-token"),
+        Some(Uuid::new_v4()),
+        Some(serde_json::json!({"role": "moderator"})),
+    )
+    .await;
+    assert_eq!(repeated.status(), StatusCode::OK);
+    let repeated_body = response_json(repeated).await;
+    assert_eq!(repeated_body["created_at"], first_created_at);
+    assert_eq!(
+        fixture.catalog.state.read().unwrap().platform_roles.len(),
+        2,
+        "an idempotent grant must not create a second assignment row"
+    );
+
+    let revoked = send(
+        fixture.state,
+        Method::DELETE,
+        &format!("{path}/moderator"),
+        Some("administrator-token"),
+        Some(Uuid::new_v4()),
+        None,
+    )
+    .await;
+    assert_eq!(revoked.status(), StatusCode::OK);
+    let revoked_body = response_json(revoked).await;
+    assert_eq!(revoked_body["state"], "revoked");
+    assert_eq!(
+        revoked_body["created_at"], first_created_at,
+        "revocation must retain the original grant time for audit"
+    );
+    let state = fixture.catalog.state.read().unwrap();
+    assert_eq!(
+        state.platform_roles.len(),
+        2,
+        "revocation must preserve the assignment row rather than delete it"
+    );
+}
+
+/// The last active administrator can neither be revoked nor suspended.
+#[tokio::test]
+async fn last_administrator_authority_cannot_be_removed() {
+    let fixture = fixture();
+    let administrator = fixture.administrator_id;
+
+    let revoked = send(
+        fixture.state.clone(),
+        Method::DELETE,
+        &format!("/v1/admin/accounts/{administrator}/platform-roles/administrator"),
+        Some("administrator-token"),
+        Some(Uuid::new_v4()),
+        None,
+    )
+    .await;
+    assert_eq!(revoked.status(), StatusCode::BAD_REQUEST);
+
+    let suspended = send(
+        fixture.state.clone(),
+        Method::PATCH,
+        &format!("/v1/admin/accounts/{administrator}/status"),
+        Some("administrator-token"),
+        Some(Uuid::new_v4()),
+        Some(serde_json::json!({"status": "suspended"})),
+    )
+    .await;
+    assert_eq!(suspended.status(), StatusCode::BAD_REQUEST);
+
+    // Authority must remain intact and usable after both rejections.
+    let state = fixture.catalog.state.read().unwrap();
+    assert!(state.platform_roles.iter().any(|record| {
+        record.account_id == administrator
+            && record.role == PlatformRole::Administrator
+            && record.state == PlatformRoleState::Active
+    }));
+    assert_eq!(state.accounts[&administrator].status, AccountStatus::Active);
+}
+
+/// A second administrator makes the first administrator's role revocable.
+#[tokio::test]
+async fn administrator_role_is_revocable_once_coverage_exists() {
+    let fixture = fixture();
+    let second = fixture.ordinary_id;
+    let promote = send(
+        fixture.state.clone(),
+        Method::POST,
+        &format!("/v1/admin/accounts/{second}/platform-roles"),
+        Some("administrator-token"),
+        Some(Uuid::new_v4()),
+        Some(serde_json::json!({"role": "administrator"})),
+    )
+    .await;
+    assert_eq!(promote.status(), StatusCode::OK);
+
+    let revoked = send(
+        fixture.state,
+        Method::DELETE,
+        &format!(
+            "/v1/admin/accounts/{}/platform-roles/administrator",
+            fixture.administrator_id
+        ),
+        Some("administrator-token"),
+        Some(Uuid::new_v4()),
+        None,
+    )
+    .await;
+    assert_eq!(
+        revoked.status(),
+        StatusCode::OK,
+        "revocation is permitted once another active administrator provides coverage"
+    );
+}
+
+/// Suspending an account blocks its next authenticated request.
+#[tokio::test]
+async fn suspended_account_loses_authenticated_access() {
+    let fixture = fixture();
+    let target = fixture.ordinary_id;
+    // Grant a role first so the account has authority to lose.
+    let granted = send(
+        fixture.state.clone(),
+        Method::POST,
+        &format!("/v1/admin/accounts/{target}/platform-roles"),
+        Some("administrator-token"),
+        Some(Uuid::new_v4()),
+        Some(serde_json::json!({"role": "moderator"})),
+    )
+    .await;
+    assert_eq!(granted.status(), StatusCode::OK);
+
+    let suspended = send(
+        fixture.state.clone(),
+        Method::PATCH,
+        &format!("/v1/admin/accounts/{target}/status"),
+        Some("administrator-token"),
+        Some(Uuid::new_v4()),
+        Some(serde_json::json!({"status": "suspended"})),
+    )
+    .await;
+    assert_eq!(suspended.status(), StatusCode::OK);
+    assert_eq!(response_json(suspended).await["status"], "suspended");
+
+    let after = send(
+        fixture.state.clone(),
+        Method::GET,
+        "/v1/account",
+        Some("ordinary-token"),
+        Some(Uuid::new_v4()),
+        None,
+    )
+    .await;
+    assert_eq!(
+        after.status(),
+        StatusCode::FORBIDDEN,
+        "a suspended account must be rejected on its next authenticated request"
+    );
+
+    // Suspension must preserve the account and its assignment history.
+    let state = fixture.catalog.state.read().unwrap();
+    assert!(state.accounts.contains_key(&target));
+    assert!(state
+        .platform_roles
+        .iter()
+        .any(|record| record.account_id == target));
 }
