@@ -1,0 +1,29 @@
+# Validate the reviewed source for the public GitHub Wiki.
+name: Wiki documentation
+
+on:
+  push:
+    branches: ["main", "master"]
+    paths:
+      - "docs/wiki/**"
+      - "scripts/wiki-docs.sh"
+      - ".github/workflows/wiki-docs.yml"
+  pull_request:
+    paths:
+      - "docs/wiki/**"
+      - "scripts/wiki-docs.sh"
+      - ".github/workflows/wiki-docs.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate Wiki source
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Check shell syntax
+        run: bash -n scripts/wiki-docs.sh
+      - name: Validate canonical Wiki source
+        run: bash scripts/wiki-docs.sh validate
