@@ -14,6 +14,7 @@ use frameshift_client::session_store::{
     SessionStore, SessionStoreError, SessionStoreMetadata, StoredSession,
 };
 use frameshift_client::{registry_base_url, Client, ClientError};
+use secrecy::SecretString;
 use url::{Position, Url};
 
 use crate::util::{validate_server_url, CliError};
@@ -177,6 +178,45 @@ fn run_status() -> Result<(), CliError> {
     };
     print_account(&view);
     Ok(())
+}
+
+/// Return a refreshed stored access token only for its exact registry base URL.
+pub(crate) fn access_token_for_registry(server: &str) -> Result<Option<SecretString>, CliError> {
+    let requested_registry = normalized_registry_url(server)?;
+    let client = Client::with_default_data_root()?;
+    let store = SessionStore::new(client.data_root());
+    let Some(mut stored) = optional_stored_session(store.load())? else {
+        return Ok(None);
+    };
+    if normalized_registry_url(stored.metadata.registry_url.as_str())? != requested_registry {
+        return Ok(None);
+    }
+    if session_expires_soon(&stored.session) && stored.session.refresh_token().is_some() {
+        let session_client = session_client_for(&stored)?;
+        stored.session = session_client
+            .refresh(&stored.session)
+            .map_err(|error| CliError::Account(error.to_string()))?;
+        persist_loaded_session(&store, &stored)?;
+    }
+    Ok(Some(stored.session.access_token().clone()))
+}
+
+/// Convert a session load into optional state while preserving real failures.
+fn optional_stored_session<T>(result: Result<T, SessionStoreError>) -> Result<Option<T>, CliError> {
+    match result {
+        Ok(stored) => Ok(Some(stored)),
+        Err(SessionStoreError::NotFound) => Ok(None),
+        Err(error) => Err(account_store_error(error)),
+    }
+}
+
+/// Normalize a registry base URL while treating one trailing slash as cosmetic.
+fn normalized_registry_url(server: &str) -> Result<Url, CliError> {
+    validate_server_url(server)?;
+    let mut registry = Url::parse(server).map_err(|error| CliError::Account(error.to_string()))?;
+    let normalized_path = registry.path().trim_end_matches('/').to_string();
+    registry.set_path(&normalized_path);
+    Ok(registry)
 }
 
 /// Best-effort revoke the provider session, then erase exact local state.
@@ -459,6 +499,39 @@ fn unix_now() -> u64 {
 /// Deterministic account command tests.
 mod tests {
     use super::*;
+
+    /// Registry matching ignores a cosmetic trailing slash only.
+    #[test]
+    fn normalizes_registry_trailing_slash_without_weakening_base_binding() {
+        let base = normalized_registry_url("https://registry.example/api").expect("base URL");
+        let trailing =
+            normalized_registry_url("https://registry.example/api/").expect("trailing URL");
+        let other_scheme =
+            normalized_registry_url("http://registry.example/api").expect("scheme URL");
+        let other_path =
+            normalized_registry_url("https://registry.example/other").expect("path URL");
+
+        assert_eq!(base, trailing);
+        assert_ne!(base, other_scheme);
+        assert_ne!(base, other_path);
+    }
+
+    /// Missing stored sessions become optional while storage failures remain visible.
+    #[test]
+    fn distinguishes_missing_sessions_from_store_failures() {
+        assert_eq!(
+            optional_stored_session::<()>(Err(SessionStoreError::NotFound))
+                .expect("missing session"),
+            None
+        );
+        let error = optional_stored_session::<()>(Err(SessionStoreError::Invalid(
+            "bad metadata".to_string(),
+        )))
+        .expect_err("invalid session");
+        assert!(error
+            .to_string()
+            .contains("stored FrameShift session is invalid"));
+    }
 
     /// A valid origin-form callback is reconstructed on the registered origin.
     #[test]
