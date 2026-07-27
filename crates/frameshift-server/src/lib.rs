@@ -51,6 +51,7 @@ pub mod error;
 pub mod mcp;
 pub mod metrics;
 pub mod middleware;
+pub mod password_auth;
 pub mod publication;
 pub mod router;
 pub mod routes;

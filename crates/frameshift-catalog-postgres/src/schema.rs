@@ -42,6 +42,54 @@ diesel::table! {
 }
 
 diesel::table! {
+    /// Optional first-party password credentials linked to stable accounts.
+    account_password_credentials (account_id) {
+        /// Account authenticated by the credential.
+        account_id -> Uuid,
+        /// Normalized unique email used for first-party sign-in.
+        normalized_email -> Text,
+        /// Argon2id PHC string containing the salt and cost parameters.
+        password_hash -> Text,
+        /// Application password-record schema version.
+        password_version -> SmallInt,
+        /// External credential-broker pepper version.
+        pepper_version -> SmallInt,
+        /// Successful email-verification timestamp.
+        email_verified_at -> Nullable<Timestamptz>,
+        /// Credential creation timestamp.
+        created_at -> Timestamptz,
+        /// Most recent password-change timestamp.
+        password_changed_at -> Timestamptz,
+        /// Most recent credential-record update timestamp.
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    /// Revocable sessions storing only SHA-256 digests of opaque tokens.
+    account_sessions (id) {
+        /// Stable session identifier.
+        id -> Uuid,
+        /// Account authenticated by the session.
+        account_id -> Uuid,
+        /// SHA-256 digest of the random session token.
+        token_digest -> Binary,
+        /// Client class receiving the session.
+        client_kind -> Text,
+        /// Session creation timestamp.
+        created_at -> Timestamptz,
+        /// Most recent authenticated-use timestamp.
+        last_seen_at -> Timestamptz,
+        /// Sliding inactivity expiry timestamp.
+        idle_expires_at -> Timestamptz,
+        /// Non-extendable session expiry timestamp.
+        absolute_expires_at -> Timestamptz,
+        /// Explicit revocation timestamp.
+        revoked_at -> Nullable<Timestamptz>,
+    }
+}
+
+diesel::table! {
     /// Public artifact publisher profiles.
     publisher_profiles (id) {
         /// Internal stable publisher identifier.
@@ -465,6 +513,9 @@ diesel::joinable!(handles -> authors (pubkey));
 // Allow Diesel join inference for publisher memberships.
 diesel::joinable!(publisher_memberships -> accounts (account_id));
 diesel::joinable!(publisher_memberships -> publisher_profiles (publisher_id));
+// Allow Diesel join inference for first-party credentials and sessions.
+diesel::joinable!(account_password_credentials -> accounts (account_id));
+diesel::joinable!(account_sessions -> accounts (account_id));
 // Allow Diesel join inference for publisher keys.
 diesel::joinable!(publisher_keys -> publisher_profiles (publisher_id));
 // Allow Diesel join inference for audit events.
@@ -495,6 +546,8 @@ diesel::allow_tables_to_appear_in_same_query!(
     pack_downloads,
     signed_request_nonces,
     accounts,
+    account_password_credentials,
+    account_sessions,
     account_platform_roles,
     publisher_profiles,
     publisher_memberships,
