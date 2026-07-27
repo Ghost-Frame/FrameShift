@@ -324,6 +324,38 @@ async fn invite_config_discloses_invite_only_policy() {
     assert!(body["turnstile_site_key"].is_null());
 }
 
+/// The production TCP boundary supplies peer addresses to rate-limited routes.
+#[tokio::test]
+async fn invite_config_works_over_tcp_with_ip_rate_limiting() {
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = probe.local_addr().unwrap();
+    drop(probe);
+
+    let mut config = (*test_config()).clone();
+    config.bind_addr = address;
+    config.abuse_rate_per_min = 60;
+    let state = test_state_with_config(MockCatalog::new(), None, Arc::new(config));
+    let server = tokio::spawn(frameshift_server::run(state));
+    let url = format!("http://{address}/v1/account-invite-requests");
+
+    let mut response = None;
+    for _attempt in 0..50 {
+        match reqwest::get(&url).await {
+            Ok(candidate) => {
+                response = Some(candidate);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+        }
+    }
+
+    let response = response.expect("server did not accept a TCP request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.json::<Value>().await.unwrap();
+    assert_eq!(body["registration"], "invite_only");
+    drop(server);
+}
+
 /// A verified application is stored once and duplicate responses remain identical.
 #[tokio::test]
 async fn invite_application_is_verified_and_idempotent_by_email() {

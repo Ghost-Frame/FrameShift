@@ -124,10 +124,13 @@ async fn serve(state: AppState, router: axum::Router) -> Result<(), ServerError>
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("listening on {addr}");
 
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal(shutdown_grace))
-        .await
-        .map_err(ServerError::Bind)?;
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal(shutdown_grace))
+    .await
+    .map_err(ServerError::Bind)?;
 
     Ok(())
 }
