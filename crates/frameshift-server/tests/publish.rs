@@ -144,6 +144,7 @@ fn test_config_with_abuse_rate(
         quarantine_r2_region: "auto".to_string(),
         quarantine_r2_access_key_id: String::new(),
         quarantine_r2_secret_access_key: SecretString::new(String::new()),
+        invite_requests: frameshift_server::InviteRequestConfig::disabled(),
         memory_backend: "none".to_string(),
         memory_http_endpoint: String::new(),
         memory_http_auth: "none".to_string(),

@@ -26,12 +26,12 @@ use diesel_migrations::{embed_migrations, EmbeddedMigrations, MigrationHarness a
 use tracing::{debug, error, instrument};
 
 use frameshift_catalog::{
-    AccountRecord, AccountStatusChangeRequest, AuthorRecord, CatalogBackend, CatalogError,
-    Ed25519PublicKey, HealthStatus, MembershipState, PackRecord, PackSearchFilters,
-    PackSearchResult, PackStatus, PackVersionRecord, PlatformRole, PlatformRoleAssignmentRequest,
-    PlatformRoleRecord, PlatformRoleRevocationRequest, PublicationAppealCaseRecord,
-    PublicationAppealCursor, PublicationAppealDisposition, PublicationAppealRecord,
-    PublicationAppealRequest, PublicationAppealResolutionRecord,
+    AccountInviteRequestRecord, AccountRecord, AccountStatusChangeRequest, AuthorRecord,
+    CatalogBackend, CatalogError, Ed25519PublicKey, HealthStatus, MembershipState, PackRecord,
+    PackSearchFilters, PackSearchResult, PackStatus, PackVersionRecord, PlatformRole,
+    PlatformRoleAssignmentRequest, PlatformRoleRecord, PlatformRoleRevocationRequest,
+    PublicationAppealCaseRecord, PublicationAppealCursor, PublicationAppealDisposition,
+    PublicationAppealRecord, PublicationAppealRequest, PublicationAppealResolutionRecord,
     PublicationAppealResolutionRequest, PublicationIntentClaim, PublicationIntentRecord,
     PublicationLifecycleAction, PublicationLifecycleCursor, PublicationLifecycleDecisionRecord,
     PublicationModerationAction, PublicationModerationDecisionRecord,
@@ -47,8 +47,8 @@ use frameshift_publication::{inventory_hash, FindingSeverity, REPORT_SCHEMA_VERS
 use crate::config::PostgresCatalogConfig;
 use crate::errors::{map_diesel_error, map_migration_error, map_pool_error};
 use crate::models::{
-    encode_text_enum, vec_to_pubkey, AccountRow, AuthorRow, HandleRow, NewAccountRow, NewAuthorRow,
-    NewHandleRow, NewPackDownloadRow, NewPackRow, NewPackVersionRow,
+    encode_text_enum, vec_to_pubkey, AccountRow, AuthorRow, HandleRow, NewAccountInviteRequestRow,
+    NewAccountRow, NewAuthorRow, NewHandleRow, NewPackDownloadRow, NewPackRow, NewPackVersionRow,
     NewPublicationAppealResolutionRow, NewPublicationAppealRow, NewPublicationIntentRow,
     NewPublicationLifecycleDecisionRow, NewPublicationModerationDecisionRow,
     NewPublicationPromotionRow, NewPublicationSubmissionRow, NewPublisherAuditEventRow,
@@ -59,8 +59,8 @@ use crate::models::{
 };
 use crate::pool::{build_pool, PgPool};
 use crate::schema::{
-    account_platform_roles, accounts, authors, handles, pack_downloads, pack_versions, packs,
-    publication_appeal_resolutions, publication_appeals, publication_intents,
+    account_invite_requests, account_platform_roles, accounts, authors, handles, pack_downloads,
+    pack_versions, packs, publication_appeal_resolutions, publication_appeals, publication_intents,
     publication_lifecycle_decisions, publication_moderation_decisions, publication_promotions,
     publication_submissions, publisher_audit_events, publisher_keys, publisher_memberships,
     publisher_profiles, signed_request_nonces,
@@ -1220,6 +1220,34 @@ async fn register_pack_version_on_connection(
 /// Diesel DSL or raw SQL query, and maps driver errors to [`CatalogError`].
 #[async_trait]
 impl CatalogBackend for PostgresCatalog {
+    /// Store one invite application while suppressing repeated normalized emails.
+    async fn create_account_invite_request(
+        &self,
+        record: AccountInviteRequestRecord,
+    ) -> Result<(), CatalogError> {
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        let key = record.normalized_email.clone();
+        let row = NewAccountInviteRequestRow {
+            id: record.id,
+            normalized_email: record.normalized_email,
+            display_name: record.display_name,
+            intent: encode_text_enum(record.intent)?,
+            statement: record.statement,
+            status: encode_text_enum(record.status)?,
+            consented_at: record.consented_at,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+        };
+        diesel::insert_into(account_invite_requests::table)
+            .values(row)
+            .on_conflict(account_invite_requests::normalized_email)
+            .do_nothing()
+            .execute(&mut conn)
+            .await
+            .map_err(|error| map_diesel_error(error, "account invite request", key))?;
+        Ok(())
+    }
+
     /// Create an OIDC-backed account with a unique identity pair.
     #[instrument(skip(self, record), fields(account_id = %record.id, issuer = %record.issuer))]
     async fn create_account(&self, record: AccountRecord) -> Result<(), CatalogError> {

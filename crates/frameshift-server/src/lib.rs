@@ -62,7 +62,7 @@ use std::sync::Arc;
 
 use frameshift_objects::PackStore;
 
-pub use config::{LogFormat, OidcConfig, ServerConfig};
+pub use config::{InviteRequestConfig, LogFormat, OidcConfig, ServerConfig};
 pub use error::AppError;
 pub use router::{app, app_with_publication_admission};
 pub use state::AppState;

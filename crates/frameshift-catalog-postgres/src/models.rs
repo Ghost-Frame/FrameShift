@@ -29,8 +29,8 @@ use frameshift_catalog::{
 use uuid::Uuid;
 
 use crate::schema::{
-    account_platform_roles, accounts, authors, handles, pack_downloads, pack_versions, packs,
-    publication_appeal_resolutions, publication_appeals, publication_intents,
+    account_invite_requests, account_platform_roles, accounts, authors, handles, pack_downloads,
+    pack_versions, packs, publication_appeal_resolutions, publication_appeals, publication_intents,
     publication_lifecycle_decisions, publication_moderation_decisions, publication_promotions,
     publication_submissions, publisher_audit_events, publisher_keys, publisher_memberships,
     publisher_profiles,
@@ -97,6 +97,30 @@ pub(crate) struct NewAccountRow {
     /// Account creation timestamp supplied by the caller.
     pub created_at: DateTime<Utc>,
     /// Initial account update timestamp supplied by the caller.
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Insertable invite application used by the public account intake route.
+#[derive(Debug, Insertable)]
+#[diesel(table_name = account_invite_requests)]
+pub(crate) struct NewAccountInviteRequestRow {
+    /// Stable internal application identifier.
+    pub id: Uuid,
+    /// Lowercase, trimmed applicant email.
+    pub normalized_email: String,
+    /// Optional applicant name retained for review.
+    pub display_name: Option<String>,
+    /// Applicant-selected intent encoded as stable snake case.
+    pub intent: String,
+    /// Bounded private application statement.
+    pub statement: String,
+    /// Review lifecycle state encoded as stable snake case.
+    pub status: String,
+    /// Applicant contact-consent timestamp.
+    pub consented_at: DateTime<Utc>,
+    /// Initial application timestamp.
+    pub created_at: DateTime<Utc>,
+    /// Most recent application update timestamp.
     pub updated_at: DateTime<Utc>,
 }
 

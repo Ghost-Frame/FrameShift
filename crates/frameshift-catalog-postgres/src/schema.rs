@@ -202,6 +202,30 @@ diesel::table! {
 }
 
 diesel::table! {
+    /// Applications for access to invite-only first-party account registration.
+    account_invite_requests (id) {
+        /// Stable internal application identifier.
+        id -> Uuid,
+        /// Lowercase, trimmed applicant email.
+        normalized_email -> Text,
+        /// Optional applicant name retained for review.
+        display_name -> Nullable<Text>,
+        /// Applicant-selected reason for requesting access.
+        intent -> Text,
+        /// Bounded private application statement.
+        statement -> Text,
+        /// Current review lifecycle state.
+        status -> Text,
+        /// Time when the applicant accepted the contact terms.
+        consented_at -> Timestamptz,
+        /// Initial application timestamp.
+        created_at -> Timestamptz,
+        /// Most recent application update timestamp.
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     /// Global moderation authority assigned independently of publisher ownership.
     account_platform_roles (account_id, role) {
         /// Account receiving the global authority.
@@ -548,6 +572,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     accounts,
     account_password_credentials,
     account_sessions,
+    account_invite_requests,
     account_platform_roles,
     publisher_profiles,
     publisher_memberships,

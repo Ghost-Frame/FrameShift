@@ -9,6 +9,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::http::{Method, Request, StatusCode};
+use axum::routing::post;
+use axum::{Json, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use chrono::Utc;
@@ -19,7 +21,7 @@ use frameshift_catalog::{
 };
 use frameshift_server::account_auth::{BearerTokenVerifier, OidcAuthError, VerifiedOidcIdentity};
 use frameshift_server::metrics::Metrics;
-use frameshift_server::{app, AppState, LogFormat, OidcConfig, ServerConfig};
+use frameshift_server::{app, AppState, InviteRequestConfig, LogFormat, OidcConfig, ServerConfig};
 use http_body_util::BodyExt as _;
 use secrecy::SecretString;
 use serde_json::{json, Value};
@@ -84,6 +86,11 @@ impl BearerTokenVerifier for FakeVerifier {
 
 /// Build a server configuration with account authentication enabled.
 fn test_config() -> Arc<ServerConfig> {
+    test_config_with_invites(InviteRequestConfig::disabled())
+}
+
+/// Build a server configuration with explicit invite application settings.
+fn test_config_with_invites(invite_requests: InviteRequestConfig) -> Arc<ServerConfig> {
     Arc::new(ServerConfig {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
         postgres_url: SecretString::new("postgres://test".into()),
@@ -137,6 +144,7 @@ fn test_config() -> Arc<ServerConfig> {
             clock_skew: Duration::from_secs(30),
             fresh_auth_max_age: Duration::from_secs(300),
         },
+        invite_requests,
         memory_backend: "none".to_string(),
         memory_http_endpoint: String::new(),
         memory_http_auth: "none".to_string(),
@@ -147,17 +155,56 @@ fn test_config() -> Arc<ServerConfig> {
 
 /// Build application state around shared catalog and bearer verifier doubles.
 fn test_state(catalog: MockCatalog, verifier: Option<FakeVerifier>) -> AppState {
+    test_state_with_config(catalog, verifier, test_config())
+}
+
+/// Build application state around explicit server configuration.
+fn test_state_with_config(
+    catalog: MockCatalog,
+    verifier: Option<FakeVerifier>,
+    config: Arc<ServerConfig>,
+) -> AppState {
     AppState {
         catalog: Arc::new(catalog),
         objects: Arc::new(MockPackStore::new()),
         runtime: None,
         memory: None,
-        config: test_config(),
+        config,
         metrics: Arc::new(Metrics::new()),
         auth_nonces: Arc::new(frameshift_server::auth::NonceCache::new(
             Duration::from_secs(600),
         )),
         account_auth: verifier.map(|value| Arc::new(value) as Arc<dyn BearerTokenVerifier>),
+    }
+}
+
+/// Start a local Turnstile Siteverify double with one deterministic outcome.
+async fn spawn_turnstile_verifier(success: bool) -> String {
+    let verifier = Router::new().route(
+        "/",
+        post(move || async move {
+            Json(json!({
+                "success": success,
+                "hostname": "frameshift.test",
+                "action": "invite_request"
+            }))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, verifier).await.unwrap();
+    });
+    format!("http://{address}/")
+}
+
+/// Return enabled invite settings bound to one local Siteverify double.
+async fn enabled_invite_config(success: bool) -> InviteRequestConfig {
+    InviteRequestConfig {
+        turnstile_site_key: "1x00000000000000000000AA".to_string(),
+        turnstile_secret: SecretString::new("test-secret".to_string()),
+        expected_hostname: "frameshift.test".to_string(),
+        verify_url: spawn_turnstile_verifier(success).await,
     }
 }
 
@@ -257,6 +304,117 @@ fn intent_body(id: Uuid, publisher_id: Uuid, key_id: Uuid) -> Value {
         "file_inventory_hash": "33".repeat(32),
         "scan_schema_version": 1
     })
+}
+
+/// Invite configuration always discloses the invite-only policy without secrets.
+#[tokio::test]
+async fn invite_config_discloses_invite_only_policy() {
+    let response = send(
+        test_state(MockCatalog::new(), None),
+        Method::GET,
+        "/v1/account-invite-requests",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["registration"], "invite_only");
+    assert_eq!(body["invite_requests_enabled"], false);
+    assert!(body["turnstile_site_key"].is_null());
+}
+
+/// A verified application is stored once and duplicate responses remain identical.
+#[tokio::test]
+async fn invite_application_is_verified_and_idempotent_by_email() {
+    let catalog = MockCatalog::new();
+    let config = test_config_with_invites(enabled_invite_config(true).await);
+    let state = test_state_with_config(catalog.clone(), None, config);
+    let body = json!({
+        "email": "  Applicant@Example.Test ",
+        "display_name": " Applicant ",
+        "intent": "publish_personas",
+        "statement": "I create security personas and want to publish them responsibly.",
+        "consent": true,
+        "turnstile_token": "single-use-test-token",
+        "website": ""
+    });
+
+    let first = send(
+        state.clone(),
+        Method::POST,
+        "/v1/account-invite-requests",
+        None,
+        Some(body.clone()),
+    )
+    .await;
+    let second = send(
+        state,
+        Method::POST,
+        "/v1/account-invite-requests",
+        None,
+        Some(body),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::ACCEPTED);
+    assert_eq!(second.status(), StatusCode::ACCEPTED);
+    assert_eq!(response_json(first).await, response_json(second).await);
+
+    let stored = catalog.state.read().unwrap();
+    assert_eq!(stored.account_invite_requests.len(), 1);
+    let application = stored
+        .account_invite_requests
+        .get("applicant@example.test")
+        .unwrap();
+    assert_eq!(application.display_name.as_deref(), Some("Applicant"));
+}
+
+/// Invite intake fails closed when anti-bot settings are absent.
+#[tokio::test]
+async fn invite_application_requires_configured_verification() {
+    let response = send(
+        test_state(MockCatalog::new(), None),
+        Method::POST,
+        "/v1/account-invite-requests",
+        None,
+        Some(json!({
+            "email": "applicant@example.test",
+            "intent": "other",
+            "statement": "I would like to evaluate account features for my workflow.",
+            "consent": true,
+            "turnstile_token": "unverified-token"
+        })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// A rejected Turnstile token never reaches durable application storage.
+#[tokio::test]
+async fn invite_application_rejects_failed_turnstile_verification() {
+    let catalog = MockCatalog::new();
+    let config = test_config_with_invites(enabled_invite_config(false).await);
+    let response = send(
+        test_state_with_config(catalog.clone(), None, config),
+        Method::POST,
+        "/v1/account-invite-requests",
+        None,
+        Some(json!({
+            "email": "applicant@example.test",
+            "intent": "contribute",
+            "statement": "I want to contribute careful documentation and useful personas.",
+            "consent": true,
+            "turnstile_token": "rejected-token"
+        })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(catalog
+        .state
+        .read()
+        .unwrap()
+        .account_invite_requests
+        .is_empty());
 }
 
 /// Disabled auth omits protected routes while retaining public capability metadata.

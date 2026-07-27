@@ -61,11 +61,12 @@ pub use filters::{PackSearchFilters, PackSearchResult, SortMode};
 pub use frameshift_pack::ObjectHash;
 pub use identity::Ed25519PublicKey;
 pub use records::{
-    AccountRecord, AccountStatus, AccountStatusChangeRequest, AuthorRecord, MembershipState,
-    OauthLink, PackRecord, PackVersionRecord, PlatformRole, PlatformRoleAssignmentRequest,
-    PlatformRoleRecord, PlatformRoleRevocationRequest, PlatformRoleState,
-    PublicationAppealCaseRecord, PublicationAppealCursor, PublicationAppealDisposition,
-    PublicationAppealRecord, PublicationAppealRequest, PublicationAppealResolutionRecord,
+    AccountInviteIntent, AccountInviteRequestRecord, AccountInviteStatus, AccountRecord,
+    AccountStatus, AccountStatusChangeRequest, AuthorRecord, MembershipState, OauthLink,
+    PackRecord, PackVersionRecord, PlatformRole, PlatformRoleAssignmentRequest, PlatformRoleRecord,
+    PlatformRoleRevocationRequest, PlatformRoleState, PublicationAppealCaseRecord,
+    PublicationAppealCursor, PublicationAppealDisposition, PublicationAppealRecord,
+    PublicationAppealRequest, PublicationAppealResolutionRecord,
     PublicationAppealResolutionRequest, PublicationIntentClaim, PublicationIntentRecord,
     PublicationLifecycleAction, PublicationLifecycleCursor, PublicationLifecycleDecisionRecord,
     PublicationModerationAction, PublicationModerationDecisionRecord,
