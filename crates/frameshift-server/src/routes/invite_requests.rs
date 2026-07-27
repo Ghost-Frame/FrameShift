@@ -172,7 +172,7 @@ fn accepted_response() -> (StatusCode, Json<InviteRequestAcceptedResponse>) {
 }
 
 /// Normalize and minimally validate one applicant email.
-fn normalize_email(raw: &str) -> Result<String, AppError> {
+pub(crate) fn normalize_email(raw: &str) -> Result<String, AppError> {
     let normalized = raw.trim().to_lowercase();
     let valid_length = !normalized.is_empty() && normalized.len() <= MAX_EMAIL_BYTES;
     let valid_shape = normalized.matches('@').count() == 1
@@ -190,7 +190,9 @@ fn normalize_email(raw: &str) -> Result<String, AppError> {
 }
 
 /// Trim and bound an optional applicant display name.
-fn normalize_optional_display_name(raw: Option<String>) -> Result<Option<String>, AppError> {
+pub(crate) fn normalize_optional_display_name(
+    raw: Option<String>,
+) -> Result<Option<String>, AppError> {
     let Some(raw) = raw else {
         return Ok(None);
     };

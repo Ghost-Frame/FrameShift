@@ -17,13 +17,15 @@ use std::time::Duration;
 use diesel::{ExpressionMethods as _, QueryDsl as _};
 use diesel_async::{RunQueryDsl as _, SimpleAsyncConnection as _};
 use frameshift_catalog::{
-    AccountRecord, AccountStatus, AccountStatusChangeRequest, AuthorRecord, CatalogBackend,
-    CatalogError, Ed25519PublicKey, MembershipState, ObjectHash, PackSearchFilters, PackStatus,
-    PackVersionRecord, PlatformRole, PlatformRoleAssignmentRequest, PlatformRoleRevocationRequest,
-    PlatformRoleState, PublicationAppealDisposition, PublicationAppealRequest,
-    PublicationAppealResolutionRequest, PublicationIntentClaim, PublicationIntentRecord,
-    PublicationLifecycleAction, PublicationLifecycleCursor, PublicationModerationAction,
-    PublicationModerationDecisionRequest, PublicationPromotionRequest,
+    AccountInviteIntent, AccountInviteIssueRequest, AccountInviteRequestRecord,
+    AccountInviteStatus, AccountPasswordCredentialRecord, AccountRecord, AccountSessionClientKind,
+    AccountSessionRecord, AccountStatus, AccountStatusChangeRequest, AuthorRecord, CatalogBackend,
+    CatalogError, Ed25519PublicKey, LocalAccountRegistrationRequest, MembershipState, ObjectHash,
+    PackSearchFilters, PackStatus, PackVersionRecord, PlatformRole, PlatformRoleAssignmentRequest,
+    PlatformRoleRevocationRequest, PlatformRoleState, PublicationAppealDisposition,
+    PublicationAppealRequest, PublicationAppealResolutionRequest, PublicationIntentClaim,
+    PublicationIntentRecord, PublicationLifecycleAction, PublicationLifecycleCursor,
+    PublicationModerationAction, PublicationModerationDecisionRequest, PublicationPromotionRequest,
     PublicationSubmissionRequest, PublicationSubmissionState, PublicationTombstoneRequest,
     PublicationWithdrawalRequest, PublishQuota, PublisherAuditEventRecord, PublisherKeyRecord,
     PublisherKeyState, PublisherMembershipRecord, PublisherModerationStatus,
@@ -31,10 +33,10 @@ use frameshift_catalog::{
     TombstoneRecord,
 };
 use frameshift_catalog_postgres::schema::{
-    account_platform_roles, accounts, pack_versions, publication_appeal_resolutions,
-    publication_appeals, publication_lifecycle_decisions, publication_moderation_decisions,
-    publication_promotions, publication_submissions, publisher_audit_events, publisher_keys,
-    publisher_memberships, publisher_profiles,
+    account_invites, account_platform_roles, accounts, pack_versions,
+    publication_appeal_resolutions, publication_appeals, publication_lifecycle_decisions,
+    publication_moderation_decisions, publication_promotions, publication_submissions,
+    publisher_audit_events, publisher_keys, publisher_memberships, publisher_profiles,
 };
 use frameshift_catalog_postgres::{
     OwnershipBackfillApplied, OwnershipBackfillManifest, OwnershipBackfillMode,
@@ -146,6 +148,52 @@ fn make_account(id: uuid::Uuid, subject: &str) -> AccountRecord {
         status: AccountStatus::Active,
         created_at: now,
         updated_at: now,
+    }
+}
+
+/// Build one local registration transaction fixture for invite race tests.
+fn make_local_registration(
+    token_digest: Vec<u8>,
+    email: &str,
+    subject: &str,
+) -> LocalAccountRegistrationRequest {
+    let now = chrono::DateTime::from_timestamp_micros(chrono::Utc::now().timestamp_micros())
+        .expect("current timestamp must fit");
+    let account = AccountRecord {
+        id: uuid::Uuid::new_v4(),
+        issuer: "https://frameshift.test/first-party".to_string(),
+        subject: subject.to_string(),
+        email: Some(email.to_string()),
+        display_name: None,
+        status: AccountStatus::Active,
+        created_at: now,
+        updated_at: now,
+    };
+    LocalAccountRegistrationRequest {
+        invite_token_digest: token_digest,
+        credential: AccountPasswordCredentialRecord {
+            account_id: account.id,
+            normalized_email: email.to_string(),
+            password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA".to_string(),
+            password_version: 1,
+            pepper_version: 1,
+            email_verified_at: Some(now),
+            created_at: now,
+            password_changed_at: now,
+            updated_at: now,
+        },
+        session: AccountSessionRecord {
+            id: uuid::Uuid::new_v4(),
+            account_id: account.id,
+            token_digest: Sha256::digest(subject.as_bytes()).to_vec(),
+            client_kind: AccountSessionClientKind::Desktop,
+            created_at: now,
+            last_seen_at: now,
+            idle_expires_at: now + chrono::Duration::hours(1),
+            absolute_expires_at: now + chrono::Duration::hours(2),
+            revoked_at: None,
+        },
+        account,
     }
 }
 
@@ -4803,4 +4851,81 @@ async fn cold_deployment_drill_reaches_a_public_pack() {
     );
     assert_eq!(drained.oldest_queued_at, None);
     assert_eq!(drained.active_reviewers, 2);
+}
+
+/// Concurrent redemption of one invitation commits exactly one complete account transaction.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn concurrent_invite_redemption_creates_exactly_one_local_account() {
+    let (catalog, _container) = setup_catalog().await;
+    let administrator = make_account(uuid::Uuid::new_v4(), "invite-race-administrator");
+    catalog
+        .create_account(administrator.clone())
+        .await
+        .expect("create invite administrator account failed");
+    assign_test_platform_role(&catalog, administrator.id, "administrator").await;
+
+    let now = chrono::DateTime::from_timestamp_micros(chrono::Utc::now().timestamp_micros())
+        .expect("current timestamp must fit");
+    let application_id = uuid::Uuid::new_v4();
+    catalog
+        .create_account_invite_request(AccountInviteRequestRecord {
+            id: application_id,
+            normalized_email: "race-invite@example.test".to_string(),
+            display_name: None,
+            intent: AccountInviteIntent::Contribute,
+            statement: "Concurrent redemption transaction coverage.".to_string(),
+            status: AccountInviteStatus::Pending,
+            consented_at: now,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("create invitation application failed");
+    let invitation_id = uuid::Uuid::new_v4();
+    let token_digest = Sha256::digest([17_u8; 32]).to_vec();
+    catalog
+        .issue_account_invite(AccountInviteIssueRequest {
+            id: invitation_id,
+            request_id: application_id,
+            token_digest: token_digest.clone(),
+            actor_account_id: administrator.id,
+            expires_at: now + chrono::Duration::hours(1),
+            created_at: now,
+        })
+        .await
+        .expect("issue invitation failed");
+
+    let first = make_local_registration(
+        token_digest.clone(),
+        "race-invite@example.test",
+        "race-invite-first",
+    );
+    let second = make_local_registration(
+        token_digest,
+        "race-invite@example.test",
+        "race-invite-second",
+    );
+    let (first_result, second_result) = tokio::join!(
+        catalog.register_local_account(first),
+        catalog.register_local_account(second),
+    );
+    let failed = match (first_result, second_result) {
+        (Ok(_), Err(error)) | (Err(error), Ok(_)) => error,
+        results => panic!("exactly one concurrent redemption may succeed, got results={results:?}"),
+    };
+    assert!(matches!(failed, CatalogError::Unauthorized { .. }));
+
+    let mut connection = catalog
+        .pool()
+        .get()
+        .await
+        .expect("invite assertion connection failed");
+    let consumed_at = account_invites::table
+        .filter(account_invites::id.eq(invitation_id))
+        .select(account_invites::consumed_at)
+        .first::<Option<chrono::DateTime<chrono::Utc>>>(&mut connection)
+        .await
+        .expect("load consumed invitation failed");
+    assert!(consumed_at.is_some());
 }

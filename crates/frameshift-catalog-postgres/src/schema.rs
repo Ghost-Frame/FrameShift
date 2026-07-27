@@ -226,6 +226,32 @@ diesel::table! {
 }
 
 diesel::table! {
+    /// One-time invitations storing only SHA-256 digests of opaque tokens.
+    account_invites (id) {
+        /// Stable internal invitation identifier.
+        id -> Uuid,
+        /// Application approved by this invitation.
+        request_id -> Nullable<Uuid>,
+        /// Lowercase, trimmed email authorized to redeem the invitation.
+        normalized_email -> Text,
+        /// SHA-256 digest of the random invitation token.
+        token_digest -> Binary,
+        /// Administrator that issued the invitation.
+        issued_by_account_id -> Nullable<Uuid>,
+        /// Whether the invitation was inserted out of band for initial bootstrap.
+        is_bootstrap -> Bool,
+        /// Exclusive invitation expiry timestamp.
+        expires_at -> Timestamptz,
+        /// Successful one-time consumption timestamp.
+        consumed_at -> Nullable<Timestamptz>,
+        /// Explicit revocation timestamp.
+        revoked_at -> Nullable<Timestamptz>,
+        /// Invitation creation timestamp.
+        created_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     /// Global moderation authority assigned independently of publisher ownership.
     account_platform_roles (account_id, role) {
         /// Account receiving the global authority.
@@ -540,6 +566,8 @@ diesel::joinable!(publisher_memberships -> publisher_profiles (publisher_id));
 // Allow Diesel join inference for first-party credentials and sessions.
 diesel::joinable!(account_password_credentials -> accounts (account_id));
 diesel::joinable!(account_sessions -> accounts (account_id));
+// Account invitation joins are written explicitly where both optional foreign keys are needed.
+diesel::joinable!(account_invites -> account_invite_requests (request_id));
 // Allow Diesel join inference for publisher keys.
 diesel::joinable!(publisher_keys -> publisher_profiles (publisher_id));
 // Allow Diesel join inference for audit events.
@@ -573,6 +601,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     account_password_credentials,
     account_sessions,
     account_invite_requests,
+    account_invites,
     account_platform_roles,
     publisher_profiles,
     publisher_memberships,

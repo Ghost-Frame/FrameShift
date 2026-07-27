@@ -1,8 +1,7 @@
 //! First-party password hashing and verification.
 //!
-//! This module only provides the cryptographic primitive. Public registration,
-//! login, recovery, and session routes remain disabled until their separate
-//! abuse-control and recovery requirements are complete.
+//! Public registration and login use this primitive behind invite checks,
+//! per-address rate limits, and a process-wide memory-work bound.
 
 use argon2::password_hash::{PasswordHash, PasswordHasher as _, PasswordVerifier as _, SaltString};
 use argon2::{Algorithm, Argon2, Params, Version};

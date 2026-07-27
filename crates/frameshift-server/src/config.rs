@@ -62,6 +62,14 @@
 //! | `INVITE_TURNSTILE_SECRET` | `""` | Secret Turnstile verification key |
 //! | `INVITE_TURNSTILE_EXPECTED_HOSTNAME` | `""` | Exact hostname accepted from Turnstile |
 //! | `INVITE_TURNSTILE_VERIFY_URL` | Cloudflare Siteverify | Turnstile verification endpoint |
+//! | `LOCAL_AUTH_PASSWORD_PEPPER` | `""` | Credential-broker password pepper; empty disables first-party auth |
+//! | `LOCAL_AUTH_PEPPER_VERSION` | `1` | Positive version stored beside password hashes |
+//! | `LOCAL_AUTH_ISSUER` | FrameShift first-party URL | Stable issuer written to local account rows |
+//! | `LOCAL_AUTH_COOKIE_NAME` | `__Host-frameshift_session` | Secure browser session cookie name |
+//! | `LOCAL_AUTH_INVITE_TTL_SECS` | `604800` | Lifetime of reviewer-issued invitations |
+//! | `LOCAL_AUTH_BROWSER_IDLE_SECS` | `604800` | Browser session inactivity lifetime |
+//! | `LOCAL_AUTH_BEARER_IDLE_SECS` | `2592000` | Desktop and CLI session inactivity lifetime |
+//! | `LOCAL_AUTH_ABSOLUTE_SECS` | `7776000` | Non-extendable lifetime for every local session |
 //!
 //! Env var names match the struct field names verbatim (figment maps
 //! `download_secret` <-> `DOWNLOAD_SECRET`); shorter aliases would require an
@@ -178,6 +186,77 @@ impl std::fmt::Debug for InviteRequestConfig {
             .field("turnstile_secret", &"[REDACTED]")
             .field("expected_hostname", &self.expected_hostname)
             .field("verify_url", &self.verify_url)
+            .finish()
+    }
+}
+
+/// First-party password, invitation, and session configuration.
+#[derive(Clone)]
+pub struct FirstPartyAuthConfig {
+    /// Deployment pepper supplied by the credential broker.
+    pub password_pepper: SecretString,
+    /// Positive pepper version stored beside newly created hashes.
+    pub pepper_version: i16,
+    /// Stable issuer written to first-party account rows.
+    pub issuer: String,
+    /// Secure browser session cookie name.
+    pub cookie_name: String,
+    /// Lifetime of reviewer-issued invitation tokens.
+    pub invite_ttl: Duration,
+    /// Sliding inactivity lifetime for browser sessions.
+    pub browser_idle_ttl: Duration,
+    /// Sliding inactivity lifetime for desktop and CLI bearer sessions.
+    pub bearer_idle_ttl: Duration,
+    /// Non-extendable maximum session lifetime.
+    pub absolute_ttl: Duration,
+}
+
+/// Constructors and readiness checks for first-party account authentication.
+impl FirstPartyAuthConfig {
+    /// Return a disabled configuration suitable for tests and local development.
+    pub fn disabled() -> Self {
+        Self {
+            password_pepper: SecretString::new(String::new()),
+            pepper_version: 1,
+            issuer: "https://frameshift.syntheos.dev/first-party".to_string(),
+            cookie_name: "__Host-frameshift_session".to_string(),
+            invite_ttl: Duration::from_secs(7 * 24 * 60 * 60),
+            browser_idle_ttl: Duration::from_secs(7 * 24 * 60 * 60),
+            bearer_idle_ttl: Duration::from_secs(30 * 24 * 60 * 60),
+            absolute_ttl: Duration::from_secs(90 * 24 * 60 * 60),
+        }
+    }
+
+    /// Return whether the password pepper and all bounded settings are valid.
+    pub fn enabled(&self) -> bool {
+        use secrecy::ExposeSecret as _;
+
+        !self.password_pepper.expose_secret().is_empty()
+            && self.pepper_version > 0
+            && !self.issuer.trim().is_empty()
+            && self.cookie_name.starts_with("__Host-")
+            && !self.cookie_name.contains([';', ' ', '\t', '\r', '\n'])
+            && !self.invite_ttl.is_zero()
+            && !self.browser_idle_ttl.is_zero()
+            && !self.bearer_idle_ttl.is_zero()
+            && self.absolute_ttl >= self.browser_idle_ttl
+            && self.absolute_ttl >= self.bearer_idle_ttl
+    }
+}
+
+/// Redacted formatting for first-party authentication configuration.
+impl std::fmt::Debug for FirstPartyAuthConfig {
+    /// Format non-secret settings while replacing the password pepper with a marker.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FirstPartyAuthConfig")
+            .field("password_pepper", &"[REDACTED]")
+            .field("pepper_version", &self.pepper_version)
+            .field("issuer", &self.issuer)
+            .field("cookie_name", &self.cookie_name)
+            .field("invite_ttl", &self.invite_ttl)
+            .field("browser_idle_ttl", &self.browser_idle_ttl)
+            .field("bearer_idle_ttl", &self.bearer_idle_ttl)
+            .field("absolute_ttl", &self.absolute_ttl)
             .finish()
     }
 }
@@ -421,6 +500,9 @@ pub struct ServerConfig {
     /// Invite-only account application and anti-bot settings.
     pub invite_requests: InviteRequestConfig,
 
+    /// First-party invitation, password, and revocable-session settings.
+    pub first_party_auth: FirstPartyAuthConfig,
+
     /// Memory backend selector: `"none"` (default), `"http"`, or `"sqlite"`.
     ///
     /// - `"none"` -- no memory adapter; personas that require memory will fail
@@ -568,6 +650,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("publisher_ownership_reads", &self.publisher_ownership_reads)
             .field("oidc", &self.oidc)
             .field("invite_requests", &self.invite_requests)
+            .field("first_party_auth", &self.first_party_auth)
             .field("memory_backend", &self.memory_backend)
             .field("memory_http_endpoint", &self.memory_http_endpoint)
             .field("memory_http_auth", &"[REDACTED]")
@@ -727,6 +810,23 @@ struct RawConfig {
     /// Turnstile Siteverify endpoint.
     invite_turnstile_verify_url: String,
 
+    /// Credential-broker deployment pepper for first-party passwords.
+    local_auth_password_pepper: String,
+    /// Positive pepper version stored beside new password hashes.
+    local_auth_pepper_version: i16,
+    /// Stable issuer written to first-party accounts.
+    local_auth_issuer: String,
+    /// Secure browser session cookie name.
+    local_auth_cookie_name: String,
+    /// Reviewer-issued invitation lifetime in seconds.
+    local_auth_invite_ttl_secs: u64,
+    /// Browser session inactivity lifetime in seconds.
+    local_auth_browser_idle_secs: u64,
+    /// Desktop and CLI session inactivity lifetime in seconds.
+    local_auth_bearer_idle_secs: u64,
+    /// Non-extendable session lifetime in seconds.
+    local_auth_absolute_secs: u64,
+
     /// Memory backend selector.
     memory_backend: String,
     /// HTTP memory endpoint URL.
@@ -822,6 +922,16 @@ impl RawConfig {
                 expected_hostname: self.invite_turnstile_expected_hostname,
                 verify_url: self.invite_turnstile_verify_url,
             },
+            first_party_auth: FirstPartyAuthConfig {
+                password_pepper: SecretString::new(self.local_auth_password_pepper),
+                pepper_version: self.local_auth_pepper_version,
+                issuer: self.local_auth_issuer,
+                cookie_name: self.local_auth_cookie_name,
+                invite_ttl: Duration::from_secs(self.local_auth_invite_ttl_secs),
+                browser_idle_ttl: Duration::from_secs(self.local_auth_browser_idle_secs),
+                bearer_idle_ttl: Duration::from_secs(self.local_auth_bearer_idle_secs),
+                absolute_ttl: Duration::from_secs(self.local_auth_absolute_secs),
+            },
             memory_backend: self.memory_backend,
             memory_http_endpoint: self.memory_http_endpoint,
             memory_http_auth: self.memory_http_auth,
@@ -892,6 +1002,14 @@ fn default_raw_config() -> RawConfig {
         invite_turnstile_expected_hostname: String::new(),
         invite_turnstile_verify_url: "https://challenges.cloudflare.com/turnstile/v0/siteverify"
             .to_string(),
+        local_auth_password_pepper: String::new(),
+        local_auth_pepper_version: 1,
+        local_auth_issuer: "https://frameshift.syntheos.dev/first-party".to_string(),
+        local_auth_cookie_name: "__Host-frameshift_session".to_string(),
+        local_auth_invite_ttl_secs: 7 * 24 * 60 * 60,
+        local_auth_browser_idle_secs: 7 * 24 * 60 * 60,
+        local_auth_bearer_idle_secs: 30 * 24 * 60 * 60,
+        local_auth_absolute_secs: 90 * 24 * 60 * 60,
         memory_backend: "none".to_string(),
         memory_http_endpoint: String::new(),
         memory_http_auth: "none".to_string(),
@@ -998,6 +1116,7 @@ mod tests {
             publisher_ownership_reads: true,
             oidc: OidcConfig::disabled(),
             invite_requests: InviteRequestConfig::disabled(),
+            first_party_auth: FirstPartyAuthConfig::disabled(),
             memory_backend: "none".to_string(),
             memory_http_endpoint: String::new(),
             memory_http_auth: "none".to_string(),
@@ -1063,6 +1182,7 @@ mod tests {
             publisher_ownership_reads: true,
             oidc: OidcConfig::disabled(),
             invite_requests: InviteRequestConfig::disabled(),
+            first_party_auth: FirstPartyAuthConfig::disabled(),
             memory_backend: "none".to_string(),
             memory_http_endpoint: String::new(),
             memory_http_auth: "none".to_string(),
@@ -1120,6 +1240,7 @@ mod tests {
             publisher_ownership_reads: true,
             oidc: OidcConfig::disabled(),
             invite_requests: InviteRequestConfig::disabled(),
+            first_party_auth: FirstPartyAuthConfig::disabled(),
             memory_backend: "none".to_string(),
             memory_http_endpoint: String::new(),
             memory_http_auth: "none".to_string(),
@@ -1229,6 +1350,7 @@ mod tests {
             publisher_ownership_reads: true,
             oidc: OidcConfig::disabled(),
             invite_requests: InviteRequestConfig::disabled(),
+            first_party_auth: FirstPartyAuthConfig::disabled(),
             memory_backend: "none".to_string(),
             memory_http_endpoint: String::new(),
             memory_http_auth: "none".to_string(),

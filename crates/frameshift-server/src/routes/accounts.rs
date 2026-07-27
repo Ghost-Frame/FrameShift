@@ -61,6 +61,10 @@ struct FilePublicationAppealRequest {
 pub struct AuthConfigResponse {
     /// Whether account routes are configured and mounted.
     pub enabled: bool,
+    /// Whether first-party invite redemption and password sessions are enabled.
+    pub first_party_enabled: bool,
+    /// Stable first-party registration policy.
+    pub registration: &'static str,
     /// Configured OIDC issuer when enabled.
     pub issuer: Option<String>,
     /// Configured resource audience when enabled.
@@ -297,11 +301,14 @@ async fn create_publisher_key_challenge(
 
 /// Return non-secret OIDC client bootstrap configuration.
 async fn get_auth_config(State(state): State<AppState>) -> Json<AuthConfigResponse> {
-    let enabled = state.account_auth.is_some();
+    let oidc_enabled = state.account_auth.is_some();
+    let first_party_enabled = state.config.first_party_auth.enabled();
     Json(AuthConfigResponse {
-        enabled,
-        issuer: enabled.then(|| state.config.oidc.issuer.clone()),
-        audience: enabled.then(|| state.config.oidc.audience.clone()),
+        enabled: oidc_enabled || first_party_enabled,
+        first_party_enabled,
+        registration: "invite_only",
+        issuer: oidc_enabled.then(|| state.config.oidc.issuer.clone()),
+        audience: oidc_enabled.then(|| state.config.oidc.audience.clone()),
     })
 }
 
