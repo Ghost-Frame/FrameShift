@@ -76,6 +76,7 @@ use crate::routes::admin::admin_router;
 use crate::routes::authors::{authors_router, authors_write_router};
 use crate::routes::downloads::{dl_router, pack_download_url_router};
 use crate::routes::handles::handles_router;
+use crate::routes::invite_requests::invite_request_router;
 use crate::routes::memory::memory_router;
 use crate::routes::moderation::moderation_router;
 use crate::routes::ops::ops_router;
@@ -214,12 +215,18 @@ fn build_app(
 
     let telemetry =
         apply_ip_rate_limit(telemetry_router(), &state, state.config.abuse_rate_per_min);
+    let invite_requests = apply_ip_rate_limit(
+        invite_request_router(),
+        &state,
+        state.config.abuse_rate_per_min,
+    );
 
     let mut v1 = Router::new()
         .nest("/packs", packs)
         .nest("/authors", authors)
         .nest("/handles", handles_router())
         .nest("/auth", auth_config_router())
+        .merge(invite_requests)
         .nest("/publishers", publisher_read_router())
         .nest("/telemetry", telemetry)
         .nest("/memory", memory_router());

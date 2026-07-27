@@ -58,6 +58,10 @@
 //! | `OIDC_JWKS_STALE_SECS` | `900` | Additional stale-key window used only during provider outages |
 //! | `OIDC_CLOCK_SKEW_SECS` | `30` | Token validation clock skew allowance |
 //! | `OIDC_FRESH_AUTH_SECS` | `300` | Maximum `auth_time` age for sensitive key operations |
+//! | `INVITE_TURNSTILE_SITE_KEY` | `""` | Public Turnstile site key; empty disables invite intake |
+//! | `INVITE_TURNSTILE_SECRET` | `""` | Secret Turnstile verification key |
+//! | `INVITE_TURNSTILE_EXPECTED_HOSTNAME` | `""` | Exact hostname accepted from Turnstile |
+//! | `INVITE_TURNSTILE_VERIFY_URL` | Cloudflare Siteverify | Turnstile verification endpoint |
 //!
 //! Env var names match the struct field names verbatim (figment maps
 //! `download_secret` <-> `DOWNLOAD_SECRET`); shorter aliases would require an
@@ -126,6 +130,55 @@ impl OidcConfig {
             clock_skew: Duration::from_secs(30),
             fresh_auth_max_age: Duration::from_secs(300),
         }
+    }
+}
+
+/// Anti-bot configuration for the public invite application endpoint.
+#[derive(Clone)]
+pub struct InviteRequestConfig {
+    /// Public Turnstile site key rendered by the marketplace.
+    pub turnstile_site_key: String,
+    /// Secret Turnstile key used only by the server-side verifier.
+    pub turnstile_secret: SecretString,
+    /// Exact marketplace hostname expected in successful verification responses.
+    pub expected_hostname: String,
+    /// Operator-configurable Siteverify URL, primarily for isolated integration tests.
+    pub verify_url: String,
+}
+
+/// Constructors and readiness checks for invite application configuration.
+impl InviteRequestConfig {
+    /// Return a disabled configuration that fails closed at the HTTP boundary.
+    pub fn disabled() -> Self {
+        Self {
+            turnstile_site_key: String::new(),
+            turnstile_secret: SecretString::new(String::new()),
+            expected_hostname: String::new(),
+            verify_url: "https://challenges.cloudflare.com/turnstile/v0/siteverify".to_string(),
+        }
+    }
+
+    /// Return whether every production verification input is configured.
+    pub fn enabled(&self) -> bool {
+        use secrecy::ExposeSecret as _;
+
+        !self.turnstile_site_key.trim().is_empty()
+            && !self.turnstile_secret.expose_secret().trim().is_empty()
+            && !self.expected_hostname.trim().is_empty()
+            && !self.verify_url.trim().is_empty()
+    }
+}
+
+/// Redacted formatting for public invite configuration and its secret verifier key.
+impl std::fmt::Debug for InviteRequestConfig {
+    /// Format non-secret settings while replacing the Turnstile secret with a marker.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InviteRequestConfig")
+            .field("turnstile_site_key", &self.turnstile_site_key)
+            .field("turnstile_secret", &"[REDACTED]")
+            .field("expected_hostname", &self.expected_hostname)
+            .field("verify_url", &self.verify_url)
+            .finish()
     }
 }
 
@@ -365,6 +418,9 @@ pub struct ServerConfig {
     /// OIDC resource-server settings for account and publisher routes.
     pub oidc: OidcConfig,
 
+    /// Invite-only account application and anti-bot settings.
+    pub invite_requests: InviteRequestConfig,
+
     /// Memory backend selector: `"none"` (default), `"http"`, or `"sqlite"`.
     ///
     /// - `"none"` -- no memory adapter; personas that require memory will fail
@@ -511,6 +567,7 @@ impl std::fmt::Debug for ServerConfig {
             )
             .field("publisher_ownership_reads", &self.publisher_ownership_reads)
             .field("oidc", &self.oidc)
+            .field("invite_requests", &self.invite_requests)
             .field("memory_backend", &self.memory_backend)
             .field("memory_http_endpoint", &self.memory_http_endpoint)
             .field("memory_http_auth", &"[REDACTED]")
@@ -661,6 +718,15 @@ struct RawConfig {
     /// Maximum fresh-auth age in seconds.
     oidc_fresh_auth_secs: u64,
 
+    /// Public Turnstile site key for the invite application.
+    invite_turnstile_site_key: String,
+    /// Secret Turnstile verification key.
+    invite_turnstile_secret: String,
+    /// Exact marketplace hostname accepted from Turnstile.
+    invite_turnstile_expected_hostname: String,
+    /// Turnstile Siteverify endpoint.
+    invite_turnstile_verify_url: String,
+
     /// Memory backend selector.
     memory_backend: String,
     /// HTTP memory endpoint URL.
@@ -750,6 +816,12 @@ impl RawConfig {
                 clock_skew: Duration::from_secs(self.oidc_clock_skew_secs),
                 fresh_auth_max_age: Duration::from_secs(self.oidc_fresh_auth_secs),
             },
+            invite_requests: InviteRequestConfig {
+                turnstile_site_key: self.invite_turnstile_site_key,
+                turnstile_secret: SecretString::new(self.invite_turnstile_secret),
+                expected_hostname: self.invite_turnstile_expected_hostname,
+                verify_url: self.invite_turnstile_verify_url,
+            },
             memory_backend: self.memory_backend,
             memory_http_endpoint: self.memory_http_endpoint,
             memory_http_auth: self.memory_http_auth,
@@ -815,6 +887,11 @@ fn default_raw_config() -> RawConfig {
         oidc_jwks_stale_secs: 900,
         oidc_clock_skew_secs: 30,
         oidc_fresh_auth_secs: 300,
+        invite_turnstile_site_key: String::new(),
+        invite_turnstile_secret: String::new(),
+        invite_turnstile_expected_hostname: String::new(),
+        invite_turnstile_verify_url: "https://challenges.cloudflare.com/turnstile/v0/siteverify"
+            .to_string(),
         memory_backend: "none".to_string(),
         memory_http_endpoint: String::new(),
         memory_http_auth: "none".to_string(),
@@ -920,6 +997,7 @@ mod tests {
             admin_pubkeys: Vec::new(),
             publisher_ownership_reads: true,
             oidc: OidcConfig::disabled(),
+            invite_requests: InviteRequestConfig::disabled(),
             memory_backend: "none".to_string(),
             memory_http_endpoint: String::new(),
             memory_http_auth: "none".to_string(),
@@ -984,6 +1062,7 @@ mod tests {
             admin_pubkeys: Vec::new(),
             publisher_ownership_reads: true,
             oidc: OidcConfig::disabled(),
+            invite_requests: InviteRequestConfig::disabled(),
             memory_backend: "none".to_string(),
             memory_http_endpoint: String::new(),
             memory_http_auth: "none".to_string(),
@@ -1040,6 +1119,7 @@ mod tests {
             admin_pubkeys: Vec::new(),
             publisher_ownership_reads: true,
             oidc: OidcConfig::disabled(),
+            invite_requests: InviteRequestConfig::disabled(),
             memory_backend: "none".to_string(),
             memory_http_endpoint: String::new(),
             memory_http_auth: "none".to_string(),
@@ -1148,6 +1228,7 @@ mod tests {
             admin_pubkeys: Vec::new(),
             publisher_ownership_reads: true,
             oidc: OidcConfig::disabled(),
+            invite_requests: InviteRequestConfig::disabled(),
             memory_backend: "none".to_string(),
             memory_http_endpoint: String::new(),
             memory_http_auth: "none".to_string(),

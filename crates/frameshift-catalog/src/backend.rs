@@ -13,10 +13,10 @@ use crate::error::{CatalogError, HealthStatus};
 use crate::filters::{PackSearchFilters, PackSearchResult};
 use crate::identity::Ed25519PublicKey;
 use crate::records::{
-    AccountRecord, AccountStatusChangeRequest, AuthorRecord, PackRecord, PackVersionRecord,
-    PlatformRoleAssignmentRequest, PlatformRoleRecord, PlatformRoleRevocationRequest,
-    PublicationAppealCaseRecord, PublicationAppealCursor, PublicationAppealRecord,
-    PublicationAppealRequest, PublicationAppealResolutionRecord,
+    AccountInviteRequestRecord, AccountRecord, AccountStatusChangeRequest, AuthorRecord,
+    PackRecord, PackVersionRecord, PlatformRoleAssignmentRequest, PlatformRoleRecord,
+    PlatformRoleRevocationRequest, PublicationAppealCaseRecord, PublicationAppealCursor,
+    PublicationAppealRecord, PublicationAppealRequest, PublicationAppealResolutionRecord,
     PublicationAppealResolutionRequest, PublicationIntentClaim, PublicationIntentRecord,
     PublicationLifecycleCursor, PublicationLifecycleDecisionRecord,
     PublicationModerationDecisionRecord, PublicationModerationDecisionRequest,
@@ -92,6 +92,17 @@ impl PublishQuota {
 /// `Box<dyn CatalogBackend>` or `Arc<dyn CatalogBackend>` for dynamic dispatch.
 #[async_trait]
 pub trait CatalogBackend: Send + Sync {
+    /// Store one invite application, treating a repeated normalized email as success.
+    ///
+    /// # Errors
+    ///
+    /// - `CatalogError::Validation` when the record violates adapter policy.
+    /// - `CatalogError::BackendError` for unexpected backend failures.
+    async fn create_account_invite_request(
+        &self,
+        record: AccountInviteRequestRecord,
+    ) -> Result<(), CatalogError>;
+
     /// Create an OIDC-backed account with a unique `(issuer, subject)` identity.
     ///
     /// # Errors

@@ -46,6 +46,8 @@ tar = "0.4"
 flate2 = "1"
 hmac = { workspace = true }
 sha2 = { workspace = true }
+argon2 = { workspace = true }
+rand_core = { workspace = true }
 tower_governor = "0.8"
 governor = "0.10"
 # default-features disabled to drop the unmaintained protobuf 2.x dependency

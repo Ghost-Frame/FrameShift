@@ -44,6 +44,59 @@ pub struct AccountRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Stated reason an applicant wants access to invite-only account features.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountInviteIntent {
+    /// The applicant wants to publish personas in the marketplace.
+    PublishPersonas,
+    /// The applicant wants access to premium account features.
+    PremiumFeatures,
+    /// The applicant is evaluating FrameShift for a team.
+    TeamEvaluation,
+    /// The applicant wants to contribute to the FrameShift ecosystem.
+    Contribute,
+    /// The applicant has another bounded reason described in their statement.
+    Other,
+}
+
+/// Review state for an invite-only account application.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountInviteStatus {
+    /// The application is waiting for an initial review.
+    Pending,
+    /// An operator is actively reviewing the application.
+    Reviewing,
+    /// An operator issued an invite for the application.
+    Invited,
+    /// An operator declined the application without deleting its audit record.
+    Declined,
+}
+
+/// Durable application for access to invite-only account registration.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AccountInviteRequestRecord {
+    /// Stable internal application identifier.
+    pub id: Uuid,
+    /// Lowercase, trimmed applicant email used for duplicate suppression.
+    pub normalized_email: String,
+    /// Optional applicant name retained only for review.
+    pub display_name: Option<String>,
+    /// Applicant-selected reason for requesting an invite.
+    pub intent: AccountInviteIntent,
+    /// Applicant's bounded private explanation for review.
+    pub statement: String,
+    /// Current review lifecycle state.
+    pub status: AccountInviteStatus,
+    /// UTC timestamp when the applicant accepted the stated contact terms.
+    pub consented_at: DateTime<Utc>,
+    /// UTC timestamp when the application was first stored.
+    pub created_at: DateTime<Utc>,
+    /// UTC timestamp of the most recent application update.
+    pub updated_at: DateTime<Utc>,
+}
+
 /// Moderation state for a public publisher profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]

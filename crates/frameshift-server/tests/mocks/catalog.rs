@@ -21,19 +21,20 @@ use frameshift_catalog::error::{CatalogError, HealthStatus};
 use frameshift_catalog::filters::{PackSearchFilters, PackSearchResult};
 use frameshift_catalog::identity::Ed25519PublicKey;
 use frameshift_catalog::records::{
-    AccountRecord, AccountStatus, AccountStatusChangeRequest, AuthorRecord, MembershipState,
-    PackRecord, PackVersionRecord, PlatformRole, PlatformRoleAssignmentRequest, PlatformRoleRecord,
-    PlatformRoleRevocationRequest, PlatformRoleState, PublicationAppealCaseRecord,
-    PublicationAppealCursor, PublicationAppealDisposition, PublicationAppealRecord,
-    PublicationAppealRequest, PublicationAppealResolutionRecord,
-    PublicationAppealResolutionRequest, PublicationIntentRecord, PublicationLifecycleAction,
-    PublicationLifecycleCursor, PublicationLifecycleDecisionRecord, PublicationModerationAction,
-    PublicationModerationDecisionRecord, PublicationModerationDecisionRequest,
-    PublicationModerationSnapshot, PublicationPromotionRecord, PublicationPromotionRequest,
-    PublicationSubmissionRecord, PublicationSubmissionRequest, PublicationSubmissionState,
-    PublicationTombstoneRequest, PublicationWithdrawalRequest, PublisherAuditEventRecord,
-    PublisherKeyRecord, PublisherKeyState, PublisherMembershipRecord, PublisherModerationStatus,
-    PublisherProfileRecord, PublisherRole, PublisherSuspensionRequest,
+    AccountInviteRequestRecord, AccountRecord, AccountStatus, AccountStatusChangeRequest,
+    AuthorRecord, MembershipState, PackRecord, PackVersionRecord, PlatformRole,
+    PlatformRoleAssignmentRequest, PlatformRoleRecord, PlatformRoleRevocationRequest,
+    PlatformRoleState, PublicationAppealCaseRecord, PublicationAppealCursor,
+    PublicationAppealDisposition, PublicationAppealRecord, PublicationAppealRequest,
+    PublicationAppealResolutionRecord, PublicationAppealResolutionRequest, PublicationIntentRecord,
+    PublicationLifecycleAction, PublicationLifecycleCursor, PublicationLifecycleDecisionRecord,
+    PublicationModerationAction, PublicationModerationDecisionRecord,
+    PublicationModerationDecisionRequest, PublicationModerationSnapshot,
+    PublicationPromotionRecord, PublicationPromotionRequest, PublicationSubmissionRecord,
+    PublicationSubmissionRequest, PublicationSubmissionState, PublicationTombstoneRequest,
+    PublicationWithdrawalRequest, PublisherAuditEventRecord, PublisherKeyRecord, PublisherKeyState,
+    PublisherMembershipRecord, PublisherModerationStatus, PublisherProfileRecord, PublisherRole,
+    PublisherSuspensionRequest,
 };
 use frameshift_catalog::status::{PackStatus, TombstoneRecord};
 // Reuse the exact same version-precedence comparator the Postgres adapter
@@ -49,6 +50,9 @@ use frameshift_pack::ObjectHash;
 /// cheaply and mutated from test setup code.
 #[derive(Default)]
 pub struct MockState {
+    /// Invite applications keyed by normalized email for duplicate suppression.
+    pub account_invite_requests: HashMap<String, AccountInviteRequestRecord>,
+
     /// OIDC-backed accounts keyed by internal identifier.
     pub accounts: HashMap<uuid::Uuid, AccountRecord>,
 
@@ -192,6 +196,22 @@ fn validate_audit(
 #[async_trait]
 /// In-memory implementation of every catalog operation used by server tests.
 impl CatalogBackend for MockCatalog {
+    /// Store the first invite application for a normalized email.
+    async fn create_account_invite_request(
+        &self,
+        record: AccountInviteRequestRecord,
+    ) -> Result<(), CatalogError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        state
+            .account_invite_requests
+            .entry(record.normalized_email.clone())
+            .or_insert(record);
+        Ok(())
+    }
+
     /// Create an account while enforcing ID and OIDC identity uniqueness.
     async fn create_account(&self, record: AccountRecord) -> Result<(), CatalogError> {
         let mut state = self

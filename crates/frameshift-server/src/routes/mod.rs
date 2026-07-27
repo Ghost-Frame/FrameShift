@@ -9,6 +9,7 @@
 //! - [`ops`] -- `GET /healthz` and `GET /metrics` operational endpoints.
 //! - [`telemetry`] -- `POST /v1/telemetry/selection` opt-in selection telemetry sink.
 //! - [`memory`] -- `GET /v1/memory/health` read-only memory backend health.
+//! - [`invite_requests`] -- public invite-only account application intake.
 //! - [`publication_intents`] -- authenticated creation and account-scoped retrieval.
 //! - [`publication_submissions`] -- signed quarantine admission and account-scoped retrieval.
 //! - [`moderation`] -- authenticated, role-gated publication review.
@@ -20,6 +21,7 @@ pub mod admin;
 pub mod authors;
 pub mod downloads;
 pub mod handles;
+pub mod invite_requests;
 pub mod memory;
 pub mod moderation;
 pub mod ops;
