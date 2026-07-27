@@ -26,12 +26,15 @@ use diesel_migrations::{embed_migrations, EmbeddedMigrations, MigrationHarness a
 use tracing::{debug, error, instrument};
 
 use frameshift_catalog::{
-    AccountInviteRequestRecord, AccountRecord, AccountStatusChangeRequest, AuthorRecord,
-    CatalogBackend, CatalogError, Ed25519PublicKey, HealthStatus, MembershipState, PackRecord,
-    PackSearchFilters, PackSearchResult, PackStatus, PackVersionRecord, PlatformRole,
-    PlatformRoleAssignmentRequest, PlatformRoleRecord, PlatformRoleRevocationRequest,
-    PublicationAppealCaseRecord, PublicationAppealCursor, PublicationAppealDisposition,
-    PublicationAppealRecord, PublicationAppealRequest, PublicationAppealResolutionRecord,
+    AccountInviteIssueRequest, AccountInviteRecord, AccountInviteRequestRecord,
+    AccountInviteReviewRequest, AccountInviteStatus, AccountPasswordCredentialRecord,
+    AccountRecord, AccountSessionRecord, AccountStatusChangeRequest, AuthorRecord, CatalogBackend,
+    CatalogError, Ed25519PublicKey, HealthStatus, LocalAccountRegistrationRequest,
+    LocalAccountRegistrationResult, MembershipState, PackRecord, PackSearchFilters,
+    PackSearchResult, PackStatus, PackVersionRecord, PlatformRole, PlatformRoleAssignmentRequest,
+    PlatformRoleRecord, PlatformRoleRevocationRequest, PublicationAppealCaseRecord,
+    PublicationAppealCursor, PublicationAppealDisposition, PublicationAppealRecord,
+    PublicationAppealRequest, PublicationAppealResolutionRecord,
     PublicationAppealResolutionRequest, PublicationIntentClaim, PublicationIntentRecord,
     PublicationLifecycleAction, PublicationLifecycleCursor, PublicationLifecycleDecisionRecord,
     PublicationModerationAction, PublicationModerationDecisionRecord,
@@ -47,20 +50,24 @@ use frameshift_publication::{inventory_hash, FindingSeverity, REPORT_SCHEMA_VERS
 use crate::config::PostgresCatalogConfig;
 use crate::errors::{map_diesel_error, map_migration_error, map_pool_error};
 use crate::models::{
-    encode_text_enum, vec_to_pubkey, AccountRow, AuthorRow, HandleRow, NewAccountInviteRequestRow,
-    NewAccountRow, NewAuthorRow, NewHandleRow, NewPackDownloadRow, NewPackRow, NewPackVersionRow,
-    NewPublicationAppealResolutionRow, NewPublicationAppealRow, NewPublicationIntentRow,
-    NewPublicationLifecycleDecisionRow, NewPublicationModerationDecisionRow,
-    NewPublicationPromotionRow, NewPublicationSubmissionRow, NewPublisherAuditEventRow,
-    NewPublisherKeyRow, NewPublisherMembershipRow, NewPublisherProfileRow, PackRow, PackVersionRow,
-    PlatformRoleRow, PublicationAppealResolutionRow, PublicationAppealRow, PublicationIntentRow,
+    encode_text_enum, vec_to_pubkey, AccountInviteRequestRow, AccountInviteRow,
+    AccountPasswordCredentialRow, AccountRow, AccountSessionRow, AuthorRow, HandleRow,
+    NewAccountInviteRequestRow, NewAccountInviteRow, NewAccountPasswordCredentialRow,
+    NewAccountRow, NewAccountSessionRow, NewAuthorRow, NewHandleRow, NewPackDownloadRow,
+    NewPackRow, NewPackVersionRow, NewPublicationAppealResolutionRow, NewPublicationAppealRow,
+    NewPublicationIntentRow, NewPublicationLifecycleDecisionRow,
+    NewPublicationModerationDecisionRow, NewPublicationPromotionRow, NewPublicationSubmissionRow,
+    NewPublisherAuditEventRow, NewPublisherKeyRow, NewPublisherMembershipRow,
+    NewPublisherProfileRow, PackRow, PackVersionRow, PlatformRoleRow,
+    PublicationAppealResolutionRow, PublicationAppealRow, PublicationIntentRow,
     PublicationLifecycleDecisionRow, PublicationModerationDecisionRow, PublicationPromotionRow,
     PublicationSubmissionRow, PublisherKeyRow, PublisherMembershipRow, PublisherProfileRow,
 };
 use crate::pool::{build_pool, PgPool};
 use crate::schema::{
-    account_invite_requests, account_platform_roles, accounts, authors, handles, pack_downloads,
-    pack_versions, packs, publication_appeal_resolutions, publication_appeals, publication_intents,
+    account_invite_requests, account_invites, account_password_credentials, account_platform_roles,
+    account_sessions, accounts, authors, handles, pack_downloads, pack_versions, packs,
+    publication_appeal_resolutions, publication_appeals, publication_intents,
     publication_lifecycle_decisions, publication_moderation_decisions, publication_promotions,
     publication_submissions, publisher_audit_events, publisher_keys, publisher_memberships,
     publisher_profiles, signed_request_nonces,
@@ -1245,6 +1252,450 @@ impl CatalogBackend for PostgresCatalog {
             .execute(&mut conn)
             .await
             .map_err(|error| map_diesel_error(error, "account invite request", key))?;
+        Ok(())
+    }
+
+    /// List invite applications in stable queue order under administrator authority.
+    async fn list_account_invite_requests(
+        &self,
+        actor_account_id: uuid::Uuid,
+        status: Option<AccountInviteStatus>,
+        limit: u32,
+    ) -> Result<Vec<AccountInviteRequestRecord>, CatalogError> {
+        if limit == 0 || limit > 200 {
+            return Err(CatalogError::Validation(
+                "invite request list limit must be between 1 and 200".to_string(),
+            ));
+        }
+        let status = status.map(encode_text_enum).transpose()?;
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        use diesel_async::AsyncConnection as _;
+        let result = conn
+            .transaction::<Vec<AccountInviteRequestRow>, CatalogTransactionError, _>(
+                async move |conn| {
+                    require_active_administrator(conn, actor_account_id, "account_invite_request")
+                        .await?;
+                    let mut query = account_invite_requests::table.into_boxed();
+                    if let Some(status) = status {
+                        query = query.filter(account_invite_requests::status.eq(status));
+                    }
+                    query
+                        .order((
+                            account_invite_requests::created_at.asc(),
+                            account_invite_requests::id.asc(),
+                        ))
+                        .limit(i64::from(limit))
+                        .select(AccountInviteRequestRow::as_select())
+                        .load(conn)
+                        .await
+                        .map_err(CatalogTransactionError::from)
+                },
+            )
+            .await;
+        match result {
+            Ok(rows) => rows
+                .into_iter()
+                .map(AccountInviteRequestRow::into_record)
+                .collect(),
+            Err(CatalogTransactionError::Catalog(error)) => Err(error),
+            Err(CatalogTransactionError::Diesel(error)) => Err(map_diesel_error(
+                error,
+                "account_invite_request",
+                "list".to_string(),
+            )),
+        }
+    }
+
+    /// Transition one invite application under administrator authority.
+    async fn review_account_invite_request(
+        &self,
+        request: AccountInviteReviewRequest,
+    ) -> Result<AccountInviteRequestRecord, CatalogError> {
+        if request.status == AccountInviteStatus::Invited {
+            return Err(CatalogError::Validation(
+                "invited status may only be reached by issuing an invitation".to_string(),
+            ));
+        }
+        let status = encode_text_enum(request.status)?;
+        let request_id = request.request_id;
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        use diesel_async::AsyncConnection as _;
+        let result = conn
+            .transaction::<AccountInviteRequestRow, CatalogTransactionError, _>(async move |conn| {
+                require_active_administrator(
+                    conn,
+                    request.actor_account_id,
+                    "account_invite_request",
+                )
+                .await?;
+                let existing = account_invite_requests::table
+                    .find(request.request_id)
+                    .for_update()
+                    .select(AccountInviteRequestRow::as_select())
+                    .first(conn)
+                    .await
+                    .optional()?
+                    .ok_or_else(|| {
+                        CatalogTransactionError::Catalog(CatalogError::NotFound {
+                            kind: "account_invite_request",
+                            key: request.request_id.to_string(),
+                        })
+                    })?;
+                if existing.status == "invited" {
+                    return Err(CatalogTransactionError::Catalog(CatalogError::Conflict {
+                        kind: "account_invite_request",
+                        key: request.request_id.to_string(),
+                    }));
+                }
+                diesel::update(account_invite_requests::table.find(request.request_id))
+                    .set((
+                        account_invite_requests::status.eq(status),
+                        account_invite_requests::updated_at.eq(Utc::now()),
+                    ))
+                    .returning(AccountInviteRequestRow::as_returning())
+                    .get_result(conn)
+                    .await
+                    .map_err(CatalogTransactionError::from)
+            })
+            .await;
+        match result {
+            Ok(row) => row.into_record(),
+            Err(CatalogTransactionError::Catalog(error)) => Err(error),
+            Err(CatalogTransactionError::Diesel(error)) => Err(map_diesel_error(
+                error,
+                "account_invite_request",
+                request_id.to_string(),
+            )),
+        }
+    }
+
+    /// Issue one invitation and mark its application invited in the same transaction.
+    async fn issue_account_invite(
+        &self,
+        request: AccountInviteIssueRequest,
+    ) -> Result<AccountInviteRecord, CatalogError> {
+        if request.token_digest.len() != 32 || request.expires_at <= request.created_at {
+            return Err(CatalogError::Validation(
+                "invite token digest must be 32 bytes and expiry must follow creation".to_string(),
+            ));
+        }
+        let request_id = request.request_id;
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        use diesel_async::AsyncConnection as _;
+        let result = conn
+            .transaction::<AccountInviteRow, CatalogTransactionError, _>(async move |conn| {
+                require_active_administrator(conn, request.actor_account_id, "account_invite")
+                    .await?;
+                let application = account_invite_requests::table
+                    .find(request.request_id)
+                    .for_update()
+                    .select(AccountInviteRequestRow::as_select())
+                    .first(conn)
+                    .await
+                    .optional()?
+                    .ok_or_else(|| {
+                        CatalogTransactionError::Catalog(CatalogError::NotFound {
+                            kind: "account_invite_request",
+                            key: request.request_id.to_string(),
+                        })
+                    })?;
+                if !matches!(application.status.as_str(), "pending" | "reviewing") {
+                    return Err(CatalogTransactionError::Catalog(CatalogError::Conflict {
+                        kind: "account_invite_request",
+                        key: request.request_id.to_string(),
+                    }));
+                }
+                let row = NewAccountInviteRow {
+                    id: request.id,
+                    request_id: Some(request.request_id),
+                    normalized_email: application.normalized_email,
+                    token_digest: request.token_digest,
+                    issued_by_account_id: Some(request.actor_account_id),
+                    is_bootstrap: false,
+                    expires_at: request.expires_at,
+                    consumed_at: None,
+                    revoked_at: None,
+                    created_at: request.created_at,
+                };
+                let invitation = diesel::insert_into(account_invites::table)
+                    .values(row)
+                    .returning(AccountInviteRow::as_returning())
+                    .get_result(conn)
+                    .await?;
+                diesel::update(account_invite_requests::table.find(request.request_id))
+                    .set((
+                        account_invite_requests::status.eq("invited"),
+                        account_invite_requests::updated_at.eq(request.created_at),
+                    ))
+                    .execute(conn)
+                    .await?;
+                Ok(invitation)
+            })
+            .await;
+        match result {
+            Ok(row) => Ok(row.into_record()),
+            Err(CatalogTransactionError::Catalog(error)) => Err(error),
+            Err(CatalogTransactionError::Diesel(error)) => Err(map_diesel_error(
+                error,
+                "account_invite",
+                request_id.to_string(),
+            )),
+        }
+    }
+
+    /// Redeem one invitation into an account, password credential, and session atomically.
+    async fn register_local_account(
+        &self,
+        request: LocalAccountRegistrationRequest,
+    ) -> Result<LocalAccountRegistrationResult, CatalogError> {
+        if request.invite_token_digest.len() != 32
+            || request.session.token_digest.len() != 32
+            || request.credential.account_id != request.account.id
+            || request.session.account_id != request.account.id
+            || request.account.email.as_deref()
+                != Some(request.credential.normalized_email.as_str())
+            || request.credential.email_verified_at.is_none()
+        {
+            return Err(CatalogError::Validation(
+                "local registration records are inconsistent".to_string(),
+            ));
+        }
+        let account_result = request.account.clone();
+        let session_result = request.session.clone();
+        let account_key = request.account.id;
+        let now = request.account.created_at;
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        use diesel_async::AsyncConnection as _;
+        let result = conn
+            .transaction::<(), CatalogTransactionError, _>(async move |conn| {
+                let invitation = account_invites::table
+                    .filter(account_invites::token_digest.eq(&request.invite_token_digest))
+                    .filter(account_invites::consumed_at.is_null())
+                    .filter(account_invites::revoked_at.is_null())
+                    .filter(account_invites::created_at.le(now))
+                    .filter(account_invites::expires_at.gt(now))
+                    .for_update()
+                    .select(AccountInviteRow::as_select())
+                    .first(conn)
+                    .await
+                    .optional()?
+                    .ok_or_else(|| {
+                        CatalogTransactionError::Catalog(CatalogError::Unauthorized {
+                            kind: "account_invite",
+                            key: "invalid-or-expired".to_string(),
+                        })
+                    })?;
+                if invitation.normalized_email != request.credential.normalized_email {
+                    return Err(CatalogTransactionError::Catalog(
+                        CatalogError::Unauthorized {
+                            kind: "account_invite",
+                            key: "email-mismatch".to_string(),
+                        },
+                    ));
+                }
+                diesel::update(
+                    account_invites::table
+                        .find(invitation.id)
+                        .filter(account_invites::consumed_at.is_null())
+                        .filter(account_invites::revoked_at.is_null()),
+                )
+                .set(account_invites::consumed_at.eq(now))
+                .execute(conn)
+                .await?;
+                diesel::insert_into(accounts::table)
+                    .values(NewAccountRow {
+                        id: request.account.id,
+                        issuer: request.account.issuer,
+                        subject: request.account.subject,
+                        email: request.account.email,
+                        display_name: request.account.display_name,
+                        status: encode_text_enum(request.account.status)
+                            .map_err(CatalogTransactionError::Catalog)?,
+                        created_at: request.account.created_at,
+                        updated_at: request.account.updated_at,
+                    })
+                    .execute(conn)
+                    .await?;
+                diesel::insert_into(account_password_credentials::table)
+                    .values(NewAccountPasswordCredentialRow {
+                        account_id: request.credential.account_id,
+                        normalized_email: request.credential.normalized_email,
+                        password_hash: request.credential.password_hash,
+                        password_version: request.credential.password_version,
+                        pepper_version: request.credential.pepper_version,
+                        email_verified_at: request.credential.email_verified_at,
+                        created_at: request.credential.created_at,
+                        password_changed_at: request.credential.password_changed_at,
+                        updated_at: request.credential.updated_at,
+                    })
+                    .execute(conn)
+                    .await?;
+                diesel::insert_into(account_sessions::table)
+                    .values(NewAccountSessionRow {
+                        id: request.session.id,
+                        account_id: request.session.account_id,
+                        token_digest: request.session.token_digest,
+                        client_kind: encode_text_enum(request.session.client_kind)
+                            .map_err(CatalogTransactionError::Catalog)?,
+                        created_at: request.session.created_at,
+                        last_seen_at: request.session.last_seen_at,
+                        idle_expires_at: request.session.idle_expires_at,
+                        absolute_expires_at: request.session.absolute_expires_at,
+                        revoked_at: request.session.revoked_at,
+                    })
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            })
+            .await;
+        match result {
+            Ok(()) => Ok(LocalAccountRegistrationResult {
+                account: account_result,
+                session: session_result,
+            }),
+            Err(CatalogTransactionError::Catalog(error)) => Err(error),
+            Err(CatalogTransactionError::Diesel(error)) => Err(map_diesel_error(
+                error,
+                "local_account_registration",
+                account_key.to_string(),
+            )),
+        }
+    }
+
+    /// Retrieve one first-party password credential by normalized email.
+    async fn get_account_password_credential(
+        &self,
+        normalized_email: &str,
+    ) -> Result<AccountPasswordCredentialRecord, CatalogError> {
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        account_password_credentials::table
+            .filter(account_password_credentials::normalized_email.eq(normalized_email))
+            .select(AccountPasswordCredentialRow::as_select())
+            .first(&mut conn)
+            .await
+            .map(AccountPasswordCredentialRow::into_record)
+            .map_err(|error| {
+                map_diesel_error(
+                    error,
+                    "account_password_credential",
+                    normalized_email.to_string(),
+                )
+            })
+    }
+
+    /// Create one revocable first-party session after successful authentication.
+    async fn create_account_session(
+        &self,
+        record: AccountSessionRecord,
+    ) -> Result<(), CatalogError> {
+        if record.token_digest.len() != 32 {
+            return Err(CatalogError::Validation(
+                "session token digest must be 32 bytes".to_string(),
+            ));
+        }
+        let key = record.id.to_string();
+        let client_kind = encode_text_enum(record.client_kind)?;
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        diesel::insert_into(account_sessions::table)
+            .values(NewAccountSessionRow {
+                id: record.id,
+                account_id: record.account_id,
+                token_digest: record.token_digest,
+                client_kind,
+                created_at: record.created_at,
+                last_seen_at: record.last_seen_at,
+                idle_expires_at: record.idle_expires_at,
+                absolute_expires_at: record.absolute_expires_at,
+                revoked_at: record.revoked_at,
+            })
+            .execute(&mut conn)
+            .await
+            .map_err(|error| map_diesel_error(error, "account_session", key))?;
+        Ok(())
+    }
+
+    /// Resolve one active first-party session by its opaque token digest.
+    async fn get_active_account_session(
+        &self,
+        token_digest: &[u8],
+        now: DateTime<Utc>,
+    ) -> Result<AccountSessionRecord, CatalogError> {
+        if token_digest.len() != 32 {
+            return Err(CatalogError::NotFound {
+                kind: "account_session",
+                key: "opaque-token".to_string(),
+            });
+        }
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        account_sessions::table
+            .filter(account_sessions::token_digest.eq(token_digest))
+            .filter(account_sessions::revoked_at.is_null())
+            .filter(account_sessions::idle_expires_at.gt(now))
+            .filter(account_sessions::absolute_expires_at.gt(now))
+            .select(AccountSessionRow::as_select())
+            .first(&mut conn)
+            .await
+            .map_err(|error| {
+                map_diesel_error(error, "account_session", "opaque-token".to_string())
+            })?
+            .into_record()
+    }
+
+    /// Advance one active session's last-seen and sliding-expiry timestamps.
+    async fn touch_account_session(
+        &self,
+        session_id: uuid::Uuid,
+        last_seen_at: DateTime<Utc>,
+        idle_expires_at: DateTime<Utc>,
+    ) -> Result<(), CatalogError> {
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        let rows = diesel::update(
+            account_sessions::table
+                .find(session_id)
+                .filter(account_sessions::revoked_at.is_null())
+                .filter(account_sessions::absolute_expires_at.gt(last_seen_at))
+                .filter(account_sessions::idle_expires_at.gt(last_seen_at)),
+        )
+        .set((
+            account_sessions::last_seen_at.eq(last_seen_at),
+            account_sessions::idle_expires_at.eq(idle_expires_at),
+        ))
+        .execute(&mut conn)
+        .await
+        .map_err(|error| map_diesel_error(error, "account_session", session_id.to_string()))?;
+        if rows == 0 {
+            return Err(CatalogError::NotFound {
+                kind: "account_session",
+                key: session_id.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Revoke one session only when it belongs to the authenticated account.
+    async fn revoke_account_session(
+        &self,
+        session_id: uuid::Uuid,
+        account_id: uuid::Uuid,
+        revoked_at: DateTime<Utc>,
+    ) -> Result<(), CatalogError> {
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        let rows = diesel::update(
+            account_sessions::table
+                .find(session_id)
+                .filter(account_sessions::account_id.eq(account_id))
+                .filter(account_sessions::revoked_at.is_null()),
+        )
+        .set(account_sessions::revoked_at.eq(revoked_at))
+        .execute(&mut conn)
+        .await
+        .map_err(|error| map_diesel_error(error, "account_session", session_id.to_string()))?;
+        if rows == 0 {
+            return Err(CatalogError::NotFound {
+                kind: "account_session",
+                key: session_id.to_string(),
+            });
+        }
         Ok(())
     }
 

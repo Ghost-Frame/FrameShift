@@ -535,6 +535,14 @@ Most variables are read with no prefix (e.g. `BIND_ADDR`, not `FRAMESHIFT_BIND_A
 | `OIDC_JWKS_STALE_SECS` | `900` | Additional stale-key window during provider outages |
 | `OIDC_CLOCK_SKEW_SECS` | `30` | Token-validation clock skew allowance |
 | `OIDC_FRESH_AUTH_SECS` | `300` | Maximum `auth_time` age for sensitive key operations |
+| `LOCAL_AUTH_PASSWORD_PEPPER` | `""` | Secret deployment pepper for first-party Argon2id passwords; empty disables first-party authentication |
+| `LOCAL_AUTH_PEPPER_VERSION` | `1` | Positive pepper version stored with new password credentials |
+| `LOCAL_AUTH_ISSUER` | `https://frameshift.syntheos.dev/first-party` | Stable issuer stored with first-party account identities |
+| `LOCAL_AUTH_COOKIE_NAME` | `__Host-frameshift_session` | Secure browser session cookie name; must keep the `__Host-` prefix |
+| `LOCAL_AUTH_INVITE_TTL_SECS` | `604800` | Lifetime of reviewer-issued account invitations |
+| `LOCAL_AUTH_BROWSER_IDLE_SECS` | `604800` | Sliding idle lifetime for browser sessions |
+| `LOCAL_AUTH_BEARER_IDLE_SECS` | `2592000` | Sliding idle lifetime for desktop and CLI bearer sessions |
+| `LOCAL_AUTH_ABSOLUTE_SECS` | `7776000` | Non-extendable lifetime for every first-party session |
 | `TRUST_FORWARDED_FOR` | `false` | Trust `X-Forwarded-For` for rate-limit key extraction; set `true` only behind a trusted proxy |
 | `SIGNED_REQUEST_MAX_SKEW_SECS` | `300` | Max clock skew (seconds) allowed between a signed write request's timestamp and server time |
 | `FRAMESHIFT_ADMIN_PUBKEYS` | `""` | Deprecated compatibility value; account-role administrator routes ignore it |

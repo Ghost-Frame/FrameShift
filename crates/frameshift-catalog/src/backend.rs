@@ -13,10 +13,13 @@ use crate::error::{CatalogError, HealthStatus};
 use crate::filters::{PackSearchFilters, PackSearchResult};
 use crate::identity::Ed25519PublicKey;
 use crate::records::{
-    AccountInviteRequestRecord, AccountRecord, AccountStatusChangeRequest, AuthorRecord,
-    PackRecord, PackVersionRecord, PlatformRoleAssignmentRequest, PlatformRoleRecord,
-    PlatformRoleRevocationRequest, PublicationAppealCaseRecord, PublicationAppealCursor,
-    PublicationAppealRecord, PublicationAppealRequest, PublicationAppealResolutionRecord,
+    AccountInviteIssueRequest, AccountInviteRecord, AccountInviteRequestRecord,
+    AccountInviteReviewRequest, AccountInviteStatus, AccountPasswordCredentialRecord,
+    AccountRecord, AccountSessionRecord, AccountStatusChangeRequest, AuthorRecord,
+    LocalAccountRegistrationRequest, LocalAccountRegistrationResult, PackRecord, PackVersionRecord,
+    PlatformRoleAssignmentRequest, PlatformRoleRecord, PlatformRoleRevocationRequest,
+    PublicationAppealCaseRecord, PublicationAppealCursor, PublicationAppealRecord,
+    PublicationAppealRequest, PublicationAppealResolutionRecord,
     PublicationAppealResolutionRequest, PublicationIntentClaim, PublicationIntentRecord,
     PublicationLifecycleCursor, PublicationLifecycleDecisionRecord,
     PublicationModerationDecisionRecord, PublicationModerationDecisionRequest,
@@ -102,6 +105,116 @@ pub trait CatalogBackend: Send + Sync {
         &self,
         record: AccountInviteRequestRecord,
     ) -> Result<(), CatalogError>;
+
+    /// List invite applications after proving active administrator authority.
+    async fn list_account_invite_requests(
+        &self,
+        actor_account_id: uuid::Uuid,
+        status: Option<AccountInviteStatus>,
+        limit: u32,
+    ) -> Result<Vec<AccountInviteRequestRecord>, CatalogError> {
+        let _ = (actor_account_id, status, limit);
+        Err(CatalogError::Unauthorized {
+            kind: "account_invite_request",
+            key: "list".to_string(),
+        })
+    }
+
+    /// Transition an application between non-issued review states under administrator authority.
+    async fn review_account_invite_request(
+        &self,
+        request: AccountInviteReviewRequest,
+    ) -> Result<AccountInviteRequestRecord, CatalogError> {
+        Err(CatalogError::Unauthorized {
+            kind: "account_invite_request",
+            key: request.request_id.to_string(),
+        })
+    }
+
+    /// Issue a single-use invitation and mark its application invited atomically.
+    async fn issue_account_invite(
+        &self,
+        request: AccountInviteIssueRequest,
+    ) -> Result<AccountInviteRecord, CatalogError> {
+        Err(CatalogError::Unauthorized {
+            kind: "account_invite",
+            key: request.request_id.to_string(),
+        })
+    }
+
+    /// Redeem one active invitation into an account, credential, and session atomically.
+    async fn register_local_account(
+        &self,
+        request: LocalAccountRegistrationRequest,
+    ) -> Result<LocalAccountRegistrationResult, CatalogError> {
+        Err(CatalogError::Unauthorized {
+            kind: "account_invite",
+            key: request.account.id.to_string(),
+        })
+    }
+
+    /// Retrieve a first-party password credential by normalized email.
+    async fn get_account_password_credential(
+        &self,
+        normalized_email: &str,
+    ) -> Result<AccountPasswordCredentialRecord, CatalogError> {
+        Err(CatalogError::NotFound {
+            kind: "account_password_credential",
+            key: normalized_email.to_string(),
+        })
+    }
+
+    /// Create a revocable session after successful first-party authentication.
+    async fn create_account_session(
+        &self,
+        record: AccountSessionRecord,
+    ) -> Result<(), CatalogError> {
+        Err(CatalogError::Unauthorized {
+            kind: "account_session",
+            key: record.id.to_string(),
+        })
+    }
+
+    /// Resolve one currently active session by its opaque token digest.
+    async fn get_active_account_session(
+        &self,
+        token_digest: &[u8],
+        now: DateTime<Utc>,
+    ) -> Result<AccountSessionRecord, CatalogError> {
+        let _ = (token_digest, now);
+        Err(CatalogError::NotFound {
+            kind: "account_session",
+            key: "opaque-token".to_string(),
+        })
+    }
+
+    /// Advance one session's last-seen and sliding-expiry timestamps.
+    async fn touch_account_session(
+        &self,
+        session_id: uuid::Uuid,
+        last_seen_at: DateTime<Utc>,
+        idle_expires_at: DateTime<Utc>,
+    ) -> Result<(), CatalogError> {
+        let _ = (last_seen_at, idle_expires_at);
+        Err(CatalogError::NotFound {
+            kind: "account_session",
+            key: session_id.to_string(),
+        })
+    }
+
+    /// Revoke one session owned by the authenticated account.
+    async fn revoke_account_session(
+        &self,
+        session_id: uuid::Uuid,
+        account_id: uuid::Uuid,
+        revoked_at: DateTime<Utc>,
+    ) -> Result<(), CatalogError> {
+        let _ = (account_id, revoked_at);
+        Err(CatalogError::NotFound {
+            kind: "account_session",
+            key: session_id.to_string(),
+        })
+    }
 
     /// Create an OIDC-backed account with a unique `(issuer, subject)` identity.
     ///

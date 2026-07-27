@@ -16,15 +16,20 @@ use base64::Engine as _;
 use chrono::Utc;
 use ed25519_dalek::{Signer as _, SigningKey};
 use frameshift_catalog::{
-    AccountStatus, Ed25519PublicKey, MembershipState, PublisherKeyRecord, PublisherKeyState,
-    PublisherMembershipRecord, PublisherModerationStatus, PublisherProfileRecord, PublisherRole,
+    AccountInviteIntent, AccountInviteRecord, AccountInviteRequestRecord, AccountInviteStatus,
+    AccountStatus, Ed25519PublicKey, MembershipState, PlatformRole, PlatformRoleRecord,
+    PlatformRoleState, PublisherKeyRecord, PublisherKeyState, PublisherMembershipRecord,
+    PublisherModerationStatus, PublisherProfileRecord, PublisherRole,
 };
 use frameshift_server::account_auth::{BearerTokenVerifier, OidcAuthError, VerifiedOidcIdentity};
 use frameshift_server::metrics::Metrics;
-use frameshift_server::{app, AppState, InviteRequestConfig, LogFormat, OidcConfig, ServerConfig};
+use frameshift_server::{
+    app, AppState, FirstPartyAuthConfig, InviteRequestConfig, LogFormat, OidcConfig, ServerConfig,
+};
 use http_body_util::BodyExt as _;
 use secrecy::SecretString;
 use serde_json::{json, Value};
+use sha2::{Digest as _, Sha256};
 use tower::ServiceExt as _;
 use uuid::Uuid;
 
@@ -145,12 +150,24 @@ fn test_config_with_invites(invite_requests: InviteRequestConfig) -> Arc<ServerC
             fresh_auth_max_age: Duration::from_secs(300),
         },
         invite_requests,
+        first_party_auth: frameshift_server::FirstPartyAuthConfig::disabled(),
         memory_backend: "none".to_string(),
         memory_http_endpoint: String::new(),
         memory_http_auth: "none".to_string(),
         memory_http_timeout_secs: 30,
         memory_sqlite_path: String::new(),
     })
+}
+
+/// Build a server configuration with deterministic first-party authentication enabled.
+fn first_party_test_config() -> Arc<ServerConfig> {
+    let mut config = (*test_config()).clone();
+    config.cors_allowed_origins = "https://frameshift.test".to_string();
+    config.first_party_auth = FirstPartyAuthConfig {
+        password_pepper: SecretString::new("integration-test-password-pepper".to_string()),
+        ..FirstPartyAuthConfig::disabled()
+    };
+    Arc::new(config)
 }
 
 /// Build application state around shared catalog and bearer verifier doubles.
@@ -230,6 +247,32 @@ async fn send(
         .unwrap()
 }
 
+/// Send one browser request with exact Origin and optional Cookie headers.
+async fn send_browser(
+    state: AppState,
+    method: Method,
+    path: &str,
+    origin: Option<&str>,
+    cookie: Option<&str>,
+    body: Option<Value>,
+) -> axum::http::Response<axum::body::Body> {
+    let mut builder = Request::builder().method(method).uri(path);
+    if let Some(origin) = origin {
+        builder = builder.header("origin", origin);
+    }
+    if let Some(cookie) = cookie {
+        builder = builder.header("cookie", cookie);
+    }
+    let bytes = body.map_or_else(Vec::new, |value| serde_json::to_vec(&value).unwrap());
+    if !bytes.is_empty() {
+        builder = builder.header("content-type", "application/json");
+    }
+    app(state)
+        .oneshot(builder.body(axum::body::Body::from(bytes)).unwrap())
+        .await
+        .unwrap()
+}
+
 /// Decode one JSON response body after its status has been asserted.
 async fn response_json(response: axum::http::Response<axum::body::Body>) -> Value {
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
@@ -291,6 +334,74 @@ fn seed_publisher(catalog: &MockCatalog, account_id: Uuid) -> (Uuid, Uuid) {
         },
     );
     (publisher_id, key_id)
+}
+
+/// Seed one deterministic bootstrap invitation and return its raw token.
+fn fixture_bootstrap_invite(catalog: &MockCatalog, email: &str) -> String {
+    let raw_token = [7_u8; 32];
+    let token = URL_SAFE_NO_PAD.encode(raw_token);
+    let now = Utc::now();
+    let invite = AccountInviteRecord {
+        id: Uuid::new_v4(),
+        request_id: None,
+        normalized_email: email.to_string(),
+        token_digest: Sha256::digest(raw_token).to_vec(),
+        issued_by_account_id: None,
+        is_bootstrap: true,
+        expires_at: now + chrono::Duration::hours(1),
+        consumed_at: None,
+        revoked_at: None,
+        created_at: now,
+    };
+    catalog
+        .state
+        .write()
+        .unwrap()
+        .account_invites
+        .insert(invite.id, invite);
+    token
+}
+
+/// Seed one pending invite application for administrator route tests.
+fn fixture_invite_application(catalog: &MockCatalog, email: &str) -> Uuid {
+    let now = Utc::now();
+    let record = AccountInviteRequestRecord {
+        id: Uuid::new_v4(),
+        normalized_email: email.to_string(),
+        display_name: Some("Invite Applicant".to_string()),
+        intent: AccountInviteIntent::PublishPersonas,
+        statement: "I publish carefully reviewed personas.".to_string(),
+        status: AccountInviteStatus::Pending,
+        consented_at: now,
+        created_at: now,
+        updated_at: now,
+    };
+    let id = record.id;
+    catalog
+        .state
+        .write()
+        .unwrap()
+        .account_invite_requests
+        .insert(email.to_string(), record);
+    id
+}
+
+/// Give one active account administrator authority in the test catalog.
+fn fixture_administrator(catalog: &MockCatalog, account_id: Uuid) {
+    let now = Utc::now();
+    catalog
+        .state
+        .write()
+        .unwrap()
+        .platform_roles
+        .push(PlatformRoleRecord {
+            account_id,
+            role: PlatformRole::Administrator,
+            state: PlatformRoleState::Active,
+            assigned_by_account_id: account_id,
+            created_at: now,
+            updated_at: now,
+        });
 }
 
 /// Construct a valid exact publication-intent request body.
@@ -447,6 +558,309 @@ async fn invite_application_rejects_failed_turnstile_verification() {
         .unwrap()
         .account_invite_requests
         .is_empty());
+}
+
+/// Browser registration requires a trusted origin and produces one revocable cookie session.
+#[tokio::test]
+async fn invite_redemption_creates_one_browser_account_and_logout_revokes_it() {
+    let catalog = MockCatalog::new();
+    let invite_token = fixture_bootstrap_invite(&catalog, "member@example.test");
+    let state = test_state_with_config(catalog.clone(), None, first_party_test_config());
+    let registration = json!({
+        "invite_token": invite_token,
+        "email": " Member@Example.Test ",
+        "display_name": " Member ",
+        "password": "correct horse battery staple",
+        "client_kind": "browser"
+    });
+
+    let untrusted = send_browser(
+        state.clone(),
+        Method::POST,
+        "/v1/auth/register",
+        None,
+        None,
+        Some(registration.clone()),
+    )
+    .await;
+    assert_eq!(untrusted.status(), StatusCode::FORBIDDEN);
+
+    let registered = send_browser(
+        state.clone(),
+        Method::POST,
+        "/v1/auth/register",
+        Some("https://frameshift.test"),
+        None,
+        Some(registration.clone()),
+    )
+    .await;
+    assert_eq!(registered.status(), StatusCode::OK);
+    let cookie = registered
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let registered_body = response_json(registered).await;
+    assert!(registered_body["token"].is_null());
+    assert_eq!(registered_body["account"]["email"], "member@example.test");
+
+    {
+        let stored = catalog.state.read().unwrap();
+        assert_eq!(stored.accounts.len(), 1);
+        assert_eq!(stored.account_password_credentials.len(), 1);
+        assert_eq!(stored.account_sessions.len(), 1);
+        assert!(stored
+            .account_invites
+            .values()
+            .all(|invite| invite.consumed_at.is_some()));
+        assert!(stored
+            .account_password_credentials
+            .get("member@example.test")
+            .unwrap()
+            .password_hash
+            .starts_with("$argon2id$"));
+    }
+
+    let replayed = send_browser(
+        state.clone(),
+        Method::POST,
+        "/v1/auth/register",
+        Some("https://frameshift.test"),
+        None,
+        Some(registration),
+    )
+    .await;
+    assert_eq!(replayed.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(catalog.state.read().unwrap().accounts.len(), 1);
+
+    let authenticated = send_browser(
+        state.clone(),
+        Method::GET,
+        "/v1/account",
+        None,
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(authenticated.status(), StatusCode::OK);
+
+    let logged_out = send_browser(
+        state.clone(),
+        Method::POST,
+        "/v1/auth/logout",
+        Some("https://frameshift.test"),
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(logged_out.status(), StatusCode::OK);
+    assert!(logged_out
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("Max-Age=0"));
+    assert!(catalog
+        .state
+        .read()
+        .unwrap()
+        .account_sessions
+        .values()
+        .all(|session| session.revoked_at.is_some()));
+
+    let revoked = send_browser(state, Method::GET, "/v1/account", None, Some(&cookie), None).await;
+    assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// Desktop login returns an explicit bearer token and rejects the wrong password.
+#[tokio::test]
+async fn desktop_password_login_uses_explicit_revocable_bearer_sessions() {
+    let catalog = MockCatalog::new();
+    let invite_token = fixture_bootstrap_invite(&catalog, "desktop@example.test");
+    let state = test_state_with_config(catalog, None, first_party_test_config());
+    let registered = send(
+        state.clone(),
+        Method::POST,
+        "/v1/auth/register",
+        None,
+        Some(json!({
+            "invite_token": invite_token,
+            "email": "desktop@example.test",
+            "password": "correct horse battery staple",
+            "client_kind": "desktop"
+        })),
+    )
+    .await;
+    assert_eq!(registered.status(), StatusCode::OK);
+    let initial_token = response_json(registered).await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let wrong_password = send(
+        state.clone(),
+        Method::POST,
+        "/v1/auth/login",
+        None,
+        Some(json!({
+            "email": "desktop@example.test",
+            "password": "incorrect horse battery staple",
+            "client_kind": "desktop"
+        })),
+    )
+    .await;
+    assert_eq!(wrong_password.status(), StatusCode::UNAUTHORIZED);
+
+    let logged_in = send(
+        state.clone(),
+        Method::POST,
+        "/v1/auth/login",
+        None,
+        Some(json!({
+            "email": " DESKTOP@example.test ",
+            "password": "correct horse battery staple",
+            "client_kind": "desktop"
+        })),
+    )
+    .await;
+    assert_eq!(logged_in.status(), StatusCode::OK);
+    let token = response_json(logged_in).await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(token, initial_token);
+    assert_eq!(URL_SAFE_NO_PAD.decode(&token).unwrap().len(), 32);
+
+    let authenticated = send(state, Method::GET, "/v1/account", Some(&token), None).await;
+    assert_eq!(authenticated.status(), StatusCode::OK);
+}
+
+/// Mounted local authentication rejects an invalid bearer as unauthorized.
+#[tokio::test]
+async fn local_only_invalid_bearer_returns_unauthorized() {
+    let state = test_state_with_config(MockCatalog::new(), None, first_party_test_config());
+    let response = send(
+        state,
+        Method::GET,
+        "/v1/account",
+        Some("not-a-valid-session"),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// Browser reviewers can preflight the PATCH operation used for state changes.
+#[tokio::test]
+async fn first_party_cors_allows_reviewer_patch_preflight() {
+    let response = app(test_state_with_config(
+        MockCatalog::new(),
+        None,
+        first_party_test_config(),
+    ))
+    .oneshot(
+        Request::builder()
+            .method(Method::OPTIONS)
+            .uri(format!("/v1/admin/invite-requests/{}", Uuid::new_v4()))
+            .header("origin", "https://frameshift.test")
+            .header("access-control-request-method", "PATCH")
+            .body(axum::body::Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response
+        .headers()
+        .get("access-control-allow-methods")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(',')
+        .any(|method| method.trim() == "PATCH"));
+}
+
+/// Only administrators can review applications and issued raw tokens are never persisted.
+#[tokio::test]
+async fn administrator_review_issues_one_digest_only_invitation() {
+    let now = u64::try_from(Utc::now().timestamp()).unwrap();
+    let verifier = FakeVerifier::new();
+    verifier.allow("admin", "admin-subject", now);
+    verifier.allow("member", "member-subject", now);
+    let catalog = MockCatalog::new();
+    let state = test_state_with_config(catalog.clone(), Some(verifier), first_party_test_config());
+    let administrator_id = provision_account(state.clone(), "admin").await;
+    let _member_id = provision_account(state.clone(), "member").await;
+    fixture_administrator(&catalog, administrator_id);
+    let application_id = fixture_invite_application(&catalog, "invitee@example.test");
+
+    let unauthorized = send(
+        state.clone(),
+        Method::GET,
+        "/v1/admin/invite-requests",
+        Some("member"),
+        None,
+    )
+    .await;
+    assert_eq!(unauthorized.status(), StatusCode::FORBIDDEN);
+
+    let reviewing = send(
+        state.clone(),
+        Method::PATCH,
+        &format!("/v1/admin/invite-requests/{application_id}"),
+        Some("admin"),
+        Some(json!({ "status": "reviewing" })),
+    )
+    .await;
+    assert_eq!(reviewing.status(), StatusCode::OK);
+    assert_eq!(response_json(reviewing).await["status"], "reviewing");
+
+    let issued = send(
+        state.clone(),
+        Method::POST,
+        &format!("/v1/admin/invite-requests/{application_id}/invite"),
+        Some("admin"),
+        None,
+    )
+    .await;
+    assert_eq!(issued.status(), StatusCode::OK);
+    let issued_body = response_json(issued).await;
+    let raw_token = issued_body["token"].as_str().unwrap();
+    let raw_bytes = URL_SAFE_NO_PAD.decode(raw_token).unwrap();
+    assert_eq!(raw_bytes.len(), 32);
+    {
+        let stored = catalog.state.read().unwrap();
+        assert_eq!(stored.account_invites.len(), 1);
+        assert_eq!(
+            stored.account_invites.values().next().unwrap().token_digest,
+            Sha256::digest(raw_bytes).to_vec()
+        );
+        assert_eq!(
+            stored
+                .account_invite_requests
+                .get("invitee@example.test")
+                .unwrap()
+                .status,
+            AccountInviteStatus::Invited
+        );
+    }
+
+    let duplicate = send(
+        state,
+        Method::POST,
+        &format!("/v1/admin/invite-requests/{application_id}/invite"),
+        Some("admin"),
+        None,
+    )
+    .await;
+    assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+    assert_eq!(catalog.state.read().unwrap().account_invites.len(), 1);
 }
 
 /// Disabled auth omits protected routes while retaining public capability metadata.

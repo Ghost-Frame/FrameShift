@@ -17,9 +17,11 @@ use diesel::prelude::*;
 use serde_json::Value as JsonValue;
 
 use frameshift_catalog::{
-    AccountRecord, AccountStatus, AuthorRecord, CatalogError, Ed25519PublicKey, MembershipState,
-    OauthLink, ObjectHash, PackRecord, PackStatus, PackVersionRecord, PlatformRole,
-    PlatformRoleRecord, PlatformRoleState, PublicationAppealDisposition, PublicationAppealRecord,
+    AccountInviteIntent, AccountInviteRecord, AccountInviteRequestRecord, AccountInviteStatus,
+    AccountPasswordCredentialRecord, AccountRecord, AccountSessionClientKind, AccountSessionRecord,
+    AccountStatus, AuthorRecord, CatalogError, Ed25519PublicKey, MembershipState, OauthLink,
+    ObjectHash, PackRecord, PackStatus, PackVersionRecord, PlatformRole, PlatformRoleRecord,
+    PlatformRoleState, PublicationAppealDisposition, PublicationAppealRecord,
     PublicationAppealResolutionRecord, PublicationIntentRecord, PublicationLifecycleAction,
     PublicationLifecycleDecisionRecord, PublicationModerationAction,
     PublicationModerationDecisionRecord, PublicationPromotionRecord, PublicationSubmissionRecord,
@@ -29,8 +31,9 @@ use frameshift_catalog::{
 use uuid::Uuid;
 
 use crate::schema::{
-    account_invite_requests, account_platform_roles, accounts, authors, handles, pack_downloads,
-    pack_versions, packs, publication_appeal_resolutions, publication_appeals, publication_intents,
+    account_invite_requests, account_invites, account_password_credentials, account_platform_roles,
+    account_sessions, accounts, authors, handles, pack_downloads, pack_versions, packs,
+    publication_appeal_resolutions, publication_appeals, publication_intents,
     publication_lifecycle_decisions, publication_moderation_decisions, publication_promotions,
     publication_submissions, publisher_audit_events, publisher_keys, publisher_memberships,
     publisher_profiles,
@@ -122,6 +125,182 @@ pub(crate) struct NewAccountInviteRequestRow {
     pub created_at: DateTime<Utc>,
     /// Most recent application update timestamp.
     pub updated_at: DateTime<Utc>,
+}
+
+/// Queryable invite application used by the administrator review queue.
+#[derive(Debug, Queryable, Selectable)]
+#[diesel(table_name = account_invite_requests)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub(crate) struct AccountInviteRequestRow {
+    /// Stable internal application identifier.
+    pub id: Uuid,
+    /// Lowercase, trimmed applicant email.
+    pub normalized_email: String,
+    /// Optional applicant name retained for review.
+    pub display_name: Option<String>,
+    /// Applicant-selected intent encoded as stable snake case.
+    pub intent: String,
+    /// Bounded private application statement.
+    pub statement: String,
+    /// Review lifecycle state encoded as stable snake case.
+    pub status: String,
+    /// Applicant contact-consent timestamp.
+    pub consented_at: DateTime<Utc>,
+    /// Initial application timestamp.
+    pub created_at: DateTime<Utc>,
+    /// Most recent application update timestamp.
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Queryable one-time account invitation row.
+#[derive(Debug, Queryable, Selectable)]
+#[diesel(table_name = account_invites)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub(crate) struct AccountInviteRow {
+    /// Stable internal invitation identifier.
+    pub id: Uuid,
+    /// Application approved by the invitation.
+    pub request_id: Option<Uuid>,
+    /// Lowercase, trimmed authorized email.
+    pub normalized_email: String,
+    /// SHA-256 digest of the opaque invitation token.
+    pub token_digest: Vec<u8>,
+    /// Administrator that issued the invitation.
+    pub issued_by_account_id: Option<Uuid>,
+    /// Whether the invitation was inserted out of band for initial bootstrap.
+    pub is_bootstrap: bool,
+    /// Exclusive invitation expiry timestamp.
+    pub expires_at: DateTime<Utc>,
+    /// Successful one-time redemption timestamp.
+    pub consumed_at: Option<DateTime<Utc>>,
+    /// Explicit revocation timestamp.
+    pub revoked_at: Option<DateTime<Utc>>,
+    /// Invitation creation timestamp.
+    pub created_at: DateTime<Utc>,
+}
+
+/// Insertable one-time account invitation row.
+#[derive(Debug, Insertable)]
+#[diesel(table_name = account_invites)]
+pub(crate) struct NewAccountInviteRow {
+    /// Stable internal invitation identifier.
+    pub id: Uuid,
+    /// Application approved by the invitation.
+    pub request_id: Option<Uuid>,
+    /// Lowercase, trimmed authorized email.
+    pub normalized_email: String,
+    /// SHA-256 digest of the opaque invitation token.
+    pub token_digest: Vec<u8>,
+    /// Administrator that issued the invitation.
+    pub issued_by_account_id: Option<Uuid>,
+    /// Whether the invitation was inserted out of band for initial bootstrap.
+    pub is_bootstrap: bool,
+    /// Exclusive invitation expiry timestamp.
+    pub expires_at: DateTime<Utc>,
+    /// Successful one-time redemption timestamp.
+    pub consumed_at: Option<DateTime<Utc>>,
+    /// Explicit revocation timestamp.
+    pub revoked_at: Option<DateTime<Utc>>,
+    /// Invitation creation timestamp.
+    pub created_at: DateTime<Utc>,
+}
+
+/// Queryable first-party password credential row.
+#[derive(Debug, Queryable, Selectable)]
+#[diesel(table_name = account_password_credentials)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub(crate) struct AccountPasswordCredentialRow {
+    /// Account authenticated by this credential.
+    pub account_id: Uuid,
+    /// Lowercase, trimmed unique sign-in email.
+    pub normalized_email: String,
+    /// Argon2id PHC password hash.
+    pub password_hash: String,
+    /// Application credential-record schema version.
+    pub password_version: i16,
+    /// External deployment-pepper version.
+    pub pepper_version: i16,
+    /// Successful email-verification timestamp.
+    pub email_verified_at: Option<DateTime<Utc>>,
+    /// Credential creation timestamp.
+    pub created_at: DateTime<Utc>,
+    /// Most recent password-change timestamp.
+    pub password_changed_at: DateTime<Utc>,
+    /// Most recent credential-record update timestamp.
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Insertable first-party password credential row.
+#[derive(Debug, Insertable)]
+#[diesel(table_name = account_password_credentials)]
+pub(crate) struct NewAccountPasswordCredentialRow {
+    /// Account authenticated by this credential.
+    pub account_id: Uuid,
+    /// Lowercase, trimmed unique sign-in email.
+    pub normalized_email: String,
+    /// Argon2id PHC password hash.
+    pub password_hash: String,
+    /// Application credential-record schema version.
+    pub password_version: i16,
+    /// External deployment-pepper version.
+    pub pepper_version: i16,
+    /// Successful email-verification timestamp.
+    pub email_verified_at: Option<DateTime<Utc>>,
+    /// Credential creation timestamp.
+    pub created_at: DateTime<Utc>,
+    /// Most recent password-change timestamp.
+    pub password_changed_at: DateTime<Utc>,
+    /// Most recent credential-record update timestamp.
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Queryable revocable account session row.
+#[derive(Debug, Queryable, Selectable)]
+#[diesel(table_name = account_sessions)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub(crate) struct AccountSessionRow {
+    /// Stable internal session identifier.
+    pub id: Uuid,
+    /// Account authenticated by the session.
+    pub account_id: Uuid,
+    /// SHA-256 digest of the opaque session token.
+    pub token_digest: Vec<u8>,
+    /// Browser, desktop, or CLI client kind.
+    pub client_kind: String,
+    /// Session creation timestamp.
+    pub created_at: DateTime<Utc>,
+    /// Most recent authenticated-use timestamp.
+    pub last_seen_at: DateTime<Utc>,
+    /// Sliding inactivity expiry timestamp.
+    pub idle_expires_at: DateTime<Utc>,
+    /// Non-extendable absolute expiry timestamp.
+    pub absolute_expires_at: DateTime<Utc>,
+    /// Explicit revocation timestamp.
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+/// Insertable revocable account session row.
+#[derive(Debug, Insertable)]
+#[diesel(table_name = account_sessions)]
+pub(crate) struct NewAccountSessionRow {
+    /// Stable internal session identifier.
+    pub id: Uuid,
+    /// Account authenticated by the session.
+    pub account_id: Uuid,
+    /// SHA-256 digest of the opaque session token.
+    pub token_digest: Vec<u8>,
+    /// Browser, desktop, or CLI client kind.
+    pub client_kind: String,
+    /// Session creation timestamp.
+    pub created_at: DateTime<Utc>,
+    /// Most recent authenticated-use timestamp.
+    pub last_seen_at: DateTime<Utc>,
+    /// Sliding inactivity expiry timestamp.
+    pub idle_expires_at: DateTime<Utc>,
+    /// Non-extendable absolute expiry timestamp.
+    pub absolute_expires_at: DateTime<Utc>,
+    /// Explicit revocation timestamp.
+    pub revoked_at: Option<DateTime<Utc>>,
 }
 
 /// Queryable public publisher profile row.
@@ -912,6 +1091,82 @@ impl AccountRow {
             status: parse_text_enum::<AccountStatus>(self.status, "account status")?,
             created_at: self.created_at,
             updated_at: self.updated_at,
+        })
+    }
+}
+
+/// Conversion helpers for invite application rows.
+impl AccountInviteRequestRow {
+    /// Convert this database row into a typed invite application.
+    pub(crate) fn into_record(self) -> Result<AccountInviteRequestRecord, CatalogError> {
+        Ok(AccountInviteRequestRecord {
+            id: self.id,
+            normalized_email: self.normalized_email,
+            display_name: self.display_name,
+            intent: parse_text_enum::<AccountInviteIntent>(self.intent, "account invite intent")?,
+            statement: self.statement,
+            status: parse_text_enum::<AccountInviteStatus>(self.status, "account invite status")?,
+            consented_at: self.consented_at,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        })
+    }
+}
+
+/// Conversion helpers for one-time invitation rows.
+impl AccountInviteRow {
+    /// Convert this database row into a typed one-time invitation.
+    pub(crate) fn into_record(self) -> AccountInviteRecord {
+        AccountInviteRecord {
+            id: self.id,
+            request_id: self.request_id,
+            normalized_email: self.normalized_email,
+            token_digest: self.token_digest,
+            issued_by_account_id: self.issued_by_account_id,
+            is_bootstrap: self.is_bootstrap,
+            expires_at: self.expires_at,
+            consumed_at: self.consumed_at,
+            revoked_at: self.revoked_at,
+            created_at: self.created_at,
+        }
+    }
+}
+
+/// Conversion helpers for first-party password credential rows.
+impl AccountPasswordCredentialRow {
+    /// Convert this database row into a typed password credential.
+    pub(crate) fn into_record(self) -> AccountPasswordCredentialRecord {
+        AccountPasswordCredentialRecord {
+            account_id: self.account_id,
+            normalized_email: self.normalized_email,
+            password_hash: self.password_hash,
+            password_version: self.password_version,
+            pepper_version: self.pepper_version,
+            email_verified_at: self.email_verified_at,
+            created_at: self.created_at,
+            password_changed_at: self.password_changed_at,
+            updated_at: self.updated_at,
+        }
+    }
+}
+
+/// Conversion helpers for first-party session rows.
+impl AccountSessionRow {
+    /// Convert this database row into a typed account session.
+    pub(crate) fn into_record(self) -> Result<AccountSessionRecord, CatalogError> {
+        Ok(AccountSessionRecord {
+            id: self.id,
+            account_id: self.account_id,
+            token_digest: self.token_digest,
+            client_kind: parse_text_enum::<AccountSessionClientKind>(
+                self.client_kind,
+                "account session client kind",
+            )?,
+            created_at: self.created_at,
+            last_seen_at: self.last_seen_at,
+            idle_expires_at: self.idle_expires_at,
+            absolute_expires_at: self.absolute_expires_at,
+            revoked_at: self.revoked_at,
         })
     }
 }

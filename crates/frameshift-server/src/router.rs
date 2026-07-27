@@ -76,7 +76,9 @@ use crate::routes::admin::admin_router;
 use crate::routes::authors::{authors_router, authors_write_router};
 use crate::routes::downloads::{dl_router, pack_download_url_router};
 use crate::routes::handles::handles_router;
+use crate::routes::invite_admin::invite_admin_router;
 use crate::routes::invite_requests::invite_request_router;
+use crate::routes::local_auth::{local_auth_protected_router, local_auth_public_router};
 use crate::routes::memory::memory_router;
 use crate::routes::moderation::moderation_router;
 use crate::routes::ops::ops_router;
@@ -231,10 +233,20 @@ fn build_app(
         .nest("/telemetry", telemetry)
         .nest("/memory", memory_router());
 
-    if state.account_auth.is_some() {
+    if state.config.first_party_auth.enabled() {
+        let local_auth = apply_ip_rate_limit(
+            local_auth_public_router(),
+            &state,
+            state.config.abuse_rate_per_min,
+        );
+        v1 = v1.merge(Router::new().nest("/auth", local_auth));
+    }
+
+    if state.account_auth.is_some() || state.config.first_party_auth.enabled() {
         let account_layer = axum::middleware::from_fn_with_state(state.clone(), require_account);
         let mut account_routes = account_write_router()
-            .merge(Router::new().nest("/admin", admin_router()))
+            .merge(Router::new().nest("/auth", local_auth_protected_router()))
+            .merge(Router::new().nest("/admin", admin_router().merge(invite_admin_router())))
             .merge(Router::new().nest("/publish-intents", publication_intent_router()))
             .merge(Router::new().nest(
                 "/publication-submissions",
@@ -394,27 +406,31 @@ fn build_cors_layer(state: &AppState) -> Option<CorsLayer> {
     }
 
     let expose: HeaderName = HeaderName::from_static("x-request-id");
-    Some(
-        CorsLayer::new()
-            .allow_origin(origins)
-            .allow_methods([
-                Method::GET,
-                Method::POST,
-                Method::PUT,
-                Method::DELETE,
-                Method::OPTIONS,
-                Method::HEAD,
-            ])
-            .allow_headers([
-                header::AUTHORIZATION,
-                header::CONTENT_TYPE,
-                HeaderName::from_static("x-frameshift-pubkey"),
-                HeaderName::from_static("x-frameshift-timestamp"),
-                HeaderName::from_static("x-frameshift-nonce"),
-                HeaderName::from_static("x-frameshift-signature"),
-                HeaderName::from_static("x-request-id"),
-            ])
-            .expose_headers([expose])
-            .max_age(std::time::Duration::from_secs(600)),
-    )
+    let cors = CorsLayer::new()
+        .allow_origin(origins)
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+            Method::HEAD,
+        ])
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            HeaderName::from_static("x-frameshift-pubkey"),
+            HeaderName::from_static("x-frameshift-timestamp"),
+            HeaderName::from_static("x-frameshift-nonce"),
+            HeaderName::from_static("x-frameshift-signature"),
+            HeaderName::from_static("x-request-id"),
+        ])
+        .expose_headers([expose])
+        .max_age(std::time::Duration::from_secs(600));
+    Some(if state.config.first_party_auth.enabled() {
+        cors.allow_credentials(true)
+    } else {
+        cors
+    })
 }

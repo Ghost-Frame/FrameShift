@@ -10,6 +10,8 @@
 //! - [`telemetry`] -- `POST /v1/telemetry/selection` opt-in selection telemetry sink.
 //! - [`memory`] -- `GET /v1/memory/health` read-only memory backend health.
 //! - [`invite_requests`] -- public invite-only account application intake.
+//! - [`local_auth`] -- invite redemption, password login, and session logout.
+//! - [`invite_admin`] -- administrator review and one-time invitation issuance.
 //! - [`publication_intents`] -- authenticated creation and account-scoped retrieval.
 //! - [`publication_submissions`] -- signed quarantine admission and account-scoped retrieval.
 //! - [`moderation`] -- authenticated, role-gated publication review.
@@ -21,7 +23,9 @@ pub mod admin;
 pub mod authors;
 pub mod downloads;
 pub mod handles;
+pub mod invite_admin;
 pub mod invite_requests;
+pub mod local_auth;
 pub mod memory;
 pub mod moderation;
 pub mod ops;

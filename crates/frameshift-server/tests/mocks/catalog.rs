@@ -21,20 +21,22 @@ use frameshift_catalog::error::{CatalogError, HealthStatus};
 use frameshift_catalog::filters::{PackSearchFilters, PackSearchResult};
 use frameshift_catalog::identity::Ed25519PublicKey;
 use frameshift_catalog::records::{
-    AccountInviteRequestRecord, AccountRecord, AccountStatus, AccountStatusChangeRequest,
-    AuthorRecord, MembershipState, PackRecord, PackVersionRecord, PlatformRole,
-    PlatformRoleAssignmentRequest, PlatformRoleRecord, PlatformRoleRevocationRequest,
-    PlatformRoleState, PublicationAppealCaseRecord, PublicationAppealCursor,
-    PublicationAppealDisposition, PublicationAppealRecord, PublicationAppealRequest,
-    PublicationAppealResolutionRecord, PublicationAppealResolutionRequest, PublicationIntentRecord,
-    PublicationLifecycleAction, PublicationLifecycleCursor, PublicationLifecycleDecisionRecord,
-    PublicationModerationAction, PublicationModerationDecisionRecord,
-    PublicationModerationDecisionRequest, PublicationModerationSnapshot,
-    PublicationPromotionRecord, PublicationPromotionRequest, PublicationSubmissionRecord,
-    PublicationSubmissionRequest, PublicationSubmissionState, PublicationTombstoneRequest,
-    PublicationWithdrawalRequest, PublisherAuditEventRecord, PublisherKeyRecord, PublisherKeyState,
-    PublisherMembershipRecord, PublisherModerationStatus, PublisherProfileRecord, PublisherRole,
-    PublisherSuspensionRequest,
+    AccountInviteIssueRequest, AccountInviteRecord, AccountInviteRequestRecord,
+    AccountInviteReviewRequest, AccountInviteStatus, AccountPasswordCredentialRecord,
+    AccountRecord, AccountSessionRecord, AccountStatus, AccountStatusChangeRequest, AuthorRecord,
+    LocalAccountRegistrationRequest, LocalAccountRegistrationResult, MembershipState, PackRecord,
+    PackVersionRecord, PlatformRole, PlatformRoleAssignmentRequest, PlatformRoleRecord,
+    PlatformRoleRevocationRequest, PlatformRoleState, PublicationAppealCaseRecord,
+    PublicationAppealCursor, PublicationAppealDisposition, PublicationAppealRecord,
+    PublicationAppealRequest, PublicationAppealResolutionRecord,
+    PublicationAppealResolutionRequest, PublicationIntentRecord, PublicationLifecycleAction,
+    PublicationLifecycleCursor, PublicationLifecycleDecisionRecord, PublicationModerationAction,
+    PublicationModerationDecisionRecord, PublicationModerationDecisionRequest,
+    PublicationModerationSnapshot, PublicationPromotionRecord, PublicationPromotionRequest,
+    PublicationSubmissionRecord, PublicationSubmissionRequest, PublicationSubmissionState,
+    PublicationTombstoneRequest, PublicationWithdrawalRequest, PublisherAuditEventRecord,
+    PublisherKeyRecord, PublisherKeyState, PublisherMembershipRecord, PublisherModerationStatus,
+    PublisherProfileRecord, PublisherRole, PublisherSuspensionRequest,
 };
 use frameshift_catalog::status::{PackStatus, TombstoneRecord};
 // Reuse the exact same version-precedence comparator the Postgres adapter
@@ -52,6 +54,15 @@ use frameshift_pack::ObjectHash;
 pub struct MockState {
     /// Invite applications keyed by normalized email for duplicate suppression.
     pub account_invite_requests: HashMap<String, AccountInviteRequestRecord>,
+
+    /// Issued account invitations keyed by stable identifier.
+    pub account_invites: HashMap<uuid::Uuid, AccountInviteRecord>,
+
+    /// First-party password credentials keyed by normalized email.
+    pub account_password_credentials: HashMap<String, AccountPasswordCredentialRecord>,
+
+    /// Revocable first-party sessions keyed by stable identifier.
+    pub account_sessions: HashMap<uuid::Uuid, AccountSessionRecord>,
 
     /// OIDC-backed accounts keyed by internal identifier.
     pub accounts: HashMap<uuid::Uuid, AccountRecord>,
@@ -209,6 +220,278 @@ impl CatalogBackend for MockCatalog {
             .account_invite_requests
             .entry(record.normalized_email.clone())
             .or_insert(record);
+        Ok(())
+    }
+
+    /// List invite applications after checking the mock administrator role.
+    async fn list_account_invite_requests(
+        &self,
+        actor_account_id: uuid::Uuid,
+        status: Option<AccountInviteStatus>,
+        limit: u32,
+    ) -> Result<Vec<AccountInviteRequestRecord>, CatalogError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        require_mock_administrator(&state, actor_account_id, "account_invite_request")?;
+        let mut records: Vec<_> = state
+            .account_invite_requests
+            .values()
+            .filter(|record| status.is_none_or(|status| record.status == status))
+            .cloned()
+            .collect();
+        records.sort_by_key(|record| (record.created_at, record.id));
+        records.truncate(limit as usize);
+        Ok(records)
+    }
+
+    /// Transition one mock invite application under administrator authority.
+    async fn review_account_invite_request(
+        &self,
+        request: AccountInviteReviewRequest,
+    ) -> Result<AccountInviteRequestRecord, CatalogError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        require_mock_administrator(&state, request.actor_account_id, "account_invite_request")?;
+        let record = state
+            .account_invite_requests
+            .values_mut()
+            .find(|record| record.id == request.request_id)
+            .ok_or_else(|| CatalogError::NotFound {
+                kind: "account_invite_request",
+                key: request.request_id.to_string(),
+            })?;
+        if record.status == AccountInviteStatus::Invited
+            || request.status == AccountInviteStatus::Invited
+        {
+            return Err(CatalogError::Conflict {
+                kind: "account_invite_request",
+                key: request.request_id.to_string(),
+            });
+        }
+        record.status = request.status;
+        record.updated_at = Utc::now();
+        Ok(record.clone())
+    }
+
+    /// Issue one mock invitation and mark the application invited atomically.
+    async fn issue_account_invite(
+        &self,
+        request: AccountInviteIssueRequest,
+    ) -> Result<AccountInviteRecord, CatalogError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        require_mock_administrator(&state, request.actor_account_id, "account_invite")?;
+        let application = state
+            .account_invite_requests
+            .values_mut()
+            .find(|record| record.id == request.request_id)
+            .ok_or_else(|| CatalogError::NotFound {
+                kind: "account_invite_request",
+                key: request.request_id.to_string(),
+            })?;
+        if !matches!(
+            application.status,
+            AccountInviteStatus::Pending | AccountInviteStatus::Reviewing
+        ) {
+            return Err(CatalogError::Conflict {
+                kind: "account_invite_request",
+                key: request.request_id.to_string(),
+            });
+        }
+        application.status = AccountInviteStatus::Invited;
+        application.updated_at = request.created_at;
+        let invite = AccountInviteRecord {
+            id: request.id,
+            request_id: Some(request.request_id),
+            normalized_email: application.normalized_email.clone(),
+            token_digest: request.token_digest,
+            issued_by_account_id: Some(request.actor_account_id),
+            is_bootstrap: false,
+            expires_at: request.expires_at,
+            consumed_at: None,
+            revoked_at: None,
+            created_at: request.created_at,
+        };
+        state.account_invites.insert(invite.id, invite.clone());
+        Ok(invite)
+    }
+
+    /// Redeem one mock invitation into an account, credential, and session.
+    async fn register_local_account(
+        &self,
+        request: LocalAccountRegistrationRequest,
+    ) -> Result<LocalAccountRegistrationResult, CatalogError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        let invitation_id = state
+            .account_invites
+            .values()
+            .find(|invite| invite.token_digest == request.invite_token_digest)
+            .filter(|invite| {
+                invite.consumed_at.is_none()
+                    && invite.revoked_at.is_none()
+                    && invite.expires_at > request.account.created_at
+            })
+            .ok_or_else(|| CatalogError::Unauthorized {
+                kind: "account_invite",
+                key: "invalid-or-expired".to_string(),
+            })?
+            .id;
+        let invitation = state.account_invites.get(&invitation_id).unwrap();
+        if invitation.normalized_email != request.credential.normalized_email {
+            return Err(CatalogError::Unauthorized {
+                kind: "account_invite",
+                key: "email-mismatch".to_string(),
+            });
+        }
+        let identity = (
+            request.account.issuer.clone(),
+            request.account.subject.clone(),
+        );
+        if state.accounts.contains_key(&request.account.id)
+            || state
+                .account_password_credentials
+                .contains_key(&request.credential.normalized_email)
+        {
+            return Err(CatalogError::Conflict {
+                kind: "account",
+                key: request.account.id.to_string(),
+            });
+        }
+        state
+            .account_invites
+            .get_mut(&invitation_id)
+            .unwrap()
+            .consumed_at = Some(request.account.created_at);
+        state.account_subjects.insert(identity, request.account.id);
+        state
+            .accounts
+            .insert(request.account.id, request.account.clone());
+        state.account_password_credentials.insert(
+            request.credential.normalized_email.clone(),
+            request.credential,
+        );
+        state
+            .account_sessions
+            .insert(request.session.id, request.session.clone());
+        Ok(LocalAccountRegistrationResult {
+            account: request.account,
+            session: request.session,
+        })
+    }
+
+    /// Retrieve one mock first-party password credential.
+    async fn get_account_password_credential(
+        &self,
+        normalized_email: &str,
+    ) -> Result<AccountPasswordCredentialRecord, CatalogError> {
+        self.state
+            .read()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?
+            .account_password_credentials
+            .get(normalized_email)
+            .cloned()
+            .ok_or_else(|| CatalogError::NotFound {
+                kind: "account_password_credential",
+                key: normalized_email.to_string(),
+            })
+    }
+
+    /// Create one mock first-party session.
+    async fn create_account_session(
+        &self,
+        record: AccountSessionRecord,
+    ) -> Result<(), CatalogError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        if state.account_sessions.contains_key(&record.id) {
+            return Err(CatalogError::Conflict {
+                kind: "account_session",
+                key: record.id.to_string(),
+            });
+        }
+        state.account_sessions.insert(record.id, record);
+        Ok(())
+    }
+
+    /// Resolve one active mock first-party session.
+    async fn get_active_account_session(
+        &self,
+        token_digest: &[u8],
+        now: DateTime<Utc>,
+    ) -> Result<AccountSessionRecord, CatalogError> {
+        self.state
+            .read()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?
+            .account_sessions
+            .values()
+            .find(|session| {
+                session.token_digest == token_digest
+                    && session.revoked_at.is_none()
+                    && session.idle_expires_at > now
+                    && session.absolute_expires_at > now
+            })
+            .cloned()
+            .ok_or_else(|| CatalogError::NotFound {
+                kind: "account_session",
+                key: "opaque-token".to_string(),
+            })
+    }
+
+    /// Advance one active mock session.
+    async fn touch_account_session(
+        &self,
+        session_id: uuid::Uuid,
+        last_seen_at: DateTime<Utc>,
+        idle_expires_at: DateTime<Utc>,
+    ) -> Result<(), CatalogError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        let session =
+            state
+                .account_sessions
+                .get_mut(&session_id)
+                .ok_or_else(|| CatalogError::NotFound {
+                    kind: "account_session",
+                    key: session_id.to_string(),
+                })?;
+        session.last_seen_at = last_seen_at;
+        session.idle_expires_at = idle_expires_at;
+        Ok(())
+    }
+
+    /// Revoke one mock session belonging to the authenticated account.
+    async fn revoke_account_session(
+        &self,
+        session_id: uuid::Uuid,
+        account_id: uuid::Uuid,
+        revoked_at: DateTime<Utc>,
+    ) -> Result<(), CatalogError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        let session = state
+            .account_sessions
+            .get_mut(&session_id)
+            .filter(|session| session.account_id == account_id)
+            .ok_or_else(|| CatalogError::NotFound {
+                kind: "account_session",
+                key: session_id.to_string(),
+            })?;
+        session.revoked_at = Some(revoked_at);
         Ok(())
     }
 

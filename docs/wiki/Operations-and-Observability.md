@@ -155,16 +155,59 @@ transaction as the write it authorizes.
 
 ### One-time administrator bootstrap
 
-A fresh deployment has no administrator, and there is deliberately no
-configuration setting that grants one: authority lives in the database so it is
-auditable and revocable. Insert the first administrator once, directly, after
-that account has signed in at least once so its row exists:
+A fresh deployment has no administrator. Configuration cannot grant the role;
+authority lives in the database so operators can audit and revoke it.
+
+An OIDC-backed deployment can insert the first administrator after that account
+has signed in once:
 
 ```sql
 INSERT INTO account_platform_roles
     (account_id, role, state, assigned_by_account_id)
 VALUES
     ('<account-uuid>', 'administrator', 'active', '<account-uuid>');
+```
+
+For a first-party-only deployment, create one short-lived bootstrap invitation
+out of band. Generate 32 random bytes, encode the raw bytes as unpadded
+base64url for the registration token, and store only their SHA-256 digest in
+`account_invites`:
+
+```sql
+INSERT INTO account_invites (
+    id,
+    normalized_email,
+    token_digest,
+    is_bootstrap,
+    expires_at
+)
+VALUES (
+    gen_random_uuid(),
+    lower(btrim('<administrator-email>')),
+    decode('<sha256-of-raw-token-hex>', 'hex'),
+    TRUE,
+    NOW() + INTERVAL '1 hour'
+);
+```
+
+Deliver the raw token through a secret channel. The recipient registers through
+`POST /v1/auth/register` or the marketplace registration form. After the
+transaction creates the account, grant its role with an exact email lookup:
+
+```sql
+WITH first_account AS (
+    SELECT account_id
+    FROM account_password_credentials
+    WHERE normalized_email = lower(btrim('<administrator-email>'))
+)
+INSERT INTO account_platform_roles (
+    account_id,
+    role,
+    state,
+    assigned_by_account_id
+)
+SELECT account_id, 'administrator', 'active', account_id
+FROM first_account;
 ```
 
 The bootstrap row records itself as its own assigner, which is the marker of an
@@ -177,6 +220,9 @@ reads `0`; that is the intended fail-closed behavior, not an outage.
 
 | Route | Effect |
 |---|---|
+| `GET /v1/admin/invite-requests` | List invite applications, with an optional status filter |
+| `PATCH /v1/admin/invite-requests/{request_id}` | Move an application to `pending`, `reviewing`, or `declined` |
+| `POST /v1/admin/invite-requests/{request_id}/invite` | Issue one expiring invite and return its raw token once |
 | `POST /v1/admin/accounts/{account_id}/platform-roles` | Grant `moderator` or `administrator` |
 | `DELETE /v1/admin/accounts/{account_id}/platform-roles/{role}` | Revoke a role, retaining it as auditable history |
 | `PATCH /v1/admin/accounts/{account_id}/status` | Set `active`, `suspended`, or `disabled` |

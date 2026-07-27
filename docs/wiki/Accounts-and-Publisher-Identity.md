@@ -5,9 +5,35 @@ persona, or use personas locally. An account becomes relevant when you publish:
 it owns publisher profiles, authorizes device-key enrollment and recovery, and
 provides durable server-side publication history.
 
-FrameShift does not treat the account password or login session as the signing
+Registration is invite-only. You can submit an invite application through the
+marketplace, but an application does not create an account or guarantee an
+invitation. A reviewer must approve the application and issue a single-use,
+email-bound invitation before registration.
+
+FrameShift does not treat an account password or login session as the signing
 identity. A publisher has a stable UUID, while individual devices hold
 rotatable Ed25519 signing keys.
+
+## First-party account sessions
+
+The registry exposes first-party account routes at:
+
+| Route | Purpose |
+|---|---|
+| `POST /v1/auth/register` | Redeem an unexpired invitation and create an account |
+| `POST /v1/auth/login` | Verify an Argon2id password and create a new session |
+| `POST /v1/auth/logout` | Revoke the current first-party session |
+
+Invite redemption binds the account to the invitation email and marks that
+email verified. The server consumes the invitation, creates the account and
+credential, and creates the first session in one database transaction. A
+second redemption cannot reuse the invitation.
+
+Browser clients receive a Secure, HttpOnly, SameSite=Strict cookie and must
+send an exact configured Origin for registration, login, and authenticated
+writes. Desktop and CLI clients request an explicit bearer session. The
+registry stores only SHA-256 token digests, so it cannot recover an issued
+invite or session token from the database.
 
 ## Sign in securely
 
@@ -16,10 +42,15 @@ frameshift account login
 frameshift account status
 ```
 
-Login opens the configured identity provider in your browser and uses an exact
-IP-loopback callback with S256 PKCE. Access and refresh tokens are stored in the
-operating system's native credential store. The JSON metadata in the managed
-FrameShift data directory contains no token.
+The current `frameshift account login` command uses the configured OIDC
+provider. It opens the provider in your browser and uses an exact IP-loopback
+callback with S256 PKCE. The desktop first-party login API exists for clients
+that implement the explicit bearer-session flow; the CLI command has not
+switched to that flow.
+
+The CLI stores OIDC access and refresh tokens in the operating system's native
+credential store. The JSON metadata in the managed FrameShift data directory
+contains no token.
 
 `account status` asks the registry for the authenticated account and its
 publisher memberships. `account logout` attempts provider revocation and then
