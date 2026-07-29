@@ -672,6 +672,68 @@ fn registry_install_rejects_manifest_signer_mismatch() {
     );
 }
 
+/// A pre-existing `cache/<hash>` directory that no longer matches its own
+/// hash-named content (a durably poisoned or corrupted cache entry left over
+/// from before this install) must be rejected rather than silently trusted
+/// as a "cache hit". This exercises `fetch_and_install`'s post-cache
+/// re-verification against exactly the scenario it exists to catch:
+/// `ensure_cached_pack` sees `cache_path` already exists and no-ops, so
+/// without re-verification the tampered bytes on disk would become the
+/// persona's install authority.
+#[test]
+fn registry_install_rejects_tampered_cache_hit() {
+    let signing = SigningKey::from_bytes(&[20u8; 32]);
+    let fixture = prepare_signed_fixture("demo-pack", "1.0.0", &signing);
+
+    let mut routes = HashMap::new();
+    routes.insert(
+        "/v1/packs/demo-pack/versions/1.0.0".to_string(),
+        record_response(&fixture.record),
+    );
+    routes.insert(
+        "/v1/packs/demo-pack/versions/1.0.0/pack".to_string(),
+        pack_response(fixture.targz.clone()),
+    );
+    let base = spawn_registry(routes);
+    let _env = EnvGuard::set(&base);
+
+    let temp = tempfile::tempdir().unwrap();
+    let (client, project_root) = test_client_and_project(&temp);
+
+    // Pre-seed the cache directory the fixture's hash names with completely
+    // unrelated pack content -- simulating a poisoned/corrupted cache entry
+    // that predates this install and does not actually match its own
+    // hash-named directory.
+    let paths = client.project_paths(&project_root).unwrap();
+    let cache_path = paths.cache_dir.join(&fixture.canonical_hash);
+    write_pack(
+        &cache_path,
+        "tampered-pack",
+        "9.9.9",
+        "mallory",
+        &"0".repeat(64),
+    );
+
+    let error = client
+        .install(InstallRequest {
+            project_root: project_root.clone(),
+            spec: PersonaSpec {
+                name: "demo-pack".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            source: InstallSource::Registry,
+        })
+        .expect_err("a tampered pre-existing cache hit must be rejected, not trusted");
+
+    assert!(
+        matches!(
+            error,
+            frameshift_client::ClientError::RegistryCacheTampered { .. }
+        ),
+        "expected RegistryCacheTampered, got {error:?}"
+    );
+}
+
 /// Two 404 sub-cases against the registry:
 ///
 /// 1. The version record resolves (200), but the pack archive endpoint 404s

@@ -12,12 +12,22 @@ use crate::error::ClientError;
 /// Public account-authentication bootstrap configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct AccountAuthConfig {
-    /// Whether authenticated account routes are enabled.
+    /// Whether authenticated account routes are enabled (OIDC or first-party).
     pub enabled: bool,
-    /// Exact configured OIDC issuer when enabled.
+    /// Exact configured OIDC issuer when OIDC bearer auth is enabled.
+    ///
+    /// A registry running in first-party-only mode reports `enabled = true`
+    /// with `issuer = None`; clients must consult [`Self::first_party_enabled`]
+    /// before concluding that the registry misreported its OIDC issuer.
     pub issuer: Option<String>,
-    /// Access-token audience expected by the registry when enabled.
+    /// Access-token audience expected by the registry when OIDC is enabled.
     pub audience: Option<String>,
+    /// Whether the registry accepts invite-bound first-party password sessions.
+    ///
+    /// Defaults to `false` so responses from older registries that do not yet
+    /// advertise the field deserialize unchanged.
+    #[serde(default)]
+    pub first_party_enabled: bool,
 }
 
 /// Authenticated account profile and its publisher memberships.

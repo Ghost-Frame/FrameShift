@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use axum::extract::{Multipart, Path, State};
-use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use chrono::Utc;
@@ -18,6 +17,7 @@ use uuid::Uuid;
 use crate::auth::VerifiedSigner;
 use crate::error::AppError;
 use crate::middleware::account::AuthenticatedAccount;
+use crate::middleware::request_id::ClientRequestId;
 use crate::publication::{PublicationAdmissionError, PublicationAdmissionService};
 use crate::state::AppState;
 
@@ -102,15 +102,10 @@ async fn get_publication_submission(
 async fn withdraw_publication_submission(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthenticatedAccount>,
+    Extension(client_request_id): Extension<ClientRequestId>,
     Path(submission_id): Path<Uuid>,
-    headers: HeaderMap,
     Json(body): Json<WithdrawSubmissionBody>,
 ) -> Result<Json<PublicationLifecycleDecisionRecord>, AppError> {
-    let request_id = headers
-        .get("x-request-id")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| Uuid::parse_str(value).ok())
-        .ok_or_else(|| AppError::BadRequest("x-request-id must be a UUID".to_string()))?;
     state
         .catalog
         .withdraw_publication_submission(PublicationWithdrawalRequest {
@@ -118,11 +113,23 @@ async fn withdraw_publication_submission(
             submission_id,
             actor_account_id: auth.account.id,
             reason_code: body.reason_code,
-            request_id,
+            request_id: required_client_request_id(client_request_id)?,
         })
         .await
         .map(Json)
         .map_err(|error| AppError::from_catalog(error, "publication withdrawal"))
+}
+
+/// Require a valid request UUID that was present before tracing middleware ran.
+///
+/// The synthesized id [`tower_http::request_id::SetRequestIdLayer`] would
+/// otherwise stamp onto a request with no client-supplied header must never
+/// be treated as if the caller had provided it -- that would defeat
+/// substituted-retry rejection for this idempotent mutation (F-10).
+fn required_client_request_id(client_request_id: ClientRequestId) -> Result<Uuid, AppError> {
+    client_request_id
+        .0
+        .ok_or_else(|| AppError::BadRequest("x-request-id must be a UUID".to_string()))
 }
 
 /// Parse the strict three-field multipart publication-submission contract.

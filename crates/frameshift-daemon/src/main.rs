@@ -109,11 +109,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // If no projects directory is found, skip (not a project event).
                     let project_root = derive_project_root_from_path(&data_root, &changed_path);
                     if let Some(root) = project_root {
-                        orchestrator::evaluate_and_apply(
-                            watch_client.as_ref(),
-                            &mut controller,
-                            &root,
-                        );
+                        // `evaluate_and_apply` performs synchronous filesystem
+                        // reads/writes and full persona re-materialization. Run it
+                        // on the blocking pool (mirroring the RPC path in
+                        // `socket.rs`) so a burst of watch events cannot starve the
+                        // async runtime's worker threads. The `SwitchController` is
+                        // moved into and back out of the blocking task so its switch
+                        // state persists across events; a panic there is logged and
+                        // recovered with a fresh controller rather than killing the
+                        // watcher loop.
+                        let client_ref = Arc::clone(&watch_client);
+                        controller = match tokio::task::spawn_blocking(move || {
+                            orchestrator::evaluate_and_apply(
+                                client_ref.as_ref(),
+                                &mut controller,
+                                &root,
+                            );
+                            controller
+                        })
+                        .await
+                        {
+                            Ok(returned) => returned,
+                            Err(join_error) => {
+                                tracing::error!(error = %join_error, "orchestrator evaluation task failed");
+                                SwitchController::new(SwitchPolicy::default())
+                            }
+                        };
                     }
                 }
             });

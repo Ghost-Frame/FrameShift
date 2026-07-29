@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use clap::Args;
 use frameshift_client::{Client, ClientError};
 use frameshift_source::render::{render_to_markdown, RenderTarget};
+use frameshift_source::{validate_content, ContentWarning, Severity};
 
 use crate::cmd::keys::{access_token_from_env, with_key_passphrase};
 use crate::util::{load_persona_by_name, validate_server_url, CliError};
@@ -47,6 +48,20 @@ pub fn run_publish(args: PublishArgs) -> Result<(), CliError> {
     // Build client and load the persona.
     let client = Client::with_default_data_root()?;
     let src = load_persona_by_name(&client, &args.persona)?;
+
+    // Advisory content scan (F-06): surface potentially dangerous patterns
+    // (destructive commands, sensitive paths, permission escalation, data
+    // exfiltration, behavioral-override phrasing) before packing/signing.
+    //
+    // This is intentionally warn-only and NEVER blocks the publish. Many
+    // legitimate security/devops personas legitimately contain strings the
+    // scanner flags -- e.g. a hardening persona documenting `rm -rf`,
+    // `curl | sh` risks, `base64` payload analysis, or prompt-injection
+    // phrases like "you are now" as *examples to detect/defend against*.
+    // Hard-blocking on these heuristics would break valid publishes, so
+    // findings are printed (Critical ones most prominently) and the flow
+    // always proceeds.
+    print_validation_warnings(&validate_content(&src));
 
     // Determine the output directory.
     let out_dir = match &args.out {
@@ -124,6 +139,43 @@ pub fn run_publish(args: PublishArgs) -> Result<(), CliError> {
              must also set FRAMESHIFT_ACCESS_TOKEN"
         ))),
         Err(error) => Err(CliError::Client(error)),
+    }
+}
+
+/// Print content-scan findings from `validate_content` to stderr.
+///
+/// Advisory only: this never returns an error and never blocks `run_publish`
+/// -- see the comment at the call site for why the scan is warn-only. Prints
+/// nothing when `warnings` is empty. `Critical` findings are called out with
+/// a trailing summary line so they are not missed among lower-severity noise.
+fn print_validation_warnings(warnings: &[ContentWarning]) {
+    if warnings.is_empty() {
+        return;
+    }
+
+    eprintln!(
+        "content scan found {} finding(s) (advisory only; publish will proceed):",
+        warnings.len()
+    );
+    let mut critical_count = 0usize;
+    for warning in warnings {
+        let marker = match warning.severity {
+            Severity::Critical => {
+                critical_count += 1;
+                "CRITICAL"
+            }
+            Severity::Warning => "warning",
+            Severity::Info => "info",
+        };
+        eprintln!(
+            "  [{marker}] {} ({:?}): {} (matched {:?})",
+            warning.location, warning.category, warning.detail, warning.matched_text
+        );
+    }
+    if critical_count > 0 {
+        eprintln!(
+            "{critical_count} critical finding(s) above; review before sharing this pack widely."
+        );
     }
 }
 
@@ -246,6 +298,51 @@ tone = "neutral"
             content.contains("test-persona"),
             "AGENTS.md must reference the persona name"
         );
+    }
+
+    /// F-06: `validate_content` surfaces a Critical finding for a persona
+    /// containing an obviously destructive command, but `print_validation_warnings`
+    /// is advisory only -- it must not return an error or panic, proving the
+    /// scan never blocks a publish.
+    #[test]
+    fn validate_content_finding_is_advisory_only() {
+        let src_dir = tempfile::tempdir().expect("src tempdir");
+        let toml = r#"schema_version = 1
+name = "dangerous-persona"
+version = "0.1.0"
+description = "test"
+
+[voice]
+tone = "explains how to avoid rm -rf / disasters"
+"#;
+        fs::write(src_dir.path().join("persona.toml"), toml).expect("write persona.toml");
+        let src = load_source_from(src_dir.path());
+
+        let warnings = validate_content(&src);
+        assert!(
+            warnings.iter().any(|w| w.severity == Severity::Critical),
+            "expected a Critical finding for an rm -rf / pattern"
+        );
+
+        // Advisory: printing findings (even Critical ones) must not panic or
+        // otherwise short-circuit; run_publish would proceed past this call.
+        print_validation_warnings(&warnings);
+    }
+
+    /// A clean persona source produces no findings, and printing an empty
+    /// warning list is a no-op (nothing written, no panic).
+    #[test]
+    fn validate_content_clean_persona_has_no_findings() {
+        let src_dir = tempfile::tempdir().expect("src tempdir");
+        write_persona_source(src_dir.path());
+        let src = load_source_from(src_dir.path());
+
+        let warnings = validate_content(&src);
+        assert!(
+            warnings.is_empty(),
+            "a clean persona should not trigger content-scan findings"
+        );
+        print_validation_warnings(&warnings);
     }
 
     /// write_pack_toml rejects fields that would inject TOML, and accepts clean ones.

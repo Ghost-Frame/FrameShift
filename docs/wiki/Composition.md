@@ -11,7 +11,7 @@ extends = "base-persona@^1"
 mixin = ["company-style@2.x", "safety-overlay@1.x"]
 ```
 
-- `extends` -- A single base persona. The root persona inherits everything from the base. Format: `name` or `name@semver-req`.
+- `extends` -- A single base persona. The root persona inherits the base persona's own directly-declared rules, skills, and patterns. Composition resolves exactly one level: a base that itself declares `extends` or `mixin` is rejected at install time (see Limitations) rather than silently dropping its own ancestors. Format: `name` or `name@semver-req`.
 - `mixin` -- An ordered list of overlays applied after the base. Same format.
 
 ## Resolution order
@@ -72,6 +72,6 @@ Each merged rule and skill carries a `Provenance` record indicating which layer 
 ## Limitations
 
 - Composition is resolved at install time, not at runtime.
-- Circular extends chains are rejected.
+- Composition resolves a single level. A base referenced by `extends` (or a persona referenced by `mixin`) that itself declares `extends`/`mixin` is rejected at install time; multi-level `extends` chains are not supported and are never silently flattened. This fail-closed behavior exists so an unsupported chain can never drop an ancestor's L1 safety rules without a signal.
 - Mixin order matters -- later mixins override earlier ones on ID collision.
 - Mixins cannot override L1 rules from the base (SD6 protection).

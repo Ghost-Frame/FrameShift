@@ -36,7 +36,12 @@
 //! nonce-cache and log-amplification pressure before handler work.
 //! Account and publisher-owner routes carry a separate OIDC bearer layer when
 //! the verifier is configured; public auth metadata and publisher reads remain
-//! available without bearer credentials.
+//! available without bearer credentials. The whole account-authenticated
+//! surface (`/account`, `/auth/logout`, `/admin`, `/publish-intents`,
+//! `/publication-submissions`, `/moderation/...`) also carries the same
+//! per-IP abuse limit as every other mutating surface, applied OUTSIDE (i.e.
+//! before) `require_account` so an anonymous flood is bounded by source
+//! address before any authentication work runs.
 //!
 //! The legacy mutating endpoints `POST /v1/packs` and `POST /v1/authors` carry the Ed25519
 //! signed-request `route_layer` ([`crate::middleware::auth::require_signed_request`]).
@@ -270,6 +275,15 @@ fn build_app(
         let account_routes = account_routes
             .route_layer(account_limit)
             .route_layer(account_layer);
+        // Per-IP limit OUTSIDE (before) `require_account`, mirroring every
+        // other mutating surface in this router. Without this, an anonymous
+        // flood of unauthenticated requests against `/account`, `/admin`, and
+        // `/moderation/...` would reach OIDC/session verification work on
+        // every single request -- this bounds that cost by source address
+        // before authentication runs, exactly like the abuse limit already
+        // applied to signed writes and telemetry above.
+        let account_routes =
+            apply_ip_rate_limit(account_routes, &state, state.config.abuse_rate_per_min);
         v1 = v1.merge(account_routes);
     }
 

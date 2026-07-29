@@ -47,6 +47,29 @@ pub fn merge_layers(layers: &[MergeLayer<'_>]) -> Result<ComposedPersona, Compos
         });
     }
 
+    // Structural guard for SD6 L1 protection: at most one `Layer::Base` may
+    // appear in the stack, and when present it must be the first element.
+    // Without this, the `Layer::Base(_) => true` branch below (which permits a
+    // Base layer to override a prior L1 rule) could be reached by a Base layer
+    // that is not actually the bottom of the stack, silently defeating L1
+    // protection for a future caller that passes more than one Base layer.
+    let base_count = layers
+        .iter()
+        .filter(|l| matches!(l.layer, Layer::Base(_)))
+        .count();
+    if base_count > 1 {
+        return Err(ComposeError::InvalidLayerStack {
+            reason: format!(
+                "composition stack contains {base_count} base layers; only one is permitted"
+            ),
+        });
+    }
+    if base_count == 1 && !matches!(layers[0].layer, Layer::Base(_)) {
+        return Err(ComposeError::InvalidLayerStack {
+            reason: "base layer must be the first element of the composition stack".to_string(),
+        });
+    }
+
     // Capture the root persona up front. Safe: empty check above guarantees at
     // least one element, so `last()` will always return `Some`.
     let root_persona = layers[layers.len() - 1].source.persona.clone();
@@ -91,9 +114,11 @@ pub fn merge_layers(layers: &[MergeLayer<'_>]) -> Result<ComposedPersona, Compos
                         Layer::Root => rule.override_inherited,
                         // Mixins can never override an L1 rule.
                         Layer::Mixin(_) => false,
-                        // Base layers shouldn't appear after another base, but
-                        // treat them permissively (no L1 protection against
-                        // base-on-base, which is a resolver concern).
+                        // A Base layer can only reach this point as the sole,
+                        // first-position base (enforced by the structural
+                        // guard above), so there is no prior L1 rule from an
+                        // earlier base for it to override -- permissive here
+                        // is safe.
                         Layer::Base(_) => true,
                     };
 
@@ -192,14 +217,20 @@ fn layer_description(layer: &Layer) -> String {
 
 /// Merge a list of persona source layers into a single `ComposedPersona`.
 ///
-/// Compatibility shim over `merge_layers` -- tags the first element as the
-/// root and all subsequent elements as additional `Base` layers with index-
-/// based names. This is intentionally simplified; production callers should
-/// use `merge_layers` directly with proper `Layer` tags.
+/// Compatibility shim over `merge_layers` -- tags the LAST element as `Root`
+/// (matching `merge_layers`, which always takes composed persona metadata
+/// from the last slice element) and, when present, the FIRST element as the
+/// sole `Base` layer, consistent with the `merge_layers` structural guard
+/// that a `Layer::Base` must be the first element of the stack. This is
+/// intentionally simplified and only supports the two-layer (single base,
+/// single root) case; production callers should use `merge_layers` directly
+/// with proper `Layer` tags. Calls with 3+ layers now fail closed with
+/// `ComposeError::InvalidLayerStack`, since this shim has no way to express
+/// mixins and would otherwise need more than one `Base`-tagged layer.
 ///
 /// The `MergeOrder::BaseFirst` variant means the first element of `layers` is
-/// treated as the root persona (its `Persona` block wins for metadata). Each
-/// subsequent layer is composed in above it.
+/// treated as the base persona; the last element is the root persona (its
+/// `Persona` block wins for metadata).
 pub fn merge_sources(
     order: MergeOrder,
     layers: &[&PersonaSource],
@@ -212,11 +243,12 @@ pub fn merge_sources(
                     reason: "merge_sources called with no layers".to_string(),
                 });
             }
-            // First element is the root persona; rest are treated as extra
-            // base-tagged layers for backward compat with WS-5 callers.
+            // Last element is the root persona; earlier elements are treated
+            // as base-tagged layers for backward compat with WS-5 callers.
+            let last = layers.len() - 1;
             let mut merge_layers_vec: Vec<MergeLayer<'_>> = Vec::with_capacity(layers.len());
             for (i, src) in layers.iter().enumerate() {
-                let layer = if i == 0 {
+                let layer = if i == last {
                     Layer::Root
                 } else {
                     Layer::Base(format!("layer-{i}"))
@@ -419,5 +451,56 @@ mod tests {
         assert_eq!(composed.patterns.stack.len(), 2);
         assert_eq!(composed.patterns.stack[0].category, "signing");
         assert_eq!(composed.patterns.stack[1].category, "hashing");
+    }
+
+    /// F-07 regression: two `Layer::Base` entries in the stack must be
+    /// rejected structurally, rather than silently allowed to override an L1
+    /// rule via the permissive `Layer::Base(_) => true` branch.
+    #[test]
+    fn two_base_layers_are_rejected() {
+        let base_one = fixture_with_rule("base-one", make_rule("no-panic", SourceLayer::L1, false));
+        let base_two = fixture_with_rule("base-two", make_rule("no-panic", SourceLayer::L1, false));
+
+        let layers = vec![
+            MergeLayer {
+                source: &base_one,
+                layer: ComposeLayer::Base("base-one".to_string()),
+            },
+            MergeLayer {
+                source: &base_two,
+                layer: ComposeLayer::Base("base-two".to_string()),
+            },
+        ];
+
+        let err = merge_layers(&layers).expect_err("two base layers should be rejected");
+        assert!(
+            matches!(&err, ComposeError::InvalidLayerStack { .. }),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// F-07 regression: a `Layer::Base` that is not the first element of the
+    /// stack must be rejected structurally, even when it is the only Base.
+    #[test]
+    fn non_first_base_layer_is_rejected() {
+        let root = fixture_with_rule("root", make_rule("some-rule", SourceLayer::L2, false));
+        let base = fixture_with_rule("base", make_rule("no-panic", SourceLayer::L1, false));
+
+        let layers = vec![
+            MergeLayer {
+                source: &root,
+                layer: ComposeLayer::Root,
+            },
+            MergeLayer {
+                source: &base,
+                layer: ComposeLayer::Base("base".to_string()),
+            },
+        ];
+
+        let err = merge_layers(&layers).expect_err("non-first base layer should be rejected");
+        assert!(
+            matches!(&err, ComposeError::InvalidLayerStack { .. }),
+            "unexpected error: {err}"
+        );
     }
 }

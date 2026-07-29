@@ -215,6 +215,27 @@ pub enum ClientError {
         detail: String,
     },
 
+    /// A pre-existing `cache/<hash>` directory ("cache hit") no longer
+    /// matches its own hash-named directory when re-verified after a
+    /// registry install. `fetch_and_install` only re-verifies cryptographic
+    /// signatures against the freshly-downloaded temp directory; a cache hit
+    /// skips that download entirely, so without this check a durably
+    /// poisoned or corrupted `cache/<hash>` entry would be trusted forever
+    /// (materialization always reads from `cache/<hash>`, never from the
+    /// freshly-verified temp directory).
+    #[error(
+        "registry cache entry for {pack} no longer matches its verified hash: expected \
+         {expected}, got {actual}"
+    )]
+    RegistryCacheTampered {
+        /// The pack name/version being installed (for error context).
+        pack: String,
+        /// The canonical hash verified from the freshly-downloaded registry pack.
+        expected: String,
+        /// The canonical hash recomputed from the on-disk `cache/<hash>` entry.
+        actual: String,
+    },
+
     #[error("cache entry {hash} is missing at {path}")]
     MissingCacheEntry { hash: String, path: PathBuf },
 
@@ -393,6 +414,28 @@ pub enum ClientError {
         /// The underlying template parse error.
         #[source]
         source: Box<frameshift_template::TemplateError>,
+    },
+
+    /// `materialize_persona_rendered_outputs` resolves `extends`/`mixin` exactly
+    /// one level deep (root -> its cached base/mixins), then hands the result
+    /// to `frameshift_compose::Composer`. If the resolved base or mixin itself
+    /// declares its own `extends`/`mixin`, that grandparent layer is never
+    /// composed in -- it would be silently dropped, which is especially
+    /// dangerous when the dropped layer carries inherited L1 safety rules.
+    /// This is a deliberate fail-closed guard rather than an attempt at full
+    /// recursive multi-level composition (out of scope here).
+    #[error(
+        "cannot compose persona {persona:?}: its base/mixin {base:?} itself declares its own \
+         composition ({base_parent}); multi-level composition is not supported"
+    )]
+    UnsupportedMultiLevelComposition {
+        /// The persona whose install/compose was refused.
+        persona: String,
+        /// The base or mixin persona name that itself declares further composition.
+        base: String,
+        /// Human-readable description of what `base` declares (its own `extends`
+        /// target, its own mixins, or both).
+        base_parent: String,
     },
 }
 

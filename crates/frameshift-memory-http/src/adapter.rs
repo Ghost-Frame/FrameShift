@@ -11,8 +11,9 @@ use async_trait::async_trait;
 use frameshift_memory::{
     Filters, HealthStatus, Memory, MemoryAdapter, MemoryError, MemoryId, Metadata,
 };
-use reqwest::{Client, RequestBuilder, StatusCode};
+use reqwest::{Client, RequestBuilder, Response, StatusCode};
 use secrecy::{ExposeSecret, SecretString};
+use serde::de::DeserializeOwned;
 use url::Url;
 
 use crate::dto::{
@@ -354,7 +355,42 @@ impl HttpAdapter {
             _ => MemoryError::ConnectionFailed(format!("{context}: unexpected status {status}")),
         }
     }
+
+    /// Read `resp`'s body into memory and deserialize it as JSON, refusing to
+    /// buffer more than [`MAX_RESPONSE_BODY_BYTES`].
+    ///
+    /// Reads the body chunk by chunk instead of trusting `Content-Length`
+    /// (which may be absent or lie) so a malicious or misbehaving backend
+    /// cannot exhaust process memory by streaming an unbounded response.
+    /// Returns [`MemoryError::Backend`] if the cap is exceeded or the bounded
+    /// bytes fail to parse as `T`.
+    async fn read_bounded_json<T: DeserializeOwned>(
+        mut resp: Response,
+        context: &str,
+    ) -> Result<T, MemoryError> {
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            let chunk = resp.chunk().await.map_err(|e| {
+                MemoryError::Backend(format!("{context}: failed to read response body: {e}"))
+            })?;
+            let Some(chunk) = chunk else { break };
+            if buf.len() + chunk.len() > MAX_RESPONSE_BODY_BYTES {
+                return Err(MemoryError::Backend(format!(
+                    "{context}: response body exceeded {MAX_RESPONSE_BODY_BYTES} byte cap"
+                )));
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        serde_json::from_slice(&buf)
+            .map_err(|e| MemoryError::Backend(format!("{context}: failed to parse response: {e}")))
+    }
 }
+
+/// Maximum size, in bytes, of a response body buffered before JSON
+/// deserialization. Bounds memory use against a misbehaving or malicious
+/// backend regardless of what `Content-Length` claims. 16 MiB comfortably
+/// covers realistic single-memory and paginated-list payloads.
+const MAX_RESPONSE_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // MemoryAdapter impl
@@ -400,10 +436,7 @@ impl MemoryAdapter for HttpAdapter {
             return Err(Self::map_status_error(status, "store"));
         }
 
-        let store_resp: StoreResponse = resp
-            .json()
-            .await
-            .map_err(|e| MemoryError::Backend(format!("store: failed to parse response: {e}")))?;
+        let store_resp: StoreResponse = Self::read_bounded_json(resp, "store").await?;
 
         Ok(MemoryId::from_uuid(store_resp.id))
     }
@@ -466,10 +499,7 @@ impl MemoryAdapter for HttpAdapter {
             return Err(Self::map_status_error(status, "search"));
         }
 
-        let search_resp: SearchResponse = resp
-            .json()
-            .await
-            .map_err(|e| MemoryError::Backend(format!("search: failed to parse response: {e}")))?;
+        let search_resp: SearchResponse = Self::read_bounded_json(resp, "search").await?;
 
         Ok(search_resp
             .results
@@ -502,10 +532,7 @@ impl MemoryAdapter for HttpAdapter {
             return Err(Self::map_status_error(status, "recall"));
         }
 
-        let dto: MemoryDto = resp
-            .json()
-            .await
-            .map_err(|e| MemoryError::Backend(format!("recall: failed to parse response: {e}")))?;
+        let dto: MemoryDto = Self::read_bounded_json(resp, "recall").await?;
 
         Ok(memory_from_dto(dto))
     }
@@ -530,10 +557,7 @@ impl MemoryAdapter for HttpAdapter {
             return Err(Self::map_status_error(status, "list"));
         }
 
-        let list_resp: ListResponse = resp
-            .json()
-            .await
-            .map_err(|e| MemoryError::Backend(format!("list: failed to parse response: {e}")))?;
+        let list_resp: ListResponse = Self::read_bounded_json(resp, "list").await?;
 
         Ok(list_resp.items.into_iter().map(memory_from_dto).collect())
     }
@@ -593,9 +617,7 @@ impl MemoryAdapter for HttpAdapter {
             )));
         }
 
-        let health_resp: HealthResponse = resp.json().await.map_err(|e| {
-            MemoryError::ConnectionFailed(format!("health: failed to parse response: {e}"))
-        })?;
+        let health_resp: HealthResponse = Self::read_bounded_json(resp, "health").await?;
 
         Ok(HealthStatus {
             healthy: health_resp.healthy,

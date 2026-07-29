@@ -2,6 +2,17 @@
 //!
 //! Public registration and login use this primitive behind invite checks,
 //! per-address rate limits, and a process-wide memory-work bound.
+//!
+//! # Pepper rotation
+//!
+//! [`PasswordService`] itself is deliberately single-pepper: it has no
+//! concept of pepper *versions*. Selecting WHICH pepper secret to build a
+//! given `PasswordService` instance from is the caller's responsibility --
+//! `routes::local_auth` picks the pepper matching a stored credential's
+//! `pepper_version` (falling back to the current deployment pepper) before
+//! constructing this type, so an operator can rotate
+//! `LOCAL_AUTH_PASSWORD_PEPPER` without permanently locking out existing
+//! accounts hashed under a previous pepper.
 
 use argon2::password_hash::{PasswordHash, PasswordHasher as _, PasswordVerifier as _, SaltString};
 use argon2::{Algorithm, Argon2, Params, Version};

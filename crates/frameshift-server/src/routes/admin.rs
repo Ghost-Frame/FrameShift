@@ -1,7 +1,6 @@
 //! Account-authenticated administrator publication lifecycle endpoints.
 
 use axum::extract::{Path, Query, State};
-use axum::http::HeaderMap;
 use axum::routing::{delete, get, patch, post};
 use axum::{Extension, Json, Router};
 use chrono::{DateTime, Utc};
@@ -122,8 +121,8 @@ struct ResolvePublicationAppealRequestBody {
 async fn tombstone_pack_route(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthenticatedAccount>,
+    Extension(client_request_id): Extension<ClientRequestId>,
     Path((name, version)): Path<(String, String)>,
-    headers: HeaderMap,
     Json(body): Json<TombstoneRequestBody>,
 ) -> Result<Json<PublicationLifecycleDecisionRecord>, AppError> {
     validate_pack_name(&name)?;
@@ -136,7 +135,7 @@ async fn tombstone_pack_route(
             version,
             actor_account_id: auth.account.id,
             reason: body.reason,
-            request_id: request_id(&headers)?,
+            request_id: required_client_request_id(client_request_id)?,
         })
         .await
         .map(Json)
@@ -147,8 +146,8 @@ async fn tombstone_pack_route(
 async fn suspend_publisher_route(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthenticatedAccount>,
+    Extension(client_request_id): Extension<ClientRequestId>,
     Path(publisher_id): Path<Uuid>,
-    headers: HeaderMap,
     Json(body): Json<SuspendPublisherRequestBody>,
 ) -> Result<Json<PublicationLifecycleDecisionRecord>, AppError> {
     state
@@ -158,7 +157,7 @@ async fn suspend_publisher_route(
             publisher_id,
             actor_account_id: auth.account.id,
             reason_code: body.reason_code,
-            request_id: request_id(&headers)?,
+            request_id: required_client_request_id(client_request_id)?,
         })
         .await
         .map(Json)
@@ -308,15 +307,6 @@ fn lifecycle_cursor(
             "before_created_at and before_id must be supplied together".to_string(),
         )),
     }
-}
-
-/// Parse the mandatory request correlation header as a stable UUID.
-fn request_id(headers: &HeaderMap) -> Result<Uuid, AppError> {
-    headers
-        .get("x-request-id")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| Uuid::parse_str(value).ok())
-        .ok_or_else(|| AppError::BadRequest("x-request-id must be a UUID".to_string()))
 }
 
 /// Require a valid request UUID that was present before tracing middleware ran.

@@ -283,6 +283,38 @@ async fn health_happy_path() {
 }
 
 // ---------------------------------------------------------------------------
+// store -- oversized response body -> Backend (bounded-read cap)
+// ---------------------------------------------------------------------------
+
+/// `store` against a 201 whose body exceeds the bounded-read cap must return
+/// `MemoryError::Backend` instead of buffering the entire body.
+#[tokio::test]
+async fn store_rejects_oversized_response_body() {
+    let server = MockServer::start().await;
+
+    // One byte over the 16 MiB cap enforced by `read_bounded_json`.
+    let oversized_body = vec![b'a'; 16 * 1024 * 1024 + 1];
+
+    Mock::given(method("POST"))
+        .and(path("/store"))
+        .respond_with(ResponseTemplate::new(201).set_body_bytes(oversized_body))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let adapter = make_adapter(&server);
+    let err = adapter
+        .store("hello memory", &[], Metadata::new())
+        .await
+        .expect_err("oversized body must be rejected");
+
+    assert!(
+        matches!(err, MemoryError::Backend(_)),
+        "expected Backend, got: {err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // store -- 401 -> Unauthorized
 // ---------------------------------------------------------------------------
 

@@ -661,6 +661,51 @@ async fn moderation_decision_uses_trusted_bindings() {
 }
 
 #[tokio::test]
+/// Decisions and promotions with no client-supplied `x-request-id` header are
+/// rejected instead of silently accepting a server-generated id, which would
+/// defeat substituted-retry rejection (F-10 regression).
+async fn moderation_mutations_require_client_supplied_request_id() {
+    let fixture = fixture();
+    let decision_path = format!(
+        "/v1/moderation/publication-submissions/{}/decisions",
+        fixture.submission.id
+    );
+    let decision = send(
+        fixture.router.clone(),
+        Method::POST,
+        &decision_path,
+        Some("moderator-token"),
+        None,
+        Some(decision_body(Uuid::new_v4(), "approve")),
+    )
+    .await;
+    assert_eq!(decision.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(decision).await,
+        json!({"error": "x-request-id must be a UUID"})
+    );
+
+    let promotion_path = format!(
+        "/v1/moderation/publication-submissions/{}/promotion",
+        fixture.submission.id
+    );
+    let promotion = send(
+        fixture.router,
+        Method::POST,
+        &promotion_path,
+        Some("moderator-token"),
+        None,
+        Some(json!({ "id": Uuid::new_v4() })),
+    )
+    .await;
+    assert_eq!(promotion.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(promotion).await,
+        json!({"error": "x-request-id must be a UUID"})
+    );
+}
+
+#[tokio::test]
 /// Unknown identity and replay binding fields are rejected instead of ignored.
 async fn moderation_decision_rejects_binding_overrides() {
     let fixture = fixture();
