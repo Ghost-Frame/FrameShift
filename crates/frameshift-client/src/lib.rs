@@ -2015,14 +2015,15 @@ static WRITE_FILE_TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic:
 /// parent directories first.
 ///
 /// Stages the content in a same-directory temp file (`<name>.tmp-<pid>-<n>`),
-/// fsyncs it, then `fs::rename`s it over `path`. Rename within the same
-/// directory is atomic on every POSIX filesystem, so a crash or power loss
-/// mid-write leaves `path` either fully containing the previous content or
-/// fully containing the new content -- never truncated or partially written,
-/// unlike the previous `create(true).truncate(true)` + single `write_all`
-/// implementation this replaces (used for `lock.toml`, `config.toml`, and the
-/// `active` marker, all of which previously hard-errored the whole project on
-/// a truncated read after a crash mid-write).
+/// fsyncs it, then `fs::rename`s it over `path` and fsyncs the parent directory
+/// on Unix. Rename within the same directory is atomic on POSIX filesystems,
+/// so a crash or power loss mid-write leaves `path` either fully containing
+/// the previous content or fully containing the new content -- never
+/// truncated or partially written, unlike the previous
+/// `create(true).truncate(true)` + single `write_all` implementation this
+/// replaces (used for `lock.toml`, `config.toml`, and the `active` marker, all
+/// of which previously hard-errored the whole project on a truncated read
+/// after a crash mid-write).
 ///
 /// Preserves the previous `O_NOFOLLOW` symlink-safety guarantee: refuses to
 /// write through `path` if it already exists as a symlink, instead of
@@ -2090,10 +2091,25 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<(), ClientError> {
         return Err(error);
     }
 
-    fs::rename(&tmp_path, path).map_err(|source| ClientError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
+    if let Err(source) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(ClientError::Io {
+            path: path.to_path_buf(),
+            source,
+        });
+    }
+
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|source| ClientError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+    }
+
+    Ok(())
 }
 
 /// Read the entire contents of `path` as a UTF-8 string, wrapping failures
