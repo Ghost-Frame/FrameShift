@@ -24,6 +24,7 @@ use cmd::grow::GrowArgs;
 use cmd::keys::KeysArgs;
 use cmd::migrate::MigrateArgs;
 use cmd::prefs::PrefsArgs;
+use cmd::publication::PublicationArgs;
 use cmd::publish::PublishArgs;
 use cmd::register::RegisterArgs;
 use cmd::render::RenderArgs;
@@ -121,6 +122,9 @@ enum Command {
 
     /// Publish a persona pack to a directory or registry.
     Publish(PublishArgs),
+
+    /// Review and submit Creator Studio drafts through moderated publication.
+    Publication(PublicationArgs),
 
     /// Register this machine's author key under a handle at the registry.
     Register(RegisterArgs),
@@ -486,6 +490,9 @@ fn run() -> Result<(), RunError> {
         // ------------------------------------------------------------------
         Command::Verify(args) => cmd::verify::run_verify(args).map_err(RunError::from),
         Command::Publish(args) => cmd::publish::run_publish(args).map_err(RunError::from),
+        Command::Publication(args) => {
+            cmd::publication::run_publication(args).map_err(RunError::from)
+        }
         Command::Register(args) => cmd::register::run_register(args).map_err(RunError::from),
         Command::Keys(args) => cmd::keys::run_keys(args).map_err(RunError::from),
         Command::Search(args) => cmd::search::run_search(args).map_err(RunError::from),
@@ -575,6 +582,55 @@ fn conformance_upgrade_warning(
             "{persona}'s conformance baseline score is invalid; cannot evaluate this \
              upgrade (install not blocked)"
         )),
+    }
+}
+
+/// CLI parsing regressions for the human-reviewed publication surface.
+#[cfg(test)]
+mod publication_cli_tests {
+    use super::*;
+    use cmd::publication::PublicationCommand;
+
+    /// Review parsing requires the draft, registry, and publisher selections.
+    #[test]
+    fn parses_publication_review() {
+        let cli = Cli::try_parse_from([
+            "frameshift",
+            "publication",
+            "review",
+            "--draft",
+            "draft-1",
+            "--server",
+            "https://registry.example",
+            "--publisher",
+            "alice",
+        ])
+        .expect("review arguments should parse");
+        assert!(matches!(
+            cli.command,
+            Command::Publication(PublicationArgs {
+                command: PublicationCommand::Review { .. }
+            })
+        ));
+    }
+
+    /// Submit parsing rejects an incomplete human-confirmation boundary.
+    #[test]
+    fn publication_submit_requires_all_confirmations() {
+        let result = Cli::try_parse_from([
+            "frameshift",
+            "publication",
+            "submit",
+            "--draft",
+            "draft-1",
+            "--server",
+            "https://registry.example",
+            "--publisher",
+            "alice",
+            "--confirm-archive-hash",
+            "0101010101010101010101010101010101010101010101010101010101010101",
+        ]);
+        assert!(result.is_err());
     }
 }
 

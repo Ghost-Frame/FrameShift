@@ -588,7 +588,7 @@ pub(crate) fn access_token_from_env() -> Result<Option<SecretString>, CliError> 
 }
 
 /// Resolve a bearer token from explicit, stored-session, or interactive input.
-fn resolve_access_token(server: &str) -> Result<SecretString, CliError> {
+pub(crate) fn resolve_access_token(server: &str) -> Result<SecretString, CliError> {
     resolve_access_token_with(
         server,
         access_token_from_env(),
