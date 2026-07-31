@@ -55,12 +55,24 @@ impl ModeState {
     }
 
     /// Persist mode state to a JSON file, creating parent directories as needed.
+    ///
+    /// The write is atomic: data is serialized to a uniquely-named temp file in
+    /// the same directory and then renamed over the target, mirroring
+    /// `Preferences::save` and `CachedEmbedder::persist_raw`, so a crash or a
+    /// concurrent writer never leaves a half-written `automate.json` that
+    /// `load` would fail to parse.
     pub fn save(&self, path: &Path) -> Result<(), OrchestratorError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let data = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, data)?;
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("automate.json");
+        let tmp_path = path.with_file_name(format!(".{file_name}.tmp.{}", std::process::id()));
+        std::fs::write(&tmp_path, data.as_bytes())?;
+        std::fs::rename(&tmp_path, path)?;
         Ok(())
     }
 }
@@ -119,5 +131,32 @@ mod tests {
         let loaded = ModeState::load(&path).unwrap();
         assert_eq!(loaded.mode, Mode::On);
         assert!((loaded.sensitivity - 0.5).abs() < f32::EPSILON);
+    }
+
+    /// A successful save leaves no leftover temp file behind and produces a
+    /// file `load` can parse cleanly, proving the write is atomic (temp file
+    /// + rename) rather than a direct in-place write.
+    #[test]
+    fn save_leaves_no_temp_file() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("automate.json");
+
+        let state = ModeState {
+            mode: Mode::On,
+            sensitivity: 0.7,
+        };
+        state.save(&path).unwrap();
+
+        assert!(path.exists());
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        // No temp file should remain after a successful save.
+        assert!(leftovers.is_empty());
+        // And the saved file loads cleanly.
+        let loaded = ModeState::load(&path).unwrap();
+        assert_eq!(loaded.mode, Mode::On);
     }
 }

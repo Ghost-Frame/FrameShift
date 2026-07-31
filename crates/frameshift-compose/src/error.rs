@@ -27,4 +27,15 @@ pub enum ComposeError {
         /// Human-readable description of the layer that attempted the override.
         mixin_layer: String,
     },
+
+    /// The composition stack passed to `merge_layers` violates the structural
+    /// invariant that at most one `Layer::Base` may be present, and it must be
+    /// the first element. This is enforced up front so a `Layer::Base` can
+    /// never appear mid-stack or duplicated, which would otherwise let it
+    /// silently defeat L1 protection (SD6) for a rule owned by an earlier base.
+    #[error("invalid composition layer stack: {reason}")]
+    InvalidLayerStack {
+        /// Human-readable description of the structural violation.
+        reason: String,
+    },
 }

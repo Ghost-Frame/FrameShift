@@ -263,7 +263,22 @@ fn resolve_issuer(server: &str, override_value: Option<String>) -> Result<Url, C
                 ));
             }
             config.issuer.ok_or_else(|| {
-                CliError::Account("registry omitted its enabled OIDC issuer".to_string())
+                // A registry running in first-party-only mode reports
+                // enabled=true with no OIDC issuer. `frameshift account login`
+                // only speaks the OIDC browser flow today, so surface an
+                // accurate, actionable message instead of implying the registry
+                // misreported an issuer it never advertised.
+                if config.first_party_enabled {
+                    CliError::Account(
+                        "this registry uses invite-only first-party accounts; \
+                         `frameshift account login` currently supports only OIDC sign-in. \
+                         Sign in through the FrameShift web portal, or set FRAMESHIFT_ACCESS_TOKEN \
+                         to an issued session token for CLI publisher-key commands"
+                            .to_string(),
+                    )
+                } else {
+                    CliError::Account("registry omitted its enabled OIDC issuer".to_string())
+                }
             })
         })?;
     Url::parse(&value).map_err(|error| CliError::Account(format!("invalid OIDC issuer: {error}")))

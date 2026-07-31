@@ -26,14 +26,14 @@ The selected project is always shown in the sidebar. Installing or activating a 
 
 ### Command line
 
-Every release includes both `frameshift`, for people, and `frameshift-mcp`, for agents. Download the archive for your computer, verify it with the matching checksum in `SHA256SUMS`, extract it, and place both binaries somewhere on your `PATH`.
+Every release includes both `frameshift`, for people, and `frameshift-mcp`, for agents. Open the [**FrameShift releases page**](https://github.com/Ghost-Frame/FrameShift/releases) and pick the newest release, then download the archive for your computer, verify it with the matching checksum in `SHA256SUMS`, extract it, and place both binaries somewhere on your `PATH`.
 
 | Platform | Release archive |
 | --- | --- |
-| Linux x64 | [frameshift-linux-x86_64.tar.gz](https://github.com/Ghost-Frame/FrameShift/releases/latest/download/frameshift-linux-x86_64.tar.gz) |
-| Windows x64 | [frameshift-windows-x86_64.zip](https://github.com/Ghost-Frame/FrameShift/releases/latest/download/frameshift-windows-x86_64.zip) |
+| Linux x64 | `frameshift-linux-x86_64.tar.gz` |
+| Windows x64 | `frameshift-windows-x86_64.zip` |
 
-These early-access Windows command-line archives are also unsigned. Verify the archive against `SHA256SUMS` before extracting it. Persona packs downloaded from the registry are separately signature-verified by FrameShift.
+While early-access builds are published as pre-releases, GitHub's "latest" pointer resolves to the most recent full release, so download from the [releases list](https://github.com/Ghost-Frame/FrameShift/releases) rather than a `releases/latest/download/...` URL. These early-access Windows command-line archives are also unsigned. Verify the archive against `SHA256SUMS` before extracting it. Persona packs downloaded from the registry are separately signature-verified by FrameShift.
 
 Confirm the installation:
 
@@ -279,7 +279,7 @@ Both paths write the file each agent expects into `rendered/<target>/`: `CLAUDE.
 
 ### Composition: extends and mixins
 
-A typed pack can `extends` a single base persona and `mixin` a list of others. Composition merges in a fixed order -- base, then each mixin in turn, then the persona itself -- with later layers overriding earlier ones by rule or skill id (last write wins). One invariant is protected: a mixin can never override a base's **L1** rule, and a persona can override an inherited L1 rule only by explicitly opting in. A missing base or an illegal L1 override fails the install. Bases and mixins are resolved from packs already installed in the same project. A freeform pack that declares composition metadata cannot be structurally composed; Frameshift warns and renders its Markdown body unchanged.
+A typed pack can `extends` a single base persona and `mixin` a list of others. Composition merges in a fixed order -- base, then each mixin in turn, then the persona itself -- with later layers overriding earlier ones by rule or skill id (last write wins). One invariant is protected: a mixin can never override a base's **L1** rule, and a persona can override an inherited L1 rule only by explicitly opting in. A missing base or an illegal L1 override fails the install. Composition resolves a single level: a base (or mixin) that itself declares `extends`/`mixin` is rejected at install time rather than silently dropping its own ancestors, so an unsupported multi-level chain can never quietly discard an inherited L1 rule. Bases and mixins are resolved from packs already installed in the same project. A freeform pack that declares composition metadata cannot be structurally composed; Frameshift warns and renders its Markdown body unchanged.
 
 ### Capabilities
 

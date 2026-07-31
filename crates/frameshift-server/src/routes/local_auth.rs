@@ -193,6 +193,7 @@ async fn login_local_account(
     let credential = credential
         .filter(|_| password_matches)
         .ok_or_else(|| AppError::Unauthorized("email or password is incorrect".to_string()))?;
+    warn_if_credential_uses_rotated_out_pepper(&state, &credential);
     let account = state
         .catalog
         .get_account(credential.account_id)
@@ -287,6 +288,11 @@ fn protected_password(password: String) -> Result<SecretString, AppError> {
 }
 
 /// Hash one password on the blocking pool using the deployment pepper.
+///
+/// New hashes always use the CURRENT pepper (never a previous one) so every
+/// freshly created credential is stamped with `pepper_version ==
+/// state.config.first_party_auth.pepper_version` at the call site in
+/// [`register_local_account`].
 async fn hash_password(state: &AppState, password: SecretString) -> Result<String, AppError> {
     let _permit = password_work_permit()?;
     let service = PasswordService::new(state.config.first_party_auth.password_pepper.clone())
@@ -297,15 +303,47 @@ async fn hash_password(state: &AppState, password: SecretString) -> Result<Strin
         .map_err(map_password_hash_error)
 }
 
+/// Select the pepper that was current when `pepper_version` was stamped
+/// beside a stored credential.
+///
+/// Falls back to the CURRENT deployment pepper when `pepper_version` already
+/// matches it, or when no matching entry exists in
+/// `first_party_auth.previous_peppers` (an operator error or a version older
+/// than any retained pepper). The fallback is safe rather than fail-closed:
+/// verifying against the wrong pepper is already indistinguishable from an
+/// ordinary password mismatch in [`PasswordService::verify_password`], so no
+/// credential can be accepted with an incorrect pepper either way -- this
+/// choice only affects which normal rejection path is taken.
+fn pepper_for_version(state: &AppState, pepper_version: i16) -> SecretString {
+    if pepper_version == state.config.first_party_auth.pepper_version {
+        return state.config.first_party_auth.password_pepper.clone();
+    }
+    state
+        .config
+        .first_party_auth
+        .previous_peppers
+        .get(&pepper_version)
+        .cloned()
+        .unwrap_or_else(|| state.config.first_party_auth.password_pepper.clone())
+}
+
 /// Verify a credential or perform equivalent Argon2 work for an unknown email.
+///
+/// Verification uses the pepper that was active when the stored credential's
+/// `pepper_version` was stamped (see [`pepper_for_version`]), not
+/// unconditionally the current deployment pepper -- rotating
+/// `LOCAL_AUTH_PASSWORD_PEPPER` would otherwise permanently lock out every
+/// existing account (F-05).
 async fn verify_or_absorb_password_work(
     state: &AppState,
     password: SecretString,
     credential: Option<&AccountPasswordCredentialRecord>,
 ) -> Result<bool, AppError> {
     let _permit = password_work_permit()?;
-    let service = PasswordService::new(state.config.first_party_auth.password_pepper.clone())
-        .map_err(map_password_configuration_error)?;
+    let pepper = credential
+        .map(|record| pepper_for_version(state, record.pepper_version))
+        .unwrap_or_else(|| state.config.first_party_auth.password_pepper.clone());
+    let service = PasswordService::new(pepper).map_err(map_password_configuration_error)?;
     let encoded_hash = credential.map(|record| record.password_hash.clone());
     tokio::task::spawn_blocking(move || match encoded_hash {
         Some(encoded_hash) => service
@@ -318,6 +356,33 @@ async fn verify_or_absorb_password_work(
     })
     .await
     .map_err(|_| AppError::Internal("password verification task failed".to_string()))?
+}
+
+/// Log (without persisting) that a successful login verified against a
+/// rotated-out pepper version.
+///
+/// TODO(F-05 follow-up): once `CatalogBackend` exposes a mutator for
+/// [`AccountPasswordCredentialRecord`] (there is currently none -- only
+/// [`frameshift_catalog::CatalogBackend::get_account_password_credential`]
+/// exists), re-hash this password with the CURRENT pepper here and persist
+/// it so the credential migrates off the rotated-out pepper. Deliberately
+/// NOT inventing a schema change to do that persistence now; the login above
+/// already verified correctly against the credential's own historical
+/// pepper, so there is no security gap, only a missed migration opportunity
+/// until that catalog mutator exists.
+fn warn_if_credential_uses_rotated_out_pepper(
+    state: &AppState,
+    credential: &AccountPasswordCredentialRecord,
+) {
+    if credential.pepper_version != state.config.first_party_auth.pepper_version {
+        tracing::info!(
+            account_id = %credential.account_id,
+            credential_pepper_version = credential.pepper_version,
+            current_pepper_version = state.config.first_party_auth.pepper_version,
+            "first-party login verified against a rotated-out pepper version; \
+             rehash-on-login is not yet wired pending a catalog credential mutator"
+        );
+    }
 }
 
 /// Reserve one bounded Argon2 memory-work slot or reject excess parallel work.

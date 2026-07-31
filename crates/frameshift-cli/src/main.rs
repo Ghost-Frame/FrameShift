@@ -101,6 +101,10 @@ enum Command {
     Diff(DiffArgs),
 
     /// Render a persona source to markdown.
+    ///
+    /// Renders the persona's own source only; `extends`/`mixin` composition
+    /// is NOT resolved (unlike installing/activating the persona), so the
+    /// preview for a composed persona will differ from what gets installed.
     Render(RenderArgs),
 
     /// Migrate legacy project files to the central store.

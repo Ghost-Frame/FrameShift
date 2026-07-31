@@ -356,11 +356,18 @@ pub fn read_entries(
         if trimmed.is_empty() {
             continue;
         }
-        let entry: GrowthEntry = serde_json::from_str(trimmed).map_err(|e| GrowthError::Io {
-            path: path.clone(),
-            source: std::io::Error::new(std::io::ErrorKind::InvalidData, e),
-        })?;
-        entries.push(entry);
+        // A single truncated or corrupt line (realistic given the non-atomic
+        // append above) must not take down the whole read -- skip it with a
+        // warning and keep the entries parsed so far and any that follow.
+        match serde_json::from_str::<GrowthEntry>(trimmed) {
+            Ok(entry) => entries.push(entry),
+            Err(e) => {
+                eprintln!(
+                    "frameshift-growth: skipping unparsable line in {}: {e}",
+                    path.display()
+                );
+            }
+        }
     }
 
     Ok(entries)
@@ -850,6 +857,46 @@ mod tests {
         }
         let entries = read_entries(tmp.path(), "p1", "rust", Scope::Project).unwrap();
         assert_eq!(entries.len(), 3);
+    }
+
+    #[test]
+    /// A malformed line (e.g. a truncated append) is skipped, and every other
+    /// valid line is still returned rather than the whole read aborting.
+    fn read_entries_skips_malformed_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let entry = GrowthEntry {
+            ts: "2026-05-24T14:30:00Z".to_string(),
+            session: "s1".to_string(),
+            project_id: "p1".to_string(),
+            persona: "rust".to_string(),
+            auto_selected: false,
+            task: None,
+            intent: None,
+            text: "entry 0".to_string(),
+            scope: Scope::Project,
+        };
+        append_jsonl(tmp.path(), "p1", "rust", &entry).unwrap();
+
+        // Simulate a truncated/corrupt line from a non-atomic append.
+        let path = tmp.path().join("projects/p1/personas/rust/growth.jsonl");
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        use std::io::Write as _;
+        file.write_all(b"{\"ts\":\"2026-05-24T14:31:00Z\",\"broken\n")
+            .unwrap();
+
+        let mut entry2 = entry.clone();
+        entry2.ts = "2026-05-24T14:32:00Z".to_string();
+        entry2.text = "entry 2".to_string();
+        append_jsonl(tmp.path(), "p1", "rust", &entry2).unwrap();
+
+        let entries = read_entries(tmp.path(), "p1", "rust", Scope::Project).unwrap();
+        assert_eq!(
+            entries.len(),
+            2,
+            "the malformed line is skipped, both valid entries remain"
+        );
+        assert_eq!(entries[0].text, "entry 0");
+        assert_eq!(entries[1].text, "entry 2");
     }
 
     #[test]

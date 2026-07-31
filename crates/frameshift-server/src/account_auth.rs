@@ -7,19 +7,31 @@
 
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use url::Url;
 
 use crate::config::OidcConfig;
 
 /// Maximum accepted discovery or JWKS response size.
 const MAX_OIDC_DOCUMENT_BYTES: usize = 1024 * 1024;
+
+/// Minimum interval between forced (unknown-`kid`) JWKS refreshes.
+///
+/// An unauthenticated caller can trivially present a random `kid` on every
+/// request; without this throttle each such request would force a live
+/// network fetch against the provider, an amplification / DoS vector that
+/// costs nothing to trigger and can stall verification for every other
+/// caller behind the provider's round trip. At most one forced refresh is
+/// honored per cooldown window; genuine key rotation still resolves because
+/// the very next eligible `verify` call after the cooldown elapses performs
+/// a real fetch.
+const FORCED_REFRESH_COOLDOWN: Duration = Duration::from_secs(5);
 
 /// Identity claims retained after successful bearer-token validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,8 +114,16 @@ pub struct OidcVerifier {
     jwks_url: RwLock<Option<Url>>,
     /// Last successfully fetched key set.
     cache: RwLock<Option<CachedJwks>>,
+    /// Serializes provider refreshes without blocking readers of fresh cached keys.
+    refresh_lock: Mutex<()>,
     /// Parsed asymmetric algorithm allowlist.
     algorithms: Vec<Algorithm>,
+    /// Monotonic time of the most recent forced (unknown-`kid`) JWKS refresh.
+    ///
+    /// Bounds an unauthenticated caller's ability to force live provider
+    /// fetches by presenting a stream of unknown `kid` values -- see
+    /// [`FORCED_REFRESH_COOLDOWN`] and [`OidcVerifier::forced_refresh_keys`].
+    last_forced_refresh: RwLock<Option<Instant>>,
 }
 
 /// Construction, retrieval, and validation behavior for [`OidcVerifier`].
@@ -147,7 +167,9 @@ impl OidcVerifier {
             client,
             jwks_url: RwLock::new(jwks_url),
             cache: RwLock::new(None),
+            refresh_lock: Mutex::new(()),
             algorithms,
+            last_forced_refresh: RwLock::new(None),
         })))
     }
 
@@ -195,6 +217,13 @@ impl OidcVerifier {
     }
 
     /// Return fresh keys, refresh expired keys, or use bounded stale data on outage.
+    ///
+    /// The network fetch (discovery plus JWKS retrieval) runs WITHOUT holding
+    /// the cache lock: only the brief read of a still-fresh cache and the
+    /// brief write that stores a freshly fetched result take the lock. A
+    /// separate refresh lock plus a second cache check serializes provider
+    /// traffic while letting concurrent callers reuse the first completed
+    /// refresh.
     async fn keys(&self, force_refresh: bool) -> Result<JwkSet, OidcAuthError> {
         if !force_refresh {
             if let Some(cached) = self.cache.read().await.as_ref() {
@@ -203,9 +232,9 @@ impl OidcVerifier {
                 }
             }
         }
-        let mut cache = self.cache.write().await;
+        let _refresh_guard = self.refresh_lock.lock().await;
         if !force_refresh {
-            if let Some(cached) = cache.as_ref() {
+            if let Some(cached) = self.cache.read().await.as_ref() {
                 if cached.fetched_at.elapsed() <= self.config.jwks_cache_ttl {
                     return Ok(cached.keys.clone());
                 }
@@ -217,6 +246,7 @@ impl OidcVerifier {
         };
         match fetched {
             Ok(keys) if !keys.keys.is_empty() => {
+                let mut cache = self.cache.write().await;
                 *cache = Some(CachedJwks {
                     keys: keys.clone(),
                     fetched_at: Instant::now(),
@@ -226,13 +256,38 @@ impl OidcVerifier {
             Ok(_) => Err(OidcAuthError::ProviderUnavailable),
             Err(error) => {
                 let stale_limit = self.config.jwks_cache_ttl + self.config.jwks_stale_ttl;
-                cache
+                self.cache
+                    .read()
+                    .await
                     .as_ref()
                     .filter(|cached| cached.fetched_at.elapsed() <= stale_limit)
                     .map(|cached| cached.keys.clone())
                     .ok_or(error)
             }
         }
+    }
+
+    /// Perform a cooldown-throttled forced JWKS refresh for an unrecognized `kid`.
+    ///
+    /// At most one forced (`force_refresh = true`) fetch is allowed per
+    /// [`FORCED_REFRESH_COOLDOWN`]; an attempt inside the cooldown returns
+    /// [`OidcAuthError::InvalidToken`] without ever reaching the network,
+    /// which is the same outcome an unrecognized key id produces anyway. The
+    /// throttle lock is held only long enough to check and record the
+    /// attempt timestamp -- never across the fetch itself -- so this cannot
+    /// itself become a lock-contention amplifier.
+    async fn forced_refresh_keys(&self) -> Result<JwkSet, OidcAuthError> {
+        {
+            let mut last = self.last_forced_refresh.write().await;
+            let now = Instant::now();
+            if let Some(previous) = *last {
+                if now.duration_since(previous) < FORCED_REFRESH_COOLDOWN {
+                    return Err(OidcAuthError::InvalidToken);
+                }
+            }
+            *last = Some(now);
+        }
+        self.keys(true).await
     }
 
     /// Validate a token against a particular key set, refreshing once for rotation.
@@ -245,7 +300,7 @@ impl OidcVerifier {
         let mut keys = self.keys(false).await?;
         let mut key = keys.find(key_id);
         if key.is_none() {
-            keys = self.keys(true).await?;
+            keys = self.forced_refresh_keys().await?;
             key = keys.find(key_id);
         }
         let decoding_key = DecodingKey::from_jwk(key.ok_or(OidcAuthError::InvalidToken)?)
@@ -341,8 +396,8 @@ fn discovery_url(issuer: &str) -> Result<Url, OidcAuthError> {
 #[cfg(test)]
 /// Unit tests for OIDC configuration rejection before network access.
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use axum::extract::State;
     use axum::http::StatusCode;
@@ -364,10 +419,19 @@ mod tests {
         jwks: Arc<RwLock<Value>>,
         /// Whether the provider should return a temporary outage.
         unavailable: Arc<AtomicBool>,
+        /// Count of JWKS document requests actually received by the provider.
+        requests: Arc<AtomicUsize>,
+        /// Artificial provider latency used to make refresh-concurrency tests deterministic.
+        delay_ms: Arc<AtomicU64>,
     }
 
     /// Return the current JWKS document or a temporary provider failure.
     async fn serve_jwks(State(state): State<TestProviderState>) -> Response {
+        state.requests.fetch_add(1, Ordering::SeqCst);
+        let delay_ms = state.delay_ms.load(Ordering::SeqCst);
+        if delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
         if state.unavailable.load(Ordering::SeqCst) {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
@@ -383,6 +447,8 @@ mod tests {
         let state = TestProviderState {
             jwks: Arc::new(RwLock::new(initial_jwks)),
             unavailable: Arc::new(AtomicBool::new(false)),
+            requests: Arc::new(AtomicUsize::new(0)),
+            delay_ms: Arc::new(AtomicU64::new(0)),
         };
         let router = Router::new()
             .route("/jwks", get(serve_jwks))
@@ -532,6 +598,115 @@ mod tests {
         assert_eq!(
             verifier.verify(&rotated).await,
             Err(OidcAuthError::ProviderUnavailable)
+        );
+        task.abort();
+    }
+
+    /// Repeated unknown key ids inside the forced-refresh cooldown must not
+    /// each force a live provider fetch (F-03 DoS/amplification regression).
+    #[tokio::test]
+    async fn unknown_kid_throttles_forced_refresh_within_cooldown() {
+        let seed = [33_u8; 32];
+        let (issuer, provider, task) =
+            start_provider(json!({"keys": [jwk(seed, "key-one")]})).await;
+        let config = OidcConfig {
+            enabled: true,
+            issuer: issuer.clone(),
+            audience: "frameshift-api".to_string(),
+            jwks_url: format!("{issuer}/jwks"),
+            allowed_algorithms: vec!["EdDSA".to_string()],
+            // A long fresh-cache TTL isolates the forced-refresh cooldown as
+            // the only thing that can trigger a second fetch in this test.
+            jwks_cache_ttl: Duration::from_secs(300),
+            jwks_stale_ttl: Duration::from_secs(300),
+            clock_skew: Duration::ZERO,
+            fresh_auth_max_age: Duration::from_secs(300),
+        };
+        let verifier = OidcVerifier::from_config(&config).unwrap().unwrap();
+        let now = unix_now();
+
+        // Warm the cache with one legitimate verification so the baseline
+        // fetch count below reflects only the forced-refresh attempts.
+        let valid = token(
+            seed,
+            "key-one",
+            json!({"iss":issuer,"sub":"a","aud":"frameshift-api","exp":now+300}),
+        );
+        assert!(verifier.verify(&valid).await.is_ok());
+        let baseline = provider.requests.load(Ordering::SeqCst);
+
+        let unknown_one = token(
+            seed,
+            "unknown-kid-one",
+            json!({"iss":issuer,"sub":"b","aud":"frameshift-api","exp":now+300}),
+        );
+        let unknown_two = token(
+            seed,
+            "unknown-kid-two",
+            json!({"iss":issuer,"sub":"c","aud":"frameshift-api","exp":now+300}),
+        );
+        assert_eq!(
+            verifier.verify(&unknown_one).await,
+            Err(OidcAuthError::InvalidToken)
+        );
+        assert_eq!(
+            verifier.verify(&unknown_two).await,
+            Err(OidcAuthError::InvalidToken)
+        );
+
+        // Only the first unknown kid may force a live fetch; the second must
+        // be throttled by the cooldown and never reach the provider.
+        assert_eq!(
+            provider.requests.load(Ordering::SeqCst) - baseline,
+            1,
+            "at most one forced JWKS fetch may occur per cooldown window"
+        );
+        task.abort();
+    }
+
+    /// Concurrent callers that observe an expired cache share one provider refresh.
+    #[tokio::test]
+    async fn expired_cache_refresh_is_single_flight() {
+        let seed = [44_u8; 32];
+        let (issuer, provider, task) =
+            start_provider(json!({"keys": [jwk(seed, "key-one")]})).await;
+        let config = OidcConfig {
+            enabled: true,
+            issuer: issuer.clone(),
+            audience: "frameshift-api".to_string(),
+            jwks_url: format!("{issuer}/jwks"),
+            allowed_algorithms: vec!["EdDSA".to_string()],
+            jwks_cache_ttl: Duration::from_millis(100),
+            jwks_stale_ttl: Duration::from_secs(300),
+            clock_skew: Duration::ZERO,
+            fresh_auth_max_age: Duration::from_secs(300),
+        };
+        let verifier = OidcVerifier::from_config(&config).unwrap().unwrap();
+        let now = unix_now();
+        let valid = token(
+            seed,
+            "key-one",
+            json!({"iss":issuer,"sub":"account","aud":"frameshift-api","exp":now+300}),
+        );
+        assert!(verifier.verify(&valid).await.is_ok());
+        tokio::time::sleep(Duration::from_millis(110)).await;
+        let baseline = provider.requests.load(Ordering::SeqCst);
+        provider.delay_ms.store(50, Ordering::SeqCst);
+
+        let mut requests = Vec::new();
+        for _ in 0..8 {
+            let verifier = Arc::clone(&verifier);
+            let valid = valid.clone();
+            requests.push(tokio::spawn(async move { verifier.verify(&valid).await }));
+        }
+        for request in requests {
+            assert!(request.await.unwrap().is_ok());
+        }
+
+        assert_eq!(
+            provider.requests.load(Ordering::SeqCst) - baseline,
+            1,
+            "expired-cache callers must share one JWKS provider refresh"
         );
         task.abort();
     }

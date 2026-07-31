@@ -947,6 +947,49 @@ async fn submission_get_is_account_scoped() {
     assert_ne!(fixture.owner_account_id, fixture.foreign_account_id);
 }
 
+/// A withdrawal with no client-supplied `x-request-id` header is rejected
+/// instead of silently accepting a server-generated id, which would defeat
+/// substituted-retry rejection (F-10 regression).
+#[tokio::test]
+async fn submission_withdrawal_requires_client_supplied_request_id() {
+    let fixture = route_fixture();
+    let submission_id = Uuid::new_v4();
+    let created = send_submission(
+        &fixture,
+        Some("owner-token"),
+        &fixture.signing_key,
+        submission_id,
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::OK);
+    let lifecycle_router = app(test_state(&fixture.catalog, &fixture.public_objects));
+    let response = lifecycle_router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!(
+                    "/v1/publication-submissions/{submission_id}/withdraw"
+                ))
+                .header("authorization", "Bearer owner-token")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "id": Uuid::new_v4(),
+                        "reason_code": "owner.cancelled"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(response).await["error"],
+        "x-request-id must be a UUID"
+    );
+}
+
 /// Owner withdrawal is account-bound, header-bound, atomic, and exactly retryable.
 #[tokio::test]
 async fn submission_withdrawal_enforces_owner_and_idempotency() {

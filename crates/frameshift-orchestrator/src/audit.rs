@@ -65,10 +65,19 @@ impl AuditLog {
             if trimmed.is_empty() {
                 continue;
             }
-            let t: Transition = serde_json::from_str(trimmed)?;
-            entries.push_back(t);
-            if max > 0 && entries.len() > max {
-                entries.pop_front();
+            // A single corrupt line must not hard-fail the whole load -- the
+            // daemon already tolerates this via `unwrap_or_default`, so skip
+            // the bad line with a warning and keep every other entry loadable.
+            match serde_json::from_str::<Transition>(trimmed) {
+                Ok(t) => {
+                    entries.push_back(t);
+                    if max > 0 && entries.len() > max {
+                        entries.pop_front();
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "skipping unparsable audit log line");
+                }
             }
         }
         Ok(AuditLog {
@@ -219,5 +228,36 @@ mod tests {
         assert_eq!(loaded.entries.len(), 3, "only the 3 most recent retained");
         assert_eq!(loaded.entries.first().unwrap().to, "p2");
         assert_eq!(loaded.entries.last().unwrap().to, "p4");
+    }
+
+    /// A malformed line (e.g. from a non-atomic append) is skipped rather than
+    /// aborting the whole load; every valid transition is still returned.
+    #[test]
+    fn load_skips_malformed_line_and_keeps_valid_entries() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("audit.jsonl");
+
+        let mut log = AuditLog::default();
+        log.append(&path, make_transition(None, "alpha")).unwrap();
+
+        // Append a corrupt line directly, simulating a truncated write.
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"{\"timestamp\":\"broken\n").unwrap();
+
+        log.append(&path, make_transition(Some("alpha"), "beta"))
+            .unwrap();
+
+        let loaded = AuditLog::load(&path).unwrap();
+        assert_eq!(
+            loaded.entries.len(),
+            2,
+            "the malformed line is skipped, both valid transitions remain"
+        );
+        assert_eq!(loaded.entries[0].to, "alpha");
+        assert_eq!(loaded.entries[1].to, "beta");
     }
 }

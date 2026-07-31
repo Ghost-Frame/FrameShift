@@ -1406,6 +1406,55 @@ async fn send_on_router(
         .unwrap()
 }
 
+/// Send one unauthenticated request through a shared router so per-IP
+/// limiter state persists across calls. Uses an explicit `x-forwarded-for`
+/// source address (with `trust_forwarded_for` enabled by the caller's
+/// config) because `tower::ServiceExt::oneshot` never populates a real
+/// socket `ConnectInfo` for the default `PeerIpKeyExtractor` to read.
+async fn send_anonymous(
+    router: &axum::Router,
+    path: &str,
+) -> axum::http::Response<axum::body::Body> {
+    router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(path)
+                .header("x-forwarded-for", "10.0.0.9")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+/// An anonymous flood against the account surface is bounded by the per-IP
+/// abuse limit before `require_account` ever runs (F-08 regression).
+///
+/// The first request still reaches `require_account` and is rejected `401`
+/// for lacking a bearer token; the second request must never reach that
+/// authentication work at all -- it is rejected `429` by the per-IP layer.
+#[tokio::test]
+async fn account_surface_bounds_anonymous_floods_by_source_address() {
+    let mut state = test_state(MockCatalog::new(), Some(FakeVerifier::new()));
+    let mut config = (*state.config).clone();
+    config.abuse_rate_per_min = 1;
+    config.trust_forwarded_for = true;
+    state.config = Arc::new(config);
+    let router = app(state);
+
+    let first = send_anonymous(&router, "/v1/account").await;
+    assert_eq!(first.status(), StatusCode::UNAUTHORIZED);
+    let second = send_anonymous(&router, "/v1/account").await;
+    assert_eq!(
+        second.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "the per-IP abuse limit must reject the second anonymous request \
+         before account authentication runs"
+    );
+}
+
 /// One account exhausting its identity budget is rejected while another proceeds.
 #[tokio::test]
 async fn account_rate_limit_bounds_each_account_independently() {

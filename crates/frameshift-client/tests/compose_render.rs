@@ -132,6 +132,121 @@ extends = "base@0.1.0"
     );
 }
 
+/// Installing a child pack that `extends` a base which itself `extends` a
+/// grandparent must hard-fail instead of silently dropping the grandparent's
+/// rules. The composer only resolves one level (child -> base), so composing
+/// anyway would produce a child persona whose effective ruleset is missing
+/// everything the grandparent contributed to the base -- most dangerous when
+/// that dropped layer carries inherited L1 safety rules.
+#[test]
+fn install_fails_when_base_itself_declares_extends() {
+    let temp = TempDir::new().expect("tempdir");
+    let data_root = temp.path().join("data-root");
+    let project_root = temp.path().join("project");
+    fs::create_dir_all(&project_root).expect("create project");
+
+    let client = Client::new(ClientOptions {
+        data_root: data_root.clone(),
+        config_root: None,
+        vault: None,
+    });
+
+    // Grandparent pack: typed source with one L1 rule, no composition of its own.
+    let grandparent_dir = temp.path().join("grandparent-pack");
+    write_pack_manifest(
+        &grandparent_dir,
+        r#"
+schema_version = 1
+name = "grandparent"
+author_handle = "alice"
+author_pubkey = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+version = "0.1.0"
+"#,
+        &[("AGENTS.md", "# grandparent\n")],
+    );
+    source_with_l1_rule("grandparent", "grandparent-rule", "Grandparent rule text.")
+        .write_to_dir(&grandparent_dir)
+        .expect("write grandparent source");
+
+    client
+        .install(InstallRequest {
+            project_root: project_root.clone(),
+            spec: PersonaSpec {
+                name: "grandparent".to_string(),
+                version: "0.1.0".to_string(),
+            },
+            source: InstallSource::LocalPath(grandparent_dir),
+        })
+        .expect("install grandparent");
+
+    // Base pack: one supported level of composition, extends grandparent.
+    let base_dir = temp.path().join("base-pack");
+    write_pack_manifest(
+        &base_dir,
+        r#"
+schema_version = 1
+name = "base"
+author_handle = "alice"
+author_pubkey = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+version = "0.1.0"
+extends = "grandparent@0.1.0"
+"#,
+        &[],
+    );
+    source_with_l1_rule("base", "base-rule", "Base rule text.")
+        .write_to_dir(&base_dir)
+        .expect("write base source");
+
+    client
+        .install(InstallRequest {
+            project_root: project_root.clone(),
+            spec: PersonaSpec {
+                name: "base".to_string(),
+                version: "0.1.0".to_string(),
+            },
+            source: InstallSource::LocalPath(base_dir),
+        })
+        .expect("install base (one level of composition is supported)");
+
+    // Child pack: extends "base@0.1.0", which itself extends grandparent --
+    // this second level must be rejected rather than silently dropped.
+    let child_dir = temp.path().join("child-pack");
+    write_pack_manifest(
+        &child_dir,
+        r#"
+schema_version = 1
+name = "child"
+author_handle = "alice"
+author_pubkey = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+version = "0.1.0"
+extends = "base@0.1.0"
+"#,
+        &[],
+    );
+    source_with_l1_rule("child", "child-rule", "Child rule text.")
+        .write_to_dir(&child_dir)
+        .expect("write child source");
+
+    let err = client
+        .install(InstallRequest {
+            project_root: project_root.clone(),
+            spec: PersonaSpec {
+                name: "child".to_string(),
+                version: "0.1.0".to_string(),
+            },
+            source: InstallSource::LocalPath(child_dir),
+        })
+        .expect_err("install must fail closed when base itself declares extends");
+
+    match &err {
+        ClientError::UnsupportedMultiLevelComposition { persona, base, .. } => {
+            assert_eq!(persona, "child");
+            assert_eq!(base, "base");
+        }
+        other => panic!("expected ClientError::UnsupportedMultiLevelComposition, got {other}"),
+    }
+}
+
 /// Installing a pack that declares `extends` for a base that was never
 /// installed must hard-fail with `ClientError::Compose(ComposeError::Unresolved)`.
 #[test]

@@ -2,9 +2,11 @@
 //!
 //! Records a user override event into the per-project preference store.
 
+use std::path::Path;
+
 use clap::Args;
 use frameshift_client::Client;
-use frameshift_orchestrator::Preferences;
+use frameshift_orchestrator::{Intent, Preferences};
 
 use crate::util::CliError;
 
@@ -38,31 +40,10 @@ pub fn run_feedback(client: &Client, args: FeedbackArgs) -> Result<(), CliError>
     let state_dir = client.orchestrator_state_dir(&project_root)?;
     let prefs_path = state_dir.join("automate-prefs.json");
 
-    let mut prefs = Preferences::load(&prefs_path).unwrap_or_default();
-
     // Parse intent if provided.
-    let intent = args.intent.as_deref().and_then(|s| {
-        use frameshift_orchestrator::Intent;
-        match s.to_lowercase().as_str() {
-            "implementation" => Some(Intent::Implementation),
-            "debugging" => Some(Intent::Debugging),
-            "review" => Some(Intent::Review),
-            "security" => Some(Intent::Security),
-            "writing" => Some(Intent::Writing),
-            "ops" => Some(Intent::Ops),
-            "testing" => Some(Intent::Testing),
-            "refactoring" => Some(Intent::Refactoring),
-            "performance" => Some(Intent::Performance),
-            "design" => Some(Intent::Design),
-            _ => None,
-        }
-    });
+    let intent = args.intent.as_deref().and_then(parse_intent);
 
-    prefs.record_override_with_intent(args.auto_pick.as_deref(), &args.chosen, intent);
-
-    prefs
-        .save(&prefs_path)
-        .map_err(|e| CliError::Orchestrator(e.to_string()))?;
+    record_feedback_override(&prefs_path, args.auto_pick.as_deref(), &args.chosen, intent)?;
 
     println!(
         "recorded override: {} -> {}{}",
@@ -74,4 +55,99 @@ pub fn run_feedback(client: &Client, args: FeedbackArgs) -> Result<(), CliError>
     );
 
     Ok(())
+}
+
+/// Parse a free-form `--intent` string into the orchestrator's `Intent` enum.
+///
+/// Returns `None` for any string that does not match a known intent
+/// (case-insensitive); the caller treats this the same as "no intent given".
+fn parse_intent(s: &str) -> Option<Intent> {
+    match s.to_lowercase().as_str() {
+        "implementation" => Some(Intent::Implementation),
+        "debugging" => Some(Intent::Debugging),
+        "review" => Some(Intent::Review),
+        "security" => Some(Intent::Security),
+        "writing" => Some(Intent::Writing),
+        "ops" => Some(Intent::Ops),
+        "testing" => Some(Intent::Testing),
+        "refactoring" => Some(Intent::Refactoring),
+        "performance" => Some(Intent::Performance),
+        "design" => Some(Intent::Design),
+        _ => None,
+    }
+}
+
+/// Load preferences from `prefs_path`, record the override, and persist them.
+///
+/// `Preferences::load` already returns `Ok(default)` when the file is absent
+/// (first run for this project); any other failure (unreadable file, corrupt
+/// JSON) is propagated here instead of being swallowed, so a subsequent
+/// `save()` never silently replaces a corrupt-but-otherwise-present store
+/// with fresh defaults and destroys previously learned per-persona bias
+/// (F-13). Mirrors `cmd/prefs.rs` and `cmd/use_persona.rs::record_persona_use`.
+fn record_feedback_override(
+    prefs_path: &Path,
+    auto_pick: Option<&str>,
+    chosen: &str,
+    intent: Option<Intent>,
+) -> Result<(), CliError> {
+    let mut prefs =
+        Preferences::load(prefs_path).map_err(|e| CliError::Orchestrator(e.to_string()))?;
+    prefs.record_override_with_intent(auto_pick, chosen, intent);
+    prefs
+        .save(prefs_path)
+        .map_err(|e| CliError::Orchestrator(e.to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+/// Regression tests for the feedback subcommand's handling of the
+/// preferences store.
+mod tests {
+    use super::*;
+
+    /// A corrupt `automate-prefs.json` must make the feedback flow fail
+    /// loudly (F-13) instead of silently overwriting the file with fresh
+    /// defaults via `unwrap_or_default()` + `save()`. The file's original
+    /// (corrupt) bytes must also be left untouched -- proof that `save()`
+    /// was never reached.
+    #[test]
+    fn corrupt_prefs_file_errors_and_is_left_unchanged() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prefs_path = tmp.path().join("automate-prefs.json");
+        let corrupt = "{ this is not valid json";
+        std::fs::write(&prefs_path, corrupt).expect("write corrupt prefs");
+
+        let result = record_feedback_override(&prefs_path, Some("rust"), "security", None);
+
+        assert!(
+            result.is_err(),
+            "corrupt prefs file must surface as an error, not be silently replaced"
+        );
+
+        let after = std::fs::read_to_string(&prefs_path).expect("read prefs after call");
+        assert_eq!(
+            after, corrupt,
+            "corrupt prefs file must be left untouched, not overwritten with defaults"
+        );
+    }
+
+    /// A healthy (or absent) prefs file still records the override normally.
+    #[test]
+    fn healthy_prefs_file_records_override() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prefs_path = tmp.path().join("automate-prefs.json");
+
+        record_feedback_override(&prefs_path, Some("rust"), "security", None)
+            .expect("record_feedback_override should succeed");
+
+        let prefs = Preferences::load(&prefs_path).expect("load prefs");
+        assert!(
+            prefs.bias_for("security") > 0.0,
+            "chosen persona should be biased upward"
+        );
+    }
 }

@@ -64,6 +64,7 @@
 //! | `INVITE_TURNSTILE_VERIFY_URL` | Cloudflare Siteverify | Turnstile verification endpoint |
 //! | `LOCAL_AUTH_PASSWORD_PEPPER` | `""` | Credential-broker password pepper; empty disables first-party auth |
 //! | `LOCAL_AUTH_PEPPER_VERSION` | `1` | Positive version stored beside password hashes |
+//! | `LOCAL_AUTH_PREVIOUS_PEPPERS` | `""` | Comma-separated `version:secret` entries for peppers rotated out of `LOCAL_AUTH_PASSWORD_PEPPER`; lets credentials hashed under an older pepper version keep verifying instead of being permanently locked out by rotation |
 //! | `LOCAL_AUTH_ISSUER` | FrameShift first-party URL | Stable issuer written to local account rows |
 //! | `LOCAL_AUTH_COOKIE_NAME` | `__Host-frameshift_session` | Secure browser session cookie name |
 //! | `LOCAL_AUTH_INVITE_TTL_SECS` | `604800` | Lifetime of reviewer-issued invitations |
@@ -77,6 +78,7 @@
 //! `FRAMESHIFT_ADMIN_PUBKEYS` setting and publisher admission setting retain
 //! their historical prefix for configuration compatibility.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -197,6 +199,17 @@ pub struct FirstPartyAuthConfig {
     pub password_pepper: SecretString,
     /// Positive pepper version stored beside newly created hashes.
     pub pepper_version: i16,
+    /// Pepper values rotated out of `password_pepper`, keyed by the
+    /// `pepper_version` that was current when they were stamped beside a
+    /// stored credential.
+    ///
+    /// Rotating `LOCAL_AUTH_PASSWORD_PEPPER` (and bumping
+    /// `LOCAL_AUTH_PEPPER_VERSION`) without retaining the prior pepper here
+    /// would permanently lock out every existing account, because
+    /// verification would always run Argon2 with a pepper that never
+    /// produced the stored hash. Empty by default, matching prior behavior
+    /// exactly when no rotation has occurred.
+    pub previous_peppers: HashMap<i16, SecretString>,
     /// Stable issuer written to first-party account rows.
     pub issuer: String,
     /// Secure browser session cookie name.
@@ -218,6 +231,7 @@ impl FirstPartyAuthConfig {
         Self {
             password_pepper: SecretString::new(String::new()),
             pepper_version: 1,
+            previous_peppers: HashMap::new(),
             issuer: "https://frameshift.syntheos.dev/first-party".to_string(),
             cookie_name: "__Host-frameshift_session".to_string(),
             invite_ttl: Duration::from_secs(7 * 24 * 60 * 60),
@@ -251,6 +265,10 @@ impl std::fmt::Debug for FirstPartyAuthConfig {
         f.debug_struct("FirstPartyAuthConfig")
             .field("password_pepper", &"[REDACTED]")
             .field("pepper_version", &self.pepper_version)
+            .field(
+                "previous_peppers",
+                &format!("[REDACTED x{}]", self.previous_peppers.len()),
+            )
             .field("issuer", &self.issuer)
             .field("cookie_name", &self.cookie_name)
             .field("invite_ttl", &self.invite_ttl)
@@ -814,6 +832,9 @@ struct RawConfig {
     local_auth_password_pepper: String,
     /// Positive pepper version stored beside new password hashes.
     local_auth_pepper_version: i16,
+    /// Comma-separated `version:secret` entries for peppers rotated out of
+    /// `local_auth_password_pepper`.
+    local_auth_previous_peppers: String,
     /// Stable issuer written to first-party accounts.
     local_auth_issuer: String,
     /// Secure browser session cookie name.
@@ -851,6 +872,44 @@ fn split_comma_list(raw: &str) -> Vec<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
+        .collect()
+}
+
+/// Parse `LOCAL_AUTH_PREVIOUS_PEPPERS` into a `pepper_version -> secret` map.
+///
+/// Each comma-separated entry has the form `version:secret`, where `version`
+/// is the positive `i16` [`AccountPasswordCredentialRecord::pepper_version`]
+/// (from `frameshift_catalog`) stamped beside credentials hashed while that
+/// pepper was current, and `secret` is the exact historical pepper value.
+/// Only the first `:` splits each entry, so a secret value may itself
+/// contain colons. Malformed entries (no `:`, non-numeric, or non-positive
+/// version) are skipped with a `tracing::warn` rather than aborting startup,
+/// matching the tolerant convention [`ServerConfig::cors_origins`] already
+/// uses for `CORS_ALLOWED_ORIGINS`.
+fn parse_previous_peppers(raw: &str) -> HashMap<i16, SecretString> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .filter_map(|entry| match entry.split_once(':') {
+            Some((version, secret)) => match version.trim().parse::<i16>() {
+                Ok(version) if version > 0 => {
+                    Some((version, SecretString::new(secret.to_string())))
+                }
+                _ => {
+                    tracing::warn!(
+                        entry = version,
+                        "ignoring LOCAL_AUTH_PREVIOUS_PEPPERS entry with an invalid version"
+                    );
+                    None
+                }
+            },
+            None => {
+                tracing::warn!(
+                    "ignoring malformed LOCAL_AUTH_PREVIOUS_PEPPERS entry (missing ':')"
+                );
+                None
+            }
+        })
         .collect()
 }
 
@@ -925,6 +984,7 @@ impl RawConfig {
             first_party_auth: FirstPartyAuthConfig {
                 password_pepper: SecretString::new(self.local_auth_password_pepper),
                 pepper_version: self.local_auth_pepper_version,
+                previous_peppers: parse_previous_peppers(&self.local_auth_previous_peppers),
                 issuer: self.local_auth_issuer,
                 cookie_name: self.local_auth_cookie_name,
                 invite_ttl: Duration::from_secs(self.local_auth_invite_ttl_secs),
@@ -1004,6 +1064,7 @@ fn default_raw_config() -> RawConfig {
             .to_string(),
         local_auth_password_pepper: String::new(),
         local_auth_pepper_version: 1,
+        local_auth_previous_peppers: String::new(),
         local_auth_issuer: "https://frameshift.syntheos.dev/first-party".to_string(),
         local_auth_cookie_name: "__Host-frameshift_session".to_string(),
         local_auth_invite_ttl_secs: 7 * 24 * 60 * 60,

@@ -1250,6 +1250,28 @@ impl Client {
             load_template_context(cache_path, vault_path, self.vault.as_ref(), persona_name)?;
 
         if has_composition && has_typed_source {
+            // Fail closed on unsupported multi-level composition. The composer
+            // invoked just below resolves exactly one level: this pack's own
+            // `extends`/`mixin` against their cached bases. It does not recurse
+            // into a base's *own* declared `extends`/`mixin`, so if a resolved
+            // base itself declares composition, the grandparent's rules would
+            // be silently dropped rather than composed in -- most dangerous
+            // when the dropped layer carries inherited L1 safety rules. Detect
+            // that case up front and hard-error instead of attempting full
+            // recursive multi-level composition (out of scope; see
+            // `reject_unsupported_multi_level_base`).
+            if let Some(extends_spec) = manifest.extends.as_deref() {
+                reject_unsupported_multi_level_base(
+                    cache_dir,
+                    lockfile,
+                    persona_name,
+                    extends_spec,
+                )?;
+            }
+            for mixin_spec in &manifest.mixin {
+                reject_unsupported_multi_level_base(cache_dir, lockfile, persona_name, mixin_spec)?;
+            }
+
             let root = frameshift_source::PersonaSource::load_from_dir(cache_path)
                 .map_err(frameshift_compose::ComposeError::from)?;
             let resolver = compose_support::CacheResolver::new(cache_dir, lockfile);
@@ -1314,6 +1336,67 @@ impl Client {
             self.config_root.as_deref(),
             template_ctx.as_ref(),
         )
+    }
+}
+
+/// Fail closed if the persona `spec` (an `extends` or `mixin` entry, in
+/// `<name>` or `<name>@<version>` form) resolves to an installed persona that
+/// itself declares its own `extends`/`mixin`.
+///
+/// The composer that runs after this check resolves exactly one level of
+/// composition, so a base/mixin that declares further composition of its own
+/// would have that grandparent layer silently dropped rather than composed
+/// in. A `spec` that does not resolve to a currently-installed persona, or
+/// whose cached manifest cannot be read or parsed, is left alone here (`Ok`)
+/// -- the normal composer/resolver error paths already cover those cases;
+/// this check only adds a stricter failure for the one case it specifically
+/// detects.
+fn reject_unsupported_multi_level_base(
+    cache_dir: &Path,
+    lockfile: &Lockfile,
+    persona_name: &str,
+    spec: &str,
+) -> Result<(), ClientError> {
+    let base_name = spec.split_once('@').map(|(name, _)| name).unwrap_or(spec);
+    let Some(hash) = lockfile
+        .personas
+        .iter()
+        .find(|locked| locked.name == base_name)
+        .map(|locked| locked.hash.as_str())
+    else {
+        return Ok(());
+    };
+
+    let manifest_path = cache_dir.join(hash).join("pack.toml");
+    let Ok(manifest_raw) = fs::read_to_string(&manifest_path) else {
+        return Ok(());
+    };
+    let Ok(base_manifest) = toml::from_str::<frameshift_pack::PackManifest>(&manifest_raw) else {
+        return Ok(());
+    };
+
+    if base_manifest.extends.is_some() || !base_manifest.mixin.is_empty() {
+        return Err(ClientError::UnsupportedMultiLevelComposition {
+            persona: persona_name.to_string(),
+            base: base_name.to_string(),
+            base_parent: describe_declared_composition(&base_manifest),
+        });
+    }
+
+    Ok(())
+}
+
+/// Render a human-readable description of the composition a manifest itself
+/// declares (its `extends` target, its `mixin` list, or both), for use in
+/// [`ClientError::UnsupportedMultiLevelComposition`]'s message.
+fn describe_declared_composition(manifest: &frameshift_pack::PackManifest) -> String {
+    match (&manifest.extends, manifest.mixin.is_empty()) {
+        (Some(extends), true) => format!("extends {extends:?}"),
+        (Some(extends), false) => {
+            format!("extends {extends:?} and mixin {:?}", manifest.mixin)
+        }
+        (None, false) => format!("mixin {:?}", manifest.mixin),
+        (None, true) => String::new(),
     }
 }
 
@@ -1923,37 +2006,110 @@ fn touch_empty(path: &Path) -> Result<(), ClientError> {
     write_file(path, b"")
 }
 
-/// Write `bytes` to `path`, creating any missing parent directories first.
+/// Process-wide counter mixed into every staging path built by [`write_file`],
+/// so two writes to the same destination within the same process (same pid)
+/// never race on the same temp name.
+static WRITE_FILE_TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Write `bytes` to `path` as a single atomic operation, creating any missing
+/// parent directories first.
+///
+/// Stages the content in a same-directory temp file (`<name>.tmp-<pid>-<n>`),
+/// fsyncs it, then `fs::rename`s it over `path` and fsyncs the parent directory
+/// on Unix. Rename within the same directory is atomic on POSIX filesystems,
+/// so a crash or power loss mid-write leaves `path` either fully containing
+/// the previous content or fully containing the new content -- never
+/// truncated or partially written, unlike the previous
+/// `create(true).truncate(true)` + single `write_all` implementation this
+/// replaces (used for `lock.toml`, `config.toml`, and the `active` marker, all
+/// of which previously hard-errored the whole project on a truncated read
+/// after a crash mid-write).
+///
+/// Preserves the previous `O_NOFOLLOW` symlink-safety guarantee: refuses to
+/// write through `path` if it already exists as a symlink, instead of
+/// silently following it.
 fn write_file(path: &Path, bytes: &[u8]) -> Result<(), ClientError> {
     if let Some(parent) = path.parent() {
         ensure_dir(parent)?;
     }
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    let mut file = options.open(path).map_err(|source| ClientError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        file.set_permissions(fs::Permissions::from_mode(0o600))
-            .map_err(|source| ClientError::Io {
+
+    // Reject writing through an existing symlink at the destination. The
+    // previous implementation relied on `O_NOFOLLOW` on a direct open of
+    // `path`; renaming a staged temp file over `path` instead requires this
+    // explicit check to keep the same refusal.
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() {
+            return Err(ClientError::Io {
                 path: path.to_path_buf(),
+                source: std::io::Error::other("refusing to write through an existing symlink"),
+            });
+        }
+    }
+
+    let counter = WRITE_FILE_TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(format!(".tmp-{}-{counter}", std::process::id()));
+    let tmp_path = path.with_file_name(tmp_name);
+
+    let stage = || -> Result<(), ClientError> {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = options.open(&tmp_path).map_err(|source| ClientError::Io {
+            path: tmp_path.clone(),
+            source,
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(|source| ClientError::Io {
+                    path: tmp_path.clone(),
+                    source,
+                })?;
+        }
+        use std::io::Write as _;
+        file.write_all(bytes).map_err(|source| ClientError::Io {
+            path: tmp_path.clone(),
+            source,
+        })?;
+        // Durable before rename: a crash right after rename must not be able
+        // to observe a renamed-but-not-yet-flushed file.
+        file.sync_all().map_err(|source| ClientError::Io {
+            path: tmp_path.clone(),
+            source,
+        })
+    };
+
+    if let Err(error) = stage() {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(error);
+    }
+
+    if let Err(source) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(ClientError::Io {
+            path: path.to_path_buf(),
+            source,
+        });
+    }
+
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|source| ClientError::Io {
+                path: parent.to_path_buf(),
                 source,
             })?;
     }
-    use std::io::Write as _;
-    file.write_all(bytes).map_err(|source| ClientError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
+
+    Ok(())
 }
 
 /// Read the entire contents of `path` as a UTF-8 string, wrapping failures
@@ -2352,6 +2508,60 @@ mod tests {
             validate_cached_local_pack(tmp.path(), &spec, &original_hash),
             Err(ClientError::LocalPackChanged { .. })
         ));
+    }
+
+    /// `write_file` is atomic: a second write to the same destination fully
+    /// replaces the first (never leaves a truncated mix of old and new
+    /// bytes), and no `.tmp-*` staging file is left behind afterward. This is
+    /// the regression test for the create+truncate+write_all implementation
+    /// this replaced, which could brick a project's `lock.toml` if the
+    /// process crashed between truncation and the write completing.
+    #[test]
+    fn write_file_overwrite_is_atomic_and_leaves_no_temp_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("lock.toml");
+
+        write_file(&path, b"first version, quite long content").unwrap();
+        write_file(&path, b"second").unwrap();
+
+        let final_content = fs::read(&path).unwrap();
+        assert_eq!(
+            final_content, b"second",
+            "final content must be exactly the last write, not truncated or mixed"
+        );
+
+        let leftover_tmp = fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .any(|entry| entry.file_name().to_string_lossy().contains(".tmp-"));
+        assert!(
+            !leftover_tmp,
+            "no .tmp-* staging file should remain after a successful write"
+        );
+    }
+
+    /// `write_file` refuses to write through an existing symlink at the
+    /// destination path, matching the previous direct-open `O_NOFOLLOW`
+    /// semantics now that the write goes through a staged temp file + rename.
+    #[cfg(unix)]
+    #[test]
+    fn write_file_refuses_to_follow_existing_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real_target = tmp.path().join("outside.txt");
+        fs::write(&real_target, b"do not touch").unwrap();
+        let link_path = tmp.path().join("active");
+        std::os::unix::fs::symlink(&real_target, &link_path).unwrap();
+
+        let result = write_file(&link_path, b"attempted overwrite");
+        assert!(
+            result.is_err(),
+            "write_file must refuse to write through an existing symlink"
+        );
+        assert_eq!(
+            fs::read(&real_target).unwrap(),
+            b"do not touch",
+            "the symlink target must be left untouched"
+        );
     }
 
     /// Helper: set up a minimal pack and install it, returning the client and project root.

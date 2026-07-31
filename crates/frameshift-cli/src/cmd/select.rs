@@ -3,7 +3,7 @@
 //! Runs a read-only persona selection pass for the current project and prints
 //! the top-ranked candidates with score, confidence, and rationale.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Args;
 use frameshift_client::Client;
@@ -77,9 +77,10 @@ pub fn run_select(client: &Client, args: SelectArgs) -> Result<(), CliError> {
     let project_root = std::env::current_dir()?;
     let state_dir = client.orchestrator_state_dir(&project_root)?;
 
-    // Load preferences; continue with empty prefs if the file is absent.
+    // Load preferences; continue with empty prefs if the file is absent (or
+    // corrupt -- see `load_prefs_for_select`).
     let prefs_path = state_dir.join("automate-prefs.json");
-    let prefs = Preferences::load(&prefs_path).unwrap_or_default();
+    let prefs = load_prefs_for_select(&prefs_path);
 
     // When --library is given, use catalog_root mode; otherwise use installed source dirs.
     let (source_dirs, catalog_root) = if let Some(lib) = args.library {
@@ -137,4 +138,85 @@ pub fn run_select(client: &Client, args: SelectArgs) -> Result<(), CliError> {
     }
 
     Ok(())
+}
+
+/// Load preferences for the read-only `select` path.
+///
+/// `Preferences::load` returns `Ok(default)` only when the file is absent
+/// (first run for this project); a genuinely corrupt or unreadable file
+/// returns `Err`. Unlike `feedback`/`prefs`, this command never calls
+/// `save()`, so there is nothing to protect from being overwritten -- a
+/// corrupt file is therefore non-fatal here. Print a stderr warning (rather
+/// than silently continuing as if the file never existed, which the
+/// previous `unwrap_or_default()` did) and fall back to empty preferences so
+/// selection still runs.
+fn load_prefs_for_select(prefs_path: &Path) -> Preferences {
+    match Preferences::load(prefs_path) {
+        Ok(prefs) => prefs,
+        Err(e) => {
+            eprintln!(
+                "warning: could not read preferences at {}: {e}; continuing with no preferences",
+                prefs_path.display()
+            );
+            Preferences::default()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+/// Regression tests for `load_prefs_for_select`'s absent-vs-corrupt handling.
+mod tests {
+    use super::*;
+
+    /// An absent preferences file yields default (empty) preferences, with
+    /// no warning expected (not directly assertable here, but the important
+    /// invariant is that this does not panic or otherwise fail).
+    #[test]
+    fn absent_prefs_file_yields_default() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prefs_path = tmp.path().join("does-not-exist.json");
+
+        let prefs = load_prefs_for_select(&prefs_path);
+        assert!(
+            prefs.bias.is_empty(),
+            "an absent prefs file should yield empty preferences"
+        );
+    }
+
+    /// A corrupt preferences file must not panic or fail selection (F-06/P3
+    /// distinguishes this read-only path from the write-back paths in
+    /// `feedback`/`prefs`, which must instead propagate the error). It must
+    /// fall back to empty preferences.
+    #[test]
+    fn corrupt_prefs_file_falls_back_to_default_without_panicking() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prefs_path = tmp.path().join("automate-prefs.json");
+        std::fs::write(&prefs_path, "{ not json").expect("write corrupt prefs");
+
+        let prefs = load_prefs_for_select(&prefs_path);
+        assert!(
+            prefs.bias.is_empty(),
+            "a corrupt prefs file should fall back to empty preferences, not panic"
+        );
+    }
+
+    /// A well-formed preferences file loads normally through the same helper.
+    #[test]
+    fn healthy_prefs_file_loads_normally() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prefs_path = tmp.path().join("automate-prefs.json");
+        let mut prefs = Preferences::default();
+        prefs.record_override(None, "rust");
+        prefs.save(&prefs_path).expect("save prefs");
+
+        let loaded = load_prefs_for_select(&prefs_path);
+        assert!(
+            loaded.bias_for("rust") > 0.0,
+            "a healthy prefs file should load its recorded bias"
+        );
+    }
 }

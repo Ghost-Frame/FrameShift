@@ -289,6 +289,41 @@ async fn tombstone_requires_bearer_account() {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
+/// A mutation with no `x-request-id` header is rejected instead of silently
+/// accepting a server-generated id, which would defeat substituted-retry
+/// rejection (F-10 regression).
+#[tokio::test]
+async fn tombstone_and_suspend_require_client_supplied_request_id() {
+    let fixture = fixture();
+    let tombstone = send(
+        fixture.state.clone(),
+        Method::POST,
+        "/v1/admin/packs/my-pack/1.0.0/tombstone",
+        Some("administrator-token"),
+        None,
+        Some(serde_json::json!({
+            "id": Uuid::new_v4(),
+            "reason": "tos-violation"
+        })),
+    )
+    .await;
+    assert_eq!(tombstone.status(), StatusCode::BAD_REQUEST);
+
+    let suspend = send(
+        fixture.state,
+        Method::POST,
+        &format!("/v1/admin/publishers/{}/suspend", fixture.publisher_id),
+        Some("administrator-token"),
+        None,
+        Some(serde_json::json!({
+            "id": Uuid::new_v4(),
+            "reason_code": "policy.abuse"
+        })),
+    )
+    .await;
+    assert_eq!(suspend.status(), StatusCode::BAD_REQUEST);
+}
+
 /// An active ordinary account cannot exercise administrator lifecycle controls.
 #[tokio::test]
 async fn tombstone_rejects_non_administrator_account() {

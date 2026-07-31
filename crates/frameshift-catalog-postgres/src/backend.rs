@@ -6235,6 +6235,50 @@ fn parse_semver(s: &str) -> Option<(u64, u64, u64, Option<String>)> {
     Some((major, minor, patch, pre))
 }
 
+/// Compare two dot-separated pre-release identifiers per semver 2.0.0 §11
+/// rule 4: purely-numeric identifiers compare numerically; a numeric
+/// identifier always has LOWER precedence than an alphanumeric one; two
+/// alphanumeric identifiers compare using ASCII lexical (byte) ordering.
+///
+/// An identifier is treated as numeric only when it parses in full as a
+/// `u64` (so e.g. `"01"` or `"1a"` are alphanumeric, matching the spec's
+/// "identifiers MUST comprise only ASCII alphanumerics" / numeric-only
+/// distinction).
+fn compare_prerelease_identifier(x: &str, y: &str) -> std::cmp::Ordering {
+    match (x.parse::<u64>().ok(), y.parse::<u64>().ok()) {
+        (Some(xn), Some(yn)) => xn.cmp(&yn),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => x.cmp(y),
+    }
+}
+
+/// Compare two full pre-release strings (the part after the first `-`) per
+/// semver 2.0.0 §11 rule 4: split on `.`, compare identifier-by-identifier
+/// via [`compare_prerelease_identifier`], and -- if every shared identifier
+/// is equal -- the pre-release with MORE identifiers has higher precedence
+/// (e.g. `1.0.0-alpha` < `1.0.0-alpha.1`).
+fn compare_prerelease(a: &str, b: &str) -> std::cmp::Ordering {
+    let a_ids: Vec<&str> = a.split('.').collect();
+    let b_ids: Vec<&str> = b.split('.').collect();
+    for i in 0..a_ids.len().max(b_ids.len()) {
+        match (a_ids.get(i), b_ids.get(i)) {
+            (Some(x), Some(y)) => {
+                let ord = compare_prerelease_identifier(x, y);
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            // `a` has more identifiers than `b` (all preceding equal) -- `a` wins.
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            // `b` has more identifiers than `a` (all preceding equal) -- `b` wins.
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (None, None) => unreachable!("loop bound is max(a_ids.len(), b_ids.len())"),
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
 /// Return `true` when `a` has strictly higher semver precedence than `b`.
 ///
 /// Rules (per semver 2.0.0 §11):
@@ -6243,7 +6287,8 @@ fn parse_semver(s: &str) -> Option<(u64, u64, u64, Option<String>)> {
 ///   same `(major, minor, patch)` with a pre-release tag.
 ///   Example: `1.0.0 > 1.0.0-rc.1`.
 /// - When both have a pre-release tag and the numeric triple is equal, the
-///   tags are compared lexicographically.
+///   tags are compared per [`compare_prerelease`] (numeric-aware,
+///   dot-identifier precedence -- e.g. `1.0.0-beta.10 > 1.0.0-beta.9`).
 ///
 /// Unparseable versions are treated as lower than any parseable version.
 /// If both sides are unparseable, returns `false` (not strictly greater).
@@ -6277,7 +6322,9 @@ pub fn semver_gt(a: &str, b: &str) -> bool {
                 (None, Some(_)) => true,
                 (Some(_), None) => false,
                 (None, None) => false,
-                (Some(pa_str), Some(pb_str)) => pa_str > pb_str,
+                (Some(pa_str), Some(pb_str)) => {
+                    compare_prerelease(&pa_str, &pb_str) == std::cmp::Ordering::Greater
+                }
             }
         }
     }
@@ -6331,5 +6378,64 @@ mod semver_tests {
     /// Build metadata suffix is stripped and does not affect comparison.
     fn semver_gt_build_metadata_stripped() {
         assert!(!semver_gt("1.0.0+build.1", "1.0.0+build.2"));
+    }
+
+    #[test]
+    /// Numeric pre-release identifiers must compare numerically, not
+    /// lexically: `beta.10` outranks `beta.9` (regression for F-18).
+    fn semver_gt_prerelease_numeric_identifier() {
+        assert!(
+            semver_gt("1.0.0-beta.10", "1.0.0-beta.9"),
+            "1.0.0-beta.10 should be > 1.0.0-beta.9"
+        );
+    }
+
+    #[test]
+    /// The reverse of the above must hold too: `beta.2` does not outrank
+    /// `beta.10` under numeric comparison.
+    fn semver_gt_prerelease_numeric_identifier_reverse() {
+        assert!(
+            !semver_gt("1.0.0-beta.2", "1.0.0-beta.10"),
+            "1.0.0-beta.2 should not be > 1.0.0-beta.10"
+        );
+    }
+
+    #[test]
+    /// Fewer pre-release identifiers means lower precedence when all
+    /// shared identifiers are equal: `alpha` < `alpha.1`.
+    fn semver_gt_prerelease_shorter_identifier_list_loses() {
+        assert!(
+            !semver_gt("1.0.0-alpha", "1.0.0-alpha.1"),
+            "1.0.0-alpha should not be > 1.0.0-alpha.1"
+        );
+        assert!(
+            semver_gt("1.0.0-alpha.1", "1.0.0-alpha"),
+            "1.0.0-alpha.1 should be > 1.0.0-alpha"
+        );
+    }
+
+    #[test]
+    /// A release version still outranks any pre-release at the same
+    /// major.minor.patch, even with numeric-aware pre-release comparison.
+    fn semver_gt_release_over_prerelease_numeric() {
+        assert!(
+            semver_gt("1.0.0", "1.0.0-rc.1"),
+            "1.0.0 should be > 1.0.0-rc.1"
+        );
+    }
+
+    #[test]
+    /// Numeric identifiers have lower precedence than alphanumeric ones
+    /// per semver 2.0.0 §11 rule 4: `beta.11` (numeric second identifier)
+    /// is outranked by `beta.rc1` (alphanumeric second identifier).
+    fn semver_gt_prerelease_numeric_below_alphanumeric() {
+        assert!(
+            !semver_gt("1.0.0-beta.11", "1.0.0-beta.rc1"),
+            "1.0.0-beta.11 should not be > 1.0.0-beta.rc1 (numeric < alphanumeric)"
+        );
+        assert!(
+            semver_gt("1.0.0-beta.rc1", "1.0.0-beta.11"),
+            "1.0.0-beta.rc1 should be > 1.0.0-beta.11 (alphanumeric > numeric)"
+        );
     }
 }

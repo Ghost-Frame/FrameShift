@@ -3,8 +3,9 @@
 //! Scans rule text, skill descriptions, pattern text, and code examples
 //! for potentially dangerous content: destructive commands, sensitive path
 //! references, permission escalation, and suspicious behavioral directives.
-//! This module provides the scanning logic that `frameshift validate` calls
-//! before pack compilation.
+//! This module provides the scanning logic invoked as an advisory, warn-only
+//! step by `frameshift publish` -- findings are surfaced to the publisher but
+//! do not block publication.
 
 use crate::source::PersonaSource;
 
@@ -604,15 +605,24 @@ fn check_text_capped(
 /// Finds and returns the original-cased fragment of `text` that matches
 /// `needle` (case-insensitive).
 ///
-/// Returns the needle string itself if no match is found (should not happen
-/// since callers only call this after confirming a match, but defensive).
+/// The match position is located via `text.to_lowercase()`, but full Unicode
+/// lowercasing can change the BYTE LENGTH of a string (e.g. U+0130 'İ' expands
+/// to two bytes' worth of chars when lowercased), so a byte offset found in
+/// the lowercased string is not always valid -- or does not always mean the
+/// same thing -- in the original `text`. Rather than index `text` with that
+/// offset unconditionally (which can panic on a non-char-boundary or
+/// out-of-range slice), the computed range is validated first; if it is not a
+/// safe, in-bounds char-boundary slice of `text`, the needle itself is
+/// returned as a defensive fallback (mirroring the existing "no match" case).
 fn find_fragment(text: &str, needle: &str) -> String {
     let lower = text.to_lowercase();
     if let Some(pos) = lower.find(needle) {
-        text[pos..pos + needle.len()].to_string()
-    } else {
-        needle.to_string()
+        let end = pos + needle.len();
+        if end <= text.len() && text.is_char_boundary(pos) && text.is_char_boundary(end) {
+            return text[pos..end].to_string();
+        }
     }
+    needle.to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -1013,6 +1023,34 @@ mod tests {
                 .any(|w| w.category == WarningCategory::SensitivePath
                     && w.location.contains("reasoning")),
             "expected SensitivePath in reasoning field, got: {warnings:#?}"
+        );
+    }
+
+    /// F-06 regression: a byte-length-expanding lowercase char (U+0130 'İ')
+    /// immediately before a scanned needle must not panic `find_fragment` (or
+    /// `validate_content`), and should still surface a sensible warning.
+    #[test]
+    fn find_fragment_does_not_panic_on_byte_expanding_lowercase() {
+        let mut src = clean_source();
+        src.rules.rules.push(Rule {
+            id: "unicode-rule".to_string(),
+            layer: Layer::L2,
+            // U+0130 (LATIN CAPITAL LETTER I WITH DOT ABOVE) lowercases to a
+            // two-character, multi-byte sequence, shifting subsequent byte
+            // offsets between the original text and its lowercased form.
+            text: "İsudo".to_string(),
+            reasoning: None,
+            override_inherited: false,
+        });
+
+        // Must not panic.
+        let warnings = validate_content(&src);
+
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.category == WarningCategory::PermissionEscalation),
+            "expected PermissionEscalation warning for 'sudo', got: {warnings:#?}"
         );
     }
 }

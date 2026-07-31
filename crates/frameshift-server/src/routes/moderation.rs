@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::{header, HeaderMap};
+use axum::http::header;
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 use crate::error::AppError;
 use crate::middleware::account::AuthenticatedAccount;
+use crate::middleware::request_id::ClientRequestId;
 use crate::publication::{PublicationPromotionError, PublicationPromotionService};
 use crate::state::AppState;
 
@@ -136,8 +137,8 @@ async fn get_moderation_artifact(
 async fn create_moderation_decision(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthenticatedAccount>,
+    Extension(client_request_id): Extension<ClientRequestId>,
     Path(submission_id): Path<Uuid>,
-    headers: HeaderMap,
     Json(body): Json<ModeratePublicationRequest>,
 ) -> Result<Json<PublicationModerationDecisionRecord>, AppError> {
     let request = PublicationModerationDecisionRequest {
@@ -147,7 +148,7 @@ async fn create_moderation_decision(
         action: body.action,
         reason_code: body.reason_code,
         private_explanation: body.private_explanation,
-        request_id: request_id(&headers)?,
+        request_id: required_client_request_id(client_request_id)?,
     };
     state
         .catalog
@@ -162,8 +163,8 @@ async fn promote_publication(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthenticatedAccount>,
     Extension(promotion): Extension<Arc<PublicationPromotionService>>,
+    Extension(client_request_id): Extension<ClientRequestId>,
     Path(submission_id): Path<Uuid>,
-    headers: HeaderMap,
     Json(body): Json<PromotePublicationRequest>,
 ) -> Result<Json<PublicationPromotionRecord>, AppError> {
     let submission = state
@@ -180,7 +181,7 @@ async fn promote_publication(
             body.id,
             submission_id,
             auth.account.id,
-            request_id(&headers)?,
+            required_client_request_id(client_request_id)?,
         )
         .await
         .map(Json)
@@ -235,12 +236,15 @@ async fn require_independent_reviewer(
     }
 }
 
-/// Parse the mandatory request correlation header as a stable UUID.
-fn request_id(headers: &HeaderMap) -> Result<Uuid, AppError> {
-    headers
-        .get("x-request-id")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| Uuid::parse_str(value).ok())
+/// Require a valid request UUID that was present before tracing middleware ran.
+///
+/// The synthesized id [`tower_http::request_id::SetRequestIdLayer`] would
+/// otherwise stamp onto a request with no client-supplied header must never
+/// be treated as if the caller had provided it -- that would defeat
+/// substituted-retry rejection for these idempotent mutations (F-10).
+fn required_client_request_id(client_request_id: ClientRequestId) -> Result<Uuid, AppError> {
+    client_request_id
+        .0
         .ok_or_else(|| AppError::BadRequest("x-request-id must be a UUID".to_string()))
 }
 

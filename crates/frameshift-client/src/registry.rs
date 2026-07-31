@@ -446,7 +446,25 @@ pub fn fetch_and_install(
     let cache_path = paths.cache_dir.join(&canonical_hash);
     crate::ensure_cached_pack(verified.pack_root(), &cache_path)?;
 
-    Ok(crate::locked_persona_from_pack(&pack))
+    // `ensure_cached_pack` is a no-op when `cache_path` already existed (a
+    // cache hit): in that case the bytes materialization will actually read
+    // from `cache/<hash>` (see `materialize_one_persona`) are a pre-existing
+    // directory on disk, never re-touched by the cryptographic verification
+    // performed above against the freshly-downloaded temp directory. Re-load
+    // and re-hash the cache entry and reject a mismatch instead of silently
+    // trusting it -- mirroring how `validate_cached_local_pack` re-verifies
+    // the local-install cache path after `ensure_cached_pack`.
+    let cached_pack = Pack::from_dir(&cache_path)?;
+    let cached_hash = cached_pack.canonical_hash_hex();
+    if cached_hash != canonical_hash {
+        return Err(ClientError::RegistryCacheTampered {
+            pack: format!("{}@{}", spec.name, spec.version),
+            expected: canonical_hash,
+            actual: cached_hash,
+        });
+    }
+
+    Ok(crate::locked_persona_from_pack(&cached_pack))
 }
 
 /// Fetch, extract, and cryptographically verify one exact immutable registry version.
