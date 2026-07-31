@@ -12,6 +12,8 @@ path = "src/main.rs"
 
 [dependencies]
 frameshift-client = { path = "../frameshift-client" }
+frameshift-catalog = { path = "../frameshift-catalog" }
+frameshift-studio = { path = "../frameshift-studio" }
 frameshift-source = { path = "../frameshift-source" }
 frameshift-growth = { path = "../frameshift-growth" }
 # cli-runner is enabled intentionally: the shipped `frameshift` binary supports
@@ -25,6 +27,8 @@ frameshift-embed-candle = { path = "../frameshift-embed-candle", optional = true
 frameshift-vault = { path = "../frameshift-vault" }
 frameshift-vault-local = { path = "../frameshift-vault-local" }
 clap = { workspace = true }
+# Names the selected signing key while preserving the client key-store boundary.
+ed25519-dalek = { workspace = true }
 # Wraps the vault passphrase/value input so it is never accidentally logged.
 secrecy = { workspace = true }
 serde_json = { workspace = true }
@@ -36,6 +40,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 # Parses registry URLs so credentials are rejected before request construction.
 url.workspace = true
+uuid = { workspace = true }
 # Hidden-input prompts for `frameshift vault` passphrases/values and the
 # render-time interactive vault provider (only used when stdin is a TTY).
 rpassword = { workspace = true }

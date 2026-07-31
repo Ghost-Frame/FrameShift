@@ -2074,12 +2074,15 @@ name = "frameshift-cli"
 version = "0.10.0"
 dependencies = [
  "clap",
+ "ed25519-dalek",
+ "frameshift-catalog",
  "frameshift-client",
  "frameshift-conformance",
  "frameshift-embed-candle",
  "frameshift-growth",
  "frameshift-orchestrator",
  "frameshift-source",
+ "frameshift-studio",
  "frameshift-vault",
  "frameshift-vault-local",
  "rpassword",
@@ -2091,6 +2094,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "uuid",
  "webbrowser",
 ]
 

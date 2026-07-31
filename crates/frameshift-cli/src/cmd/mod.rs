@@ -12,6 +12,7 @@ pub mod grow;
 pub mod keys;
 pub mod migrate;
 pub mod prefs;
+pub mod publication;
 pub mod publish;
 pub mod register;
 pub mod render;
