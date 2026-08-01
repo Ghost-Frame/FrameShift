@@ -19,7 +19,7 @@ The binary is named `frameshift`.
 
 | Command | Purpose |
 |---|---|
-| `account` | Register, log in, inspect, or end an account session |
+| `account` | Manage account sessions, profiles, publishers, and administrator controls |
 | `install` | Install a persona pack into the central store |
 | `activate` | Activate an installed persona for the current project |
 | `uninstall` | Remove an installed persona from the current project |
@@ -56,6 +56,22 @@ Use `register`, `login`, `status`, or `logout` to manage the current account
 session. Registration and first-party login collect secrets only through hidden
 interactive prompts. `login --first-party` selects password login when the
 registry also advertises OIDC.
+
+Use `update-profile` to replace account metadata. At least one of `--email` or
+`--display-name` is required. Use `create-publisher` to create a pending public
+profile and active owner membership, then use `update-publisher` to replace its
+display metadata. Omit biography options to retain the current biography, or
+use `--clear-biography` to remove it.
+
+```bash
+frameshift account update-profile --server <url> [--email <email>] [--display-name <name>]
+frameshift account create-publisher --server <url> --handle <handle> --display-name <name> [--biography <text>]
+frameshift account update-publisher --server <url> --handle <handle> --display-name <name> [--biography <text> | --clear-biography]
+```
+
+These profile commands resolve the saved bearer authority for the exact
+registry and do not accept a token argument. Publisher updates require an
+active owner membership and a fresh authentication session.
 
 Active administrators can grant or revoke global platform roles and transition
 account lifecycle states. These commands resolve bearer authority for the exact

@@ -300,6 +300,13 @@ pub enum ClientError {
         detail: String,
     },
 
+    /// An account or publisher profile mutation is structurally ambiguous.
+    #[error("invalid account profile input: {detail}")]
+    InvalidAccountProfileInput {
+        /// Actionable description of the rejected mutation shape.
+        detail: String,
+    },
+
     #[error("author_pubkey is not a supported ed25519 public key encoding: {0}")]
     InvalidAuthorPublicKey(String),
 
