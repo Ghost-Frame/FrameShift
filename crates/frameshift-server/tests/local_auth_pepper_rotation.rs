@@ -109,12 +109,12 @@ async fn send(
         .unwrap()
 }
 
-/// A credential hashed under a rotated-out pepper version still verifies
-/// after `LOCAL_AUTH_PASSWORD_PEPPER`/`LOCAL_AUTH_PEPPER_VERSION` rotate, as
-/// long as the old pepper is retained in `previous_peppers` (F-05
-/// regression). Without the fix, rotation permanently locks the account out.
-/// Dropping the historical pepper entirely must fail closed rather than
-/// silently accepting the wrong one.
+/// A credential verified under a retained old pepper is rehashed with the
+/// current pepper before login succeeds.
+///
+/// The persisted upgrade must preserve the password-change timestamp and let
+/// later logins succeed after the historical pepper is removed. Before that
+/// upgrade, omitting the required historical pepper must fail closed.
 #[tokio::test]
 async fn login_verifies_credential_hashed_under_a_rotated_out_pepper() {
     let catalog = MockCatalog::new();
@@ -135,16 +135,35 @@ async fn login_verifies_credential_hashed_under_a_rotated_out_pepper() {
     )
     .await;
     assert_eq!(registered.status(), StatusCode::OK);
+    let original_credential = catalog
+        .state
+        .read()
+        .unwrap()
+        .account_password_credentials
+        .get("rotated@example.test")
+        .unwrap()
+        .clone();
+    assert_eq!(original_credential.pepper_version, 1);
+
+    let state_without_history_before_rehash = test_state(
+        catalog.clone(),
+        test_config("integration-test-pepper-v2", 2, vec![]),
+    );
+    let login_without_history_before_rehash = send(
+        state_without_history_before_rehash,
+        Method::POST,
+        "/v1/auth/login",
+        Some(json!({
+            "email": "rotated@example.test",
+            "password": "correct horse battery staple",
+            "client_kind": "desktop"
+        })),
+    )
+    .await;
     assert_eq!(
-        catalog
-            .state
-            .read()
-            .unwrap()
-            .account_password_credentials
-            .get("rotated@example.test")
-            .unwrap()
-            .pepper_version,
-        1
+        login_without_history_before_rehash.status(),
+        StatusCode::UNAUTHORIZED,
+        "dropping the historical pepper before rehash must fail closed"
     );
 
     // Rotate to pepper version 2, retaining version 1's secret as the only
@@ -170,8 +189,27 @@ async fn login_verifies_credential_hashed_under_a_rotated_out_pepper() {
         "a credential hashed under the retained previous pepper must still verify"
     );
 
-    // A rotation that drops the historical pepper entirely must fail closed
-    // rather than silently accepting the wrong pepper.
+    let rehashed_credential = catalog
+        .state
+        .read()
+        .unwrap()
+        .account_password_credentials
+        .get("rotated@example.test")
+        .unwrap()
+        .clone();
+    assert_eq!(rehashed_credential.pepper_version, 2);
+    assert_ne!(
+        rehashed_credential.password_hash,
+        original_credential.password_hash
+    );
+    assert_eq!(
+        rehashed_credential.password_changed_at,
+        original_credential.password_changed_at
+    );
+    assert!(rehashed_credential.updated_at >= original_credential.updated_at);
+
+    // The durable rehash removes the old pepper from subsequent login's
+    // dependency chain.
     let state_without_history = test_state(
         catalog,
         test_config("integration-test-pepper-v2", 2, vec![]),
@@ -189,7 +227,7 @@ async fn login_verifies_credential_hashed_under_a_rotated_out_pepper() {
     .await;
     assert_eq!(
         login_without_history.status(),
-        StatusCode::UNAUTHORIZED,
-        "dropping the historical pepper must fail closed, not silently accept"
+        StatusCode::OK,
+        "the persisted current-pepper hash must work without historical peppers"
     );
 }

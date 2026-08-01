@@ -9,8 +9,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use chrono::{DateTime, Duration, Utc};
 use frameshift_catalog::{
-    AccountPasswordCredentialRecord, AccountRecord, AccountSessionClientKind, AccountSessionRecord,
-    AccountStatus, CatalogError, LocalAccountRegistrationRequest,
+    AccountPasswordCredentialRecord, AccountPasswordRehashRequest, AccountRecord,
+    AccountSessionClientKind, AccountSessionRecord, AccountStatus, CatalogError,
+    LocalAccountRegistrationRequest,
 };
 use rand_core::{OsRng, RngCore as _};
 use secrecy::SecretString;
@@ -189,11 +190,10 @@ async fn login_local_account(
         Err(error) => return Err(AppError::from_catalog(error, "password credential")),
     };
     let password_matches =
-        verify_or_absorb_password_work(&state, password, credential.as_ref()).await?;
+        verify_or_absorb_password_work(&state, password.clone(), credential.as_ref()).await?;
     let credential = credential
         .filter(|_| password_matches)
         .ok_or_else(|| AppError::Unauthorized("email or password is incorrect".to_string()))?;
-    warn_if_credential_uses_rotated_out_pepper(&state, &credential);
     let account = state
         .catalog
         .get_account(credential.account_id)
@@ -204,6 +204,7 @@ async fn login_local_account(
             "email or password is incorrect".to_string(),
         ));
     }
+    rehash_password_if_rotated(&state, &password, &credential).await?;
     let (session_token, session_digest) = generate_token();
     let now = Utc::now();
     let session = build_session(&state, account.id, session_digest, request.client_kind, now)?;
@@ -292,7 +293,7 @@ fn protected_password(password: String) -> Result<SecretString, AppError> {
 /// New hashes always use the CURRENT pepper (never a previous one) so every
 /// freshly created credential is stamped with `pepper_version ==
 /// state.config.first_party_auth.pepper_version` at the call site in
-/// [`register_local_account`].
+/// [`register_local_account`] and [`rehash_password_if_rotated`].
 async fn hash_password(state: &AppState, password: SecretString) -> Result<String, AppError> {
     let _permit = password_work_permit()?;
     let service = PasswordService::new(state.config.first_party_auth.password_pepper.clone())
@@ -358,31 +359,49 @@ async fn verify_or_absorb_password_work(
     .map_err(|_| AppError::Internal("password verification task failed".to_string()))?
 }
 
-/// Log (without persisting) that a successful login verified against a
-/// rotated-out pepper version.
+/// Rehash a historically peppered credential with the current deployment pepper.
 ///
-/// TODO(F-05 follow-up): once `CatalogBackend` exposes a mutator for
-/// [`AccountPasswordCredentialRecord`] (there is currently none -- only
-/// [`frameshift_catalog::CatalogBackend::get_account_password_credential`]
-/// exists), re-hash this password with the CURRENT pepper here and persist
-/// it so the credential migrates off the rotated-out pepper. Deliberately
-/// NOT inventing a schema change to do that persistence now; the login above
-/// already verified correctly against the credential's own historical
-/// pepper, so there is no security gap, only a missed migration opportunity
-/// until that catalog mutator exists.
-fn warn_if_credential_uses_rotated_out_pepper(
+/// The catalog mutation compares every security-relevant field observed by
+/// verification before replacing the hash. A concurrent password change or
+/// competing rehash therefore fails closed before a session is issued.
+async fn rehash_password_if_rotated(
     state: &AppState,
+    password: &SecretString,
     credential: &AccountPasswordCredentialRecord,
-) {
-    if credential.pepper_version != state.config.first_party_auth.pepper_version {
-        tracing::info!(
-            account_id = %credential.account_id,
-            credential_pepper_version = credential.pepper_version,
-            current_pepper_version = state.config.first_party_auth.pepper_version,
-            "first-party login verified against a rotated-out pepper version; \
-             rehash-on-login is not yet wired pending a catalog credential mutator"
-        );
+) -> Result<(), AppError> {
+    let current_pepper_version = state.config.first_party_auth.pepper_version;
+    if credential.pepper_version == current_pepper_version {
+        return Ok(());
     }
+    let new_password_hash = hash_password(state, password.clone()).await?;
+    let updated = state
+        .catalog
+        .rehash_account_password_credential(AccountPasswordRehashRequest {
+            account_id: credential.account_id,
+            normalized_email: credential.normalized_email.clone(),
+            expected_password_hash: credential.password_hash.clone(),
+            expected_password_version: credential.password_version,
+            expected_pepper_version: credential.pepper_version,
+            expected_updated_at: credential.updated_at,
+            new_password_hash,
+            new_password_version: PASSWORD_VERSION,
+            new_pepper_version: current_pepper_version,
+            updated_at: Utc::now(),
+        })
+        .await
+        .map_err(|error| AppError::from_catalog(error, "password credential"))?;
+    if !updated {
+        return Err(AppError::Unauthorized(
+            "email or password is incorrect".to_string(),
+        ));
+    }
+    tracing::info!(
+        account_id = %credential.account_id,
+        previous_pepper_version = credential.pepper_version,
+        current_pepper_version,
+        "first-party password credential rehashed with the current pepper"
+    );
+    Ok(())
 }
 
 /// Reserve one bounded Argon2 memory-work slot or reject excess parallel work.

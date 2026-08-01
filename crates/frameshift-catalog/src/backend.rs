@@ -15,11 +15,11 @@ use crate::identity::Ed25519PublicKey;
 use crate::records::{
     AccountInviteIssueRequest, AccountInviteRecord, AccountInviteRequestRecord,
     AccountInviteReviewRequest, AccountInviteStatus, AccountPasswordCredentialRecord,
-    AccountRecord, AccountSessionRecord, AccountStatusChangeRequest, AuthorRecord,
-    LocalAccountRegistrationRequest, LocalAccountRegistrationResult, PackRecord, PackVersionRecord,
-    PlatformRoleAssignmentRequest, PlatformRoleRecord, PlatformRoleRevocationRequest,
-    PublicationAppealCaseRecord, PublicationAppealCursor, PublicationAppealRecord,
-    PublicationAppealRequest, PublicationAppealResolutionRecord,
+    AccountPasswordRehashRequest, AccountRecord, AccountSessionRecord, AccountStatusChangeRequest,
+    AuthorRecord, LocalAccountRegistrationRequest, LocalAccountRegistrationResult, PackRecord,
+    PackVersionRecord, PlatformRoleAssignmentRequest, PlatformRoleRecord,
+    PlatformRoleRevocationRequest, PublicationAppealCaseRecord, PublicationAppealCursor,
+    PublicationAppealRecord, PublicationAppealRequest, PublicationAppealResolutionRecord,
     PublicationAppealResolutionRequest, PublicationIntentClaim, PublicationIntentRecord,
     PublicationLifecycleCursor, PublicationLifecycleDecisionRecord,
     PublicationModerationDecisionRecord, PublicationModerationDecisionRequest,
@@ -161,6 +161,21 @@ pub trait CatalogBackend: Send + Sync {
         Err(CatalogError::NotFound {
             kind: "account_password_credential",
             key: normalized_email.to_string(),
+        })
+    }
+
+    /// Replace one verified password hash only if its credential is unchanged.
+    ///
+    /// Returns `true` when the exact expected credential was upgraded and
+    /// `false` when another writer changed or removed it first. Implementations
+    /// must not modify `password_changed_at` for this pepper-only migration.
+    async fn rehash_account_password_credential(
+        &self,
+        request: AccountPasswordRehashRequest,
+    ) -> Result<bool, CatalogError> {
+        Err(CatalogError::Unauthorized {
+            kind: "account_password_credential",
+            key: request.account_id.to_string(),
         })
     }
 
