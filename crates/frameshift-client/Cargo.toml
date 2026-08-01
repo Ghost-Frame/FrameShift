@@ -35,6 +35,8 @@ frameshift-vault-local = { path = "../frameshift-vault-local" }
 age.workspace = true
 base64.workspace = true
 chrono.workspace = true
+# Resolves platform-native user directories without assuming Unix HOME exists.
+dirs = "6"
 ed25519-dalek.workspace = true
 # Serializes cross-process publisher-key inventory mutations.
 fs2.workspace = true
