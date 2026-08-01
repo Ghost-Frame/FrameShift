@@ -142,6 +142,37 @@ struct SetAccountStatusRequest {
     status: AccountStatus,
 }
 
+/// Mutable authenticated-account profile fields serialized at the HTTP boundary.
+#[derive(Serialize)]
+struct UpdateAccountProfileRequest<'a> {
+    /// Replacement email metadata when supplied.
+    email: Option<&'a str>,
+    /// Replacement display name when supplied.
+    display_name: Option<&'a str>,
+}
+
+/// New publisher profile fields serialized at the HTTP boundary.
+#[derive(Serialize)]
+struct CreatePublisherProfileRequest<'a> {
+    /// Unique public publisher handle.
+    handle: &'a str,
+    /// Public publisher display name.
+    display_name: &'a str,
+    /// Optional public biography.
+    biography: Option<&'a str>,
+}
+
+/// Mutable publisher profile fields serialized at the HTTP boundary.
+#[derive(Serialize)]
+struct UpdatePublisherProfileRequest<'a> {
+    /// Replacement public display name.
+    display_name: &'a str,
+    /// Replacement biography when supplied.
+    biography: Option<&'a str>,
+    /// Whether to remove an existing biography.
+    clear_biography: bool,
+}
+
 /// Non-issued review states accepted by the administrator PATCH route.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -425,6 +456,99 @@ pub fn get_account(
             detail: error.to_string(),
         }),
     }
+}
+
+/// Update mutable metadata for the authenticated account.
+///
+/// Omitted fields retain their current values. Text validation remains owned
+/// by the registry so its public bounds cannot drift from the client.
+///
+/// # Errors
+///
+/// Returns an input-shape, registry URL, transport, status, size, JSON
+/// serialization, or JSON response error without including the bearer token.
+pub fn update_account_profile(
+    server_url: &str,
+    access_token: &SecretString,
+    email: Option<&str>,
+    display_name: Option<&str>,
+) -> Result<AccountRecord, ClientError> {
+    if email.is_none() && display_name.is_none() {
+        return Err(ClientError::InvalidAccountProfileInput {
+            detail: "email or display_name must be supplied".to_string(),
+        });
+    }
+    let url = crate::publisher::registry_endpoint_url(server_url, &["v1", "account"])?;
+    send_account_json(
+        crate::registry::http_agent().request("PATCH", url.as_str()),
+        &url,
+        access_token,
+        &UpdateAccountProfileRequest {
+            email,
+            display_name,
+        },
+    )
+}
+
+/// Create a pending publisher profile owned by the authenticated account.
+///
+/// # Errors
+///
+/// Returns a registry URL, transport, status, size, JSON serialization, or JSON
+/// response error without including the bearer token.
+pub fn create_publisher_profile(
+    server_url: &str,
+    access_token: &SecretString,
+    handle: &str,
+    display_name: &str,
+    biography: Option<&str>,
+) -> Result<PublisherProfileRecord, ClientError> {
+    let url = crate::publisher::registry_endpoint_url(server_url, &["v1", "publishers"])?;
+    send_account_json(
+        crate::registry::http_agent().post(url.as_str()),
+        &url,
+        access_token,
+        &CreatePublisherProfileRequest {
+            handle,
+            display_name,
+            biography,
+        },
+    )
+}
+
+/// Update a publisher profile under active-owner authority.
+///
+/// An omitted biography retains its current value. `clear_biography` removes
+/// it, and cannot be combined with a replacement biography.
+///
+/// # Errors
+///
+/// Returns an input-shape, registry URL, transport, status, size, JSON
+/// serialization, or JSON response error without including the bearer token.
+pub fn update_publisher_profile(
+    server_url: &str,
+    access_token: &SecretString,
+    handle: &str,
+    display_name: &str,
+    biography: Option<&str>,
+    clear_biography: bool,
+) -> Result<PublisherProfileRecord, ClientError> {
+    if biography.is_some() && clear_biography {
+        return Err(ClientError::InvalidAccountProfileInput {
+            detail: "biography and clear_biography cannot be supplied together".to_string(),
+        });
+    }
+    let url = crate::publisher::registry_endpoint_url(server_url, &["v1", "publishers", handle])?;
+    send_account_json(
+        crate::registry::http_agent().request("PATCH", url.as_str()),
+        &url,
+        access_token,
+        &UpdatePublisherProfileRequest {
+            display_name,
+            biography,
+            clear_biography,
+        },
+    )
 }
 
 /// Grant one global platform role under authenticated administrator authority.
@@ -712,6 +836,11 @@ mod tests {
         r#"{"id":"00000000-0000-0000-0000-000000000001","issuer":"https://issuer.example","subject":"subject-1","email":"alice@example.com","display_name":"Alice","status":"active","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#
     }
 
+    /// Return one stable publisher profile JSON object for mutation responses.
+    fn publisher_json() -> &'static str {
+        r#"{"id":"00000000-0000-0000-0000-000000000002","handle":"gatekeeper","display_name":"Gatekeeper","biography":"Verifies releases.","moderation_status":"pending","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#
+    }
+
     /// Account lookup sends the bearer only in the authorization header.
     #[test]
     fn fetches_account_with_bearer_header() {
@@ -725,6 +854,76 @@ mod tests {
         assert!(request.starts_with("GET /v1/account HTTP/1.1\r\n"));
         assert!(request.contains("\r\nAuthorization: Bearer test-access-token\r\n"));
         assert_eq!(request.matches("test-access-token").count(), 1);
+    }
+
+    /// Profile mutations preserve base paths, bearer authority, and exact JSON fields.
+    #[test]
+    fn sends_account_and_publisher_profile_mutations() {
+        let token = SecretString::new("profile-token".to_string());
+
+        let (server, handle) = serve_json_response(account_json());
+        let server = format!("{server}/registry");
+        let account =
+            update_account_profile(&server, &token, Some("new@example.test"), Some("New Name"))
+                .expect("account profile response");
+        assert_eq!(account.id, Uuid::from_u128(1));
+        let request = handle.join().expect("account request thread");
+        assert!(request.starts_with("PATCH /registry/v1/account HTTP/1.1\r\n"));
+        assert!(request.contains("\r\nAuthorization: Bearer profile-token\r\n"));
+        assert!(request.contains(r#"{"email":"new@example.test","display_name":"New Name"}"#));
+        assert_eq!(request.matches("profile-token").count(), 1);
+
+        let (server, handle) = serve_json_response(publisher_json());
+        let server = format!("{server}/registry");
+        let publisher = create_publisher_profile(
+            &server,
+            &token,
+            "gatekeeper",
+            "Gatekeeper",
+            Some("Verifies releases."),
+        )
+        .expect("publisher creation response");
+        assert_eq!(publisher.handle, "gatekeeper");
+        let request = handle.join().expect("publisher creation thread");
+        assert!(request.starts_with("POST /registry/v1/publishers HTTP/1.1\r\n"));
+        assert!(request.contains(r#"{"handle":"gatekeeper","display_name":"Gatekeeper","biography":"Verifies releases."}"#));
+        assert_eq!(request.matches("profile-token").count(), 1);
+
+        let (server, handle) = serve_json_response(publisher_json());
+        let server = format!("{server}/registry");
+        update_publisher_profile(&server, &token, "gatekeeper", "Gatekeeper", None, true)
+            .expect("publisher update response");
+        let request = handle.join().expect("publisher update thread");
+        assert!(request.starts_with("PATCH /registry/v1/publishers/gatekeeper HTTP/1.1\r\n"));
+        assert!(request
+            .contains(r#"{"display_name":"Gatekeeper","biography":null,"clear_biography":true}"#));
+        assert_eq!(request.matches("profile-token").count(), 1);
+    }
+
+    /// Structurally ambiguous profile mutations fail before transport.
+    #[test]
+    fn rejects_ambiguous_profile_mutations() {
+        let token = SecretString::new("profile-token".to_string());
+        let empty = update_account_profile("https://registry.example", &token, None, None)
+            .expect_err("empty account profile update");
+        assert!(matches!(
+            empty,
+            ClientError::InvalidAccountProfileInput { .. }
+        ));
+
+        let conflicting = update_publisher_profile(
+            "https://registry.example",
+            &token,
+            "gatekeeper",
+            "Gatekeeper",
+            Some("New biography"),
+            true,
+        )
+        .expect_err("conflicting biography update");
+        assert!(matches!(
+            conflicting,
+            ClientError::InvalidAccountProfileInput { .. }
+        ));
     }
 
     /// First-party login sends credentials only in JSON and redacts its bearer result.

@@ -8,14 +8,15 @@ use std::io::{IsTerminal as _, Read as _, Write as _};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use clap::{Args, Subcommand, ValueEnum};
+use clap::{ArgGroup, Args, Subcommand, ValueEnum};
 use frameshift_catalog::{AccountInviteStatus, AccountStatus, PlatformRole};
 use frameshift_client::account::{
-    assign_account_platform_role, get_account, get_auth_config, issue_account_invite,
-    list_account_invite_requests, login_local_account, logout_local_account,
+    assign_account_platform_role, create_publisher_profile, get_account, get_auth_config,
+    issue_account_invite, list_account_invite_requests, login_local_account, logout_local_account,
     register_local_account, review_account_invite_request, revoke_account_platform_role,
-    set_account_status, AccountInviteReviewStatus, AccountView, IssuedAccountInvite,
-    LocalAccountSession, NativeAuthClient,
+    set_account_status, update_account_profile, update_publisher_profile,
+    AccountInviteReviewStatus, AccountView, IssuedAccountInvite, LocalAccountSession,
+    NativeAuthClient,
 };
 use frameshift_client::session::{AuthenticatedSession, SessionClient, SessionClientConfig};
 use frameshift_client::session_store::{
@@ -59,6 +60,52 @@ pub enum AccountCommand {
     Status,
     /// Revoke the provider session when supported and erase local credentials.
     Logout,
+    /// Update mutable metadata for the authenticated account.
+    #[command(group(ArgGroup::new("account_profile").required(true).args(["email", "display_name"])))]
+    UpdateProfile {
+        /// Registry API base URL.
+        #[arg(long)]
+        server: String,
+        /// Replacement account email metadata.
+        #[arg(long)]
+        email: Option<String>,
+        /// Replacement account display name.
+        #[arg(long)]
+        display_name: Option<String>,
+    },
+    /// Create a pending publisher profile owned by the authenticated account.
+    CreatePublisher {
+        /// Registry API base URL.
+        #[arg(long)]
+        server: String,
+        /// Unique lowercase public publisher handle.
+        #[arg(long)]
+        handle: String,
+        /// Public publisher display name.
+        #[arg(long)]
+        display_name: String,
+        /// Optional public publisher biography.
+        #[arg(long)]
+        biography: Option<String>,
+    },
+    /// Update a publisher profile under active-owner authority.
+    UpdatePublisher {
+        /// Registry API base URL.
+        #[arg(long)]
+        server: String,
+        /// Existing public publisher handle.
+        #[arg(long)]
+        handle: String,
+        /// Replacement public display name.
+        #[arg(long)]
+        display_name: String,
+        /// Replacement public biography.
+        #[arg(long, conflicts_with = "clear_biography")]
+        biography: Option<String>,
+        /// Remove the existing public biography.
+        #[arg(long)]
+        clear_biography: bool,
+    },
     /// Grant one global platform role under administrator authority.
     GrantRole {
         /// Registry API base URL.
@@ -292,6 +339,30 @@ pub fn run_account(args: AccountArgs) -> Result<(), CliError> {
         AccountCommand::Register(args) => run_register(args),
         AccountCommand::Status => run_status(),
         AccountCommand::Logout => run_logout(),
+        AccountCommand::UpdateProfile {
+            server,
+            email,
+            display_name,
+        } => update_profile(&server, email.as_deref(), display_name.as_deref()),
+        AccountCommand::CreatePublisher {
+            server,
+            handle,
+            display_name,
+            biography,
+        } => create_publisher(&server, &handle, &display_name, biography.as_deref()),
+        AccountCommand::UpdatePublisher {
+            server,
+            handle,
+            display_name,
+            biography,
+            clear_biography,
+        } => update_publisher(
+            &server,
+            &handle,
+            &display_name,
+            biography.as_deref(),
+            clear_biography,
+        ),
         AccountCommand::GrantRole {
             server,
             account_id,
@@ -319,6 +390,58 @@ pub fn run_account(args: AccountArgs) -> Result<(), CliError> {
         } => review_invite_request(&server, request_id, status),
         AccountCommand::IssueInvite { server, request_id } => issue_invite(&server, request_id),
     }
+}
+
+/// Update the current account profile through its exact authenticated session.
+fn update_profile(
+    server: &str,
+    email: Option<&str>,
+    display_name: Option<&str>,
+) -> Result<(), CliError> {
+    validate_server_url(server)?;
+    let token = resolve_access_token(server)?;
+    let account = update_account_profile(server, &token, email, display_name)
+        .map_err(|error| CliError::Account(error.to_string()))?;
+    println!("{}", serde_json::to_string_pretty(&account)?);
+    Ok(())
+}
+
+/// Create one publisher profile through the current authenticated session.
+fn create_publisher(
+    server: &str,
+    handle: &str,
+    display_name: &str,
+    biography: Option<&str>,
+) -> Result<(), CliError> {
+    validate_server_url(server)?;
+    let token = resolve_access_token(server)?;
+    let publisher = create_publisher_profile(server, &token, handle, display_name, biography)
+        .map_err(|error| CliError::Account(error.to_string()))?;
+    println!("{}", serde_json::to_string_pretty(&publisher)?);
+    Ok(())
+}
+
+/// Update one owned publisher profile through the current authenticated session.
+fn update_publisher(
+    server: &str,
+    handle: &str,
+    display_name: &str,
+    biography: Option<&str>,
+    clear_biography: bool,
+) -> Result<(), CliError> {
+    validate_server_url(server)?;
+    let token = resolve_access_token(server)?;
+    let publisher = update_publisher_profile(
+        server,
+        &token,
+        handle,
+        display_name,
+        biography,
+        clear_biography,
+    )
+    .map_err(|error| CliError::Account(error.to_string()))?;
+    println!("{}", serde_json::to_string_pretty(&publisher)?);
+    Ok(())
 }
 
 /// Grant one role through the exact authenticated registry session.
@@ -1069,6 +1192,129 @@ mod tests {
             "login",
             "--password",
             "secret",
+        ])
+        .is_err());
+    }
+
+    /// Account profile parsing requires at least one replacement field.
+    #[test]
+    fn parses_account_profile_update() {
+        let parsed = TestCli::try_parse_from([
+            "frameshift",
+            "account",
+            "update-profile",
+            "--server",
+            "https://registry.example",
+            "--display-name",
+            "Alice Example",
+        ])
+        .expect("account profile arguments");
+        let TestCommand::Account(AccountArgs {
+            command:
+                AccountCommand::UpdateProfile {
+                    server,
+                    email,
+                    display_name,
+                },
+        }) = parsed.command
+        else {
+            panic!("expected account profile update");
+        };
+        assert_eq!(server, "https://registry.example");
+        assert_eq!(email, None);
+        assert_eq!(display_name.as_deref(), Some("Alice Example"));
+        assert!(TestCli::try_parse_from([
+            "frameshift",
+            "account",
+            "update-profile",
+            "--server",
+            "https://registry.example",
+        ])
+        .is_err());
+    }
+
+    /// Publisher creation parsing preserves its public profile fields.
+    #[test]
+    fn parses_publisher_profile_creation() {
+        let parsed = TestCli::try_parse_from([
+            "frameshift",
+            "account",
+            "create-publisher",
+            "--server",
+            "https://registry.example",
+            "--handle",
+            "gatekeeper",
+            "--display-name",
+            "Gatekeeper",
+            "--biography",
+            "Verifies releases.",
+        ])
+        .expect("publisher creation arguments");
+        let TestCommand::Account(AccountArgs {
+            command:
+                AccountCommand::CreatePublisher {
+                    server,
+                    handle,
+                    display_name,
+                    biography,
+                },
+        }) = parsed.command
+        else {
+            panic!("expected publisher profile creation");
+        };
+        assert_eq!(server, "https://registry.example");
+        assert_eq!(handle, "gatekeeper");
+        assert_eq!(display_name, "Gatekeeper");
+        assert_eq!(biography.as_deref(), Some("Verifies releases."));
+    }
+
+    /// Publisher updates expose explicit biography replacement or removal.
+    #[test]
+    fn parses_publisher_profile_update() {
+        let parsed = TestCli::try_parse_from([
+            "frameshift",
+            "account",
+            "update-publisher",
+            "--server",
+            "https://registry.example",
+            "--handle",
+            "gatekeeper",
+            "--display-name",
+            "Release Gatekeeper",
+            "--clear-biography",
+        ])
+        .expect("publisher update arguments");
+        let TestCommand::Account(AccountArgs {
+            command:
+                AccountCommand::UpdatePublisher {
+                    server,
+                    handle,
+                    display_name,
+                    biography,
+                    clear_biography,
+                },
+        }) = parsed.command
+        else {
+            panic!("expected publisher profile update");
+        };
+        assert_eq!(server, "https://registry.example");
+        assert_eq!(handle, "gatekeeper");
+        assert_eq!(display_name, "Release Gatekeeper");
+        assert_eq!(biography, None);
+        assert!(clear_biography);
+        assert!(TestCli::try_parse_from([
+            "frameshift",
+            "account",
+            "update-publisher",
+            "--server",
+            "https://registry.example",
+            "--handle",
+            "gatekeeper",
+            "--display-name",
+            "Gatekeeper",
+            "--biography",
+            "Replacement",
+            "--clear-biography",
         ])
         .is_err());
     }

@@ -126,6 +126,13 @@ frameshift account login --first-party
 # Confirm the server-validated account and publisher memberships.
 frameshift account status
 
+# Update account metadata. Supply at least one field.
+frameshift account update-profile --server <url> [--email <email>] [--display-name <name>]
+
+# Create an owned publisher profile, then update its public metadata when needed.
+frameshift account create-publisher --server <url> --handle <handle> --display-name <name> [--biography <text>]
+frameshift account update-publisher --server <url> --handle <handle> --display-name <name> [--biography <text> | --clear-biography]
+
 # Revoke the provider session, then erase the exact local credential and metadata.
 frameshift account logout
 
@@ -150,6 +157,11 @@ discovery, and `--redirect-uri` selects another pre-registered IP-loopback
 callback. Login never accepts a bearer token through arguments, environment
 variables, or command-line values. First-party credentials require an
 interactive terminal and are read through hidden prompts.
+
+Account and publisher profile commands reuse the saved session for the exact
+registry. New publisher profiles begin in pending moderation and automatically
+grant the creating account an active owner membership. Publisher profile updates
+require that active owner membership and a fresh authentication session.
 
 Administrator account controls resolve bearer authority for the exact registry
 without accepting a token argument. The registry rejects non-administrators and
@@ -459,6 +471,12 @@ frameshift account revoke-role --server <url> --account-id <uuid>          Revok
            --role <moderator|administrator>
 frameshift account set-status --server <url> --account-id <uuid>           Set an account lifecycle state
            --status <active|suspended|disabled>
+frameshift account update-profile --server <url>                          Update account profile metadata
+           [--email <email>] [--display-name <name>]
+frameshift account create-publisher --server <url> --handle <handle>       Create an owned publisher profile
+           --display-name <name> [--biography <text>]
+frameshift account update-publisher --server <url> --handle <handle>       Update an owned publisher profile
+           --display-name <name> [--biography <text> | --clear-biography]
 frameshift account invite-requests --server <url>                          List invitation requests
            [--status <pending|reviewing|invited|declined>] [--limit <1-200>]
 frameshift account review-invite-request --server <url> --request-id <uuid> Transition an invitation review state

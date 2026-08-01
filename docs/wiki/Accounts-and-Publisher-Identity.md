@@ -42,6 +42,7 @@ frameshift account register
 frameshift account login
 frameshift account login --first-party
 frameshift account status
+frameshift account update-profile --server https://frameshift-api.syntheos.dev --display-name "YOUR NAME"
 ```
 
 `frameshift account register` redeems a single-use invitation through hidden
@@ -73,9 +74,34 @@ Its handle is the public name; its UUID is the stable identity used for
 ownership checks even if display metadata changes.
 
 Publisher operations require an active account membership with the appropriate
-role. The current key CLI assumes that the publisher profile and your
-membership already exist. Use `frameshift account status` to confirm membership
-before enrolling a device.
+role. Create the profile from the authenticated CLI session:
+
+```bash
+frameshift account create-publisher \
+  --server https://frameshift-api.syntheos.dev \
+  --handle YOUR_PUBLISHER_HANDLE \
+  --display-name "YOUR PUBLISHER NAME" \
+  --biography "OPTIONAL PUBLIC BIOGRAPHY"
+```
+
+The profile begins in pending moderation, and the registry creates an active
+owner membership for the authenticated account. Confirm both records with
+`frameshift account status` before enrolling a device.
+
+Owners can replace public metadata later. The display name is required on every
+update. Omit both biography options to keep the existing biography, provide
+`--biography` to replace it, or use `--clear-biography` to remove it.
+
+```bash
+frameshift account update-publisher \
+  --server https://frameshift-api.syntheos.dev \
+  --handle YOUR_PUBLISHER_HANDLE \
+  --display-name "UPDATED PUBLISHER NAME" \
+  --clear-biography
+```
+
+Publisher updates require an active owner membership and a fresh authentication
+session.
 
 ## Create and enroll a device key
 
