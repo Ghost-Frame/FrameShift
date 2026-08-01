@@ -11,6 +11,7 @@ pub mod feedback;
 pub mod grow;
 pub mod keys;
 pub mod migrate;
+pub mod moderation;
 pub mod prefs;
 pub mod publication;
 pub mod publish;

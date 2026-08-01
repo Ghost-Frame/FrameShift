@@ -6,6 +6,8 @@ mod error;
 /// Versioned local publisher-key metadata and secret storage.
 pub mod identity;
 mod model;
+/// Account-authenticated publication moderation and promotion operations.
+pub mod moderation;
 /// Explicit authenticated Creator Studio quarantine publication operations.
 pub mod publication;
 /// Registry publish implementation: pack, sign, and HTTP upload.

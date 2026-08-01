@@ -23,6 +23,7 @@ use cmd::feedback::FeedbackArgs;
 use cmd::grow::GrowArgs;
 use cmd::keys::KeysArgs;
 use cmd::migrate::MigrateArgs;
+use cmd::moderation::ModerationArgs;
 use cmd::prefs::PrefsArgs;
 use cmd::publication::PublicationArgs;
 use cmd::publish::PublishArgs;
@@ -125,6 +126,9 @@ enum Command {
 
     /// Review and submit Creator Studio drafts through moderated publication.
     Publication(PublicationArgs),
+
+    /// Inspect, decide, and promote quarantined publication submissions.
+    Moderation(ModerationArgs),
 
     /// Register this machine's author key under a handle at the registry.
     Register(RegisterArgs),
@@ -493,6 +497,7 @@ fn run() -> Result<(), RunError> {
         Command::Publication(args) => {
             cmd::publication::run_publication(args).map_err(RunError::from)
         }
+        Command::Moderation(args) => cmd::moderation::run_moderation(args).map_err(RunError::from),
         Command::Register(args) => cmd::register::run_register(args).map_err(RunError::from),
         Command::Keys(args) => cmd::keys::run_keys(args).map_err(RunError::from),
         Command::Search(args) => cmd::search::run_search(args).map_err(RunError::from),
@@ -629,6 +634,56 @@ mod publication_cli_tests {
             "alice",
             "--confirm-archive-hash",
             "0101010101010101010101010101010101010101010101010101010101010101",
+        ]);
+        assert!(result.is_err());
+    }
+}
+
+/// CLI parsing regressions for the role-gated moderation surface.
+#[cfg(test)]
+mod moderation_cli_tests {
+    use super::*;
+    use cmd::moderation::{ModerationActionArg, ModerationCommand};
+
+    /// Decision parsing accepts the hyphenated request-changes action.
+    #[test]
+    fn parses_moderation_request_changes_decision() {
+        let cli = Cli::try_parse_from([
+            "frameshift",
+            "moderation",
+            "decide",
+            "--server",
+            "https://registry.example",
+            "--submission-id",
+            "00000000-0000-0000-0000-000000000001",
+            "--action",
+            "request-changes",
+            "--reason-code",
+            "metadata",
+        ])
+        .expect("moderation decision arguments should parse");
+        assert!(matches!(
+            cli.command,
+            Command::Moderation(ModerationArgs {
+                command: ModerationCommand::Decide {
+                    action: ModerationActionArg::RequestChanges,
+                    ..
+                }
+            })
+        ));
+    }
+
+    /// Artifact parsing requires a destination path.
+    #[test]
+    fn moderation_artifact_requires_destination() {
+        let result = Cli::try_parse_from([
+            "frameshift",
+            "moderation",
+            "artifact",
+            "--server",
+            "https://registry.example",
+            "--submission-id",
+            "00000000-0000-0000-0000-000000000001",
         ]);
         assert!(result.is_err());
     }

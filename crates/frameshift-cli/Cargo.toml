@@ -32,6 +32,8 @@ ed25519-dalek = { workspace = true }
 # Wraps the vault passphrase/value input so it is never accidentally logged.
 secrecy = { workspace = true }
 serde_json = { workspace = true }
+# Persists reviewed quarantine artifacts atomically without overwriting operator files.
+tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 # Structured logging for best-effort paths (e.g. telemetry/selection-history
@@ -50,6 +52,3 @@ webbrowser = { workspace = true }
 # Semantic selection via a local candle sentence-embedding model. Off by
 # default so the standard build stays free of the ML dependency stack.
 embeddings = ["dep:frameshift-embed-candle"]
-
-[dev-dependencies]
-tempfile = { workspace = true }

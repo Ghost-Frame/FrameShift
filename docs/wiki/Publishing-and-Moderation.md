@@ -21,9 +21,9 @@ token and an Ed25519-signed request. A local manifest without a valid signature
 cannot enter the account-backed publication pipeline, and the selected signer
 must match the manifest's `author_pubkey`.
 
-The account-backed intent and submission functions are available in the core
-client library for a human-facing client. They are not exposed through the
-current CLI or MCP server.
+The `frameshift publication review`, `submit`, and `status` commands expose the
+account-backed workflow through the CLI. Final submission is not exposed
+through the MCP server.
 
 ## Quarantine and review
 
@@ -45,6 +45,20 @@ Promotion is a distinct step that registers the reviewed artifact as an active
 public release. A request for changes or rejection does not mutate the submitted
 artifact; the publisher prepares and submits a new exact snapshot when content
 must change.
+
+The role-gated CLI accepts the submission UUID returned to the publisher:
+
+```bash
+frameshift moderation show --server https://registry.example --submission-id <UUID>
+frameshift moderation artifact --server https://registry.example --submission-id <UUID> --out submission.tar.gz
+frameshift moderation decide --server https://registry.example --submission-id <UUID> --action approve --reason-code reviewed
+frameshift moderation promote --server https://registry.example --submission-id <UUID>
+```
+
+The artifact command writes to a new destination and refuses to replace an
+existing file. The server still enforces active moderator or administrator
+membership and requires an independent reviewer for artifact access and
+promotion.
 
 ## Withdrawal and decisions
 
