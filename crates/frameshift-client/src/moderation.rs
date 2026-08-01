@@ -5,8 +5,11 @@
 //! independent-review separation, lifecycle transitions, and promotion.
 
 use frameshift_catalog::{
-    PublicationModerationAction, PublicationModerationDecisionRecord, PublicationPromotionRecord,
-    PublicationSubmissionRecord,
+    PublicationAppealCaseRecord, PublicationAppealCursor, PublicationAppealDisposition,
+    PublicationAppealResolutionRecord, PublicationLifecycleCursor,
+    PublicationLifecycleDecisionRecord, PublicationModerationAction,
+    PublicationModerationDecisionRecord, PublicationPromotionRecord, PublicationSubmissionRecord,
+    TombstoneReason,
 };
 use secrecy::SecretString;
 use serde::Serialize;
@@ -32,6 +35,37 @@ struct ModeratePublicationRequest<'a> {
 struct PromotePublicationRequest {
     /// Stable promotion identifier.
     id: Uuid,
+}
+
+/// Caller-controlled fields for one administrator publisher suspension.
+#[derive(Serialize)]
+struct SuspendPublicationPublisherRequest<'a> {
+    /// Stable lifecycle decision identifier.
+    id: Uuid,
+    /// Stable bounded private reason code.
+    reason_code: &'a str,
+}
+
+/// Caller-controlled fields for one administrator release tombstone.
+#[derive(Serialize)]
+struct TombstonePublicationReleaseRequest {
+    /// Stable lifecycle decision identifier.
+    id: Uuid,
+    /// Closed public tombstone reason category.
+    reason: TombstoneReason,
+}
+
+/// Caller-controlled fields for one administrator appeal resolution.
+#[derive(Serialize)]
+struct ResolvePublicationAppealRequest<'a> {
+    /// Stable appeal-resolution identifier.
+    id: Uuid,
+    /// Final administrator disposition.
+    disposition: PublicationAppealDisposition,
+    /// Bounded private rationale for the disposition.
+    rationale: &'a str,
+    /// Bounded audited reason for an unavoidable self-resolution.
+    separation_exception_reason: Option<&'a str>,
 }
 
 /// Retrieve one role-gated publication submission for operator review.
@@ -120,11 +154,186 @@ pub fn promote_publication_submission(
     )
 }
 
+/// Suspend one publisher under authenticated administrator authority.
+pub fn suspend_publication_publisher(
+    server_url: &str,
+    access_token: &SecretString,
+    publisher_id: Uuid,
+    decision_id: Uuid,
+    request_id: Uuid,
+    reason_code: &str,
+) -> Result<PublicationLifecycleDecisionRecord, ClientError> {
+    validate_lifecycle_reason_code(reason_code)?;
+    let publisher = publisher_id.to_string();
+    let url = admin_url(server_url, &["publishers", &publisher, "suspend"])?;
+    post_json_with_request_id(
+        &url,
+        access_token,
+        request_id,
+        &SuspendPublicationPublisherRequest {
+            id: decision_id,
+            reason_code,
+        },
+    )
+}
+
+/// Tombstone one public release under authenticated administrator authority.
+#[allow(clippy::too_many_arguments)]
+pub fn tombstone_publication_release(
+    server_url: &str,
+    access_token: &SecretString,
+    pack_name: &str,
+    version: &str,
+    decision_id: Uuid,
+    request_id: Uuid,
+    reason: TombstoneReason,
+) -> Result<PublicationLifecycleDecisionRecord, ClientError> {
+    let url = admin_url(server_url, &["packs", pack_name, version, "tombstone"])?;
+    post_json_with_request_id(
+        &url,
+        access_token,
+        request_id,
+        &TombstonePublicationReleaseRequest {
+            id: decision_id,
+            reason,
+        },
+    )
+}
+
+/// List global immutable publication lifecycle decisions for an administrator.
+pub fn list_administrator_publication_decisions(
+    server_url: &str,
+    access_token: &SecretString,
+    before: Option<PublicationLifecycleCursor>,
+    limit: u32,
+) -> Result<Vec<PublicationLifecycleDecisionRecord>, ClientError> {
+    let mut url = admin_url(server_url, &["publication-decisions"])?;
+    append_admin_page_query(
+        &mut url,
+        before.map(|cursor| (cursor.created_at, cursor.id)),
+        limit,
+    )?;
+    let request = crate::publisher::with_bearer(
+        crate::registry::http_agent().get(url.as_str()),
+        access_token,
+    );
+    crate::publisher::send_and_decode(request.call(), url.as_str())
+}
+
+/// List global private publication appeal cases for an administrator.
+pub fn list_administrator_publication_appeals(
+    server_url: &str,
+    access_token: &SecretString,
+    before: Option<PublicationAppealCursor>,
+    limit: u32,
+) -> Result<Vec<PublicationAppealCaseRecord>, ClientError> {
+    let mut url = admin_url(server_url, &["publication-appeals"])?;
+    append_admin_page_query(
+        &mut url,
+        before.map(|cursor| (cursor.created_at, cursor.id)),
+        limit,
+    )?;
+    let request = crate::publisher::with_bearer(
+        crate::registry::http_agent().get(url.as_str()),
+        access_token,
+    );
+    crate::publisher::send_and_decode(request.call(), url.as_str())
+}
+
+/// Resolve one publication appeal under administrator separation enforcement.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_administrator_publication_appeal(
+    server_url: &str,
+    access_token: &SecretString,
+    appeal_id: Uuid,
+    resolution_id: Uuid,
+    request_id: Uuid,
+    disposition: PublicationAppealDisposition,
+    rationale: &str,
+    separation_exception_reason: Option<&str>,
+) -> Result<PublicationAppealResolutionRecord, ClientError> {
+    validate_appeal_text(rationale, "--rationale", 4_000)?;
+    if let Some(reason) = separation_exception_reason {
+        validate_appeal_text(reason, "--separation-exception-reason", 1_000)?;
+    }
+    let appeal = appeal_id.to_string();
+    let url = admin_url(server_url, &["publication-appeals", &appeal, "resolution"])?;
+    post_json_with_request_id(
+        &url,
+        access_token,
+        request_id,
+        &ResolvePublicationAppealRequest {
+            id: resolution_id,
+            disposition,
+            rationale,
+            separation_exception_reason,
+        },
+    )
+}
+
 /// Build a moderation endpoint while preserving a registry base path.
 fn moderation_url(server_url: &str, suffix: &[&str]) -> Result<url::Url, ClientError> {
     let mut segments = vec!["v1", "moderation", "publication-submissions"];
     segments.extend_from_slice(suffix);
     crate::publisher::registry_endpoint_url(server_url, &segments)
+}
+
+/// Build an administrator endpoint while preserving a registry base path.
+fn admin_url(server_url: &str, suffix: &[&str]) -> Result<url::Url, ClientError> {
+    let mut segments = vec!["v1", "admin"];
+    segments.extend_from_slice(suffix);
+    crate::publisher::registry_endpoint_url(server_url, &segments)
+}
+
+/// Append a validated newest-first administrator page query.
+fn append_admin_page_query(
+    url: &mut url::Url,
+    before: Option<(chrono::DateTime<chrono::Utc>, Uuid)>,
+    limit: u32,
+) -> Result<(), ClientError> {
+    if !(1..=100).contains(&limit) {
+        return Err(ClientError::InvalidPublicationLifecycleInput {
+            detail: "--limit must be between 1 and 100".to_string(),
+        });
+    }
+    let mut query = url.query_pairs_mut();
+    if let Some((created_at, id)) = before {
+        query.append_pair("before_created_at", &created_at.to_rfc3339());
+        query.append_pair("before_id", &id.to_string());
+    }
+    query.append_pair("limit", &limit.to_string());
+    drop(query);
+    Ok(())
+}
+
+/// Validate the server's stable lifecycle reason-code grammar before transport.
+fn validate_lifecycle_reason_code(reason_code: &str) -> Result<(), ClientError> {
+    let reason = reason_code.as_bytes();
+    let valid_head = !reason.is_empty()
+        && reason.len() <= 64
+        && reason
+            .first()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit());
+    let valid_tail = reason.iter().skip(1).all(|byte| {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'.' | b'-')
+    });
+    if valid_head && valid_tail {
+        return Ok(());
+    }
+    Err(ClientError::InvalidPublicationLifecycleInput {
+        detail: "--reason-code must use 1-64 lowercase ASCII letters, digits, '.', '_', or '-'"
+            .to_string(),
+    })
+}
+
+/// Validate one bounded private administrator appeal field before transport.
+fn validate_appeal_text(value: &str, flag: &str, maximum: usize) -> Result<(), ClientError> {
+    if !value.trim().is_empty() && value.chars().count() <= maximum {
+        return Ok(());
+    }
+    Err(ClientError::InvalidPublicationLifecycleInput {
+        detail: format!("{flag} must be non-blank and at most {maximum} characters"),
+    })
 }
 
 /// Send one bearer-authenticated idempotent JSON mutation.
@@ -359,5 +568,194 @@ mod tests {
             .contains("response exceeds maximum allowed size"));
         let request = handle.join().expect("test server thread");
         assert!(request.contains("/artifact HTTP/1.1"));
+    }
+
+    /// Administrator lifecycle mutations preserve path targets and retry identifiers.
+    #[test]
+    fn sends_administrator_lifecycle_mutations() {
+        let decision_id = Uuid::from_u128(20);
+        let request_id = Uuid::from_u128(21);
+        let response = serde_json::to_vec(&serde_json::json!({
+            "id": decision_id,
+            "action": "suspend_publisher",
+            "actor_account_id": Uuid::from_u128(2),
+            "publisher_id": Uuid::from_u128(3),
+            "submission_id": null,
+            "pack_name": null,
+            "version": null,
+            "from_state": "approved",
+            "to_state": "suspended",
+            "reason_code": "policy.abuse",
+            "request_id": request_id,
+            "created_at": "2026-01-01T00:00:00Z"
+        }))
+        .expect("serialize lifecycle fixture");
+        let (server, handle) = serve_response("application/json", response);
+        let token = SecretString::new("administrator-token".to_string());
+        let record = suspend_publication_publisher(
+            &server,
+            &token,
+            Uuid::from_u128(3),
+            decision_id,
+            request_id,
+            "policy.abuse",
+        )
+        .expect("suspension response");
+        assert_eq!(record.id, decision_id);
+        let request = handle.join().expect("test server thread");
+        assert!(request.starts_with(
+            "POST /registry/v1/admin/publishers/00000000-0000-0000-0000-000000000003/suspend HTTP/1.1\r\n"
+        ));
+        assert!(request
+            .to_ascii_lowercase()
+            .contains(&format!("\r\nx-request-id: {request_id}\r\n")));
+        assert!(request.contains("\r\nAuthorization: Bearer administrator-token\r\n"));
+        assert!(request.contains(&format!("\"id\":\"{decision_id}\"")));
+        assert!(request.contains("\"reason_code\":\"policy.abuse\""));
+
+        let response = serde_json::to_vec(&serde_json::json!({
+            "id": decision_id,
+            "action": "tombstone_release",
+            "actor_account_id": Uuid::from_u128(2),
+            "publisher_id": Uuid::from_u128(3),
+            "submission_id": null,
+            "pack_name": "pack/name",
+            "version": "1.0.0+linux",
+            "from_state": "active",
+            "to_state": "tombstone",
+            "reason_code": "tos-violation",
+            "request_id": request_id,
+            "created_at": "2026-01-01T00:00:00Z"
+        }))
+        .expect("serialize tombstone fixture");
+        let (server, handle) = serve_response("application/json", response);
+        tombstone_publication_release(
+            &server,
+            &token,
+            "pack/name",
+            "1.0.0+linux",
+            decision_id,
+            request_id,
+            frameshift_catalog::TombstoneReason::TosViolation,
+        )
+        .expect("tombstone response");
+        let request = handle.join().expect("test server thread");
+        assert!(request.starts_with(
+            "POST /registry/v1/admin/packs/pack%2Fname/1.0.0+linux/tombstone HTTP/1.1\r\n"
+        ));
+        assert!(request.contains("\r\nAuthorization: Bearer administrator-token\r\n"));
+        assert!(request.contains(&format!("\"id\":\"{decision_id}\"")));
+        assert!(request.contains("\"reason\":\"tos-violation\""));
+    }
+
+    /// Administrator audit reads preserve bounded paired keyset cursors.
+    #[test]
+    fn lists_administrator_lifecycle_records() {
+        use chrono::TimeZone as _;
+
+        let cursor = frameshift_catalog::PublicationLifecycleCursor {
+            created_at: chrono::Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap(),
+            id: Uuid::from_u128(22),
+        };
+        let token = SecretString::new("administrator-token".to_string());
+        let (server, handle) = serve_response("application/json", b"[]".to_vec());
+        let records = list_administrator_publication_decisions(&server, &token, Some(cursor), 25)
+            .expect("decision list");
+        assert!(records.is_empty());
+        let request = handle.join().expect("test server thread");
+        assert!(request.starts_with("GET /registry/v1/admin/publication-decisions?"));
+        assert!(request.contains("before_created_at=2026-01-02T03%3A04%3A05%2B00%3A00"));
+        assert!(request.contains("before_id=00000000-0000-0000-0000-000000000016"));
+        assert!(request.contains("limit=25"));
+        assert!(request.contains("\r\nAuthorization: Bearer administrator-token\r\n"));
+
+        let appeal_cursor = frameshift_catalog::PublicationAppealCursor {
+            created_at: cursor.created_at,
+            id: cursor.id,
+        };
+        let (server, handle) = serve_response("application/json", b"[]".to_vec());
+        let records =
+            list_administrator_publication_appeals(&server, &token, Some(appeal_cursor), 100)
+                .expect("appeal list");
+        assert!(records.is_empty());
+        let request = handle.join().expect("test server thread");
+        assert!(request.starts_with("GET /registry/v1/admin/publication-appeals?"));
+        assert!(request.contains("limit=100"));
+    }
+
+    /// Appeal resolution sends the exact private fields and stable retry identifiers.
+    #[test]
+    fn sends_administrator_appeal_resolution() {
+        let resolution_id = Uuid::from_u128(30);
+        let appeal_id = Uuid::from_u128(31);
+        let request_id = Uuid::from_u128(32);
+        let response = serde_json::to_vec(&serde_json::json!({
+            "id": resolution_id,
+            "appeal_id": appeal_id,
+            "actor_account_id": Uuid::from_u128(2),
+            "disposition": "overturn",
+            "rationale": "Independent evidence supports reversal.",
+            "separation_exception_reason": "Only one administrator is active.",
+            "request_id": request_id,
+            "created_at": "2026-01-01T00:00:00Z"
+        }))
+        .expect("serialize resolution fixture");
+        let (server, handle) = serve_response("application/json", response);
+        let token = SecretString::new("administrator-token".to_string());
+        let record = resolve_administrator_publication_appeal(
+            &server,
+            &token,
+            appeal_id,
+            resolution_id,
+            request_id,
+            frameshift_catalog::PublicationAppealDisposition::Overturn,
+            "Independent evidence supports reversal.",
+            Some("Only one administrator is active."),
+        )
+        .expect("resolution response");
+        assert_eq!(record.id, resolution_id);
+        let request = handle.join().expect("test server thread");
+        assert!(request.starts_with(
+            "POST /registry/v1/admin/publication-appeals/00000000-0000-0000-0000-00000000001f/resolution HTTP/1.1\r\n"
+        ));
+        assert!(request.contains("\r\nAuthorization: Bearer administrator-token\r\n"));
+        assert!(request.contains(&format!("\"id\":\"{resolution_id}\"")));
+        assert!(request.contains("\"disposition\":\"overturn\""));
+        assert!(request
+            .contains("\"separation_exception_reason\":\"Only one administrator is active.\""));
+    }
+
+    /// Administrator lifecycle validation rejects malformed input before transport.
+    #[test]
+    fn rejects_invalid_administrator_lifecycle_input() {
+        let token = SecretString::new("administrator-token".to_string());
+        let reason_error = suspend_publication_publisher(
+            "https://registry.example",
+            &token,
+            Uuid::nil(),
+            Uuid::nil(),
+            Uuid::nil(),
+            "Policy.Invalid",
+        )
+        .expect_err("uppercase reason must fail");
+        assert!(reason_error.to_string().contains("reason-code"));
+
+        let rationale_error = resolve_administrator_publication_appeal(
+            "https://registry.example",
+            &token,
+            Uuid::nil(),
+            Uuid::nil(),
+            Uuid::nil(),
+            frameshift_catalog::PublicationAppealDisposition::Uphold,
+            "   ",
+            None,
+        )
+        .expect_err("blank rationale must fail");
+        assert!(rationale_error.to_string().contains("rationale"));
+
+        let limit_error =
+            list_administrator_publication_decisions("https://registry.example", &token, None, 101)
+                .expect_err("oversized page must fail");
+        assert!(limit_error.to_string().contains("limit"));
     }
 }

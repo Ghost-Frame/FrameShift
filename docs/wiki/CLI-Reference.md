@@ -229,7 +229,9 @@ history use newest-first keyset pagination with a bounded `--limit`; supply
 Active moderators and administrators can inspect a known submission UUID with
 `show`, download its exact quarantine archive with `artifact`, apply `approve`,
 `request-changes`, or `reject` with `decide`, and publish an approved submission
-with `promote`. The server enforces role membership, lifecycle transitions, and
+with `promote`. Active administrators can also suspend publishers, tombstone
+public releases, inspect global lifecycle and appeal evidence, and resolve
+appeals. The server enforces role membership, lifecycle transitions, and
 independent-review separation.
 
 ```bash
@@ -237,11 +239,18 @@ frameshift moderation show --server https://registry.example --submission-id <UU
 frameshift moderation artifact --server https://registry.example --submission-id <UUID> --out submission.tar.gz
 frameshift moderation decide --server https://registry.example --submission-id <UUID> --action approve --reason-code reviewed
 frameshift moderation promote --server https://registry.example --submission-id <UUID>
+frameshift moderation suspend-publisher --server https://registry.example --publisher-id <UUID> --reason-code policy.abuse
+frameshift moderation tombstone --server https://registry.example --name reviewed-pack --version 1.0.0 --reason tos-violation
+frameshift moderation decisions --server https://registry.example
+frameshift moderation appeals --server https://registry.example
+frameshift moderation resolve-appeal --server https://registry.example --appeal-id <UUID> --disposition overturn --rationale "Independent evidence supports reversal."
 ```
 
-`artifact` refuses to overwrite its destination. Decision and promotion
-failures print the generated operation and request UUID flags so an ambiguous
-request can be retried with the same identifiers.
+`artifact` refuses to overwrite its destination. Mutation failures print the
+generated operation and request UUID flags so an ambiguous request can be
+retried with the same identifiers. Global decision and appeal listings use
+newest-first pagination with a bounded `--limit`; supply `--before-created-at`
+and `--before-id` together for the next page.
 
 ## Project configuration and vault
 

@@ -127,7 +127,7 @@ enum Command {
     /// Manage Creator Studio submissions, owner lifecycle decisions, and appeals.
     Publication(PublicationArgs),
 
-    /// Inspect, decide, and promote quarantined publication submissions.
+    /// Moderate submissions and administer publication lifecycle controls.
     Moderation(ModerationArgs),
 
     /// Register this machine's author key under a handle at the registry.
@@ -704,7 +704,9 @@ mod publication_cli_tests {
 #[cfg(test)]
 mod moderation_cli_tests {
     use super::*;
-    use cmd::moderation::{ModerationActionArg, ModerationCommand};
+    use cmd::moderation::{
+        AppealDispositionArg, ModerationActionArg, ModerationCommand, TombstoneReasonArg,
+    };
 
     /// Decision parsing accepts the hyphenated request-changes action.
     #[test]
@@ -745,6 +747,123 @@ mod moderation_cli_tests {
             "https://registry.example",
             "--submission-id",
             "00000000-0000-0000-0000-000000000001",
+        ]);
+        assert!(result.is_err());
+    }
+
+    /// Publisher suspension parsing accepts stable retry identifiers.
+    #[test]
+    fn parses_administrator_publisher_suspension_retry() {
+        let cli = Cli::try_parse_from([
+            "frameshift",
+            "moderation",
+            "suspend-publisher",
+            "--server",
+            "https://registry.example",
+            "--publisher-id",
+            "00000000-0000-0000-0000-000000000001",
+            "--reason-code",
+            "policy.abuse",
+            "--decision-id",
+            "00000000-0000-0000-0000-000000000002",
+            "--request-id",
+            "00000000-0000-0000-0000-000000000003",
+        ])
+        .expect("publisher suspension arguments should parse");
+        assert!(matches!(
+            cli.command,
+            Command::Moderation(ModerationArgs {
+                command: ModerationCommand::SuspendPublisher { .. }
+            })
+        ));
+    }
+
+    /// Tombstone parsing maps the public kebab-case reason spelling.
+    #[test]
+    fn parses_administrator_release_tombstone_reason() {
+        let cli = Cli::try_parse_from([
+            "frameshift",
+            "moderation",
+            "tombstone",
+            "--server",
+            "https://registry.example",
+            "--name",
+            "reviewed-pack",
+            "--version",
+            "1.0.0",
+            "--reason",
+            "tos-violation",
+        ])
+        .expect("release tombstone arguments should parse");
+        assert!(matches!(
+            cli.command,
+            Command::Moderation(ModerationArgs {
+                command: ModerationCommand::Tombstone {
+                    reason: TombstoneReasonArg::TosViolation,
+                    ..
+                }
+            })
+        ));
+    }
+
+    /// Appeal resolution parsing preserves the disposition and retry identifiers.
+    #[test]
+    fn parses_administrator_appeal_resolution() {
+        let cli = Cli::try_parse_from([
+            "frameshift",
+            "moderation",
+            "resolve-appeal",
+            "--server",
+            "https://registry.example",
+            "--appeal-id",
+            "00000000-0000-0000-0000-000000000001",
+            "--disposition",
+            "overturn",
+            "--rationale",
+            "Independent evidence supports reversal.",
+            "--resolution-id",
+            "00000000-0000-0000-0000-000000000002",
+            "--request-id",
+            "00000000-0000-0000-0000-000000000003",
+        ])
+        .expect("appeal resolution arguments should parse");
+        assert!(matches!(
+            cli.command,
+            Command::Moderation(ModerationArgs {
+                command: ModerationCommand::ResolveAppeal {
+                    disposition: AppealDispositionArg::Overturn,
+                    ..
+                }
+            })
+        ));
+    }
+
+    /// Administrator audit pagination requires both keyset cursor components.
+    #[test]
+    fn administrator_decisions_reject_partial_cursor() {
+        let result = Cli::try_parse_from([
+            "frameshift",
+            "moderation",
+            "decisions",
+            "--server",
+            "https://registry.example",
+            "--before-id",
+            "00000000-0000-0000-0000-000000000001",
+        ]);
+        assert!(result.is_err());
+    }
+
+    /// Administrator appeal listing enforces the server's page-size bound locally.
+    #[test]
+    fn administrator_appeals_reject_oversized_page() {
+        let result = Cli::try_parse_from([
+            "frameshift",
+            "moderation",
+            "appeals",
+            "--server",
+            "https://registry.example",
+            "--limit",
+            "101",
         ]);
         assert!(result.is_err());
     }

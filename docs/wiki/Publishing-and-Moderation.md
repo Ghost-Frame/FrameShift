@@ -96,11 +96,14 @@ IDs so retries cannot silently become different actions.
 ```bash
 frameshift publication appeal --server https://registry.example --publisher alice --decision-id <UUID> --statement "The unchanged artifact meets policy."
 frameshift publication appeals --server https://registry.example --publisher alice
+frameshift moderation appeals --server https://registry.example
+frameshift moderation resolve-appeal --server https://registry.example --appeal-id <UUID> --disposition overturn --rationale "Independent evidence supports reversal."
 ```
 
 Appeal failures include the appeal and request UUID flags required for an exact
-retry. Appeal history uses the same bounded newest-first pagination contract as
-decision history.
+retry. Resolution failures include the resolution and request UUID flags.
+Owner and administrator appeal history use the same bounded newest-first
+pagination contract as decision history.
 
 ## Suspension and tombstones
 
@@ -111,6 +114,16 @@ A tombstone is a one-way public removal transition with an explicit reason and
 audit evidence. Direct downloads stop serving the tombstoned version, and the
 catalog recomputes the latest version from the remaining active releases.
 Historical signer and decision records remain evidence of what happened.
+
+```bash
+frameshift moderation suspend-publisher --server https://registry.example --publisher-id <UUID> --reason-code policy.abuse
+frameshift moderation tombstone --server https://registry.example --name reviewed-pack --version 1.0.0 --reason tos-violation
+frameshift moderation decisions --server https://registry.example
+```
+
+Suspension and tombstone failures include the decision and request UUID flags
+required for an exact retry. The global decision stream uses bounded paired
+keyset cursor flags.
 
 ## Legacy CLI publication is different
 
