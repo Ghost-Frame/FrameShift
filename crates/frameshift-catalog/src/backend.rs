@@ -818,7 +818,7 @@ pub trait CatalogBackend: Send + Sync {
         content_hash: &ObjectHash,
     ) -> Result<PackVersionRecord, CatalogError>;
 
-    /// List all versions of a pack, ordered by `published_at ASC`.
+    /// List all versions of a pack, ordered by `published_at ASC, version ASC`.
     ///
     /// Returns an empty `Vec` if the pack has no published versions. Returns
     /// `CatalogError::NotFound` if the pack does not exist at all.
@@ -841,6 +841,31 @@ pub trait CatalogBackend: Send + Sync {
     ///
     /// Never panics.
     async fn list_pack_versions(&self, name: &str) -> Result<Vec<PackVersionRecord>, CatalogError>;
+
+    /// List one bounded page of pack versions.
+    ///
+    /// Results use the same `published_at ASC, version ASC` order and include
+    /// tombstoned records just like [`CatalogBackend::list_pack_versions`]. The
+    /// default implementation preserves compatibility for existing backends;
+    /// database adapters SHOULD override it so pagination executes in storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`CatalogBackend::list_pack_versions`].
+    async fn list_pack_versions_page(
+        &self,
+        name: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<PackVersionRecord>, CatalogError> {
+        Ok(self
+            .list_pack_versions(name)
+            .await?
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect())
+    }
 
     /// Search for packs matching the given filters.
     ///

@@ -3590,7 +3590,7 @@ async fn test_register_pack_version_conflict() {
     );
 }
 
-/// List versions of a pack, ordered by published_at ASC.
+/// List versions of a pack, ordered by published_at ASC and version ASC.
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_list_pack_versions() {
@@ -3618,6 +3618,55 @@ async fn test_list_pack_versions() {
     assert_eq!(versions.len(), 2);
     assert_eq!(versions[0].version, "1.0.0");
     assert_eq!(versions[1].version, "1.1.0");
+}
+
+/// Paginated version reads apply stable ordering and page bounds in PostgreSQL.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn test_list_pack_versions_page() {
+    let (catalog, _container) = setup_catalog().await;
+    let published_at = chrono::Utc::now();
+
+    catalog
+        .register_author(make_author(73, "version-pager"))
+        .await
+        .expect("register author failed");
+
+    for (version, hash_seed) in [("1.2.0", 73), ("1.0.0", 74), ("1.1.0", 75)] {
+        let mut record = make_version("page-pack", version, 73, hash_seed);
+        record.published_at = published_at;
+        catalog
+            .register_pack_version(record)
+            .await
+            .expect("register paginated version failed");
+    }
+
+    let page = catalog
+        .list_pack_versions_page("page-pack", 2, 1)
+        .await
+        .expect("list_pack_versions_page failed");
+    assert_eq!(
+        page.iter()
+            .map(|record| record.version.as_str())
+            .collect::<Vec<_>>(),
+        ["1.1.0", "1.2.0"]
+    );
+    assert!(
+        catalog
+            .list_pack_versions_page("page-pack", 2, 3)
+            .await
+            .expect("empty version page failed")
+            .is_empty(),
+        "an offset at the end must return an empty page"
+    );
+    assert!(
+        catalog
+            .list_pack_versions_page("page-pack", 0, 0)
+            .await
+            .expect("zero-limit version page failed")
+            .is_empty(),
+        "a zero limit must return an empty page"
+    );
 }
 
 /// Search packs by tag intersection.

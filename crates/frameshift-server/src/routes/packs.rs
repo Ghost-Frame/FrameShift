@@ -1189,23 +1189,22 @@ pub struct VersionsQuery {
     pub limit: Option<u32>,
 
     /// Number of version records to skip before returning matches, applied
-    /// after ordering by `published_at ASC`.
+    /// after ordering by `published_at ASC, version ASC`.
     pub offset: Option<u32>,
 }
 
 /// `GET /v1/packs/{name}/versions?limit=&offset=`
 ///
-/// List published versions of a pack, ordered by `published_at ASC`.
+/// List published versions of a pack, ordered by
+/// `published_at ASC, version ASC`.
 ///
 /// The `limit` parameter defaults to `100` and is clamped to
 /// `config.max_search_limit`, the same convention [`search_packs`] uses. When
 /// clamped, the response includes a `Warning` header:
 /// `299 - "limit clamped to <max>"`.
 ///
-/// The catalog trait's `list_pack_versions` has no `limit`/`offset` of its
-/// own (unlike [`frameshift_catalog::CatalogBackend::list_authors`]), so
-/// pagination is applied here, over the full version list returned by the
-/// backend, rather than pushed down into the query.
+/// Pagination is passed to the catalog so database backends can apply it in
+/// storage rather than materializing the complete version history.
 ///
 /// # Response
 ///
@@ -1214,7 +1213,7 @@ pub struct VersionsQuery {
 ///
 /// # Backend calls
 ///
-/// - `catalog.list_pack_versions(name)` -- loads the page source.
+/// - `catalog.list_pack_versions_page(name, limit, offset)` -- loads the page.
 /// - Parent pack and ownership lookups when read enrichment is enabled.
 ///
 /// # Errors
@@ -1233,19 +1232,13 @@ pub async fn list_pack_versions(
     let raw_limit = q.limit.unwrap_or(100);
     let clamped = raw_limit.min(max);
     let was_clamped = clamped < raw_limit;
-    let offset = q.offset.unwrap_or(0) as usize;
+    let offset = q.offset.unwrap_or(0);
 
-    let versions = state
+    let page = state
         .catalog
-        .list_pack_versions(&name)
+        .list_pack_versions_page(&name, clamped, offset)
         .await
         .map_err(|e| AppError::from_catalog(e, "pack"))?;
-
-    let page: Vec<_> = versions
-        .into_iter()
-        .skip(offset)
-        .take(clamped as usize)
-        .collect();
     let page = if state.config.publisher_ownership_reads {
         let pack = load_version_parent(&state, &name).await?;
         let mut resolver = OwnershipResolver::new(&state);

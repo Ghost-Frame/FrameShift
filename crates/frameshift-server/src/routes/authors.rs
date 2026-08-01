@@ -129,9 +129,8 @@ pub struct AuthorsListResponse {
 /// [`crate::routes::packs::list_pack_versions`] use. When clamped, the
 /// response includes a `Warning` header: `299 - "limit clamped to <max>"`.
 ///
-/// Unlike `GET /v1/packs/{name}/versions`, pagination here is pushed all the
-/// way down into `catalog.list_authors(limit, offset)`, which already
-/// accepts both parameters at the trait level.
+/// Pagination is pushed into `catalog.list_authors(limit, offset)`, matching
+/// the bounded catalog read used by `GET /v1/packs/{name}/versions`.
 ///
 /// # Response
 ///
