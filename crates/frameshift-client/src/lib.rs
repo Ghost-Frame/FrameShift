@@ -62,6 +62,7 @@ use frameshift_vault_local::{LocalAgeBackend, Recipients};
 use secrecy::SecretString;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1405,44 +1406,64 @@ fn describe_declared_composition(manifest: &frameshift_pack::PackManifest) -> St
 /// Resolve the default Frameshift data root.
 ///
 /// Uses `XDG_DATA_HOME/frameshift` when `XDG_DATA_HOME` is set and
-/// non-empty, otherwise falls back to `$HOME/.local/share/frameshift`.
-/// Errors when neither is available.
+/// non-empty. Otherwise uses the operating system's local application-data
+/// directory, which is `$HOME/.local/share` on Linux and the Local AppData
+/// known folder on Windows. Errors when no user-specific directory is
+/// available.
 fn default_data_root() -> Result<PathBuf, ClientError> {
-    if let Ok(xdg_data_home) = std::env::var("XDG_DATA_HOME") {
-        if !xdg_data_home.is_empty() {
-            return Ok(PathBuf::from(xdg_data_home).join("frameshift"));
-        }
-    }
-
-    let home = std::env::var("HOME")
-        .map(PathBuf::from)
-        .map_err(|source| ClientError::Io {
-            path: PathBuf::from("$HOME"),
-            source: std::io::Error::new(std::io::ErrorKind::NotFound, source),
-        })?;
-    Ok(home.join(".local").join("share").join("frameshift"))
+    resolve_data_root(non_empty_env_path("XDG_DATA_HOME"), dirs::data_local_dir())
 }
 
-/// Resolve the XDG config home directory.
+/// Resolve the default Frameshift configuration root.
 ///
-/// Returns an error when neither `XDG_CONFIG_HOME` nor `HOME` is set so the
-/// caller fails closed rather than writing state to a world-traversable `/tmp`
-/// path. Mirrors the error shape used by [`default_data_root`].
+/// Uses `XDG_CONFIG_HOME` when it is set and non-empty. Otherwise uses the
+/// operating system's configuration directory, including the Roaming AppData
+/// known folder on Windows. Returns an error rather than falling back to a
+/// shared temporary directory when no user-specific directory is available.
 fn default_config_root() -> Result<PathBuf, ClientError> {
-    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-        if !xdg.is_empty() {
-            return Ok(PathBuf::from(xdg));
-        }
-    }
+    resolve_config_root(non_empty_env_path("XDG_CONFIG_HOME"), dirs::config_dir())
+}
 
-    // Fail closed: no /tmp fallback when HOME is absent.
-    let home = std::env::var("HOME")
-        .map(PathBuf::from)
-        .map_err(|source| ClientError::Io {
-            path: PathBuf::from("$HOME"),
-            source: std::io::Error::new(std::io::ErrorKind::NotFound, source),
-        })?;
-    Ok(home.join(".config"))
+/// Converts a non-empty environment variable into a path override.
+fn non_empty_env_path(name: &str) -> Option<PathBuf> {
+    non_empty_path(std::env::var_os(name))
+}
+
+/// Converts a non-empty operating-system string into a path.
+fn non_empty_path(value: Option<OsString>) -> Option<PathBuf> {
+    value.filter(|value| !value.is_empty()).map(PathBuf::from)
+}
+
+/// Selects an explicit XDG data root or an operating-system user data root.
+fn resolve_data_root(
+    xdg_data_home: Option<PathBuf>,
+    platform_data_dir: Option<PathBuf>,
+) -> Result<PathBuf, ClientError> {
+    xdg_data_home
+        .or(platform_data_dir)
+        .map(|root| root.join("frameshift"))
+        .ok_or_else(|| missing_user_directory("<user data directory>"))
+}
+
+/// Selects an explicit XDG config root or an operating-system config root.
+fn resolve_config_root(
+    xdg_config_home: Option<PathBuf>,
+    platform_config_dir: Option<PathBuf>,
+) -> Result<PathBuf, ClientError> {
+    xdg_config_home
+        .or(platform_config_dir)
+        .ok_or_else(|| missing_user_directory("<user config directory>"))
+}
+
+/// Builds the typed error returned when no per-user platform directory exists.
+fn missing_user_directory(label: &str) -> ClientError {
+    ClientError::Io {
+        path: PathBuf::from(label),
+        source: std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "operating system did not provide a user-specific directory",
+        ),
+    }
 }
 
 /// Validate an explicit project id supplied via `FRAMESHIFT_PROJECT_ID`.
@@ -2415,6 +2436,57 @@ fn read_pack_conformance_baseline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Empty XDG values are ignored instead of becoming relative paths.
+    #[test]
+    fn empty_environment_path_is_ignored() {
+        assert_eq!(non_empty_path(Some(OsString::new())), None);
+        assert_eq!(
+            non_empty_path(Some(OsString::from("configured"))),
+            Some(PathBuf::from("configured"))
+        );
+    }
+
+    /// An explicit XDG data directory overrides the platform-native location.
+    #[test]
+    fn data_root_prefers_xdg_override() {
+        let resolved = resolve_data_root(
+            Some(PathBuf::from("/xdg/data")),
+            Some(PathBuf::from("/platform/data")),
+        )
+        .expect("resolve data root");
+
+        assert_eq!(resolved, PathBuf::from("/xdg/data/frameshift"));
+    }
+
+    /// A platform-native data directory supports GUI processes without HOME.
+    #[test]
+    fn data_root_uses_platform_directory_without_xdg() {
+        let resolved = resolve_data_root(None, Some(PathBuf::from("platform-data")))
+            .expect("resolve data root");
+
+        assert_eq!(resolved, PathBuf::from("platform-data/frameshift"));
+    }
+
+    /// A platform-native config directory supports GUI processes without HOME.
+    #[test]
+    fn config_root_uses_platform_directory_without_xdg() {
+        let resolved = resolve_config_root(None, Some(PathBuf::from("platform-config")))
+            .expect("resolve config root");
+
+        assert_eq!(resolved, PathBuf::from("platform-config"));
+    }
+
+    /// Missing platform and XDG directories fail closed without using temp.
+    #[test]
+    fn default_roots_fail_without_user_directories() {
+        let data_error = resolve_data_root(None, None).expect_err("missing data root must fail");
+        let config_error =
+            resolve_config_root(None, None).expect_err("missing config root must fail");
+
+        assert!(data_error.to_string().contains("<user data directory>"));
+        assert!(config_error.to_string().contains("<user config directory>"));
+    }
 
     /// enforce_conformance_integrity blocks IntegrityFailure, honors the
     /// operator override, and passes every other decision (and fresh
