@@ -233,7 +233,7 @@ On registry install, the client verifies the pack signature against the exact ke
 
 ### Admin
 
-The registry server exposes account-authenticated lifecycle controls. Publisher owners can withdraw eligible non-public submissions with `frameshift publication withdraw` and read their scoped immutable evidence with `frameshift publication decisions`. Active administrators can suspend a publisher with `POST /v1/admin/publishers/{publisher_id}/suspend` or tombstone an active release with `POST /v1/admin/packs/{name}/{version}/tombstone`. Each accepted transition and its reason are committed atomically to immutable audit evidence. Administrators can read the global stream at `GET /v1/admin/publication-decisions`.
+The registry server exposes account-authenticated lifecycle controls. Publisher owners can withdraw eligible non-public submissions with `frameshift publication withdraw` and read their scoped immutable evidence with `frameshift publication decisions`. Active administrators can suspend a publisher with `frameshift moderation suspend-publisher`, tombstone an active release with `frameshift moderation tombstone`, and read the global stream with `frameshift moderation decisions`. Each accepted transition and its reason are committed atomically to immutable audit evidence.
 
 Active moderators and administrators can inspect a known quarantined
 submission with `frameshift moderation show`, download its exact archive with
@@ -241,7 +241,7 @@ submission with `frameshift moderation show`, download its exact archive with
 `decide`, and publish an approved submission with `promote`. The server retains
 the role, lifecycle, and independent-review checks for every operation.
 
-Publisher owners may file one appeal within 30 days of a `request_changes` or `reject` moderation decision with `frameshift publication appeal` and read private cases with `frameshift publication appeals`. Active administrators resolve appeals at `POST /v1/admin/publication-appeals/{appeal_id}/resolution`; an `overturn` approves the exact unchanged submission, while `uphold` preserves its adverse state. The original reviewer cannot resolve the appeal when another active administrator is available. A sole administrator must record a bounded separation exception. Filing and resolution require a caller-supplied UUID `x-request-id`, reject substituted retries, and retain immutable evidence.
+Publisher owners may file one appeal within 30 days of a `request_changes` or `reject` moderation decision with `frameshift publication appeal` and read private cases with `frameshift publication appeals`. Active administrators list global cases with `frameshift moderation appeals` and resolve them with `frameshift moderation resolve-appeal`; an `overturn` approves the exact unchanged submission, while `uphold` preserves its adverse state. The original reviewer cannot resolve the appeal when another active administrator is available. A sole administrator must record a bounded separation exception. Filing and resolution require a caller-supplied UUID `x-request-id`, reject substituted retries, and retain immutable evidence.
 
 ### Registry safety controls
 
@@ -449,6 +449,14 @@ frameshift moderation artifact --server <url> --submission-id <uuid> --out <file
 frameshift moderation decide --server <url> --submission-id <uuid>              Record approve, request-changes, or reject
            --action <action> --reason-code <code>
 frameshift moderation promote --server <url> --submission-id <uuid>             Publish an approved submission
+frameshift moderation suspend-publisher --server <url> --publisher-id <uuid>    Suspend an approved publisher
+           --reason-code <code>
+frameshift moderation tombstone --server <url> --name <pack> --version <semver> Tombstone one active public release
+           --reason <author-request|tos-violation|dmca>
+frameshift moderation decisions --server <url>                                 List global lifecycle evidence
+frameshift moderation appeals --server <url>                                   List global private appeal cases
+frameshift moderation resolve-appeal --server <url> --appeal-id <uuid>          Resolve one publication appeal
+           --disposition <uphold|overturn> --rationale <text>
 frameshift search [QUERY] [--tag <tag>] [--limit <n>]                      Search the registry
 frameshift project-id                                                      Print the hashed project ID
 ```

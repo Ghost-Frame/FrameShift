@@ -7,11 +7,17 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+use chrono::{DateTime, Utc};
 use clap::{Args, Subcommand, ValueEnum};
-use frameshift_catalog::PublicationModerationAction;
+use frameshift_catalog::{
+    PublicationAppealCursor, PublicationAppealDisposition, PublicationLifecycleCursor,
+    PublicationModerationAction, TombstoneReason,
+};
 use frameshift_client::moderation::{
-    get_moderation_artifact, get_moderation_submission, moderate_publication_submission,
-    promote_publication_submission,
+    get_moderation_artifact, get_moderation_submission, list_administrator_publication_appeals,
+    list_administrator_publication_decisions, moderate_publication_submission,
+    promote_publication_submission, resolve_administrator_publication_appeal,
+    suspend_publication_publisher, tombstone_publication_release,
 };
 use uuid::Uuid;
 
@@ -89,6 +95,99 @@ pub enum ModerationCommand {
         #[arg(long)]
         request_id: Option<Uuid>,
     },
+    /// Suspend one approved publisher under administrator authority.
+    SuspendPublisher {
+        /// Registry base URL.
+        #[arg(long)]
+        server: String,
+        /// Stable publisher profile UUID.
+        #[arg(long)]
+        publisher_id: Uuid,
+        /// Stable 1-64 character private reason code.
+        #[arg(long)]
+        reason_code: String,
+        /// Stable decision UUID to reuse after an ambiguous network failure.
+        #[arg(long)]
+        decision_id: Option<Uuid>,
+        /// Stable request UUID to reuse after an ambiguous network failure.
+        #[arg(long)]
+        request_id: Option<Uuid>,
+    },
+    /// Tombstone one active public release under administrator authority.
+    Tombstone {
+        /// Registry base URL.
+        #[arg(long)]
+        server: String,
+        /// Public pack name.
+        #[arg(long)]
+        name: String,
+        /// Exact public semantic version.
+        #[arg(long)]
+        version: String,
+        /// Closed public takedown reason category.
+        #[arg(long, value_enum)]
+        reason: TombstoneReasonArg,
+        /// Stable decision UUID to reuse after an ambiguous network failure.
+        #[arg(long)]
+        decision_id: Option<Uuid>,
+        /// Stable request UUID to reuse after an ambiguous network failure.
+        #[arg(long)]
+        request_id: Option<Uuid>,
+    },
+    /// List global immutable publication lifecycle evidence.
+    Decisions {
+        /// Registry base URL.
+        #[arg(long)]
+        server: String,
+        /// RFC 3339 timestamp from the final record of the preceding page.
+        #[arg(long, requires = "before_id")]
+        before_created_at: Option<DateTime<Utc>>,
+        /// UUID from the final record of the preceding page.
+        #[arg(long, requires = "before_created_at")]
+        before_id: Option<Uuid>,
+        /// Number of newest-first records to return.
+        #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..=100))]
+        limit: u32,
+    },
+    /// List global private publication appeal cases.
+    Appeals {
+        /// Registry base URL.
+        #[arg(long)]
+        server: String,
+        /// RFC 3339 timestamp from the final record of the preceding page.
+        #[arg(long, requires = "before_id")]
+        before_created_at: Option<DateTime<Utc>>,
+        /// UUID from the final record of the preceding page.
+        #[arg(long, requires = "before_created_at")]
+        before_id: Option<Uuid>,
+        /// Number of newest-first appeal cases to return.
+        #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..=100))]
+        limit: u32,
+    },
+    /// Resolve one publication appeal under administrator separation enforcement.
+    ResolveAppeal {
+        /// Registry base URL.
+        #[arg(long)]
+        server: String,
+        /// Stable appeal UUID.
+        #[arg(long)]
+        appeal_id: Uuid,
+        /// Final appeal disposition.
+        #[arg(long, value_enum)]
+        disposition: AppealDispositionArg,
+        /// Private administrator rationale of at most 4000 characters.
+        #[arg(long)]
+        rationale: String,
+        /// Audited reason for an unavoidable sole-administrator self-resolution.
+        #[arg(long)]
+        separation_exception_reason: Option<String>,
+        /// Stable resolution UUID to reuse after an ambiguous network failure.
+        #[arg(long)]
+        resolution_id: Option<Uuid>,
+        /// Stable request UUID to reuse after an ambiguous network failure.
+        #[arg(long)]
+        request_id: Option<Uuid>,
+    },
 }
 
 /// CLI spelling for the server's supported moderation actions.
@@ -110,6 +209,49 @@ impl From<ModerationActionArg> for PublicationModerationAction {
             ModerationActionArg::Approve => Self::Approve,
             ModerationActionArg::RequestChanges => Self::RequestChanges,
             ModerationActionArg::Reject => Self::Reject,
+        }
+    }
+}
+
+/// CLI spelling for the closed public release tombstone reasons.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum TombstoneReasonArg {
+    /// The pack author requested removal.
+    AuthorRequest,
+    /// The pack violated platform terms of service.
+    TosViolation,
+    /// A DMCA takedown notice requires removal.
+    Dmca,
+}
+
+/// Convert a CLI tombstone reason into the shared wire enum.
+impl From<TombstoneReasonArg> for TombstoneReason {
+    /// Preserve the selected public reason category exactly.
+    fn from(value: TombstoneReasonArg) -> Self {
+        match value {
+            TombstoneReasonArg::AuthorRequest => Self::AuthorRequest,
+            TombstoneReasonArg::TosViolation => Self::TosViolation,
+            TombstoneReasonArg::Dmca => Self::Dmca,
+        }
+    }
+}
+
+/// CLI spelling for administrator appeal dispositions.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum AppealDispositionArg {
+    /// Preserve the original adverse decision.
+    Uphold,
+    /// Reverse the adverse decision and approve the unchanged submission.
+    Overturn,
+}
+
+/// Convert a CLI appeal disposition into the shared wire enum.
+impl From<AppealDispositionArg> for PublicationAppealDisposition {
+    /// Preserve the selected appeal outcome exactly.
+    fn from(value: AppealDispositionArg) -> Self {
+        match value {
+            AppealDispositionArg::Uphold => Self::Uphold,
+            AppealDispositionArg::Overturn => Self::Overturn,
         }
     }
 }
@@ -149,6 +291,54 @@ pub fn run_moderation(args: ModerationArgs) -> Result<(), CliError> {
             promotion_id,
             request_id,
         } => promote(&server, submission_id, promotion_id, request_id),
+        ModerationCommand::SuspendPublisher {
+            server,
+            publisher_id,
+            reason_code,
+            decision_id,
+            request_id,
+        } => suspend_publisher(&server, publisher_id, &reason_code, decision_id, request_id),
+        ModerationCommand::Tombstone {
+            server,
+            name,
+            version,
+            reason,
+            decision_id,
+            request_id,
+        } => tombstone_release(&server, &name, &version, reason, decision_id, request_id),
+        ModerationCommand::Decisions {
+            server,
+            before_created_at,
+            before_id,
+            limit,
+        } => administrator_decisions(
+            &server,
+            lifecycle_cursor(before_created_at, before_id)?,
+            limit,
+        ),
+        ModerationCommand::Appeals {
+            server,
+            before_created_at,
+            before_id,
+            limit,
+        } => administrator_appeals(&server, appeal_cursor(before_created_at, before_id)?, limit),
+        ModerationCommand::ResolveAppeal {
+            server,
+            appeal_id,
+            disposition,
+            rationale,
+            separation_exception_reason,
+            resolution_id,
+            request_id,
+        } => resolve_appeal(
+            &server,
+            appeal_id,
+            disposition,
+            &rationale,
+            separation_exception_reason.as_deref(),
+            resolution_id,
+            request_id,
+        ),
     }
 }
 
@@ -233,6 +423,166 @@ fn promote(
             })?;
     println!("{}", serde_json::to_string_pretty(&promotion)?);
     Ok(())
+}
+
+/// Suspend one publisher while preserving stable retry identifiers in failures.
+fn suspend_publisher(
+    server: &str,
+    publisher_id: Uuid,
+    reason_code: &str,
+    decision_id: Option<Uuid>,
+    request_id: Option<Uuid>,
+) -> Result<(), CliError> {
+    validate_server_url(server)?;
+    let token = resolve_access_token(server)?;
+    let decision_id = decision_id.unwrap_or_else(Uuid::new_v4);
+    let request_id = request_id.unwrap_or_else(Uuid::new_v4);
+    let record = suspend_publication_publisher(
+        server,
+        &token,
+        publisher_id,
+        decision_id,
+        request_id,
+        reason_code,
+    )
+    .map_err(|error| {
+        mutation_error(
+            "publisher suspension",
+            "decision-id",
+            error,
+            decision_id,
+            request_id,
+        )
+    })?;
+    println!("{}", serde_json::to_string_pretty(&record)?);
+    Ok(())
+}
+
+/// Tombstone one release while preserving stable retry identifiers in failures.
+fn tombstone_release(
+    server: &str,
+    name: &str,
+    version: &str,
+    reason: TombstoneReasonArg,
+    decision_id: Option<Uuid>,
+    request_id: Option<Uuid>,
+) -> Result<(), CliError> {
+    validate_server_url(server)?;
+    let token = resolve_access_token(server)?;
+    let decision_id = decision_id.unwrap_or_else(Uuid::new_v4);
+    let request_id = request_id.unwrap_or_else(Uuid::new_v4);
+    let record = tombstone_publication_release(
+        server,
+        &token,
+        name,
+        version,
+        decision_id,
+        request_id,
+        reason.into(),
+    )
+    .map_err(|error| {
+        mutation_error(
+            "release tombstone",
+            "decision-id",
+            error,
+            decision_id,
+            request_id,
+        )
+    })?;
+    println!("{}", serde_json::to_string_pretty(&record)?);
+    Ok(())
+}
+
+/// Print one bounded newest-first page of global lifecycle decisions.
+fn administrator_decisions(
+    server: &str,
+    before: Option<PublicationLifecycleCursor>,
+    limit: u32,
+) -> Result<(), CliError> {
+    validate_server_url(server)?;
+    let token = resolve_access_token(server)?;
+    let records = list_administrator_publication_decisions(server, &token, before, limit)?;
+    println!("{}", serde_json::to_string_pretty(&records)?);
+    Ok(())
+}
+
+/// Print one bounded newest-first page of global private appeal cases.
+fn administrator_appeals(
+    server: &str,
+    before: Option<PublicationAppealCursor>,
+    limit: u32,
+) -> Result<(), CliError> {
+    validate_server_url(server)?;
+    let token = resolve_access_token(server)?;
+    let records = list_administrator_publication_appeals(server, &token, before, limit)?;
+    println!("{}", serde_json::to_string_pretty(&records)?);
+    Ok(())
+}
+
+/// Resolve one appeal while preserving stable retry identifiers in failures.
+#[allow(clippy::too_many_arguments)]
+fn resolve_appeal(
+    server: &str,
+    appeal_id: Uuid,
+    disposition: AppealDispositionArg,
+    rationale: &str,
+    separation_exception_reason: Option<&str>,
+    resolution_id: Option<Uuid>,
+    request_id: Option<Uuid>,
+) -> Result<(), CliError> {
+    validate_server_url(server)?;
+    let token = resolve_access_token(server)?;
+    let resolution_id = resolution_id.unwrap_or_else(Uuid::new_v4);
+    let request_id = request_id.unwrap_or_else(Uuid::new_v4);
+    let record = resolve_administrator_publication_appeal(
+        server,
+        &token,
+        appeal_id,
+        resolution_id,
+        request_id,
+        disposition.into(),
+        rationale,
+        separation_exception_reason,
+    )
+    .map_err(|error| {
+        mutation_error(
+            "appeal resolution",
+            "resolution-id",
+            error,
+            resolution_id,
+            request_id,
+        )
+    })?;
+    println!("{}", serde_json::to_string_pretty(&record)?);
+    Ok(())
+}
+
+/// Construct a lifecycle cursor after Clap has enforced paired flags.
+fn lifecycle_cursor(
+    created_at: Option<DateTime<Utc>>,
+    id: Option<Uuid>,
+) -> Result<Option<PublicationLifecycleCursor>, CliError> {
+    match (created_at, id) {
+        (None, None) => Ok(None),
+        (Some(created_at), Some(id)) => Ok(Some(PublicationLifecycleCursor { created_at, id })),
+        _ => Err(CliError::Moderation(
+            "--before-created-at and --before-id must be supplied together".to_string(),
+        )),
+    }
+}
+
+/// Construct an appeal cursor after Clap has enforced paired flags.
+fn appeal_cursor(
+    created_at: Option<DateTime<Utc>>,
+    id: Option<Uuid>,
+) -> Result<Option<PublicationAppealCursor>, CliError> {
+    match (created_at, id) {
+        (None, None) => Ok(None),
+        (Some(created_at), Some(id)) => Ok(Some(PublicationAppealCursor { created_at, id })),
+        _ => Err(CliError::Moderation(
+            "--before-created-at and --before-id must be supplied together".to_string(),
+        )),
+    }
 }
 
 /// Persist artifact bytes atomically while refusing an existing destination.
@@ -327,6 +677,36 @@ mod tests {
         assert_eq!(
             PublicationModerationAction::from(ModerationActionArg::Reject),
             PublicationModerationAction::Reject
+        );
+    }
+
+    /// CLI tombstone reasons map exactly to the shared public wire variants.
+    #[test]
+    fn tombstone_reason_mapping_preserves_all_variants() {
+        assert_eq!(
+            TombstoneReason::from(TombstoneReasonArg::AuthorRequest),
+            TombstoneReason::AuthorRequest
+        );
+        assert_eq!(
+            TombstoneReason::from(TombstoneReasonArg::TosViolation),
+            TombstoneReason::TosViolation
+        );
+        assert_eq!(
+            TombstoneReason::from(TombstoneReasonArg::Dmca),
+            TombstoneReason::Dmca
+        );
+    }
+
+    /// CLI appeal dispositions map exactly to the shared wire variants.
+    #[test]
+    fn appeal_disposition_mapping_preserves_all_variants() {
+        assert_eq!(
+            PublicationAppealDisposition::from(AppealDispositionArg::Uphold),
+            PublicationAppealDisposition::Uphold
+        );
+        assert_eq!(
+            PublicationAppealDisposition::from(AppealDispositionArg::Overturn),
+            PublicationAppealDisposition::Overturn
         );
     }
 }
