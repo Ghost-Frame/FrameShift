@@ -174,6 +174,36 @@ pub struct AccountPasswordCredentialRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Conditional replacement of a verified first-party password hash.
+///
+/// The expected fields bind the mutation to the exact credential observed by
+/// the verifier so a pepper upgrade cannot overwrite a concurrent password
+/// change. A pepper-only upgrade preserves `password_changed_at`; only the
+/// hash metadata and `updated_at` change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountPasswordRehashRequest {
+    /// Account whose credential was successfully verified.
+    pub account_id: Uuid,
+    /// Normalized sign-in email used to locate the credential.
+    pub normalized_email: String,
+    /// Password hash that was successfully verified.
+    pub expected_password_hash: String,
+    /// Application credential version observed during verification.
+    pub expected_password_version: i16,
+    /// Deployment pepper version observed during verification.
+    pub expected_pepper_version: i16,
+    /// Credential update timestamp observed during verification.
+    pub expected_updated_at: DateTime<Utc>,
+    /// Fresh Argon2id PHC string produced with the current pepper.
+    pub new_password_hash: String,
+    /// Application credential version for the fresh hash.
+    pub new_password_version: i16,
+    /// Current deployment pepper version for the fresh hash.
+    pub new_pepper_version: i16,
+    /// UTC timestamp of the conditional credential update.
+    pub updated_at: DateTime<Utc>,
+}
+
 /// Client class receiving a first-party account session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]

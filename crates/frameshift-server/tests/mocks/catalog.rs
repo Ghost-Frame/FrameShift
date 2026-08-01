@@ -23,20 +23,21 @@ use frameshift_catalog::identity::Ed25519PublicKey;
 use frameshift_catalog::records::{
     AccountInviteIssueRequest, AccountInviteRecord, AccountInviteRequestRecord,
     AccountInviteReviewRequest, AccountInviteStatus, AccountPasswordCredentialRecord,
-    AccountRecord, AccountSessionRecord, AccountStatus, AccountStatusChangeRequest, AuthorRecord,
-    LocalAccountRegistrationRequest, LocalAccountRegistrationResult, MembershipState, PackRecord,
-    PackVersionRecord, PlatformRole, PlatformRoleAssignmentRequest, PlatformRoleRecord,
-    PlatformRoleRevocationRequest, PlatformRoleState, PublicationAppealCaseRecord,
-    PublicationAppealCursor, PublicationAppealDisposition, PublicationAppealRecord,
-    PublicationAppealRequest, PublicationAppealResolutionRecord,
-    PublicationAppealResolutionRequest, PublicationIntentRecord, PublicationLifecycleAction,
-    PublicationLifecycleCursor, PublicationLifecycleDecisionRecord, PublicationModerationAction,
-    PublicationModerationDecisionRecord, PublicationModerationDecisionRequest,
-    PublicationModerationSnapshot, PublicationPromotionRecord, PublicationPromotionRequest,
-    PublicationSubmissionRecord, PublicationSubmissionRequest, PublicationSubmissionState,
-    PublicationTombstoneRequest, PublicationWithdrawalRequest, PublisherAuditEventRecord,
-    PublisherKeyRecord, PublisherKeyState, PublisherMembershipRecord, PublisherModerationStatus,
-    PublisherProfileRecord, PublisherRole, PublisherSuspensionRequest,
+    AccountPasswordRehashRequest, AccountRecord, AccountSessionRecord, AccountStatus,
+    AccountStatusChangeRequest, AuthorRecord, LocalAccountRegistrationRequest,
+    LocalAccountRegistrationResult, MembershipState, PackRecord, PackVersionRecord, PlatformRole,
+    PlatformRoleAssignmentRequest, PlatformRoleRecord, PlatformRoleRevocationRequest,
+    PlatformRoleState, PublicationAppealCaseRecord, PublicationAppealCursor,
+    PublicationAppealDisposition, PublicationAppealRecord, PublicationAppealRequest,
+    PublicationAppealResolutionRecord, PublicationAppealResolutionRequest, PublicationIntentRecord,
+    PublicationLifecycleAction, PublicationLifecycleCursor, PublicationLifecycleDecisionRecord,
+    PublicationModerationAction, PublicationModerationDecisionRecord,
+    PublicationModerationDecisionRequest, PublicationModerationSnapshot,
+    PublicationPromotionRecord, PublicationPromotionRequest, PublicationSubmissionRecord,
+    PublicationSubmissionRequest, PublicationSubmissionState, PublicationTombstoneRequest,
+    PublicationWithdrawalRequest, PublisherAuditEventRecord, PublisherKeyRecord, PublisherKeyState,
+    PublisherMembershipRecord, PublisherModerationStatus, PublisherProfileRecord, PublisherRole,
+    PublisherSuspensionRequest,
 };
 use frameshift_catalog::status::{PackStatus, TombstoneRecord};
 // Reuse the exact same version-precedence comparator the Postgres adapter
@@ -403,6 +404,36 @@ impl CatalogBackend for MockCatalog {
                 kind: "account_password_credential",
                 key: normalized_email.to_string(),
             })
+    }
+
+    /// Conditionally replace one unchanged mock credential hash.
+    async fn rehash_account_password_credential(
+        &self,
+        request: AccountPasswordRehashRequest,
+    ) -> Result<bool, CatalogError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        let Some(credential) = state
+            .account_password_credentials
+            .get_mut(&request.normalized_email)
+        else {
+            return Ok(false);
+        };
+        if credential.account_id != request.account_id
+            || credential.password_hash != request.expected_password_hash
+            || credential.password_version != request.expected_password_version
+            || credential.pepper_version != request.expected_pepper_version
+            || credential.updated_at != request.expected_updated_at
+        {
+            return Ok(false);
+        }
+        credential.password_hash = request.new_password_hash;
+        credential.password_version = request.new_password_version;
+        credential.pepper_version = request.new_pepper_version;
+        credential.updated_at = request.updated_at;
+        Ok(true)
     }
 
     /// Create one mock first-party session.

@@ -28,13 +28,13 @@ use tracing::{debug, error, instrument};
 use frameshift_catalog::{
     AccountInviteIssueRequest, AccountInviteRecord, AccountInviteRequestRecord,
     AccountInviteReviewRequest, AccountInviteStatus, AccountPasswordCredentialRecord,
-    AccountRecord, AccountSessionRecord, AccountStatusChangeRequest, AuthorRecord, CatalogBackend,
-    CatalogError, Ed25519PublicKey, HealthStatus, LocalAccountRegistrationRequest,
-    LocalAccountRegistrationResult, MembershipState, PackRecord, PackSearchFilters,
-    PackSearchResult, PackStatus, PackVersionRecord, PlatformRole, PlatformRoleAssignmentRequest,
-    PlatformRoleRecord, PlatformRoleRevocationRequest, PublicationAppealCaseRecord,
-    PublicationAppealCursor, PublicationAppealDisposition, PublicationAppealRecord,
-    PublicationAppealRequest, PublicationAppealResolutionRecord,
+    AccountPasswordRehashRequest, AccountRecord, AccountSessionRecord, AccountStatusChangeRequest,
+    AuthorRecord, CatalogBackend, CatalogError, Ed25519PublicKey, HealthStatus,
+    LocalAccountRegistrationRequest, LocalAccountRegistrationResult, MembershipState, PackRecord,
+    PackSearchFilters, PackSearchResult, PackStatus, PackVersionRecord, PlatformRole,
+    PlatformRoleAssignmentRequest, PlatformRoleRecord, PlatformRoleRevocationRequest,
+    PublicationAppealCaseRecord, PublicationAppealCursor, PublicationAppealDisposition,
+    PublicationAppealRecord, PublicationAppealRequest, PublicationAppealResolutionRecord,
     PublicationAppealResolutionRequest, PublicationIntentClaim, PublicationIntentRecord,
     PublicationLifecycleAction, PublicationLifecycleCursor, PublicationLifecycleDecisionRecord,
     PublicationModerationAction, PublicationModerationDecisionRecord,
@@ -1581,6 +1581,57 @@ impl CatalogBackend for PostgresCatalog {
                     normalized_email.to_string(),
                 )
             })
+    }
+
+    /// Conditionally replace an unchanged credential with a freshly peppered hash.
+    async fn rehash_account_password_credential(
+        &self,
+        request: AccountPasswordRehashRequest,
+    ) -> Result<bool, CatalogError> {
+        if request.normalized_email.is_empty()
+            || request.expected_password_hash.is_empty()
+            || request.new_password_hash.is_empty()
+            || request.expected_password_version <= 0
+            || request.expected_pepper_version <= 0
+            || request.new_password_version <= 0
+            || request.new_pepper_version <= 0
+            || request.updated_at < request.expected_updated_at
+        {
+            return Err(CatalogError::Validation(
+                "password rehash request is invalid".to_string(),
+            ));
+        }
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        let account_id = request.account_id;
+        let rows_affected = diesel::update(
+            account_password_credentials::table
+                .filter(account_password_credentials::account_id.eq(account_id))
+                .filter(account_password_credentials::normalized_email.eq(request.normalized_email))
+                .filter(
+                    account_password_credentials::password_hash.eq(request.expected_password_hash),
+                )
+                .filter(
+                    account_password_credentials::password_version
+                        .eq(request.expected_password_version),
+                )
+                .filter(
+                    account_password_credentials::pepper_version
+                        .eq(request.expected_pepper_version),
+                )
+                .filter(account_password_credentials::updated_at.eq(request.expected_updated_at)),
+        )
+        .set((
+            account_password_credentials::password_hash.eq(request.new_password_hash),
+            account_password_credentials::password_version.eq(request.new_password_version),
+            account_password_credentials::pepper_version.eq(request.new_pepper_version),
+            account_password_credentials::updated_at.eq(request.updated_at),
+        ))
+        .execute(&mut conn)
+        .await
+        .map_err(|error| {
+            map_diesel_error(error, "account_password_credential", account_id.to_string())
+        })?;
+        Ok(rows_affected == 1)
     }
 
     /// Create one revocable first-party session after successful authentication.

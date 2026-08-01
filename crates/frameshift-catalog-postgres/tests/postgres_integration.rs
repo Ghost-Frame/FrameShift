@@ -18,14 +18,15 @@ use diesel::{ExpressionMethods as _, QueryDsl as _};
 use diesel_async::{RunQueryDsl as _, SimpleAsyncConnection as _};
 use frameshift_catalog::{
     AccountInviteIntent, AccountInviteIssueRequest, AccountInviteRequestRecord,
-    AccountInviteStatus, AccountPasswordCredentialRecord, AccountRecord, AccountSessionClientKind,
-    AccountSessionRecord, AccountStatus, AccountStatusChangeRequest, AuthorRecord, CatalogBackend,
-    CatalogError, Ed25519PublicKey, LocalAccountRegistrationRequest, MembershipState, ObjectHash,
-    PackSearchFilters, PackStatus, PackVersionRecord, PlatformRole, PlatformRoleAssignmentRequest,
-    PlatformRoleRevocationRequest, PlatformRoleState, PublicationAppealDisposition,
-    PublicationAppealRequest, PublicationAppealResolutionRequest, PublicationIntentClaim,
-    PublicationIntentRecord, PublicationLifecycleAction, PublicationLifecycleCursor,
-    PublicationModerationAction, PublicationModerationDecisionRequest, PublicationPromotionRequest,
+    AccountInviteStatus, AccountPasswordCredentialRecord, AccountPasswordRehashRequest,
+    AccountRecord, AccountSessionClientKind, AccountSessionRecord, AccountStatus,
+    AccountStatusChangeRequest, AuthorRecord, CatalogBackend, CatalogError, Ed25519PublicKey,
+    LocalAccountRegistrationRequest, MembershipState, ObjectHash, PackSearchFilters, PackStatus,
+    PackVersionRecord, PlatformRole, PlatformRoleAssignmentRequest, PlatformRoleRevocationRequest,
+    PlatformRoleState, PublicationAppealDisposition, PublicationAppealRequest,
+    PublicationAppealResolutionRequest, PublicationIntentClaim, PublicationIntentRecord,
+    PublicationLifecycleAction, PublicationLifecycleCursor, PublicationModerationAction,
+    PublicationModerationDecisionRequest, PublicationPromotionRequest,
     PublicationSubmissionRequest, PublicationSubmissionState, PublicationTombstoneRequest,
     PublicationWithdrawalRequest, PublishQuota, PublisherAuditEventRecord, PublisherKeyRecord,
     PublisherKeyState, PublisherMembershipRecord, PublisherModerationStatus,
@@ -33,7 +34,7 @@ use frameshift_catalog::{
     TombstoneRecord,
 };
 use frameshift_catalog_postgres::schema::{
-    account_invites, account_platform_roles, accounts, pack_versions,
+    account_invites, account_password_credentials, account_platform_roles, accounts, pack_versions,
     publication_appeal_resolutions, publication_appeals, publication_lifecycle_decisions,
     publication_moderation_decisions, publication_promotions, publication_submissions,
     publisher_audit_events, publisher_keys, publisher_memberships, publisher_profiles,
@@ -195,6 +196,77 @@ fn make_local_registration(
         },
         account,
     }
+}
+
+/// Verify PostgreSQL applies password rehashes only to the exact observed credential.
+#[tokio::test]
+#[ignore]
+async fn password_rehash_is_compare_and_swap() {
+    let (catalog, _container) = setup_catalog().await;
+    let account = make_account(uuid::Uuid::new_v4(), "password-rehash");
+    catalog
+        .create_account(account.clone())
+        .await
+        .expect("create password rehash account failed");
+    let now = chrono::DateTime::from_timestamp_micros(chrono::Utc::now().timestamp_micros())
+        .expect("current timestamp must fit");
+    let old_hash = "$argon2id$v=19$m=19456,t=2,p=1$b2xk$cGFzcw".to_string();
+    let new_hash = "$argon2id$v=19$m=65536,t=3,p=1$bmV3$cGFzcw".to_string();
+    let mut connection = catalog
+        .pool()
+        .get()
+        .await
+        .expect("password rehash insert connection failed");
+    diesel::insert_into(account_password_credentials::table)
+        .values((
+            account_password_credentials::account_id.eq(account.id),
+            account_password_credentials::normalized_email.eq("password-rehash@example.test"),
+            account_password_credentials::password_hash.eq(old_hash.clone()),
+            account_password_credentials::password_version.eq(1_i16),
+            account_password_credentials::pepper_version.eq(1_i16),
+            account_password_credentials::email_verified_at.eq(Some(now)),
+            account_password_credentials::created_at.eq(now),
+            account_password_credentials::password_changed_at.eq(now),
+            account_password_credentials::updated_at.eq(now),
+        ))
+        .execute(&mut connection)
+        .await
+        .expect("insert password rehash credential failed");
+    drop(connection);
+
+    let updated_at = now + chrono::Duration::seconds(1);
+    let request = AccountPasswordRehashRequest {
+        account_id: account.id,
+        normalized_email: "password-rehash@example.test".to_string(),
+        expected_password_hash: old_hash,
+        expected_password_version: 1,
+        expected_pepper_version: 1,
+        expected_updated_at: now,
+        new_password_hash: new_hash.clone(),
+        new_password_version: 1,
+        new_pepper_version: 2,
+        updated_at,
+    };
+    assert!(catalog
+        .rehash_account_password_credential(request.clone())
+        .await
+        .expect("first password rehash failed"));
+    assert!(
+        !catalog
+            .rehash_account_password_credential(request)
+            .await
+            .expect("stale password rehash failed"),
+        "a stale rehash must not overwrite the upgraded credential"
+    );
+
+    let credential = catalog
+        .get_account_password_credential("password-rehash@example.test")
+        .await
+        .expect("load upgraded password credential failed");
+    assert_eq!(credential.password_hash, new_hash);
+    assert_eq!(credential.pepper_version, 2);
+    assert_eq!(credential.password_changed_at, now);
+    assert_eq!(credential.updated_at, updated_at);
 }
 
 /// Create one approved publisher with an active deterministic signing key.
