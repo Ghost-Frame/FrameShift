@@ -10,7 +10,10 @@ use std::path::{Path, PathBuf};
 use clap::Args;
 use frameshift_client::{Client, ClientError};
 use frameshift_source::render::{render_to_markdown, RenderTarget};
-use frameshift_source::{validate_content, ContentWarning, Severity};
+use frameshift_source::{
+    audit_manifest, validate_content, CapabilityManifest, ContentWarning, ManifestSeverity,
+    Severity,
+};
 
 use crate::cmd::keys::{access_token_from_env, with_key_passphrase};
 use crate::util::{load_persona_by_name, validate_server_url, CliError};
@@ -60,8 +63,9 @@ pub fn run_publish(args: PublishArgs) -> Result<(), CliError> {
     // phrases like "you are now" as *examples to detect/defend against*.
     // Hard-blocking on these heuristics would break valid publishes, so
     // findings are printed (Critical ones most prominently) and the flow
-    // always proceeds.
+    // do not block publication on their own.
     print_validation_warnings(&validate_content(&src));
+    enforce_capability_manifest_policy(src.persona.capability_manifest.as_ref())?;
 
     // Determine the output directory.
     let out_dir = match &args.out {
@@ -177,6 +181,35 @@ fn print_validation_warnings(warnings: &[ContentWarning]) {
             "{critical_count} critical finding(s) above; review before sharing this pack widely."
         );
     }
+}
+
+/// Enforce blocking capability findings before a pack is written or uploaded.
+///
+/// Advisory capability concerns remain part of the existing content-scan
+/// output. Only findings classified as [`ManifestSeverity::Block`] stop the
+/// publish operation.
+fn enforce_capability_manifest_policy(
+    manifest: Option<&CapabilityManifest>,
+) -> Result<(), CliError> {
+    let Some(manifest) = manifest else {
+        return Ok(());
+    };
+
+    let audit = audit_manifest(manifest);
+    let blocking_details = audit
+        .findings
+        .iter()
+        .filter(|finding| finding.severity == ManifestSeverity::Block)
+        .map(|finding| finding.detail.as_str())
+        .collect::<Vec<_>>();
+    if blocking_details.is_empty() {
+        return Ok(());
+    }
+
+    Err(CliError::Publish(format!(
+        "capability manifest blocks publication: {}",
+        blocking_details.join("; ")
+    )))
 }
 
 /// Write a minimal but valid `pack.toml` into `dir` so it loads as a Pack.
@@ -343,6 +376,47 @@ tone = "explains how to avoid rm -rf / disasters"
             "a clean persona should not trigger content-scan findings"
         );
         print_validation_warnings(&warnings);
+    }
+
+    /// A persona without a capability manifest passes the publish policy.
+    #[test]
+    fn capability_policy_accepts_absent_manifest() {
+        enforce_capability_manifest_policy(None)
+            .expect("a missing capability manifest should not block publication");
+    }
+
+    /// Advisory network and shell findings do not block publication.
+    #[test]
+    fn capability_policy_accepts_advisory_findings() {
+        let manifest = CapabilityManifest {
+            required_tools: vec!["bash".to_string()],
+            filesystem_scope: "./src/**".to_string(),
+            network_egress: true,
+            primary_intents: vec![],
+            anti_keywords: vec![],
+        };
+
+        enforce_capability_manifest_policy(Some(&manifest))
+            .expect("advisory capability findings should not block publication");
+    }
+
+    /// An unrestricted filesystem scope blocks publication with its reason.
+    #[test]
+    fn capability_policy_rejects_blocking_findings() {
+        let manifest = CapabilityManifest {
+            required_tools: vec![],
+            filesystem_scope: "/".to_string(),
+            network_egress: false,
+            primary_intents: vec![],
+            anti_keywords: vec![],
+        };
+
+        let error = enforce_capability_manifest_policy(Some(&manifest))
+            .expect_err("an unrestricted filesystem scope must block publication");
+        assert!(
+            matches!(error, CliError::Publish(ref detail) if detail.contains("unrestricted filesystem access")),
+            "blocking capability error should explain the unrestricted scope: {error}"
+        );
     }
 
     /// write_pack_toml rejects fields that would inject TOML, and accepts clean ones.
