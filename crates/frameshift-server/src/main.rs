@@ -20,10 +20,24 @@ use frameshift_objects_r2::{R2PackStore, R2PackStoreConfig};
 use frameshift_server::metrics::Metrics;
 use frameshift_server::{AppState, LogFormat, ServerConfig, ServerError};
 
+/// Delay between bounded signed-request nonce cleanup batches.
+const SIGNED_REQUEST_NONCE_CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Maximum number of expired signed-request nonce rows removed per batch.
+const SIGNED_REQUEST_NONCE_CLEANUP_BATCH_SIZE: i64 = 1_000;
+
 /// Use mimalloc as the global allocator for improved throughput on
 /// allocation-heavy workloads (many small async tasks).
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
+
+/// Fully initialized server state plus its concrete PostgreSQL maintenance handle.
+struct InitializedState {
+    /// Shared state consumed by the HTTP server.
+    state: AppState,
+    /// Concrete catalog retained for PostgreSQL-specific background maintenance.
+    postgres_catalog: Arc<PostgresCatalog>,
+}
 
 /// Initialize the `tracing` subscriber based on the resolved [`ServerConfig`].
 ///
@@ -51,7 +65,7 @@ fn init_tracing(config: &ServerConfig) {
 /// errors (bad connection string, unwritable directory, invalid memory config)
 /// are surfaced immediately as `ServerError::Startup` rather than causing
 /// runtime failures after the server is already accepting connections.
-async fn build_state(config: Arc<ServerConfig>) -> Result<AppState, ServerError> {
+async fn build_state(config: Arc<ServerConfig>) -> Result<InitializedState, ServerError> {
     use secrecy::ExposeSecret as _;
 
     let catalog_config = PostgresCatalogConfig {
@@ -61,9 +75,11 @@ async fn build_state(config: Arc<ServerConfig>) -> Result<AppState, ServerError>
         statement_timeout: Duration::from_secs(30),
     };
 
-    let catalog = PostgresCatalog::new(catalog_config)
-        .await
-        .map_err(|e| ServerError::Startup(e.to_string()))?;
+    let catalog = Arc::new(
+        PostgresCatalog::new(catalog_config)
+            .await
+            .map_err(|e| ServerError::Startup(e.to_string()))?,
+    );
 
     let objects = build_object_store(&config).await?;
     let memory = build_memory_adapter(&config).await?;
@@ -87,16 +103,41 @@ async fn build_state(config: Arc<ServerConfig>) -> Result<AppState, ServerError>
             }
         };
 
-    Ok(AppState {
-        catalog: Arc::new(catalog),
-        objects,
-        runtime: None,
-        memory,
-        config,
-        metrics,
-        auth_nonces,
-        account_auth,
+    Ok(InitializedState {
+        state: AppState {
+            catalog: catalog.clone(),
+            objects,
+            runtime: None,
+            memory,
+            config,
+            metrics,
+            auth_nonces,
+            account_auth,
+        },
+        postgres_catalog: catalog,
     })
+}
+
+/// Remove expired signed-request nonce rows in bounded background batches.
+async fn run_signed_request_nonce_cleanup(catalog: Arc<PostgresCatalog>) {
+    let mut interval = tokio::time::interval(SIGNED_REQUEST_NONCE_CLEANUP_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        interval.tick().await;
+        match catalog
+            .cleanup_expired_signed_request_nonces(SIGNED_REQUEST_NONCE_CLEANUP_BATCH_SIZE)
+            .await
+        {
+            Ok(0) => {}
+            Ok(deleted) => {
+                tracing::debug!(deleted, "cleaned expired signed-request nonces");
+            }
+            Err(error) => {
+                tracing::warn!(%error, "signed-request nonce cleanup failed");
+            }
+        }
+    }
 }
 
 /// Construct the configured [`PackStore`] backend and return it as
@@ -409,8 +450,11 @@ async fn main() {
     init_tracing(&config);
     tracing::debug!(?config, "resolved server configuration");
 
-    let state = match build_state(Arc::clone(&config)).await {
-        Ok(s) => s,
+    let InitializedState {
+        state,
+        postgres_catalog,
+    } = match build_state(Arc::clone(&config)).await {
+        Ok(initialized) => initialized,
         Err(e) => {
             tracing::error!("startup failed: {e}");
             std::process::exit(3);
@@ -425,10 +469,19 @@ async fn main() {
         }
     };
 
+    let nonce_cleanup = tokio::spawn(run_signed_request_nonce_cleanup(postgres_catalog));
+
     let server_result = match quarantine {
         Some(store) => frameshift_server::run_with_publication_admission(state, store).await,
         None => frameshift_server::run(state).await,
     };
+
+    nonce_cleanup.abort();
+    if let Err(error) = nonce_cleanup.await {
+        if !error.is_cancelled() {
+            tracing::warn!(%error, "signed-request nonce cleanup task stopped unexpectedly");
+        }
+    }
 
     if let Err(e) = server_result {
         tracing::error!("server error: {e}");

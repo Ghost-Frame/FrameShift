@@ -1000,7 +1000,8 @@ pub trait CatalogBackend: Send + Sync {
     ///
     /// Returns `true` only for the first unexpired claim of `(pubkey, nonce)`.
     /// Implementations MUST make the insert atomic across all server instances.
-    /// Expired rows may be removed opportunistically.
+    /// Implementations SHOULD remove expired rows through backend maintenance so
+    /// request latency is independent of nonce-table cleanup.
     ///
     /// # Errors
     ///
