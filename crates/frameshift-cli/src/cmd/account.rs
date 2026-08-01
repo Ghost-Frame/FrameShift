@@ -12,11 +12,11 @@ use clap::{ArgGroup, Args, Subcommand, ValueEnum};
 use frameshift_catalog::{AccountInviteStatus, AccountStatus, PlatformRole};
 use frameshift_client::account::{
     assign_account_platform_role, create_publisher_profile, get_account, get_auth_config,
-    issue_account_invite, list_account_invite_requests, login_local_account, logout_local_account,
-    register_local_account, review_account_invite_request, revoke_account_platform_role,
-    set_account_status, update_account_profile, update_publisher_profile,
-    AccountInviteReviewStatus, AccountView, IssuedAccountInvite, LocalAccountSession,
-    NativeAuthClient,
+    get_publisher_profile, issue_account_invite, list_account_invite_requests, login_local_account,
+    logout_local_account, register_local_account, review_account_invite_request,
+    revoke_account_platform_role, set_account_status, update_account_profile,
+    update_publisher_profile, AccountInviteReviewStatus, AccountView, IssuedAccountInvite,
+    LocalAccountSession, NativeAuthClient,
 };
 use frameshift_client::session::{AuthenticatedSession, SessionClient, SessionClientConfig};
 use frameshift_client::session_store::{
@@ -72,6 +72,15 @@ pub enum AccountCommand {
         /// Replacement account display name.
         #[arg(long)]
         display_name: Option<String>,
+    },
+    /// Fetch and print one public publisher profile without authentication.
+    ShowPublisher {
+        /// Registry API base URL.
+        #[arg(long)]
+        server: String,
+        /// Existing public publisher handle.
+        #[arg(long)]
+        handle: String,
     },
     /// Create a pending publisher profile owned by the authenticated account.
     CreatePublisher {
@@ -344,6 +353,7 @@ pub fn run_account(args: AccountArgs) -> Result<(), CliError> {
             email,
             display_name,
         } => update_profile(&server, email.as_deref(), display_name.as_deref()),
+        AccountCommand::ShowPublisher { server, handle } => show_publisher(&server, &handle),
         AccountCommand::CreatePublisher {
             server,
             handle,
@@ -403,6 +413,15 @@ fn update_profile(
     let account = update_account_profile(server, &token, email, display_name)
         .map_err(|error| CliError::Account(error.to_string()))?;
     println!("{}", serde_json::to_string_pretty(&account)?);
+    Ok(())
+}
+
+/// Print one public publisher profile without resolving an account session.
+fn show_publisher(server: &str, handle: &str) -> Result<(), CliError> {
+    validate_server_url(server)?;
+    let publisher = get_publisher_profile(server, handle)
+        .map_err(|error| CliError::Account(error.to_string()))?;
+    println!("{}", serde_json::to_string_pretty(&publisher)?);
     Ok(())
 }
 
@@ -1231,6 +1250,29 @@ mod tests {
             "https://registry.example",
         ])
         .is_err());
+    }
+
+    /// Public publisher lookup parsing requires only registry and handle metadata.
+    #[test]
+    fn parses_public_publisher_profile_lookup() {
+        let parsed = TestCli::try_parse_from([
+            "frameshift",
+            "account",
+            "show-publisher",
+            "--server",
+            "https://registry.example",
+            "--handle",
+            "gatekeeper",
+        ])
+        .expect("publisher lookup arguments");
+        let TestCommand::Account(AccountArgs {
+            command: AccountCommand::ShowPublisher { server, handle },
+        }) = parsed.command
+        else {
+            panic!("expected publisher profile lookup");
+        };
+        assert_eq!(server, "https://registry.example");
+        assert_eq!(handle, "gatekeeper");
     }
 
     /// Publisher creation parsing preserves its public profile fields.

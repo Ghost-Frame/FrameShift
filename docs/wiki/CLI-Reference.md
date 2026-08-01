@@ -58,20 +58,22 @@ interactive prompts. `login --first-party` selects password login when the
 registry also advertises OIDC.
 
 Use `update-profile` to replace account metadata. At least one of `--email` or
-`--display-name` is required. Use `create-publisher` to create a pending public
-profile and active owner membership, then use `update-publisher` to replace its
-display metadata. Omit biography options to retain the current biography, or
-use `--clear-biography` to remove it.
+`--display-name` is required. `show-publisher` reads public profile metadata and
+does not require a saved account session. Use `create-publisher` to create a
+pending public profile and active owner membership, then use `update-publisher`
+to replace its display metadata. Omit biography options to retain the current
+biography, or use `--clear-biography` to remove it.
 
 ```bash
 frameshift account update-profile --server <url> [--email <email>] [--display-name <name>]
+frameshift account show-publisher --server <url> --handle <handle>
 frameshift account create-publisher --server <url> --handle <handle> --display-name <name> [--biography <text>]
 frameshift account update-publisher --server <url> --handle <handle> --display-name <name> [--biography <text> | --clear-biography]
 ```
 
-These profile commands resolve the saved bearer authority for the exact
-registry and do not accept a token argument. Publisher updates require an
-active owner membership and a fresh authentication session.
+The write commands resolve the saved bearer authority for the exact registry
+and do not accept a token argument. Publisher updates require an active owner
+membership and a fresh authentication session.
 
 Active administrators can grant or revoke global platform roles and transition
 account lifecycle states. These commands resolve bearer authority for the exact
