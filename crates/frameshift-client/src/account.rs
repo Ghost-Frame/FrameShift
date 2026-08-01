@@ -3,11 +3,14 @@
 //! Access tokens enter only through [`SecretString`] and are attached solely
 //! to the registry request's `Authorization` header.
 
+use chrono::{DateTime, Utc};
 use frameshift_catalog::{AccountRecord, PublisherMembershipRecord, PublisherProfileRecord};
-use secrecy::SecretString;
-use serde::Deserialize;
+use secrecy::{ExposeSecret as _, SecretString};
+use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::error::ClientError;
+use crate::session::AuthenticatedSession;
 
 /// Public account-authentication bootstrap configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -28,6 +31,96 @@ pub struct AccountAuthConfig {
     /// advertise the field deserialize unchanged.
     #[serde(default)]
     pub first_party_enabled: bool,
+    /// First-party registration policy advertised by the registry.
+    #[serde(default)]
+    pub registration: Option<String>,
+}
+
+/// Native first-party client presentation requested from the registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeAuthClient {
+    /// Desktop application session.
+    Desktop,
+    /// Command-line session.
+    Cli,
+}
+
+/// Successful first-party authentication with its secret-bearing session.
+pub struct LocalAccountSession {
+    /// Durable authenticated account returned by the registry.
+    pub account: AccountRecord,
+    /// Opaque native bearer session.
+    pub session: AuthenticatedSession,
+}
+
+/// Redacted diagnostics for one local authentication result.
+impl std::fmt::Debug for LocalAccountSession {
+    /// Render public account metadata and the session's redacted representation.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LocalAccountSession")
+            .field("account", &self.account)
+            .field("session", &self.session)
+            .finish()
+    }
+}
+
+/// Password login request serialized only at the HTTP boundary.
+#[derive(Serialize)]
+struct LoginLocalAccountRequest<'a> {
+    /// Normalized sign-in email supplied by the caller.
+    email: &'a str,
+    /// Secret account password exposed only to the serializer.
+    password: &'a str,
+    /// Native session presentation.
+    client_kind: NativeAuthClient,
+}
+
+/// Invitation registration request serialized only at the HTTP boundary.
+#[derive(Serialize)]
+struct RegisterLocalAccountRequest<'a> {
+    /// Secret one-time invitation token exposed only to the serializer.
+    invite_token: &'a str,
+    /// Invitation-bound email address.
+    email: &'a str,
+    /// Optional account display name.
+    display_name: Option<&'a str>,
+    /// Secret account password exposed only to the serializer.
+    password: &'a str,
+    /// Native session presentation.
+    client_kind: NativeAuthClient,
+}
+
+/// Wire response containing a bearer token that is wiped after conversion.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalAuthResponse {
+    /// Durable authenticated account.
+    account: AccountRecord,
+    /// Opaque token required for native clients.
+    token: Option<String>,
+    /// Non-extendable session expiry.
+    expires_at: DateTime<Utc>,
+}
+
+/// Wipe the raw response token when its temporary wire value leaves scope.
+impl Drop for LocalAuthResponse {
+    /// Zero the optional raw token string.
+    fn drop(&mut self) {
+        use zeroize::Zeroize as _;
+        if let Some(token) = &mut self.token {
+            token.zeroize();
+        }
+    }
+}
+
+/// Stable local logout acknowledgement.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalLogoutResponse {
+    /// Whether the registry accepted the revocation.
+    logged_out: bool,
 }
 
 /// Authenticated account profile and its publisher memberships.
@@ -68,6 +161,154 @@ pub fn get_auth_config(server_url: &str) -> Result<AccountAuthConfig, ClientErro
     }
 }
 
+/// Register an invitation-bound first-party account and create a native session.
+///
+/// # Errors
+///
+/// Returns a registry URL, transport, status, size, JSON, token-validation, or
+/// expiry error without including the invitation, password, or bearer token.
+pub fn register_local_account(
+    server_url: &str,
+    invite_token: &SecretString,
+    email: &str,
+    display_name: Option<&str>,
+    password: &SecretString,
+    client_kind: NativeAuthClient,
+) -> Result<LocalAccountSession, ClientError> {
+    let request = RegisterLocalAccountRequest {
+        invite_token: invite_token.expose_secret(),
+        email,
+        display_name,
+        password: password.expose_secret(),
+        client_kind,
+    };
+    post_local_auth(server_url, "register", request)
+}
+
+/// Verify first-party credentials and create a native bearer session.
+///
+/// # Errors
+///
+/// Returns a registry URL, transport, status, size, JSON, token-validation, or
+/// expiry error without including the password or bearer token.
+pub fn login_local_account(
+    server_url: &str,
+    email: &str,
+    password: &SecretString,
+    client_kind: NativeAuthClient,
+) -> Result<LocalAccountSession, ClientError> {
+    let request = LoginLocalAccountRequest {
+        email,
+        password: password.expose_secret(),
+        client_kind,
+    };
+    post_local_auth(server_url, "login", request)
+}
+
+/// Revoke one first-party bearer session at the registry.
+///
+/// # Errors
+///
+/// Returns a registry URL, transport, status, size, or JSON error without ever
+/// including the bearer token in the diagnostic.
+pub fn logout_local_account(
+    server_url: &str,
+    access_token: &SecretString,
+) -> Result<(), ClientError> {
+    let url = crate::publisher::registry_endpoint_url(server_url, &["v1", "auth", "logout"])?;
+    let request = ureq::AgentBuilder::new()
+        .redirects(0)
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .post(url.as_str());
+    match crate::publisher::with_bearer(request, access_token).call() {
+        Ok(response) => {
+            let acknowledgement: LocalLogoutResponse =
+                crate::registry::response_json_bounded(response, url.as_str())?;
+            if acknowledgement.logged_out {
+                Ok(())
+            } else {
+                Err(ClientError::RegistryRejected {
+                    url: url.to_string(),
+                    status: 502,
+                    message: "registry did not acknowledge local logout".to_string(),
+                })
+            }
+        }
+        Err(ureq::Error::Status(status, response)) => Err(ClientError::RegistryRejected {
+            url: url.to_string(),
+            status,
+            message: crate::registry::response_text_bounded(response, url.as_str()),
+        }),
+        Err(error) => Err(ClientError::RegistryHttp {
+            url: url.to_string(),
+            detail: error.to_string(),
+        }),
+    }
+}
+
+/// Submit one first-party credential request and validate its native session.
+fn post_local_auth(
+    server_url: &str,
+    operation: &str,
+    request: impl Serialize,
+) -> Result<LocalAccountSession, ClientError> {
+    let url = crate::publisher::registry_endpoint_url(server_url, &["v1", "auth", operation])?;
+    let body = Zeroizing::new(
+        serde_json::to_vec(&request)
+            .map_err(|error| ClientError::JsonSerialize(error.to_string()))?,
+    );
+    let response = ureq::AgentBuilder::new()
+        .redirects(0)
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .post(url.as_str())
+        .set("Content-Type", "application/json")
+        .send_bytes(body.as_slice());
+    let mut response: LocalAuthResponse = match response {
+        Ok(response) => crate::registry::response_json_bounded(response, url.as_str())?,
+        Err(ureq::Error::Status(status, response)) => {
+            return Err(ClientError::RegistryRejected {
+                url: url.to_string(),
+                status,
+                message: crate::registry::response_text_bounded(response, url.as_str()),
+            });
+        }
+        Err(error) => {
+            return Err(ClientError::RegistryHttp {
+                url: url.to_string(),
+                detail: error.to_string(),
+            });
+        }
+    };
+    let token = response
+        .token
+        .take()
+        .ok_or_else(|| ClientError::RegistryRejected {
+            url: url.to_string(),
+            status: 502,
+            message: "registry omitted the native bearer token".to_string(),
+        })?;
+    let expires_at = u64::try_from(response.expires_at.timestamp()).map_err(|_| {
+        ClientError::RegistryRejected {
+            url: url.to_string(),
+            status: 502,
+            message: "registry returned an invalid native session expiry".to_string(),
+        }
+    })?;
+    let session =
+        AuthenticatedSession::from_first_party_bearer(SecretString::new(token), expires_at)
+            .map_err(|_| ClientError::RegistryRejected {
+                url: url.to_string(),
+                status: 502,
+                message: "registry returned an invalid native bearer session".to_string(),
+            })?;
+    Ok(LocalAccountSession {
+        account: response.account.clone(),
+        session,
+    })
+}
+
 /// Fetch the current account view from one FrameShift registry.
 ///
 /// # Errors
@@ -104,18 +345,54 @@ mod tests {
     use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
     use std::thread;
+    use std::time::Duration;
 
     use super::*;
 
-    /// Serve one fixed account response and return the captured request.
-    fn serve_account_response() -> (String, thread::JoinHandle<String>) {
+    /// Read one complete bounded HTTP request including its declared body.
+    fn read_request(stream: &mut std::net::TcpStream) -> String {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set read timeout");
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        loop {
+            let count = stream.read(&mut chunk).expect("read request");
+            if count == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..count]);
+            let Some(headers_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let headers_end = headers_end + 4;
+            let headers = String::from_utf8_lossy(&request[..headers_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':').and_then(|(name, value)| {
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                })
+                .unwrap_or(0);
+            if request.len() >= headers_end + content_length {
+                break;
+            }
+        }
+        String::from_utf8(request).expect("request UTF-8")
+    }
+
+    /// Serve one fixed JSON response and return the captured request.
+    fn serve_json_response(body: impl Into<String>) -> (String, thread::JoinHandle<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
         let address = listener.local_addr().expect("test server address");
+        let body = body.into();
         let handle = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept request");
-            let mut request = vec![0_u8; 4096];
-            let count = stream.read(&mut request).expect("read request");
-            let body = r#"{"account":{"id":"00000000-0000-0000-0000-000000000001","issuer":"https://issuer.example","subject":"subject-1","email":null,"display_name":"Alice","status":"active","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"},"memberships":[]}"#;
+            let request = read_request(&mut stream);
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
@@ -123,15 +400,21 @@ mod tests {
             stream
                 .write_all(response.as_bytes())
                 .expect("write response");
-            String::from_utf8_lossy(&request[..count]).into_owned()
+            request
         });
         (format!("http://{address}"), handle)
+    }
+
+    /// Return one stable account JSON object for native-auth responses.
+    fn account_json() -> &'static str {
+        r#"{"id":"00000000-0000-0000-0000-000000000001","issuer":"https://issuer.example","subject":"subject-1","email":"alice@example.com","display_name":"Alice","status":"active","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#
     }
 
     /// Account lookup sends the bearer only in the authorization header.
     #[test]
     fn fetches_account_with_bearer_header() {
-        let (server, handle) = serve_account_response();
+        let body = format!(r#"{{"account":{},"memberships":[]}}"#, account_json());
+        let (server, handle) = serve_json_response(body);
         let token = SecretString::new("test-access-token".to_string());
         let view = get_account(&server, &token).expect("account response");
         assert_eq!(view.account.display_name.as_deref(), Some("Alice"));
@@ -140,5 +423,79 @@ mod tests {
         assert!(request.starts_with("GET /v1/account HTTP/1.1\r\n"));
         assert!(request.contains("\r\nAuthorization: Bearer test-access-token\r\n"));
         assert_eq!(request.matches("test-access-token").count(), 1);
+    }
+
+    /// First-party login sends credentials only in JSON and redacts its bearer result.
+    #[test]
+    fn logs_in_with_native_bearer_without_debug_disclosure() {
+        let body = format!(
+            r#"{{"account":{},"token":"native-session-token","expires_at":"2099-01-01T00:00:00Z"}}"#,
+            account_json()
+        );
+        let (server, handle) = serve_json_response(body);
+        let password = SecretString::new("correct horse battery staple".to_string());
+        let authenticated = login_local_account(
+            &server,
+            "alice@example.com",
+            &password,
+            NativeAuthClient::Cli,
+        )
+        .expect("native login");
+
+        assert_eq!(
+            authenticated.account.email.as_deref(),
+            Some("alice@example.com")
+        );
+        assert_eq!(
+            authenticated.session.access_token().expose_secret(),
+            "native-session-token"
+        );
+        let debug = format!("{authenticated:?}");
+        assert!(!debug.contains("native-session-token"));
+        assert!(!debug.contains("correct horse battery staple"));
+        let request = handle.join().expect("test server thread");
+        assert!(request.starts_with("POST /v1/auth/login HTTP/1.1\r\n"));
+        assert!(request.contains("\"client_kind\":\"cli\""));
+        assert!(request.contains("\"password\":\"correct horse battery staple\""));
+        assert!(!request.contains("Authorization:"));
+    }
+
+    /// Invitation registration preserves native client kind and optional profile data.
+    #[test]
+    fn registers_invited_native_account() {
+        let body = format!(
+            r#"{{"account":{},"token":"registered-session-token","expires_at":"2099-01-01T00:00:00Z"}}"#,
+            account_json()
+        );
+        let (server, handle) = serve_json_response(body);
+        let invite = SecretString::new("one-time-invite".to_string());
+        let password = SecretString::new("a sufficiently long password".to_string());
+        let authenticated = register_local_account(
+            &server,
+            &invite,
+            "alice@example.com",
+            Some("Alice"),
+            &password,
+            NativeAuthClient::Desktop,
+        )
+        .expect("native registration");
+
+        assert_eq!(authenticated.account.display_name.as_deref(), Some("Alice"));
+        let request = handle.join().expect("test server thread");
+        assert!(request.starts_with("POST /v1/auth/register HTTP/1.1\r\n"));
+        assert!(request.contains("\"invite_token\":\"one-time-invite\""));
+        assert!(request.contains("\"client_kind\":\"desktop\""));
+    }
+
+    /// Local logout uses the bearer header and requires an affirmative acknowledgement.
+    #[test]
+    fn logs_out_local_session_with_bearer_header() {
+        let (server, handle) = serve_json_response(r#"{"logged_out":true}"#);
+        let token = SecretString::new("native-session-token".to_string());
+        logout_local_account(&server, &token).expect("local logout");
+        let request = handle.join().expect("test server thread");
+        assert!(request.starts_with("POST /v1/auth/logout HTTP/1.1\r\n"));
+        assert!(request.contains("\r\nAuthorization: Bearer native-session-token\r\n"));
+        assert_eq!(request.matches("native-session-token").count(), 1);
     }
 }

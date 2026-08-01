@@ -1,4 +1,4 @@
-//! Provider-neutral OIDC Authorization Code session client.
+//! OIDC Authorization Code client and provider-neutral bearer session.
 //!
 //! The module owns discovery validation, S256 PKCE construction, exact callback
 //! validation, bounded token exchange, refresh, and revocation. Callers remain
@@ -96,8 +96,12 @@ impl fmt::Debug for AuthorizationFlow {
     }
 }
 
-/// Authenticated OAuth session returned by the configured OIDC issuer.
-pub struct OidcSession {
+/// Secret-bearing authenticated session used for registry API calls.
+///
+/// OIDC and first-party authentication both produce the same bearer-session
+/// shape. Provider-specific refresh behavior remains owned by [`SessionClient`]
+/// and the persisted authentication metadata.
+pub struct AuthenticatedSession {
     /// Bearer access token used only through explicit secret accessors.
     pub(crate) access_token: SecretString,
     /// Optional refresh token.
@@ -111,11 +115,11 @@ pub struct OidcSession {
 }
 
 /// Redacted session diagnostics.
-impl fmt::Debug for OidcSession {
+impl fmt::Debug for AuthenticatedSession {
     /// Render metadata while hiding all token values.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("OidcSession")
+            .debug_struct("AuthenticatedSession")
             .field("access_token", &"[REDACTED]")
             .field(
                 "refresh_token",
@@ -127,6 +131,9 @@ impl fmt::Debug for OidcSession {
             .finish()
     }
 }
+
+/// Backward-compatible name for sessions returned by [`SessionClient`].
+pub type OidcSession = AuthenticatedSession;
 
 /// Public session metadata safe to print in account-status output.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -504,7 +511,7 @@ impl SessionClient {
 }
 
 /// Secret and metadata accessors for an authenticated session.
-impl OidcSession {
+impl AuthenticatedSession {
     /// Borrow the bearer access token for an authenticated API call.
     pub fn access_token(&self) -> &SecretString {
         &self.access_token
@@ -526,6 +533,45 @@ impl OidcSession {
                 .expires_in
                 .and_then(|lifetime| self.acquired_at.checked_add(lifetime)),
         }
+    }
+
+    /// Build a non-refreshable first-party bearer session with an exact expiry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-configuration error when the token is empty, contains
+    /// HTTP-header whitespace or controls, or the supplied expiry is not later
+    /// than the current Unix timestamp.
+    pub fn from_first_party_bearer(
+        access_token: SecretString,
+        expires_at: u64,
+    ) -> Result<Self, SessionError> {
+        let token = access_token.expose_secret();
+        if token.is_empty()
+            || token
+                .chars()
+                .any(|character| character.is_whitespace() || character.is_control())
+        {
+            return Err(SessionError::InvalidConfiguration(
+                "first-party bearer token failed validation".to_string(),
+            ));
+        }
+        let acquired_at = unix_now();
+        let expires_in = expires_at
+            .checked_sub(acquired_at)
+            .filter(|value| *value > 0);
+        let expires_in = expires_in.ok_or_else(|| {
+            SessionError::InvalidConfiguration(
+                "first-party bearer session is already expired".to_string(),
+            )
+        })?;
+        Ok(Self {
+            access_token,
+            refresh_token: None,
+            expires_in: Some(expires_in),
+            scope: None,
+            acquired_at,
+        })
     }
 
     /// Reconstruct a session from a validated native credential-store payload.
@@ -860,6 +906,44 @@ mod tests {
             .expect("responses lock poisoned")
             .push_back(response(queued_discovery));
         SessionClient::discover_with_http(config(), fake)
+    }
+
+    /// First-party sessions validate the bearer and expose only non-secret lifetime metadata.
+    #[test]
+    fn builds_non_refreshable_first_party_session() {
+        let expires_at = unix_now().saturating_add(120);
+        let session = AuthenticatedSession::from_first_party_bearer(
+            SecretString::new("native-session-token".to_string()),
+            expires_at,
+        )
+        .expect("first-party session");
+
+        assert_eq!(
+            session.access_token().expose_secret(),
+            "native-session-token"
+        );
+        assert!(session.refresh_token().is_none());
+        assert!(!session.summary().refreshable);
+        assert_eq!(session.summary().expires_at, Some(expires_at));
+        assert!(!format!("{session:?}").contains("native-session-token"));
+    }
+
+    /// Empty, header-unsafe, and expired first-party bearer values fail closed.
+    #[test]
+    fn rejects_invalid_first_party_session_material() {
+        let future = unix_now().saturating_add(120);
+        for token in ["", "contains space", "contains\0control"] {
+            assert!(AuthenticatedSession::from_first_party_bearer(
+                SecretString::new(token.to_string()),
+                future,
+            )
+            .is_err());
+        }
+        assert!(AuthenticatedSession::from_first_party_bearer(
+            SecretString::new("native-session-token".to_string()),
+            unix_now(),
+        )
+        .is_err());
     }
 
     /// Discovery and authorization construction preserve required protocol fields.

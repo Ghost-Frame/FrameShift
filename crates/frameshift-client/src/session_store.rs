@@ -14,10 +14,12 @@ use sha2::{Digest as _, Sha256};
 use url::Url;
 use zeroize::{Zeroize as _, Zeroizing};
 
-use crate::session::OidcSession;
+use crate::session::AuthenticatedSession;
 
 /// Current non-secret session metadata schema version.
-const SESSION_METADATA_SCHEMA_VERSION: u32 = 1;
+const SESSION_METADATA_SCHEMA_VERSION: u32 = 2;
+/// Legacy OIDC-only metadata schema version accepted during migration.
+const LEGACY_SESSION_METADATA_SCHEMA_VERSION: u32 = 1;
 /// Current secret payload schema version.
 const SESSION_SECRET_SCHEMA_VERSION: u32 = 1;
 /// Native credential-store service namespace.
@@ -35,14 +37,8 @@ const MAX_SESSION_STORAGE_BYTES: u64 = 1024 * 1024;
 pub struct StoredSessionMetadata {
     /// On-disk schema version.
     pub schema_version: u32,
-    /// Exact OIDC issuer.
-    pub issuer: Url,
-    /// Public OAuth client identifier.
-    pub client_id: String,
-    /// Registered callback URI.
-    pub redirect_uri: Url,
-    /// Requested OIDC scopes.
-    pub scopes: Vec<String>,
+    /// Provider-specific public authentication metadata.
+    pub authentication: SessionAuthentication,
     /// FrameShift registry API base URL.
     pub registry_url: Url,
     /// Derived native credential-store account.
@@ -56,7 +52,7 @@ pub struct StoredSession {
     /// Non-secret session metadata.
     pub metadata: StoredSessionMetadata,
     /// Secret-bearing authenticated session.
-    pub session: OidcSession,
+    pub session: AuthenticatedSession,
 }
 
 /// Redacted stored-session diagnostics.
@@ -74,16 +70,61 @@ impl std::fmt::Debug for StoredSession {
 /// Inputs used to persist one newly authenticated session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionStoreMetadata {
-    /// Exact OIDC issuer.
-    pub issuer: Url,
-    /// Public OAuth client identifier.
-    pub client_id: String,
-    /// Registered callback URI.
-    pub redirect_uri: Url,
-    /// Requested OIDC scopes.
-    pub scopes: Vec<String>,
+    /// Provider-specific public authentication metadata.
+    pub authentication: SessionAuthentication,
     /// FrameShift registry API base URL.
     pub registry_url: Url,
+}
+
+/// Public metadata needed to manage one authenticated session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SessionAuthentication {
+    /// OIDC discovery, refresh, and revocation configuration.
+    Oidc {
+        /// Exact OIDC issuer.
+        issuer: Url,
+        /// Public OAuth client identifier.
+        client_id: String,
+        /// Registered callback URI.
+        redirect_uri: Url,
+        /// Requested OIDC scopes.
+        scopes: Vec<String>,
+    },
+    /// First-party opaque bearer session managed by the registry.
+    FirstParty,
+}
+
+/// Schema-v1 OIDC metadata accepted without changing its keyring binding.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyStoredSessionMetadata {
+    /// Legacy on-disk schema version.
+    schema_version: u32,
+    /// Exact OIDC issuer.
+    issuer: Url,
+    /// Public OAuth client identifier.
+    client_id: String,
+    /// Registered callback URI.
+    redirect_uri: Url,
+    /// Requested OIDC scopes.
+    scopes: Vec<String>,
+    /// FrameShift registry API base URL.
+    registry_url: Url,
+    /// Derived native credential-store account.
+    credential_id: String,
+    /// Unix timestamp when this session was saved.
+    saved_at: u64,
+}
+
+/// Current or legacy metadata wire representation.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StoredSessionMetadataWire {
+    /// Current provider-tagged metadata.
+    Current(StoredSessionMetadata),
+    /// Legacy OIDC-only metadata.
+    Legacy(LegacyStoredSessionMetadata),
 }
 
 /// Local session persistence manager.
@@ -218,7 +259,7 @@ impl SessionStore {
     pub fn save(
         &self,
         metadata: SessionStoreMetadata,
-        session: &OidcSession,
+        session: &AuthenticatedSession,
     ) -> Result<StoredSessionMetadata, SessionStoreError> {
         self.save_with_store(metadata, session, &SystemSessionCredentialStore)
     }
@@ -237,10 +278,11 @@ impl SessionStore {
     fn save_with_store(
         &self,
         metadata: SessionStoreMetadata,
-        session: &OidcSession,
+        session: &AuthenticatedSession,
         credentials: &dyn SessionCredentialStore,
     ) -> Result<StoredSessionMetadata, SessionStoreError> {
         validate_store_metadata(&metadata)?;
+        validate_session_authentication(&metadata.authentication, session)?;
         let _lock = self.acquire_lock()?;
         let prior_metadata = self.load_metadata_optional()?;
         let credential_id = credential_id(&metadata);
@@ -254,10 +296,7 @@ impl SessionStore {
 
         let stored = StoredSessionMetadata {
             schema_version: SESSION_METADATA_SCHEMA_VERSION,
-            issuer: metadata.issuer,
-            client_id: metadata.client_id,
-            redirect_uri: metadata.redirect_uri,
-            scopes: metadata.scopes,
+            authentication: metadata.authentication,
             registry_url: metadata.registry_url,
             credential_id: credential_id.clone(),
             saved_at: unix_now(),
@@ -297,6 +336,7 @@ impl SessionStore {
                 )
             })?;
         let session = deserialize_session(&payload)?;
+        validate_session_authentication(&metadata.authentication, &session)?;
         Ok(StoredSession { metadata, session })
     }
 
@@ -355,8 +395,12 @@ impl SessionStore {
                 "metadata exceeded the size limit".to_string(),
             ));
         }
-        let metadata: StoredSessionMetadata = serde_json::from_slice(&bytes)
+        let metadata: StoredSessionMetadataWire = serde_json::from_slice(&bytes)
             .map_err(|_| SessionStoreError::Invalid("metadata JSON is malformed".to_string()))?;
+        let metadata = match metadata {
+            StoredSessionMetadataWire::Current(metadata) => metadata,
+            StoredSessionMetadataWire::Legacy(metadata) => migrate_legacy_metadata(metadata)?,
+        };
         validate_stored_metadata(&metadata)?;
         Ok(Some(metadata))
     }
@@ -408,45 +452,66 @@ impl SessionStore {
 
 /// Validate caller-supplied non-secret metadata.
 fn validate_store_metadata(metadata: &SessionStoreMetadata) -> Result<(), SessionStoreError> {
-    if metadata.client_id.trim().is_empty()
-        || metadata.scopes.is_empty()
-        || !metadata.scopes.iter().any(|scope| scope == "openid")
-        || metadata
-            .scopes
-            .iter()
-            .any(|scope| scope.trim().is_empty() || scope.chars().any(char::is_whitespace))
+    validate_https_url(&metadata.registry_url, "registry URL")?;
+    if let SessionAuthentication::Oidc {
+        issuer,
+        client_id,
+        redirect_uri,
+        scopes,
+    } = &metadata.authentication
     {
-        return Err(SessionStoreError::Invalid(
-            "client ID and valid openid scope are required".to_string(),
-        ));
-    }
-    let mut unique_scopes = std::collections::BTreeSet::new();
-    if !metadata
-        .scopes
-        .iter()
-        .all(|scope| unique_scopes.insert(scope))
-    {
-        return Err(SessionStoreError::Invalid(
-            "session scopes must not contain duplicates".to_string(),
-        ));
-    }
-    for (url, label) in [
-        (&metadata.issuer, "issuer"),
-        (&metadata.registry_url, "registry URL"),
-    ] {
-        if url.scheme() != "https"
-            || url.host_str().is_none()
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.query().is_some()
-            || url.fragment().is_some()
+        if client_id.trim().is_empty()
+            || scopes.is_empty()
+            || !scopes.iter().any(|scope| scope == "openid")
+            || scopes
+                .iter()
+                .any(|scope| scope.trim().is_empty() || scope.chars().any(char::is_whitespace))
         {
-            return Err(SessionStoreError::Invalid(format!(
-                "{label} must be a credential-free HTTPS URL"
-            )));
+            return Err(SessionStoreError::Invalid(
+                "client ID and valid openid scope are required".to_string(),
+            ));
         }
+        let mut unique_scopes = std::collections::BTreeSet::new();
+        if !scopes.iter().all(|scope| unique_scopes.insert(scope)) {
+            return Err(SessionStoreError::Invalid(
+                "session scopes must not contain duplicates".to_string(),
+            ));
+        }
+        validate_https_url(issuer, "issuer")?;
+        validate_redirect_uri(redirect_uri)?;
     }
-    validate_redirect_uri(&metadata.redirect_uri)?;
+    Ok(())
+}
+
+/// Require secret-session fields that match the persisted provider kind.
+fn validate_session_authentication(
+    authentication: &SessionAuthentication,
+    session: &AuthenticatedSession,
+) -> Result<(), SessionStoreError> {
+    let summary = session.summary();
+    if matches!(authentication, SessionAuthentication::FirstParty)
+        && (summary.refreshable || summary.scope.is_some() || summary.expires_in.is_none())
+    {
+        return Err(SessionStoreError::Invalid(
+            "first-party sessions must have an expiry and no OIDC refresh metadata".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Require one credential-free HTTPS URL without query or fragment state.
+fn validate_https_url(url: &Url, label: &str) -> Result<(), SessionStoreError> {
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(SessionStoreError::Invalid(format!(
+            "{label} must be a credential-free HTTPS URL"
+        )));
+    }
     Ok(())
 }
 
@@ -480,17 +545,11 @@ fn validate_stored_metadata(metadata: &StoredSessionMetadata) -> Result<(), Sess
         )));
     }
     validate_store_metadata(&SessionStoreMetadata {
-        issuer: metadata.issuer.clone(),
-        client_id: metadata.client_id.clone(),
-        redirect_uri: metadata.redirect_uri.clone(),
-        scopes: metadata.scopes.clone(),
+        authentication: metadata.authentication.clone(),
         registry_url: metadata.registry_url.clone(),
     })?;
     let expected = credential_id(&SessionStoreMetadata {
-        issuer: metadata.issuer.clone(),
-        client_id: metadata.client_id.clone(),
-        redirect_uri: metadata.redirect_uri.clone(),
-        scopes: metadata.scopes.clone(),
+        authentication: metadata.authentication.clone(),
         registry_url: metadata.registry_url.clone(),
     });
     if metadata.credential_id != expected {
@@ -501,15 +560,50 @@ fn validate_stored_metadata(metadata: &StoredSessionMetadata) -> Result<(), Sess
     Ok(())
 }
 
+/// Convert schema-v1 OIDC metadata into the provider-tagged in-memory shape.
+fn migrate_legacy_metadata(
+    metadata: LegacyStoredSessionMetadata,
+) -> Result<StoredSessionMetadata, SessionStoreError> {
+    if metadata.schema_version != LEGACY_SESSION_METADATA_SCHEMA_VERSION {
+        return Err(SessionStoreError::Invalid(format!(
+            "unsupported legacy metadata schema version {}",
+            metadata.schema_version
+        )));
+    }
+    Ok(StoredSessionMetadata {
+        schema_version: SESSION_METADATA_SCHEMA_VERSION,
+        authentication: SessionAuthentication::Oidc {
+            issuer: metadata.issuer,
+            client_id: metadata.client_id,
+            redirect_uri: metadata.redirect_uri,
+            scopes: metadata.scopes,
+        },
+        registry_url: metadata.registry_url,
+        credential_id: metadata.credential_id,
+        saved_at: metadata.saved_at,
+    })
+}
+
 /// Derive a stable credential account without embedding user identifiers.
 fn credential_id(metadata: &SessionStoreMetadata) -> String {
     let mut hasher = Sha256::new();
-    for value in [
-        metadata.issuer.as_str(),
-        &metadata.client_id,
-        metadata.redirect_uri.as_str(),
-        metadata.registry_url.as_str(),
-    ] {
+    let values = match &metadata.authentication {
+        SessionAuthentication::Oidc {
+            issuer,
+            client_id,
+            redirect_uri,
+            ..
+        } => vec![
+            issuer.as_str(),
+            client_id.as_str(),
+            redirect_uri.as_str(),
+            metadata.registry_url.as_str(),
+        ],
+        SessionAuthentication::FirstParty => {
+            vec!["first_party", metadata.registry_url.as_str()]
+        }
+    };
+    for value in values {
         hasher.update((value.len() as u64).to_be_bytes());
         hasher.update(value.as_bytes());
     }
@@ -517,7 +611,9 @@ fn credential_id(metadata: &SessionStoreMetadata) -> String {
 }
 
 /// Serialize only secret-bearing session fields for native storage.
-fn serialize_session(session: &OidcSession) -> Result<Zeroizing<Vec<u8>>, SessionStoreError> {
+fn serialize_session(
+    session: &AuthenticatedSession,
+) -> Result<Zeroizing<Vec<u8>>, SessionStoreError> {
     let payload = SessionSecretPayload {
         schema_version: SESSION_SECRET_SCHEMA_VERSION,
         access_token: session.access_token.expose_secret().to_owned(),
@@ -535,7 +631,7 @@ fn serialize_session(session: &OidcSession) -> Result<Zeroizing<Vec<u8>>, Sessio
 }
 
 /// Decode and validate a native credential payload.
-fn deserialize_session(payload: &[u8]) -> Result<OidcSession, SessionStoreError> {
+fn deserialize_session(payload: &[u8]) -> Result<AuthenticatedSession, SessionStoreError> {
     if payload.len() as u64 > MAX_SESSION_STORAGE_BYTES {
         return Err(SessionStoreError::Invalid(
             "credential payload exceeded the size limit".to_string(),
@@ -543,20 +639,34 @@ fn deserialize_session(payload: &[u8]) -> Result<OidcSession, SessionStoreError>
     }
     let payload: SessionSecretPayload = serde_json::from_slice(payload)
         .map_err(|_| SessionStoreError::Invalid("credential payload is malformed".to_string()))?;
+    let invalid_access_token = invalid_token_value(&payload.access_token);
+    let invalid_refresh_token = payload
+        .refresh_token
+        .as_deref()
+        .is_some_and(invalid_token_value);
     if payload.schema_version != SESSION_SECRET_SCHEMA_VERSION
-        || payload.access_token.trim().is_empty()
+        || invalid_access_token
+        || invalid_refresh_token
     {
         return Err(SessionStoreError::Invalid(
             "credential payload failed validation".to_string(),
         ));
     }
-    Ok(OidcSession::from_stored_parts(
+    Ok(AuthenticatedSession::from_stored_parts(
         SecretString::new(payload.access_token.clone()),
         payload.refresh_token.clone().map(SecretString::new),
         payload.expires_in,
         payload.scope.clone(),
         payload.acquired_at,
     ))
+}
+
+/// Reject token values that cannot be placed safely in an authorization header.
+fn invalid_token_value(token: &str) -> bool {
+    token.is_empty()
+        || token
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
 }
 
 /// Restore or delete a credential after metadata persistence fails.
@@ -714,17 +824,19 @@ mod tests {
     /// Build non-secret metadata.
     fn metadata() -> SessionStoreMetadata {
         SessionStoreMetadata {
-            issuer: Url::parse("https://issuer.example").expect("issuer URL"),
-            client_id: "frameshift-cli".to_string(),
-            redirect_uri: Url::parse("http://127.0.0.1:8765/callback").expect("redirect URL"),
-            scopes: vec!["openid".to_string(), "profile".to_string()],
+            authentication: SessionAuthentication::Oidc {
+                issuer: Url::parse("https://issuer.example").expect("issuer URL"),
+                client_id: "frameshift-cli".to_string(),
+                redirect_uri: Url::parse("http://127.0.0.1:8765/callback").expect("redirect URL"),
+                scopes: vec!["openid".to_string(), "profile".to_string()],
+            },
             registry_url: Url::parse("https://registry.example").expect("registry URL"),
         }
     }
 
     /// Build one secret-bearing session.
-    fn session() -> OidcSession {
-        OidcSession::from_stored_parts(
+    fn session() -> AuthenticatedSession {
+        AuthenticatedSession::from_stored_parts(
             SecretString::new("secret-access".to_string()),
             Some(SecretString::new("secret-refresh".to_string())),
             Some(300),
@@ -797,21 +909,30 @@ mod tests {
         let mut cases = Vec::new();
 
         let mut issuer_query = metadata();
-        issuer_query.issuer =
-            Url::parse("https://issuer.example?tenant=other").expect("issuer URL");
+        if let SessionAuthentication::Oidc { issuer, .. } = &mut issuer_query.authentication {
+            *issuer = Url::parse("https://issuer.example?tenant=other").expect("issuer URL");
+        }
         cases.push(issuer_query);
 
         let mut remote_http_redirect = metadata();
-        remote_http_redirect.redirect_uri =
-            Url::parse("http://192.0.2.1:8765/callback").expect("redirect URL");
+        if let SessionAuthentication::Oidc { redirect_uri, .. } =
+            &mut remote_http_redirect.authentication
+        {
+            *redirect_uri = Url::parse("http://192.0.2.1:8765/callback").expect("redirect URL");
+        }
         cases.push(remote_http_redirect);
 
         let mut duplicate_scopes = metadata();
-        duplicate_scopes.scopes = vec!["openid".to_string(), "openid".to_string()];
+        if let SessionAuthentication::Oidc { scopes, .. } = &mut duplicate_scopes.authentication {
+            *scopes = vec!["openid".to_string(), "openid".to_string()];
+        }
         cases.push(duplicate_scopes);
 
         let mut embedded_whitespace = metadata();
-        embedded_whitespace.scopes = vec!["openid".to_string(), "bad scope".to_string()];
+        if let SessionAuthentication::Oidc { scopes, .. } = &mut embedded_whitespace.authentication
+        {
+            *scopes = vec!["openid".to_string(), "bad scope".to_string()];
+        }
         cases.push(embedded_whitespace);
 
         for invalid in cases {
@@ -820,5 +941,115 @@ mod tests {
                 .is_err());
         }
         assert!(!store.metadata_path().exists());
+    }
+
+    /// First-party sessions use explicit metadata and remain non-refreshable.
+    #[test]
+    fn saves_and_loads_first_party_session() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = SessionStore::new(temp.path());
+        let credentials = FakeCredentials::default();
+        let metadata = SessionStoreMetadata {
+            authentication: SessionAuthentication::FirstParty,
+            registry_url: Url::parse("https://registry.example").expect("registry URL"),
+        };
+        let session = AuthenticatedSession::from_stored_parts(
+            SecretString::new("local-access".to_string()),
+            None,
+            Some(600),
+            None,
+            42,
+        );
+
+        store
+            .save_with_store(metadata, &session, &credentials)
+            .expect("save first-party session");
+        let metadata_text =
+            fs::read_to_string(store.metadata_path()).expect("read first-party metadata");
+        assert!(metadata_text.contains("\"kind\": \"first_party\""));
+        assert!(!metadata_text.contains("local-access"));
+        let loaded = store.load_with_store(&credentials).expect("load session");
+        assert_eq!(
+            loaded.metadata.authentication,
+            SessionAuthentication::FirstParty
+        );
+        assert!(loaded.session.refresh_token().is_none());
+        assert_eq!(
+            loaded.session.access_token().expose_secret(),
+            "local-access"
+        );
+    }
+
+    /// Provider metadata cannot relabel an OIDC refreshable session as first-party.
+    #[test]
+    fn rejects_first_party_metadata_for_oidc_session_shape() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = SessionStore::new(temp.path());
+        let credentials = FakeCredentials::default();
+        let metadata = SessionStoreMetadata {
+            authentication: SessionAuthentication::FirstParty,
+            registry_url: Url::parse("https://registry.example").expect("registry URL"),
+        };
+
+        assert!(store
+            .save_with_store(metadata, &session(), &credentials)
+            .is_err());
+        assert!(!store.metadata_path().exists());
+    }
+
+    /// Schema-v1 OIDC metadata keeps its exact existing keyring credential binding.
+    #[test]
+    fn migrates_legacy_oidc_metadata_without_changing_credential_id() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = SessionStore::new(temp.path());
+        let credentials = FakeCredentials::default();
+        let current = metadata();
+        let expected_credential_id = credential_id(&current);
+        let SessionAuthentication::Oidc {
+            issuer,
+            client_id,
+            redirect_uri,
+            scopes,
+        } = &current.authentication
+        else {
+            panic!("test metadata must be OIDC");
+        };
+        let legacy = serde_json::json!({
+            "schema_version": LEGACY_SESSION_METADATA_SCHEMA_VERSION,
+            "issuer": issuer,
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "scopes": scopes,
+            "registry_url": current.registry_url,
+            "credential_id": expected_credential_id.clone(),
+            "saved_at": 41
+        });
+        let path = store.metadata_path();
+        ensure_private_directory(path.parent().expect("metadata parent"))
+            .expect("create metadata parent");
+        write_private_file(
+            &path,
+            &serde_json::to_vec(&legacy).expect("serialize legacy metadata"),
+        )
+        .expect("write legacy metadata");
+        credentials
+            .put(
+                &expected_credential_id,
+                &serialize_session(&session()).expect("secret payload"),
+            )
+            .expect("write legacy credential");
+
+        let loaded = store
+            .load_with_store(&credentials)
+            .expect("load legacy session");
+        assert_eq!(
+            loaded.metadata.schema_version,
+            SESSION_METADATA_SCHEMA_VERSION
+        );
+        assert_eq!(loaded.metadata.credential_id, expected_credential_id);
+        assert!(matches!(
+            loaded.metadata.authentication,
+            SessionAuthentication::Oidc { .. }
+        ));
     }
 }

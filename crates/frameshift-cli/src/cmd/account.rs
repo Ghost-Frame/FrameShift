@@ -1,20 +1,24 @@
-//! Interactive account login, status, and logout commands.
+//! Interactive account registration, login, status, and logout commands.
 //!
-//! Login uses the system browser and a loopback Authorization Code callback
-//! with S256 PKCE. Tokens never enter command-line arguments or terminal input.
+//! OIDC login uses the system browser and a loopback Authorization Code callback
+//! with S256 PKCE. First-party credentials use hidden terminal prompts. No
+//! password, invitation, or token is accepted through arguments or environment.
 
-use std::io::{Read as _, Write as _};
+use std::io::{IsTerminal as _, Read as _, Write as _};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Subcommand};
-use frameshift_client::account::{get_account, get_auth_config, AccountView};
-use frameshift_client::session::{OidcSession, SessionClient, SessionClientConfig};
+use frameshift_client::account::{
+    get_account, get_auth_config, login_local_account, logout_local_account,
+    register_local_account, AccountView, LocalAccountSession, NativeAuthClient,
+};
+use frameshift_client::session::{AuthenticatedSession, SessionClient, SessionClientConfig};
 use frameshift_client::session_store::{
-    SessionStore, SessionStoreError, SessionStoreMetadata, StoredSession,
+    SessionAuthentication, SessionStore, SessionStoreError, SessionStoreMetadata, StoredSession,
 };
 use frameshift_client::{registry_base_url, Client, ClientError};
-use secrecy::SecretString;
+use secrecy::{ExposeSecret as _, SecretString};
 use url::{Position, Url};
 
 use crate::util::{validate_server_url, CliError};
@@ -41,20 +45,25 @@ pub struct AccountArgs {
 /// Account session operations.
 #[derive(Debug, Subcommand)]
 pub enum AccountCommand {
-    /// Authenticate in the system browser and save the session securely.
+    /// Authenticate through an advertised provider and save the session securely.
     Login(AccountLoginArgs),
+    /// Redeem a first-party invitation and save the new session securely.
+    Register(AccountRegisterArgs),
     /// Fetch and print the current authenticated account.
     Status,
     /// Revoke the provider session when supported and erase local credentials.
     Logout,
 }
 
-/// Browser login options.
+/// Account login options.
 #[derive(Debug, Args)]
 pub struct AccountLoginArgs {
     /// Registry API base URL; defaults to `FRAMESHIFT_REGISTRY_URL` or production.
     #[arg(long)]
     pub server: Option<String>,
+    /// Use first-party password login when the registry also advertises OIDC.
+    #[arg(long)]
+    pub first_party: bool,
     /// OIDC issuer override; defaults to `FRAMESHIFT_OIDC_ISSUER` or registry discovery.
     #[arg(long)]
     pub issuer: Option<String>,
@@ -76,6 +85,22 @@ pub struct AccountLoginArgs {
     pub timeout_secs: u64,
 }
 
+/// First-party invitation registration options.
+#[derive(Debug, Args)]
+pub struct AccountRegisterArgs {
+    /// Registry API base URL; defaults to `FRAMESHIFT_REGISTRY_URL` or production.
+    #[arg(long)]
+    pub server: Option<String>,
+}
+
+/// Authentication mode selected from explicit intent and registry capabilities.
+enum AccountLoginMode {
+    /// OIDC system-browser flow through the exact issuer.
+    Oidc(Url),
+    /// First-party password flow through hidden terminal prompts.
+    FirstParty,
+}
+
 /// Accepted callback URL paired with its response stream.
 struct PendingCallback {
     /// Exact callback URL reconstructed from the registered redirect.
@@ -88,17 +113,30 @@ struct PendingCallback {
 pub fn run_account(args: AccountArgs) -> Result<(), CliError> {
     match args.command {
         AccountCommand::Login(args) => run_login(args),
+        AccountCommand::Register(args) => run_register(args),
         AccountCommand::Status => run_status(),
         AccountCommand::Logout => run_logout(),
     }
 }
 
-/// Authenticate through the browser and persist the resulting session.
+/// Authenticate through the selected provider and persist the resulting session.
 fn run_login(args: AccountLoginArgs) -> Result<(), CliError> {
-    let server = args.server.unwrap_or_else(registry_base_url);
+    let server = args.server.clone().unwrap_or_else(registry_base_url);
     validate_server_url(&server)?;
     let registry_url = Url::parse(&server).map_err(|error| CliError::Account(error.to_string()))?;
-    let issuer = resolve_issuer(&server, args.issuer)?;
+    match resolve_login_mode(&server, args.first_party, args.issuer.clone())? {
+        AccountLoginMode::Oidc(issuer) => run_oidc_login(args, server, registry_url, issuer),
+        AccountLoginMode::FirstParty => run_first_party_login(&server, registry_url),
+    }
+}
+
+/// Complete OIDC system-browser login and persist its refreshable session.
+fn run_oidc_login(
+    args: AccountLoginArgs,
+    server: String,
+    registry_url: Url,
+    issuer: Url,
+) -> Result<(), CliError> {
     let client_id = resolve_client_id(args.client_id)?;
     let redirect_uri = Url::parse(&args.redirect_uri)
         .map_err(|error| CliError::Account(format!("invalid redirect URI: {error}")))?;
@@ -128,10 +166,12 @@ fn run_login(args: AccountLoginArgs) -> Result<(), CliError> {
     let store = SessionStore::new(client.data_root());
     if let Err(error) = store.save(
         SessionStoreMetadata {
-            issuer,
-            client_id,
-            redirect_uri,
-            scopes: args.scopes,
+            authentication: SessionAuthentication::Oidc {
+                issuer,
+                client_id,
+                redirect_uri,
+                scopes: args.scopes,
+            },
             registry_url,
         },
         &session,
@@ -144,26 +184,95 @@ fn run_login(args: AccountLoginArgs) -> Result<(), CliError> {
     Ok(())
 }
 
+/// Prompt for first-party credentials and persist one opaque bearer session.
+fn run_first_party_login(server: &str, registry_url: Url) -> Result<(), CliError> {
+    require_interactive_terminal()?;
+    let email = prompt_line("Email: ")?;
+    let password = prompt_secret("Password: ", "password")?;
+    let authenticated = login_local_account(server, &email, &password, NativeAuthClient::Cli)
+        .map_err(|error| CliError::Account(error.to_string()))?;
+    persist_first_party_session(registry_url, &authenticated)?;
+    let view = get_account(server, authenticated.session.access_token())
+        .map_err(|error| CliError::Account(error.to_string()))?;
+    println!("logged in to {server}");
+    print_account(&view);
+    Ok(())
+}
+
+/// Redeem one invitation through hidden prompts and persist the initial session.
+fn run_register(args: AccountRegisterArgs) -> Result<(), CliError> {
+    let server = args.server.unwrap_or_else(registry_base_url);
+    validate_server_url(&server)?;
+    let config = get_auth_config(&server).map_err(|error| CliError::Account(error.to_string()))?;
+    if !config.first_party_enabled {
+        return Err(CliError::Account(
+            "registry does not advertise first-party account registration".to_string(),
+        ));
+    }
+    if config.registration.as_deref() != Some("invite_only") {
+        return Err(CliError::Account(
+            "registry does not advertise invite-only account registration".to_string(),
+        ));
+    }
+    require_interactive_terminal()?;
+    let invite = prompt_secret("Invitation token: ", "invitation token")?;
+    let email = prompt_line("Email: ")?;
+    let display_name = prompt_line_allow_empty("Display name (optional): ")?;
+    let password = prompt_confirmed_password()?;
+    let authenticated = register_local_account(
+        &server,
+        &invite,
+        &email,
+        (!display_name.is_empty()).then_some(display_name.as_str()),
+        &password,
+        NativeAuthClient::Cli,
+    )
+    .map_err(|error| CliError::Account(error.to_string()))?;
+    let registry_url = Url::parse(&server).map_err(|error| CliError::Account(error.to_string()))?;
+    persist_first_party_session(registry_url, &authenticated)?;
+    println!("registered and logged in to {server}");
+    Ok(())
+}
+
+/// Persist one first-party session and revoke it if local storage fails.
+fn persist_first_party_session(
+    registry_url: Url,
+    authenticated: &LocalAccountSession,
+) -> Result<(), CliError> {
+    let client = Client::with_default_data_root()?;
+    let store = SessionStore::new(client.data_root());
+    if let Err(error) = store.save(
+        SessionStoreMetadata {
+            authentication: SessionAuthentication::FirstParty,
+            registry_url: registry_url.clone(),
+        },
+        &authenticated.session,
+    ) {
+        let _ = logout_local_account(registry_url.as_str(), authenticated.session.access_token());
+        return Err(account_store_error(error));
+    }
+    Ok(())
+}
+
 /// Load, refresh when needed, and print the current registry account.
 fn run_status() -> Result<(), CliError> {
     let client = Client::with_default_data_root()?;
     let store = SessionStore::new(client.data_root());
     let mut stored = store.load().map_err(account_store_error)?;
-    let session_client = session_client_for(&stored)?;
-    if session_expires_soon(&stored.session) && stored.session.refresh_token().is_some() {
-        stored.session = session_client
-            .refresh(&stored.session)
-            .map_err(|error| CliError::Account(error.to_string()))?;
-        persist_loaded_session(&store, &stored)?;
-    }
+    refresh_loaded_session_if_needed(&store, &mut stored)?;
     let view = match get_account(
         stored.metadata.registry_url.as_str(),
         stored.session.access_token(),
     ) {
         Ok(view) => view,
         Err(ClientError::RegistryRejected { status: 401, .. })
-            if stored.session.refresh_token().is_some() =>
+            if stored.session.refresh_token().is_some()
+                && matches!(
+                    &stored.metadata.authentication,
+                    SessionAuthentication::Oidc { .. }
+                ) =>
         {
+            let session_client = session_client_for(&stored)?;
             stored.session = session_client
                 .refresh(&stored.session)
                 .map_err(|error| CliError::Account(error.to_string()))?;
@@ -191,13 +300,7 @@ pub(crate) fn access_token_for_registry(server: &str) -> Result<Option<SecretStr
     if normalized_registry_url(stored.metadata.registry_url.as_str())? != requested_registry {
         return Ok(None);
     }
-    if session_expires_soon(&stored.session) && stored.session.refresh_token().is_some() {
-        let session_client = session_client_for(&stored)?;
-        stored.session = session_client
-            .refresh(&stored.session)
-            .map_err(|error| CliError::Account(error.to_string()))?;
-        persist_loaded_session(&store, &stored)?;
-    }
+    refresh_loaded_session_if_needed(&store, &mut stored)?;
     Ok(Some(stored.session.access_token().clone()))
 }
 
@@ -229,11 +332,19 @@ fn run_logout() -> Result<(), CliError> {
         Err(error) => return Err(account_store_error(error)),
     };
     if let Some(stored) = &stored {
-        match session_client_for(stored).and_then(|client| {
-            client
-                .revoke(&stored.session)
-                .map_err(|error| CliError::Account(error.to_string()))
-        }) {
+        let revocation = match &stored.metadata.authentication {
+            SessionAuthentication::Oidc { .. } => session_client_for(stored).and_then(|client| {
+                client
+                    .revoke(&stored.session)
+                    .map_err(|error| CliError::Account(error.to_string()))
+            }),
+            SessionAuthentication::FirstParty => logout_local_account(
+                stored.metadata.registry_url.as_str(),
+                stored.session.access_token(),
+            )
+            .map_err(|error| CliError::Account(error.to_string())),
+        };
+        match revocation {
             Ok(()) => {}
             Err(CliError::Account(message))
                 if message.contains("does not advertise a revocation endpoint") => {}
@@ -249,39 +360,49 @@ fn run_logout() -> Result<(), CliError> {
     Ok(())
 }
 
-/// Resolve the issuer from an override, environment, or registry bootstrap.
-fn resolve_issuer(server: &str, override_value: Option<String>) -> Result<Url, CliError> {
-    let value = override_value
-        .or_else(|| nonempty_env("FRAMESHIFT_OIDC_ISSUER"))
-        .map(Ok)
-        .unwrap_or_else(|| {
-            let config =
-                get_auth_config(server).map_err(|error| CliError::Account(error.to_string()))?;
-            if !config.enabled {
-                return Err(CliError::Account(
-                    "registry account authentication is disabled".to_string(),
-                ));
-            }
-            config.issuer.ok_or_else(|| {
-                // A registry running in first-party-only mode reports
-                // enabled=true with no OIDC issuer. `frameshift account login`
-                // only speaks the OIDC browser flow today, so surface an
-                // accurate, actionable message instead of implying the registry
-                // misreported an issuer it never advertised.
-                if config.first_party_enabled {
-                    CliError::Account(
-                        "this registry uses invite-only first-party accounts; \
-                         `frameshift account login` currently supports only OIDC sign-in. \
-                         Sign in through the FrameShift web portal, or set FRAMESHIFT_ACCESS_TOKEN \
-                         to an issued session token for CLI publisher-key commands"
-                            .to_string(),
-                    )
-                } else {
-                    CliError::Account("registry omitted its enabled OIDC issuer".to_string())
-                }
-            })
-        })?;
-    Url::parse(&value).map_err(|error| CliError::Account(format!("invalid OIDC issuer: {error}")))
+/// Resolve first-party or OIDC login from explicit intent and registry capability.
+fn resolve_login_mode(
+    server: &str,
+    first_party: bool,
+    issuer_override: Option<String>,
+) -> Result<AccountLoginMode, CliError> {
+    if first_party && issuer_override.is_some() {
+        return Err(CliError::Account(
+            "--first-party cannot be combined with --issuer".to_string(),
+        ));
+    }
+    if !first_party {
+        if let Some(value) = issuer_override.or_else(|| nonempty_env("FRAMESHIFT_OIDC_ISSUER")) {
+            let issuer = Url::parse(&value)
+                .map_err(|error| CliError::Account(format!("invalid OIDC issuer: {error}")))?;
+            return Ok(AccountLoginMode::Oidc(issuer));
+        }
+    }
+    let config = get_auth_config(server).map_err(|error| CliError::Account(error.to_string()))?;
+    if !config.enabled {
+        return Err(CliError::Account(
+            "registry account authentication is disabled".to_string(),
+        ));
+    }
+    if first_party {
+        return config
+            .first_party_enabled
+            .then_some(AccountLoginMode::FirstParty)
+            .ok_or_else(|| {
+                CliError::Account("registry does not advertise first-party login".to_string())
+            });
+    }
+    if let Some(value) = config.issuer {
+        let issuer = Url::parse(&value)
+            .map_err(|error| CliError::Account(format!("invalid OIDC issuer: {error}")))?;
+        return Ok(AccountLoginMode::Oidc(issuer));
+    }
+    if config.first_party_enabled {
+        return Ok(AccountLoginMode::FirstParty);
+    }
+    Err(CliError::Account(
+        "registry omitted every enabled authentication provider".to_string(),
+    ))
 }
 
 /// Resolve and validate the public OAuth client identifier.
@@ -302,6 +423,60 @@ fn nonempty_env(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
         .filter(|value| !value.trim().is_empty())
+}
+
+/// Require an interactive terminal before reading first-party credentials.
+fn require_interactive_terminal() -> Result<(), CliError> {
+    if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
+        Ok(())
+    } else {
+        Err(CliError::Account(
+            "first-party credentials require an interactive terminal".to_string(),
+        ))
+    }
+}
+
+/// Read one required visible line without accepting control characters.
+fn prompt_line(prompt: &str) -> Result<String, CliError> {
+    let value = prompt_line_allow_empty(prompt)?;
+    if value.is_empty() {
+        return Err(CliError::Account("a required value was empty".to_string()));
+    }
+    Ok(value)
+}
+
+/// Read one optional visible line from the interactive terminal.
+fn prompt_line_allow_empty(prompt: &str) -> Result<String, CliError> {
+    eprint!("{prompt}");
+    std::io::stderr().flush()?;
+    let mut value = String::new();
+    std::io::stdin().read_line(&mut value)?;
+    let value = value.trim_end_matches(['\r', '\n']).to_string();
+    if value.chars().any(char::is_control) {
+        return Err(CliError::Account(
+            "interactive account values must not contain control characters".to_string(),
+        ));
+    }
+    Ok(value)
+}
+
+/// Read one non-empty secret through a hidden terminal prompt.
+fn prompt_secret(prompt: &str, label: &str) -> Result<SecretString, CliError> {
+    let value = rpassword::prompt_password(prompt)?;
+    if value.is_empty() {
+        return Err(CliError::Account(format!("{label} cannot be empty")));
+    }
+    Ok(SecretString::new(value))
+}
+
+/// Read and exactly confirm one new password through hidden prompts.
+fn prompt_confirmed_password() -> Result<SecretString, CliError> {
+    let password = prompt_secret("Password: ", "password")?;
+    let confirmation = prompt_secret("Confirm password: ", "password confirmation")?;
+    if password.expose_secret() != confirmation.expose_secret() {
+        return Err(CliError::Account("passwords did not match".to_string()));
+    }
+    Ok(password)
 }
 
 /// Bind only the exact IP loopback callback address and explicit port.
@@ -444,21 +619,52 @@ fn respond_to_browser(stream: &mut TcpStream, success: bool) {
 
 /// Recreate the provider client for persisted metadata.
 fn session_client_for(stored: &StoredSession) -> Result<SessionClient, CliError> {
+    let SessionAuthentication::Oidc {
+        issuer,
+        client_id,
+        redirect_uri,
+        scopes,
+    } = &stored.metadata.authentication
+    else {
+        return Err(CliError::Account(
+            "first-party sessions do not use OIDC discovery".to_string(),
+        ));
+    };
     SessionClient::discover(SessionClientConfig {
-        issuer: stored.metadata.issuer.clone(),
-        client_id: stored.metadata.client_id.clone(),
-        redirect_uri: stored.metadata.redirect_uri.clone(),
-        scopes: stored.metadata.scopes.clone(),
+        issuer: issuer.clone(),
+        client_id: client_id.clone(),
+        redirect_uri: redirect_uri.clone(),
+        scopes: scopes.clone(),
     })
     .map_err(|error| CliError::Account(error.to_string()))
 }
 
 /// Return whether an access token is expired or within the refresh margin.
-fn session_expires_soon(session: &OidcSession) -> bool {
+fn session_expires_soon(session: &AuthenticatedSession) -> bool {
     session
         .summary()
         .expires_at
         .is_some_and(|expiry| expiry <= unix_now().saturating_add(REFRESH_MARGIN_SECS))
+}
+
+/// Refresh one expiring OIDC session while leaving first-party sessions untouched.
+fn refresh_loaded_session_if_needed(
+    store: &SessionStore,
+    stored: &mut StoredSession,
+) -> Result<(), CliError> {
+    if matches!(
+        &stored.metadata.authentication,
+        SessionAuthentication::Oidc { .. }
+    ) && session_expires_soon(&stored.session)
+        && stored.session.refresh_token().is_some()
+    {
+        let session_client = session_client_for(stored)?;
+        stored.session = session_client
+            .refresh(&stored.session)
+            .map_err(|error| CliError::Account(error.to_string()))?;
+        persist_loaded_session(store, stored)?;
+    }
+    Ok(())
 }
 
 /// Rewrite one refreshed session using its existing public metadata.
@@ -466,10 +672,7 @@ fn persist_loaded_session(store: &SessionStore, stored: &StoredSession) -> Resul
     store
         .save(
             SessionStoreMetadata {
-                issuer: stored.metadata.issuer.clone(),
-                client_id: stored.metadata.client_id.clone(),
-                redirect_uri: stored.metadata.redirect_uri.clone(),
-                scopes: stored.metadata.scopes.clone(),
+                authentication: stored.metadata.authentication.clone(),
                 registry_url: stored.metadata.registry_url.clone(),
             },
             &stored.session,
@@ -514,6 +717,79 @@ fn unix_now() -> u64 {
 /// Deterministic account command tests.
 mod tests {
     use super::*;
+    use clap::Parser as _;
+
+    /// Minimal parser that exercises the public account command hierarchy.
+    #[derive(Debug, clap::Parser)]
+    #[command(name = "frameshift")]
+    struct TestCli {
+        /// Parsed top-level command.
+        #[command(subcommand)]
+        command: TestCommand,
+    }
+
+    /// Top-level command subset needed for account parser tests.
+    #[derive(Debug, clap::Subcommand)]
+    enum TestCommand {
+        /// Account-session command group.
+        Account(AccountArgs),
+    }
+
+    /// Registration accepts only public connection options, never credential material.
+    #[test]
+    fn parses_registration_without_secret_arguments() {
+        let parsed = TestCli::try_parse_from([
+            "frameshift",
+            "account",
+            "register",
+            "--server",
+            "https://registry.example",
+        ])
+        .expect("registration arguments");
+        let TestCommand::Account(AccountArgs {
+            command: AccountCommand::Register(arguments),
+        }) = parsed.command
+        else {
+            panic!("expected account registration");
+        };
+        assert_eq!(
+            arguments.server.as_deref(),
+            Some("https://registry.example")
+        );
+
+        for secret_flag in ["--password", "--invite-token"] {
+            assert!(TestCli::try_parse_from([
+                "frameshift",
+                "account",
+                "register",
+                secret_flag,
+                "secret",
+            ])
+            .is_err());
+        }
+    }
+
+    /// Login exposes an explicit first-party selector without accepting a password argument.
+    #[test]
+    fn parses_first_party_login_without_password_argument() {
+        let parsed = TestCli::try_parse_from(["frameshift", "account", "login", "--first-party"])
+            .expect("first-party login arguments");
+        let TestCommand::Account(AccountArgs {
+            command: AccountCommand::Login(arguments),
+        }) = parsed.command
+        else {
+            panic!("expected account login");
+        };
+        assert!(arguments.first_party);
+        assert!(TestCli::try_parse_from([
+            "frameshift",
+            "account",
+            "login",
+            "--password",
+            "secret",
+        ])
+        .is_err());
+    }
 
     /// Registry matching ignores a cosmetic trailing slash only.
     #[test]

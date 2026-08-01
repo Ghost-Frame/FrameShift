@@ -38,23 +38,27 @@ invite or session token from the database.
 ## Sign in securely
 
 ```bash
+frameshift account register
 frameshift account login
+frameshift account login --first-party
 frameshift account status
 ```
 
-The current `frameshift account login` command uses the configured OIDC
-provider. It opens the provider in your browser and uses an exact IP-loopback
-callback with S256 PKCE. The desktop first-party login API exists for clients
-that implement the explicit bearer-session flow; the CLI command has not
-switched to that flow.
+`frameshift account register` redeems a single-use invitation through hidden
+terminal prompts. `frameshift account login` uses the registry's advertised
+provider, preferring OIDC when both OIDC and first-party login are available.
+Use `--first-party` to select password login explicitly. OIDC opens the provider
+in your system browser and uses an exact IP-loopback callback with S256 PKCE.
 
-The CLI stores OIDC access and refresh tokens in the operating system's native
-credential store. The JSON metadata in the managed FrameShift data directory
-contains no token.
+The CLI accepts no password or invitation through arguments or environment.
+First-party credentials require an interactive terminal, and secret values use
+hidden prompts. OIDC and first-party bearer credentials remain in the operating
+system's native credential store. Provider-tagged JSON metadata in the managed
+FrameShift data directory contains no token.
 
 `account status` asks the registry for the authenticated account and its
-publisher memberships. `account logout` attempts provider revocation and then
-removes the exact local credential and metadata.
+publisher memberships. `account logout` requests the matching provider's
+revocation endpoint and then removes the exact local credential and metadata.
 
 A saved session is bound to the registry used during login. Remote key commands
 reuse and refresh that session only when their `--server` value names the same
