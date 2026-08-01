@@ -33,6 +33,8 @@ chrono.workspace = true
 ed25519-dalek = { workspace = true }
 # Wraps the vault passphrase/value input so it is never accidentally logged.
 secrecy = { workspace = true }
+# Serializes one-time invitation output directly to standard output.
+serde = { workspace = true }
 serde_json = { workspace = true }
 # Persists reviewed quarantine artifacts atomically without overwriting operator files.
 tempfile = { workspace = true }

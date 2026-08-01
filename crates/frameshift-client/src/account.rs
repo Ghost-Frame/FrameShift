@@ -5,7 +5,8 @@
 
 use chrono::{DateTime, Utc};
 use frameshift_catalog::{
-    AccountRecord, AccountStatus, PlatformRole, PlatformRoleRecord, PublisherMembershipRecord,
+    AccountInviteRecord, AccountInviteRequestRecord, AccountInviteStatus, AccountRecord,
+    AccountStatus, PlatformRole, PlatformRoleRecord, PublisherMembershipRecord,
     PublisherProfileRecord,
 };
 use secrecy::{ExposeSecret as _, SecretString};
@@ -139,6 +140,75 @@ struct AssignPlatformRoleRequest {
 struct SetAccountStatusRequest {
     /// Status the target account must hold after the transition.
     status: AccountStatus,
+}
+
+/// Non-issued review states accepted by the administrator PATCH route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountInviteReviewStatus {
+    /// Return an application to the initial review queue.
+    Pending,
+    /// Mark an application as actively under review.
+    Reviewing,
+    /// Decline an application while retaining its audit record.
+    Declined,
+}
+
+/// Caller-controlled field for one administrator invite-request review.
+#[derive(Serialize)]
+struct ReviewAccountInviteRequest {
+    /// Non-issued state the application must hold after the transition.
+    status: AccountInviteReviewStatus,
+}
+
+/// Wire response containing an invitation token that is wiped after conversion.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IssuedAccountInviteResponse {
+    /// Durable non-secret invitation metadata.
+    invite: AccountInviteRecord,
+    /// Raw one-time token returned only at issuance.
+    token: Option<String>,
+}
+
+/// Wipe the raw invitation token when its temporary wire value leaves scope.
+impl Drop for IssuedAccountInviteResponse {
+    /// Zero the optional raw token string.
+    fn drop(&mut self) {
+        use zeroize::Zeroize as _;
+        if let Some(token) = &mut self.token {
+            token.zeroize();
+        }
+    }
+}
+
+/// One newly issued invitation with its secret-bearing one-time token.
+pub struct IssuedAccountInvite {
+    /// Durable invitation metadata safe for normal structured output.
+    pub invite: AccountInviteRecord,
+    /// Raw one-time token retained in secret memory.
+    token: SecretString,
+}
+
+/// Redacted diagnostics for one newly issued account invitation.
+impl std::fmt::Debug for IssuedAccountInvite {
+    /// Render invitation metadata while withholding the raw token.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IssuedAccountInvite")
+            .field("invite", &self.invite)
+            .field("token", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Expose the one-time token only to callers that deliberately deliver it.
+impl IssuedAccountInvite {
+    /// Borrow the secret invitation token.
+    #[must_use]
+    pub fn token(&self) -> &SecretString {
+        &self.token
+    }
 }
 
 /// Authenticated account profile and its publisher memberships.
@@ -423,6 +493,100 @@ pub fn set_account_status(
     )
 }
 
+/// List administrator-visible account invitation requests.
+///
+/// # Errors
+///
+/// Returns an input-bound, registry URL, transport, status, size, or JSON
+/// response error without including the bearer token in the diagnostic.
+pub fn list_account_invite_requests(
+    server_url: &str,
+    access_token: &SecretString,
+    status: Option<AccountInviteStatus>,
+    limit: u32,
+) -> Result<Vec<AccountInviteRequestRecord>, ClientError> {
+    if !(1..=200).contains(&limit) {
+        return Err(ClientError::InvalidAccountInviteInput {
+            detail: "limit must be between 1 and 200".to_string(),
+        });
+    }
+    let mut url = administrator_invite_url(server_url, &[])?;
+    let mut query = url.query_pairs_mut();
+    if let Some(status) = status {
+        query.append_pair("status", account_invite_status_name(status));
+    }
+    query.append_pair("limit", &limit.to_string());
+    drop(query);
+    let request = crate::publisher::with_bearer(
+        crate::registry::http_agent().get(url.as_str()),
+        access_token,
+    );
+    crate::publisher::send_and_decode(request.call(), url.as_str())
+}
+
+/// Transition one account invitation request to a non-issued review state.
+///
+/// # Errors
+///
+/// Returns a registry URL, transport, status, size, JSON serialization, or JSON
+/// response error without including the bearer token in the diagnostic.
+pub fn review_account_invite_request(
+    server_url: &str,
+    access_token: &SecretString,
+    request_id: Uuid,
+    status: AccountInviteReviewStatus,
+) -> Result<AccountInviteRequestRecord, ClientError> {
+    let request = request_id.to_string();
+    let url = administrator_invite_url(server_url, &[&request])?;
+    send_account_json(
+        crate::registry::http_agent().request("PATCH", url.as_str()),
+        &url,
+        access_token,
+        &ReviewAccountInviteRequest { status },
+    )
+}
+
+/// Issue one account invitation and retain its raw token as a secret.
+///
+/// # Errors
+///
+/// Returns a registry URL, transport, status, size, JSON, or token-validation
+/// error without including either bearer or invitation token in the diagnostic.
+pub fn issue_account_invite(
+    server_url: &str,
+    access_token: &SecretString,
+    request_id: Uuid,
+) -> Result<IssuedAccountInvite, ClientError> {
+    let request = request_id.to_string();
+    let url = administrator_invite_url(server_url, &[&request, "invite"])?;
+    let request = crate::publisher::with_bearer(
+        crate::registry::http_agent().post(url.as_str()),
+        access_token,
+    );
+    let mut response: IssuedAccountInviteResponse =
+        crate::publisher::send_and_decode(request.call(), url.as_str())?;
+    let mut token = response
+        .token
+        .take()
+        .ok_or_else(|| invalid_invitation_token(&url))?;
+    let mut decoded = Zeroizing::new([0_u8; 32]);
+    let valid_token = base64::Engine::decode_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        token.as_bytes(),
+        decoded.as_mut(),
+    )
+    .is_ok_and(|length| length == decoded.len());
+    if !valid_token {
+        use zeroize::Zeroize as _;
+        token.zeroize();
+        return Err(invalid_invitation_token(&url));
+    }
+    Ok(IssuedAccountInvite {
+        invite: response.invite.clone(),
+        token: SecretString::new(token),
+    })
+}
+
 /// Build one administrator account endpoint while preserving a registry base path.
 fn administrator_account_url(
     server_url: &str,
@@ -433,6 +597,32 @@ fn administrator_account_url(
     let mut segments = vec!["v1", "admin", "accounts", account.as_str()];
     segments.extend_from_slice(suffix);
     crate::publisher::registry_endpoint_url(server_url, &segments)
+}
+
+/// Build one administrator invitation endpoint while preserving a registry base path.
+fn administrator_invite_url(server_url: &str, suffix: &[&str]) -> Result<url::Url, ClientError> {
+    let mut segments = vec!["v1", "admin", "invite-requests"];
+    segments.extend_from_slice(suffix);
+    crate::publisher::registry_endpoint_url(server_url, &segments)
+}
+
+/// Render one invitation status in its exact query-string spelling.
+const fn account_invite_status_name(status: AccountInviteStatus) -> &'static str {
+    match status {
+        AccountInviteStatus::Pending => "pending",
+        AccountInviteStatus::Reviewing => "reviewing",
+        AccountInviteStatus::Invited => "invited",
+        AccountInviteStatus::Declined => "declined",
+    }
+}
+
+/// Build one bounded server-response error for a missing or malformed invitation token.
+fn invalid_invitation_token(url: &url::Url) -> ClientError {
+    ClientError::RegistryRejected {
+        url: url.to_string(),
+        status: 502,
+        message: "registry returned an invalid one-time invitation token".to_string(),
+    }
 }
 
 /// Send one bearer-authenticated administrator account JSON mutation.
@@ -631,6 +821,12 @@ mod tests {
             "POST /registry/v1/admin/accounts/00000000-0000-0000-0000-000000000001/platform-roles HTTP/1.1\r\n"
         ));
         assert!(request.contains("\r\nAuthorization: Bearer administrator-token\r\n"));
+        let error = list_account_invite_requests(&server, &token, None, 201)
+            .expect_err("oversized invite queue");
+        assert!(matches!(
+            error,
+            ClientError::InvalidAccountInviteInput { .. }
+        ));
         assert!(request.contains("\"role\":\"administrator\""));
 
         let (server, handle) = serve_json_response(role_body);
@@ -664,5 +860,74 @@ mod tests {
         ));
         assert!(request.contains("\r\nAuthorization: Bearer administrator-token\r\n"));
         assert!(request.contains("\"status\":\"suspended\""));
+    }
+
+    /// Administrator invitation controls preserve queue, review, issuance, and token boundaries.
+    #[test]
+    fn sends_administrator_invitation_controls() {
+        let request_body = r#"{"id":"00000000-0000-0000-0000-000000000003","normalized_email":"invitee@example.test","display_name":null,"intent":"publish_personas","statement":"I want to publish personas.","status":"reviewing","consented_at":"2026-01-01T00:00:00Z","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#;
+        let (server, handle) = serve_json_response(format!("[{request_body}]"));
+        let server = format!("{server}/registry");
+        let token = SecretString::new("administrator-token".to_string());
+        let requests = list_account_invite_requests(
+            &server,
+            &token,
+            Some(frameshift_catalog::AccountInviteStatus::Reviewing),
+            25,
+        )
+        .expect("invite queue response");
+        assert_eq!(requests.len(), 1);
+        let request = handle.join().expect("test server thread");
+        assert!(request.starts_with(
+            "GET /registry/v1/admin/invite-requests?status=reviewing&limit=25 HTTP/1.1\r\n"
+        ));
+        assert!(request.contains("\r\nAuthorization: Bearer administrator-token\r\n"));
+
+        let declined_body = request_body.replace("\"reviewing\"", "\"declined\"");
+        let (server, handle) = serve_json_response(declined_body);
+        let server = format!("{server}/registry");
+        let reviewed = review_account_invite_request(
+            &server,
+            &token,
+            uuid::Uuid::from_u128(3),
+            AccountInviteReviewStatus::Declined,
+        )
+        .expect("invite review response");
+        assert_eq!(
+            reviewed.status,
+            frameshift_catalog::AccountInviteStatus::Declined
+        );
+        let request = handle.join().expect("test server thread");
+        assert!(request.starts_with(
+            "PATCH /registry/v1/admin/invite-requests/00000000-0000-0000-0000-000000000003 HTTP/1.1\r\n"
+        ));
+        assert!(request.contains("\"status\":\"declined\""));
+
+        let raw_invitation_token = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            [7_u8; 32],
+        );
+        let issued_body = format!(
+            r#"{{"invite":{{"id":"00000000-0000-0000-0000-000000000004","request_id":"00000000-0000-0000-0000-000000000003","normalized_email":"invitee@example.test","token_digest":"AQID","issued_by_account_id":"00000000-0000-0000-0000-000000000002","is_bootstrap":false,"expires_at":"2026-01-08T00:00:00Z","consumed_at":null,"revoked_at":null,"created_at":"2026-01-01T00:00:00Z"}},"token":"{raw_invitation_token}"}}"#
+        );
+        let (server, handle) = serve_json_response(issued_body.clone());
+        let server = format!("{server}/registry");
+        let issued = issue_account_invite(&server, &token, uuid::Uuid::from_u128(3))
+            .expect("invite issuance response");
+        assert_eq!(issued.token().expose_secret(), &raw_invitation_token);
+        assert!(!format!("{issued:?}").contains(&raw_invitation_token));
+        let request = handle.join().expect("test server thread");
+        assert!(request.starts_with(
+            "POST /registry/v1/admin/invite-requests/00000000-0000-0000-0000-000000000003/invite HTTP/1.1\r\n"
+        ));
+        assert!(!request.contains(&raw_invitation_token));
+
+        let malformed_body = issued_body.replace(&raw_invitation_token, "malformed-token");
+        let (server, handle) = serve_json_response(malformed_body);
+        let server = format!("{server}/registry");
+        let error = issue_account_invite(&server, &token, uuid::Uuid::from_u128(3))
+            .expect_err("malformed invitation token");
+        assert!(!error.to_string().contains("malformed-token"));
+        let _request = handle.join().expect("test server thread");
     }
 }

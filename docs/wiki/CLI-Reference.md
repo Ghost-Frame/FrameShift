@@ -65,10 +65,15 @@ registry and do not accept a token argument.
 frameshift account grant-role --server <url> --account-id <uuid> --role <moderator|administrator>
 frameshift account revoke-role --server <url> --account-id <uuid> --role <moderator|administrator>
 frameshift account set-status --server <url> --account-id <uuid> --status <active|suspended|disabled>
+frameshift account invite-requests --server <url> [--status <pending|reviewing|invited|declined>] [--limit <1-200>]
+frameshift account review-invite-request --server <url> --request-id <uuid> --status <pending|reviewing|declined>
+frameshift account issue-invite --server <url> --request-id <uuid>
 ```
 
 The registry prevents revoking, suspending, or disabling the last active
-administrator.
+administrator. `issue-invite` prints durable invitation metadata and the raw
+registration token exactly once. The registry retains only the token digest and
+cannot display the raw value again.
 
 ### `frameshift install [OPTIONS] <SPEC>`
 

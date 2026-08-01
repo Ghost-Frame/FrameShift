@@ -9,11 +9,13 @@ use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Subcommand, ValueEnum};
-use frameshift_catalog::{AccountStatus, PlatformRole};
+use frameshift_catalog::{AccountInviteStatus, AccountStatus, PlatformRole};
 use frameshift_client::account::{
-    assign_account_platform_role, get_account, get_auth_config, login_local_account,
-    logout_local_account, register_local_account, revoke_account_platform_role, set_account_status,
-    AccountView, LocalAccountSession, NativeAuthClient,
+    assign_account_platform_role, get_account, get_auth_config, issue_account_invite,
+    list_account_invite_requests, login_local_account, logout_local_account,
+    register_local_account, review_account_invite_request, revoke_account_platform_role,
+    set_account_status, AccountInviteReviewStatus, AccountView, IssuedAccountInvite,
+    LocalAccountSession, NativeAuthClient,
 };
 use frameshift_client::session::{AuthenticatedSession, SessionClient, SessionClientConfig};
 use frameshift_client::session_store::{
@@ -93,6 +95,39 @@ pub enum AccountCommand {
         #[arg(long, value_enum)]
         status: AccountStatusArg,
     },
+    /// List administrator-visible account invitation requests.
+    InviteRequests {
+        /// Registry API base URL.
+        #[arg(long)]
+        server: String,
+        /// Optional invitation review state filter.
+        #[arg(long, value_enum)]
+        status: Option<InviteQueueStatusArg>,
+        /// Number of newest requests to return.
+        #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..=200))]
+        limit: u32,
+    },
+    /// Transition one invitation request to a non-issued review state.
+    ReviewInviteRequest {
+        /// Registry API base URL.
+        #[arg(long)]
+        server: String,
+        /// Stable invitation-request UUID.
+        #[arg(long)]
+        request_id: Uuid,
+        /// Pending, reviewing, or declined state to apply.
+        #[arg(long, value_enum)]
+        status: InviteReviewStatusArg,
+    },
+    /// Issue one invitation and print its raw one-time token once.
+    IssueInvite {
+        /// Registry API base URL.
+        #[arg(long)]
+        server: String,
+        /// Stable invitation-request UUID.
+        #[arg(long)]
+        request_id: Uuid,
+    },
 }
 
 /// CLI spelling for global platform roles.
@@ -136,6 +171,64 @@ impl From<AccountStatusArg> for AccountStatus {
             AccountStatusArg::Disabled => Self::Disabled,
         }
     }
+}
+
+/// CLI spelling for administrator invitation queue filters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum InviteQueueStatusArg {
+    /// Applications waiting for initial review.
+    Pending,
+    /// Applications actively under review.
+    Reviewing,
+    /// Applications whose one-time invitation was issued.
+    Invited,
+    /// Applications declined with their audit record retained.
+    Declined,
+}
+
+/// Convert a CLI queue filter into the shared invitation status.
+impl From<InviteQueueStatusArg> for AccountInviteStatus {
+    /// Preserve the selected queue state exactly.
+    fn from(value: InviteQueueStatusArg) -> Self {
+        match value {
+            InviteQueueStatusArg::Pending => Self::Pending,
+            InviteQueueStatusArg::Reviewing => Self::Reviewing,
+            InviteQueueStatusArg::Invited => Self::Invited,
+            InviteQueueStatusArg::Declined => Self::Declined,
+        }
+    }
+}
+
+/// CLI spelling for non-issued invitation review transitions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum InviteReviewStatusArg {
+    /// Return an application to the initial review queue.
+    Pending,
+    /// Mark an application as actively under review.
+    Reviewing,
+    /// Decline an application while retaining its audit record.
+    Declined,
+}
+
+/// Convert a CLI review transition into the restricted client input.
+impl From<InviteReviewStatusArg> for AccountInviteReviewStatus {
+    /// Preserve the selected non-issued review state exactly.
+    fn from(value: InviteReviewStatusArg) -> Self {
+        match value {
+            InviteReviewStatusArg::Pending => Self::Pending,
+            InviteReviewStatusArg::Reviewing => Self::Reviewing,
+            InviteReviewStatusArg::Declined => Self::Declined,
+        }
+    }
+}
+
+/// Borrowed structured output for one newly issued invitation.
+#[derive(serde::Serialize)]
+struct IssuedAccountInviteOutput<'a> {
+    /// Durable non-secret invitation metadata.
+    invite: &'a frameshift_catalog::AccountInviteRecord,
+    /// Raw invitation token deliberately displayed exactly once.
+    token: &'a str,
 }
 
 /// Account login options.
@@ -214,6 +307,17 @@ pub fn run_account(args: AccountArgs) -> Result<(), CliError> {
             account_id,
             status,
         } => set_status(&server, account_id, status),
+        AccountCommand::InviteRequests {
+            server,
+            status,
+            limit,
+        } => invite_requests(&server, status, limit),
+        AccountCommand::ReviewInviteRequest {
+            server,
+            request_id,
+            status,
+        } => review_invite_request(&server, request_id, status),
+        AccountCommand::IssueInvite { server, request_id } => issue_invite(&server, request_id),
     }
 }
 
@@ -244,6 +348,56 @@ fn set_status(server: &str, account_id: Uuid, status: AccountStatusArg) -> Resul
     let account = set_account_status(server, &token, account_id, status.into())
         .map_err(|error| CliError::Account(error.to_string()))?;
     println!("{}", serde_json::to_string_pretty(&account)?);
+    Ok(())
+}
+
+/// Print one bounded administrator invitation queue.
+fn invite_requests(
+    server: &str,
+    status: Option<InviteQueueStatusArg>,
+    limit: u32,
+) -> Result<(), CliError> {
+    validate_server_url(server)?;
+    let token = resolve_access_token(server)?;
+    let requests = list_account_invite_requests(server, &token, status.map(Into::into), limit)
+        .map_err(|error| CliError::Account(error.to_string()))?;
+    println!("{}", serde_json::to_string_pretty(&requests)?);
+    Ok(())
+}
+
+/// Transition one invitation request through administrator review.
+fn review_invite_request(
+    server: &str,
+    request_id: Uuid,
+    status: InviteReviewStatusArg,
+) -> Result<(), CliError> {
+    validate_server_url(server)?;
+    let token = resolve_access_token(server)?;
+    let request = review_account_invite_request(server, &token, request_id, status.into())
+        .map_err(|error| CliError::Account(error.to_string()))?;
+    println!("{}", serde_json::to_string_pretty(&request)?);
+    Ok(())
+}
+
+/// Issue one invitation and deliberately write its one-time token to standard output.
+fn issue_invite(server: &str, request_id: Uuid) -> Result<(), CliError> {
+    validate_server_url(server)?;
+    let token = resolve_access_token(server)?;
+    let issued = issue_account_invite(server, &token, request_id)
+        .map_err(|error| CliError::Account(error.to_string()))?;
+    print_issued_invite(&issued)
+}
+
+/// Serialize one secret-bearing invitation without creating a debug representation.
+fn print_issued_invite(issued: &IssuedAccountInvite) -> Result<(), CliError> {
+    let output = IssuedAccountInviteOutput {
+        invite: &issued.invite,
+        token: issued.token().expose_secret(),
+    };
+    let stdout = std::io::stdout();
+    let mut writer = stdout.lock();
+    serde_json::to_writer_pretty(&mut writer, &output)?;
+    writeln!(writer)?;
     Ok(())
 }
 
@@ -1056,6 +1210,151 @@ mod tests {
         assert_eq!(
             AccountStatus::from(AccountStatusArg::Disabled),
             AccountStatus::Disabled
+        );
+    }
+
+    /// Administrator invite queue parsing preserves the exact filter and bounded limit.
+    #[test]
+    fn parses_administrator_invite_queue() {
+        let parsed = TestCli::try_parse_from([
+            "frameshift",
+            "account",
+            "invite-requests",
+            "--server",
+            "https://registry.example",
+            "--status",
+            "invited",
+            "--limit",
+            "200",
+        ])
+        .expect("invite queue arguments");
+        let TestCommand::Account(AccountArgs {
+            command:
+                AccountCommand::InviteRequests {
+                    server,
+                    status,
+                    limit,
+                },
+        }) = parsed.command
+        else {
+            panic!("expected administrator invite queue");
+        };
+        assert_eq!(server, "https://registry.example");
+        assert_eq!(status, Some(InviteQueueStatusArg::Invited));
+        assert_eq!(limit, 200);
+        assert!(TestCli::try_parse_from([
+            "frameshift",
+            "account",
+            "invite-requests",
+            "--server",
+            "https://registry.example",
+            "--limit",
+            "201",
+        ])
+        .is_err());
+    }
+
+    /// Administrator invite review parsing excludes the issuance-only invited state.
+    #[test]
+    fn parses_administrator_invite_review() {
+        let parsed = TestCli::try_parse_from([
+            "frameshift",
+            "account",
+            "review-invite-request",
+            "--server",
+            "https://registry.example",
+            "--request-id",
+            "00000000-0000-0000-0000-000000000003",
+            "--status",
+            "declined",
+        ])
+        .expect("invite review arguments");
+        let TestCommand::Account(AccountArgs {
+            command:
+                AccountCommand::ReviewInviteRequest {
+                    server,
+                    request_id,
+                    status,
+                },
+        }) = parsed.command
+        else {
+            panic!("expected administrator invite review");
+        };
+        assert_eq!(server, "https://registry.example");
+        assert_eq!(request_id, Uuid::from_u128(3));
+        assert_eq!(status, InviteReviewStatusArg::Declined);
+        assert!(TestCli::try_parse_from([
+            "frameshift",
+            "account",
+            "review-invite-request",
+            "--server",
+            "https://registry.example",
+            "--request-id",
+            "00000000-0000-0000-0000-000000000003",
+            "--status",
+            "invited",
+        ])
+        .is_err());
+    }
+
+    /// Administrator invitation issuance parsing preserves the exact application target.
+    #[test]
+    fn parses_administrator_invite_issuance() {
+        let parsed = TestCli::try_parse_from([
+            "frameshift",
+            "account",
+            "issue-invite",
+            "--server",
+            "https://registry.example",
+            "--request-id",
+            "00000000-0000-0000-0000-000000000003",
+        ])
+        .expect("invite issuance arguments");
+        let TestCommand::Account(AccountArgs {
+            command: AccountCommand::IssueInvite { server, request_id },
+        }) = parsed.command
+        else {
+            panic!("expected administrator invite issuance");
+        };
+        assert_eq!(server, "https://registry.example");
+        assert_eq!(request_id, Uuid::from_u128(3));
+    }
+
+    /// Every CLI invitation queue filter maps to its exact shared wire value.
+    #[test]
+    fn maps_all_administrator_invite_queue_statuses() {
+        assert_eq!(
+            AccountInviteStatus::from(InviteQueueStatusArg::Pending),
+            AccountInviteStatus::Pending
+        );
+        assert_eq!(
+            AccountInviteStatus::from(InviteQueueStatusArg::Reviewing),
+            AccountInviteStatus::Reviewing
+        );
+        assert_eq!(
+            AccountInviteStatus::from(InviteQueueStatusArg::Invited),
+            AccountInviteStatus::Invited
+        );
+        assert_eq!(
+            AccountInviteStatus::from(InviteQueueStatusArg::Declined),
+            AccountInviteStatus::Declined
+        );
+    }
+
+    /// Every CLI invitation review state maps to its restricted client input.
+    #[test]
+    fn maps_all_administrator_invite_review_statuses() {
+        assert_eq!(
+            AccountInviteReviewStatus::from(InviteReviewStatusArg::Pending),
+            AccountInviteReviewStatus::Pending
+        );
+        assert_eq!(
+            AccountInviteReviewStatus::from(InviteReviewStatusArg::Reviewing),
+            AccountInviteReviewStatus::Reviewing
+        );
+        assert_eq!(
+            AccountInviteReviewStatus::from(InviteReviewStatusArg::Declined),
+            AccountInviteReviewStatus::Declined
         );
     }
 
