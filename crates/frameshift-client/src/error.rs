@@ -293,6 +293,13 @@ pub enum ClientError {
         detail: String,
     },
 
+    /// An account-invitation argument violates a stable client-visible server bound.
+    #[error("invalid account invitation input: {detail}")]
+    InvalidAccountInviteInput {
+        /// Actionable description of the rejected argument and its accepted shape.
+        detail: String,
+    },
+
     #[error("author_pubkey is not a supported ed25519 public key encoding: {0}")]
     InvalidAuthorPublicKey(String),
 

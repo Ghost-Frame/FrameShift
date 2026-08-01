@@ -135,6 +135,13 @@ frameshift account revoke-role --server <url> --account-id <uuid> --role <modera
 
 # Set an account lifecycle state as an administrator.
 frameshift account set-status --server <url> --account-id <uuid> --status <active|suspended|disabled>
+
+# Review account invitation requests as an administrator.
+frameshift account invite-requests --server <url> [--status <pending|reviewing|invited|declined>]
+frameshift account review-invite-request --server <url> --request-id <uuid> --status <pending|reviewing|declined>
+
+# Issue an invitation and print its raw one-time token once.
+frameshift account issue-invite --server <url> --request-id <uuid>
 ```
 
 Deployments that register a different public OAuth client set
@@ -147,6 +154,9 @@ interactive terminal and are read through hidden prompts.
 Administrator account controls resolve bearer authority for the exact registry
 without accepting a token argument. The registry rejects non-administrators and
 prevents revoking, suspending, or disabling the last active administrator.
+Invitation issuance returns durable metadata plus the raw registration token on
+standard output exactly once. Deliver that token to the invitation-bound email;
+the registry stores only its digest and cannot display it again.
 
 ## Automate mode
 
@@ -449,6 +459,11 @@ frameshift account revoke-role --server <url> --account-id <uuid>          Revok
            --role <moderator|administrator>
 frameshift account set-status --server <url> --account-id <uuid>           Set an account lifecycle state
            --status <active|suspended|disabled>
+frameshift account invite-requests --server <url>                          List invitation requests
+           [--status <pending|reviewing|invited|declined>] [--limit <1-200>]
+frameshift account review-invite-request --server <url> --request-id <uuid> Transition an invitation review state
+           --status <pending|reviewing|declined>
+frameshift account issue-invite --server <url> --request-id <uuid>         Issue and display one invitation token
 frameshift register --server <url> --handle <handle> [--display-name <name>]   Claim an author handle
 frameshift publish --persona <name> [--out <dir>]                          Build a persona pack (add --server + --handle to sign and upload)
            [--server <url> --handle <handle>]
