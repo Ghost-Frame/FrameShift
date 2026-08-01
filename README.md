@@ -1,69 +1,88 @@
 <p align="center">
-  <img src="personas/assets/banner.png" alt="Frameshift" width="100%" />
+  <img src="personas/assets/banner.png" alt="FrameShift specialists moving modular frame plates through a physical studio" width="100%" />
 </p>
 
-# Frameshift
+# FrameShift
 
-A persona engine for AI coding agents. Install behavioral identities as versioned packs, activate them per-project, and let the engine pick the right one for the task.
+Versioned behavioral identity for AI coding agents.
 
-**Status:** Pre-release. The CLI, pack runtime, orchestrator, watch daemon, and marketplace server are implemented. The public registry API is online; the browser marketplace remains behind an access gate while release validation finishes.
+FrameShift packages a persona's behavior, constraints, skills, and operating posture into a project-scoped runtime. One pack can render the instruction format expected by Claude Code, Codex, Gemini CLI, or a generic agent host. Packs are content-addressed, signed by their publishers, and locked per project.
 
-**Desktop app:** [download.frameshift.syntheos.dev](https://download.frameshift.syntheos.dev/) -- the easiest way to browse, install, activate, and connect personas without using a terminal. Early-access builds currently support Linux x64 and Windows x64. The Windows installer is not yet Authenticode-signed and may show an unrecognized publisher warning. macOS distribution is withheld until signed and notarized builds are available.
+[Get FrameShift Desktop](https://download.frameshift.syntheos.dev/) · [Desktop source](https://github.com/Ghost-Frame/FrameShift-Desktop) · [CLI releases](https://github.com/Ghost-Frame/FrameShift/releases) · [Documentation](docs/wiki/Home.md) · [Marketplace](https://frameshift.syntheos.dev/)
 
-Personas are not instruction lists. They are complete behavioral frames -- identity, rules, skills, operating posture -- that survive long sessions, surprising inputs, and the slow drift that turns careful agents into sloppy ones around turn 200. Same model, different frame.
+> **Pre-release:** The CLI, runtime, MCP server, watch daemon, and registry API are available. Hosted desktop downloads, the browser marketplace, and account features remain access-gated while release validation finishes.
+
+FrameShift is not an `AGENTS.md` swapper. It treats behavioral identity as software: versioned, composable, inspectable, and portable across agent hosts.
 
 ## Start here
 
-### Desktop app
+### Desktop
 
-1. [Download FrameShift Desktop](https://download.frameshift.syntheos.dev/) for your operating system.
-2. Open the app and choose the project folder where you use an AI coding agent.
-3. Open Marketplace, choose a persona, and select Install.
-4. Return to Personas and activate it for the selected project.
-5. Open Settings, choose your agent, and select Connect. The desktop app installs its bundled CLI and MCP server automatically.
+FrameShift Desktop is the shortest path from discovery to an active persona:
 
-The selected project is always shown in the sidebar. Installing or activating a persona affects that project only, and you can switch projects at any time.
+1. [Download the current build](https://download.frameshift.syntheos.dev/).
+2. Open the project where you use an AI coding agent.
+3. Browse Marketplace, install a persona, and activate it for that project.
+4. Open Settings, choose your agent, and select Connect.
+
+The desktop app installs its bundled CLI and MCP server when it connects an agent. Its complete public source, build instructions, and release provenance live in [Ghost-Frame/FrameShift-Desktop](https://github.com/Ghost-Frame/FrameShift-Desktop).
 
 ### Command line
 
-Every release includes both `frameshift`, for people, and `frameshift-mcp`, for agents. Open the [**FrameShift releases page**](https://github.com/Ghost-Frame/FrameShift/releases) and pick the newest release, then download the archive for your computer, verify it with the matching checksum in `SHA256SUMS`, extract it, and place both binaries somewhere on your `PATH`.
+Download the newest archive from the [releases list](https://github.com/Ghost-Frame/FrameShift/releases), verify it against `SHA256SUMS`, and put both `frameshift` and `frameshift-mcp` on your `PATH`. Use the releases list instead of a `releases/latest` URL while early-access builds are published as prereleases.
 
-| Platform | Release archive |
-| --- | --- |
-| Linux x64 | `frameshift-linux-x86_64.tar.gz` |
-| Windows x64 | `frameshift-windows-x86_64.zip` |
-
-While early-access builds are published as pre-releases, GitHub's "latest" pointer resolves to the most recent full release, so download from the [releases list](https://github.com/Ghost-Frame/FrameShift/releases) rather than a `releases/latest/download/...` URL. These early-access Windows command-line archives are also unsigned. Verify the archive against `SHA256SUMS` before extracting it. Persona packs downloaded from the registry are separately signature-verified by FrameShift.
-
-Confirm the installation:
+Then run these commands from the project FrameShift should manage:
 
 ```bash
-frameshift --help
+frameshift install cryptographic
+frameshift use cryptographic --target codex
 ```
 
-The MCP setup commands below will report a launch error if `frameshift-mcp` is not on the same `PATH`.
-
-Then run these commands from the project you want FrameShift to manage:
+Valid render targets are `claude`, `codex`, `gemini`, and `generic`. For local pack development:
 
 ```bash
-# Install the latest signed persona pack from the public registry.
-frameshift install cryptographic
-
-# Activate it and print the instructions for your agent.
-frameshift use cryptographic --target codex
-
-# Or install a complete local pack directory.
 frameshift install cryptographic@0.1.0 --from-path /path/to/cryptographic
 frameshift use cryptographic --target generic
 ```
 
-Valid targets are `claude`, `codex`, `gemini`, and `generic`. Use the target matching your agent so FrameShift produces the instruction format that host expects.
+See [Getting Started](docs/wiki/Getting-Started.md) for platform notes, release archives, checksums, project selection, and first-run verification.
+
+## What FrameShift guarantees
+
+| Concern | FrameShift behavior |
+| --- | --- |
+| Project scope | Installation and activation are recorded against one project. The active version is pinned in that project's lock state. |
+| Pack identity | A canonical SHA-256 identifies the logical pack contents independent of archive compression. |
+| Publisher identity | Ed25519 signatures bind a pack hash to the publisher key that signed it. Account-backed publishers add ownership and key lifecycle records. |
+| Host output | One persona can render native instructions for Claude Code, Codex, Gemini CLI, or a generic Markdown host. |
+| Declared access | Capability manifests describe required tools, network egress, filesystem scope, and memory expectations before activation. |
+| Local state | Installed objects live in a central store outside the project tree. The project retains its lock and configuration, not duplicated pack bodies. |
+
+The detailed hashing, signing, trust, extraction, and publisher rules are documented in [Trust and Security](docs/wiki/Trust-and-Security.md).
+
+## How it works
+
+```text
+persona source -> rendered pack -> hash and signature -> verified install -> project lock -> agent-native activation
+```
+
+A pack combines a typed manifest with behavioral content. Authors can use a freeform agent body or structured TOML source when they need composition and semantic editing. FrameShift renders the target-specific output, verifies the pack contract, stores content by hash, and activates the selected version without copying an unmanaged instruction tree into every project.
+
+Automate mode lets a host integration rank installed personas against the task and project context. It records the mode, sensitivity, preferences, lock state, and transition history per project. Enabling it does not switch personas by itself; the host decides when to select and activate a result.
+
+```bash
+frameshift automate on --sensitivity 0.7
+frameshift select --task "review this authentication boundary" --format json
+```
+
+The public [`personas/`](personas/) directory is a manifest catalog. Install public personas from the registry unless you also have their complete behavioral source. Read [How It Works](docs/wiki/How-It-Works.md), [Pack Format](docs/wiki/Pack-Format.md), and [Automate Mode](docs/wiki/Automate-Mode.md) for the full model.
 
 ## Connect an AI agent with MCP
 
-The MCP server lets an agent search, install, select, activate, and inspect personas without asking you to translate every action into CLI commands. Install the release binaries first, open a terminal in your project, then run the command for your agent.
+`frameshift-mcp` lets an agent search, install, select, activate, and inspect personas through the Model Context Protocol. Install the release binaries first, then add the server from the project it should manage.
 
-### Claude Code
+<details>
+<summary>Claude Code</summary>
 
 ```bash
 claude mcp add --scope local --transport stdio \
@@ -71,9 +90,12 @@ claude mcp add --scope local --transport stdio \
   frameshift -- frameshift-mcp
 ```
 
-Claude Code supplies the project root automatically. Run `/mcp` inside Claude Code and confirm that `frameshift` is connected.
+Claude Code supplies the project root. Run `/mcp` and confirm that `frameshift` is connected.
 
-### Codex
+</details>
+
+<details>
+<summary>Codex</summary>
 
 ```bash
 codex mcp add frameshift \
@@ -82,9 +104,12 @@ codex mcp add frameshift \
   -- frameshift-mcp
 ```
 
-Run `/mcp` inside Codex and confirm that `frameshift` is connected. Repeat the command with a different server name when you want fixed MCP entries for several projects.
+Run `/mcp` and confirm that `frameshift` is connected. Use a distinct server name for each fixed project entry.
 
-### Gemini CLI
+</details>
+
+<details>
+<summary>Gemini CLI</summary>
 
 ```bash
 gemini mcp add --scope project \
@@ -92,564 +117,52 @@ gemini mcp add --scope project \
   frameshift frameshift-mcp
 ```
 
-Gemini stores this entry in the current project. Use `gemini mcp list` to confirm the connection.
+Gemini stores this entry in the current project. Run `gemini mcp list` to confirm the connection.
 
-### MCP defaults
+</details>
 
-Every project-scoped MCP tool accepts an optional `project_root`. Resolution follows this order: the tool argument, `FRAMESHIFT_PROJECT_ROOT`, Claude Code's `CLAUDE_PROJECT_DIR`, then the MCP process working directory. The render target follows the tool argument, `FRAMESHIFT_TARGET`, then `generic`. This makes simple project-scoped setups work without repeating paths on every tool call while preserving explicit control for multi-project agents.
+Project resolution follows the explicit tool argument, `FRAMESHIFT_PROJECT_ROOT`, the host-provided project directory, then the MCP process working directory. See [MCP Server](docs/wiki/MCP-Server.md) for tool coverage, prompts, defaults, and multi-project setups.
 
-Registry commands use `https://frameshift-api.syntheos.dev` by default. Set `FRAMESHIFT_REGISTRY_URL` to target another deployment. The `personas/` directory in this repository is a manifest-only public catalog, not a complete local pack library; install those personas from the registry unless you also have their behavioral source.
+## Create and publish
 
-## Account sessions
+Local persona authoring does not require a hosted account. A complete pack can use a freeform instruction body, structured TOML source, or a composition of parent and mixin packs. Conformance bundles keep expected behavior testable as a persona evolves.
 
-FrameShift supports registry-owned first-party accounts and OIDC providers.
-First-party registration and login collect credentials only through hidden
-interactive terminal prompts. OIDC login opens the configured provider in the
-system browser and receives the Authorization Code response on an exact
-IP-loopback callback using S256 PKCE, random state, and a random nonce.
+Registry publishing uses signed publisher identity and exact-snapshot review. Account creation and publisher management remain invite-only during the current release phase. Start with [Writing Personas](docs/wiki/Writing-Personas.md), then use [Composition](docs/wiki/Composition.md), [Conformance](docs/wiki/Conformance.md), and [Publishing and Moderation](docs/wiki/Publishing-and-Moderation.md) as needed.
 
-All native bearer credentials are stored only in the operating system's
-credential store. The owner-only JSON file under the FrameShift data directory
-contains provider-tagged public metadata and never contains a token, password,
-or invitation.
+## Repository and development
 
-```bash
-# Redeem a single-use invitation and create a first-party account.
-frameshift account register
+- [`crates/`](crates/) contains the Rust workspace: CLI, runtime, pack tooling, composition, conformance, memory, object storage, registry server, MCP server, watch daemon, orchestration, and selection.
+- [`personas/`](personas/) contains the public persona manifest catalog and project artwork.
+- [`docs/wiki/`](docs/wiki/) contains the maintained user, author, security, and operator documentation.
 
-# Use the registry's advertised provider. OIDC remains preferred when both exist.
-frameshift account login
-
-# Explicitly use first-party password login when OIDC is also advertised.
-frameshift account login --first-party
-
-# Confirm the server-validated account and publisher memberships.
-frameshift account status
-
-# Update account metadata. Supply at least one field.
-frameshift account update-profile --server <url> [--email <email>] [--display-name <name>]
-
-# Create an owned publisher profile, then update its public metadata when needed.
-frameshift account create-publisher --server <url> --handle <handle> --display-name <name> [--biography <text>]
-frameshift account update-publisher --server <url> --handle <handle> --display-name <name> [--biography <text> | --clear-biography]
-
-# Revoke the provider session, then erase the exact local credential and metadata.
-frameshift account logout
-
-# Grant or revoke one global platform role as an administrator.
-frameshift account grant-role --server <url> --account-id <uuid> --role <moderator|administrator>
-frameshift account revoke-role --server <url> --account-id <uuid> --role <moderator|administrator>
-
-# Set an account lifecycle state as an administrator.
-frameshift account set-status --server <url> --account-id <uuid> --status <active|suspended|disabled>
-
-# Review account invitation requests as an administrator.
-frameshift account invite-requests --server <url> [--status <pending|reviewing|invited|declined>]
-frameshift account review-invite-request --server <url> --request-id <uuid> --status <pending|reviewing|declined>
-
-# Issue an invitation and print its raw one-time token once.
-frameshift account issue-invite --server <url> --request-id <uuid>
-```
-
-Deployments that register a different public OAuth client set
-`FRAMESHIFT_OIDC_CLIENT_ID`. `FRAMESHIFT_OIDC_ISSUER` overrides registry issuer
-discovery, and `--redirect-uri` selects another pre-registered IP-loopback
-callback. Login never accepts a bearer token through arguments, environment
-variables, or command-line values. First-party credentials require an
-interactive terminal and are read through hidden prompts.
-
-Account and publisher profile commands reuse the saved session for the exact
-registry. New publisher profiles begin in pending moderation and automatically
-grant the creating account an active owner membership. Publisher profile updates
-require that active owner membership and a fresh authentication session.
-
-Administrator account controls resolve bearer authority for the exact registry
-without accepting a token argument. The registry rejects non-administrators and
-prevents revoking, suspending, or disabling the last active administrator.
-Invitation issuance returns durable metadata plus the raw registration token on
-standard output exactly once. Deliver that token to the invitation-bound email;
-the registry stores only its digest and cannot display it again.
-
-## Automate mode
-
-Automate mode lets a host integration pick the persona for you. Frameshift classifies the task, ranks installed personas against project context, and stores the mode, sensitivity, lock, preferences, and transition audit. A session hook or other host integration decides when to run selection and activate a result; `frameshift automate on` does not switch personas by itself.
-
-```bash
-# Turn on for this project:
-frameshift automate on
-
-# With a sensitivity dial (0.0 = stable, 1.0 = responsive):
-frameshift automate on --sensitivity 0.7
-
-# Check current state:
-frameshift automate status
-```
-
-The default selection pipeline scores four components: language overlap (how well the persona's language set matches your project), lexical match (IDF-weighted task token hits against persona keywords), intent alignment (10-category task classification), and capability fit. Scores blend into a ranked list with confidence values. Hosts can consume JSON output and let the active model rerank the candidates before activation.
-
-### Intent classification
-
-The engine classifies task descriptions into one of ten intents: Implementation, Debugging, Review, Security, Writing, Ops, Testing, Refactoring, Performance, and Design. Personas declare which intents they handle best. A persona built for debugging scores higher when the task looks like debugging.
-
-### Selection output
-
-```bash
-# Table format using personas installed for this project (default):
-frameshift select --task "debug a rust compilation error"
-
-# Structured JSON for programmatic consumption or LLM reranking:
-frameshift select --task "debug a rust compilation error" --format json
-```
-
-JSON output includes the full context snapshot (detected languages, frameworks, inferred intent), per-candidate component scores, matched tokens, and rationale. Host LLMs can rerank using this data. Pass `--library /path/to/library` only when each persona directory contains `AGENTS.md` or typed persona source; a manifest-only catalog has no behavioral content to rank.
-
-### Feedback loop
-
-When the engine picks wrong, record the override. The engine adjusts per-persona bias for future selections, with optional intent context and time decay.
-
-```bash
-frameshift feedback --auto-pick web-designer --chosen rust --intent debugging
-```
-
-## How it works
-
-Frameshift takes a persona body plus a typed manifest, renders the instruction file each agent expects, and distributes the result as a signed, content-addressed pack that installs into a central store outside your project tree. Structured TOML source is available when a persona needs composition or semantic editing.
-
-### Packs
-
-A persona ships as a **pack**: a `pack.toml` manifest plus behavioral content. Marketplace packs use freeform `AGENTS.md` as the primary body; `CLAUDE.md`, `GEMINI.md`, or `README.md` are accepted as fallback bodies. Frameshift also supports an optional typed source made from `persona.toml`, `rules.toml`, `skills.toml`, and `patterns.toml` for structured editing and composition. The manifest carries identity and contract metadata:
-
-```toml
-schema_version = 1
-name = "cryptographic"
-version = "0.1.0"
-author_handle = "ghost-frame"
-author_pubkey = "1a2b3c..."  # 64 hex chars (Ed25519 verifying key)
-license = "Elastic-2.0"
-description = "Specification-anchored cryptographic implementation"
-tags = ["security", "rust"]
-
-[capability_manifest]
-required_tools = ["Read", "Edit", "Write", "Bash"]
-network_egress = false
-filesystem_scope = "project-only"
-memory_required = "none"
-```
-
-`description` and `tags` feed registry search; `capability_manifest` declares the tools, network egress, filesystem scope, and memory requirement the persona expects (see Capabilities and Memory below). For typed packs, `extends` and `mixin` drive composition. `parent_hash` tracks version lineage; `conformance_baseline` feeds the install-time regression gate (see Conformance below).
-
-Before the client signs or uploads a pack, it builds a versioned publication
-report over the exact public inventory. Root files are limited to the documented
-manifest, render, typed-source, template, and variable files; only
-`overlays/**/*.md` and `conformance/bundle.toml` are accepted below the root.
-Symlinks, unknown files, growth state, hidden or secret-state paths, malformed
-shared schemas, unsafe system-wide filesystem capability requests, stale typed
-renders, and mismatched conformance evidence block publication. The accepted
-files are rehashed into a private temporary snapshot, and that snapshot is the
-only input to hashing, signing, and archive construction.
-
-### Content addressing and signatures
-
-Every pack has a **canonical hash**: a SHA-256 computed from its files by normalizing each relative path (NFC, forward slashes), sorting byte-lexicographically, and hashing `path \0 length \0 content \0` for each. Because it is derived from the directory's logical contents, the canonical hash is independent of how the pack is later archived or compressed -- two byte-identical pack directories always produce the same hash. This is the pack's identity and the exact value an author signs.
-
-Signing is Ed25519 over that 32-byte hash; the signature travels alongside the pack, never inside the tarball. On the wire the registry addresses the compressed `.tar.gz` by a second hash (the SHA-256 of the archive bytes), which the client checks on download before it extracts anything.
-
-### Trust: publisher identity and signed history
-
-There is no central signing authority. Legacy authors **claim a handle** (e.g. `ghost-frame`) with a signed request, and the registry binds that handle to the first key that claimed it. Account-backed publishers instead have a stable publisher UUID, owner memberships, and one or more enrolled signing keys. New publisher writes require both an authenticated owner and a request signed by an active enrolled key. When a publisher and legacy author share a handle, publisher authority takes precedence and failed publisher authentication never falls back to the legacy key.
-
-On registry install, the client verifies the pack signature against the exact key in the registry's version record, not a key embedded in the manifest. It pins legacy installs by handle and key. Once ownership metadata is present, it also pins the stable publisher UUID while retaining the exact signer-key pin. A newly presented publisher key triggers the existing key-change error until the protocol can carry a cryptographic rotation proof. A revoked key remains valid evidence for a historical version but cannot authorize a new publish. With ownership enrichment enabled, missing or mismatched linked ownership data fails closed and never triggers a legacy downgrade. Installing directly from a local path verifies a signature if one is present, and installs unsigned local packs as-is. Registered legacy authors remain publicly listable via `GET /v1/authors`.
-
-### Downloads
-
-`frameshift install` fetches pack bytes from the direct, unauthenticated `GET /v1/packs/{name}/versions/{version}/pack` route -- this is the supported download path today. The server also implements a signed-download flow: `POST .../download-url` mints a short-lived, HMAC-signed `/dl/{hash}` URL (gated on the `DOWNLOAD_SECRET` env var, disabled when it is unset). That flow is fully built and tested server-side but has no caller yet in the CLI or client, so treat it as experimental / not-yet-default until something mints and follows those URLs.
-
-### Admin
-
-The registry server exposes account-authenticated lifecycle controls. Publisher owners can withdraw eligible non-public submissions with `frameshift publication withdraw` and read their scoped immutable evidence with `frameshift publication decisions`. Active administrators can suspend a publisher with `frameshift moderation suspend-publisher`, tombstone an active release with `frameshift moderation tombstone`, and read the global stream with `frameshift moderation decisions`. Each accepted transition and its reason are committed atomically to immutable audit evidence.
-
-Active moderators and administrators can inspect a known quarantined
-submission with `frameshift moderation show`, download its exact archive with
-`artifact`, record an `approve`, `request-changes`, or `reject` decision with
-`decide`, and publish an approved submission with `promote`. The server retains
-the role, lifecycle, and independent-review checks for every operation.
-
-Publisher owners may file one appeal within 30 days of a `request_changes` or `reject` moderation decision with `frameshift publication appeal` and read private cases with `frameshift publication appeals`. Active administrators list global cases with `frameshift moderation appeals` and resolve them with `frameshift moderation resolve-appeal`; an `overturn` approves the exact unchanged submission, while `uphold` preserves its adverse state. The original reviewer cannot resolve the appeal when another active administrator is available. A sole administrator must record a bounded separation exception. Filing and resolution require a caller-supplied UUID `x-request-id`, reject substituted retries, and retain immutable evidence.
-
-### Registry safety controls
-
-Registry reads are public. Registration, publication, and administration require Ed25519-signed requests that bind the method, path, body hash, timestamp, and nonce. The server checks clock skew, claims nonces in the shared catalog to reject cross-instance replay, and admits publishers through `FRAMESHIFT_PUBLISHER_PUBKEYS`.
-
-Request-body and archive limits bound memory and decompression work. Publication also enforces per-author version and byte quotas plus a registry-wide byte quota. Uploaded archives may contain at most 256 regular-file entries and decompress to at most 16 MiB; unsafe paths and non-regular entries are rejected before catalog registration.
-
-### Install and the central store
-
-`frameshift install` resolves a pack (from the registry, or `--from-path`), verifies it, and materializes it into a central store -- your project tree is never written to. The project is keyed by `project-id = sha256(realpath(project_root))`, so the same directory always maps to the same state regardless of how you path to it.
-
-All state lives under `$XDG_DATA_HOME/frameshift/`:
-
-```
-cache/<canonical-hash>/                      Content-addressed pack cache (shared across projects)
-identity/ed25519-signing-key.bin             Your managed author signing key (mode 0600)
-studio/drafts/<draft-id>/
-  draft.json                                 Private versioned review state
-  content/                                   Exact files eligible for publication
-projects/<project-id>/
-  config.toml                                Declared dependencies, telemetry opt-in, memory adapter
-  lock.toml                                  Exact versions, hashes, author pubkeys
-  active                                     Name of the currently active persona
-  automate.json  automate-prefs.json         Automate mode + learned selection biases
-  automate-audit.jsonl  automate-lock.json   Switch audit log + lock marker
-  selection-history.jsonl                    Local record of past selections
-  personas/<name>/
-    source/                                  The pack's own files
-    rendered/{claude,codex,gemini,generic}/  Per-agent rendered output
-    growth.md  growth.jsonl                  Append-only growth log: markdown + JSONL
-```
-
-The lockfile records each installed persona as name, version, author handle, author pubkey, and canonical hash. Re-running `install`/`sync` rebuilds the per-project `personas/` tree from the content-addressed cache to match the lockfile.
-
-### Conformance
-
-A pack's `pack.toml` can ship a `[conformance_baseline]` -- a score from 0.0 to 1.0, plus the hash of the conformance bundle it was measured against. When `install` would overwrite an already-installed version of the same persona in the current project, the client compares the incoming pack's baseline against the installed one, without re-running any tests:
-
-- **Pass** -- the incoming score meets or exceeds the installed score.
-- **Regression** -- the incoming score is lower. Warn-only; the install proceeds.
-- **MissingBaseline** -- either side ships no baseline. Non-fatal; baselines are optional.
-- **InvalidScore** -- a score is non-finite or outside 0.0-1.0. Warn-only.
-- **IntegrityFailure** -- the incoming pack's declared `bundle_hash` doesn't match the hash of its own shipped conformance bundle, or it ships none at all. This **hard-blocks the install** -- an unverifiable score can't be trusted regardless of what it claims. Override with `FRAMESHIFT_ALLOW_CONFORMANCE_INTEGRITY_FAILURE=1`.
-
-A fresh install of a persona with no prior version in the project skips the comparison entirely. `frameshift verify` (see CLI, below) runs a persona's conformance bundle through a runner and reports the score; it does not modify `pack.toml`. A published baseline must correspond to the bundle shipped in the pack.
-
-### Rendering: one pack, per-agent outputs
-
-Freeform packs use their Markdown body for every target, with Frameshift's host overlay and persona header prepended. Typed packs use four TOML files -- `persona.toml` (identity, voice, anchors), `rules.toml`, `skills.toml`, and `patterns.toml` -- and render target-specific Markdown. Typed rules carry a **layer**: L1 (non-negotiable invariants), L2 (contextual defaults, overridable with explicit justification), L3 (preferences).
-
-Both paths write the file each agent expects into `rendered/<target>/`: `CLAUDE.md` for Claude, `AGENTS.md` for Codex and generic, and `GEMINI.md` for Gemini. Typed targets differ in which sections they carry: Claude and generic get the full document, Codex omits Design Notes and Safety-Layer sections, and Gemini omits Design Notes.
-
-### Composition: extends and mixins
-
-A typed pack can `extends` a single base persona and `mixin` a list of others. Composition merges in a fixed order -- base, then each mixin in turn, then the persona itself -- with later layers overriding earlier ones by rule or skill id (last write wins). One invariant is protected: a mixin can never override a base's **L1** rule, and a persona can override an inherited L1 rule only by explicitly opting in. A missing base or an illegal L1 override fails the install. Composition resolves a single level: a base (or mixin) that itself declares `extends`/`mixin` is rejected at install time rather than silently dropping its own ancestors, so an unsupported multi-level chain can never quietly discard an inherited L1 rule. Bases and mixins are resolved from packs already installed in the same project. A freeform pack that declares composition metadata cannot be structurally composed; Frameshift warns and renders its Markdown body unchanged.
-
-### Capabilities
-
-Each pack's `capability_manifest` declares the tools it expects, whether it needs network egress, its filesystem scope, and its memory requirement. Over MCP, Frameshift surfaces this contract as **advisory**: the `frameshift_capabilities` tool annotates a proposed tool list against the active persona's declared tools. It never blocks or hides the host agent's own tools -- the manifest names agent-side tools (Read, Bash, ...), a separate namespace from Frameshift's own MCP tools -- it only reports the contract.
-
-### Creator Studio drafts
-
-Creator Studio drafts live in the managed Frameshift data root, separate from
-installed personas and project repositories. Draft writes use same-directory
-temporary files and atomic replacement. Imports reject symlinks, special files,
-private-state paths, traversal, unsupported public paths, and format limits
-before the draft becomes visible.
-
-The local MCP server exposes `frameshift_draft_create`,
-`frameshift_draft_list`, `frameshift_draft_status`,
-`frameshift_draft_preview`, `frameshift_draft_read`, and
-`frameshift_draft_write`. Status returns the deterministic validation report
-and exact public file inventory. MCP intentionally cannot confirm human review
-or submission intent.
-
-A human-facing client freezes the valid inventory, prepares its deterministic
-signed archive, and presents a path-free final report containing the full
-manifest, scanner findings, archive hash, manifest hash, inventory hash,
-scanner schema, publisher ID, and publisher-key ID. Review and submission
-intent must repeat that exact binding. Any later file write or removal clears
-both confirmations before changing content, so interrupted edits fail closed.
-
-### Memory
-
-A persona can declare a memory requirement in its manifest, and it is enforced at activation: a persona with `memory_required = "hard"` refuses to activate unless the project declares a memory adapter (a `[memory]` table in the project's central `config.toml`), and a `"soft"` requirement activates with a warning. Frameshift defines a pluggable `MemoryAdapter` (store, search, recall, list, forget, health) with backends for HTTP APIs and local SQLite full-text search. Any knowledge system exposing those operations works; [Kleos](https://github.com/Ghost-Frame/Kleos) is the reference integration. The registry server can be configured with a backend via `MEMORY_BACKEND` and reports its status at `/v1/memory/health`.
-
-### Growth
-
-Each persona keeps an append-only local growth log -- things learned, mistakes caught, patterns discovered over a working session. Entries are dual-written to the legacy `personas/<name>/growth.md` and a structured `growth.jsonl`; `grow log` and `grow summary` read the structured form back.
-
-```bash
-frameshift grow append --persona rust --text "orphan rules prevent implementing foreign traits on foreign types"
-frameshift grow log --persona rust --limit 5
-frameshift grow summary --persona rust --scope project
-```
-
-### Tokens and the vault
-
-A pack can ship a `pack.template.toml` manifest declaring `{{token}}` placeholders its markdown uses -- personal values like how the agent should address you that belong to the user, not the pack:
-
-```toml
-[tokens.principal_address]
-type = "string"
-required = true
-description = "How the agent should address you"
-```
-
-Token values live in a per-project **vault**: a single age-encrypted file in the central store (never in the project root, never in the pack). When install/activate/use/sync write a persona's `rendered/<target>/` outputs, every `{{token}}` is substituted from the vault (the separate `frameshift render` debug command renders typed source directly and does not substitute tokens). A missing `required = true` token fails the render with one error naming every missing token; an optional token without a value keeps its literal `{{name}}` placeholder. Packs that ship no `pack.template.toml` render without opening the vault.
-
-Vault initialization and token-value management require the CLI; the desktop app has no vault editor.
-
-The vault passphrase comes from `FRAMESHIFT_VAULT_PASSPHRASE`, or a hidden interactive prompt when the CLI runs in a terminal. Only the CLI ever prompts. The daemon and MCP server resolve the passphrase from the environment variable alone: rendering a templated pack there without it set fails with an error rather than degrading silently (packs without `pack.template.toml` are unaffected either way). There is no built-in passphrase recovery -- losing the passphrase means losing the vault's contents, so keep your own backup.
-
-```bash
-frameshift vault init                     # create this project's empty vault
-frameshift vault set principal_address    # prompts for the value, hidden
-frameshift vault list                     # keys only, never values
-```
-
-### Interfaces
-
-The same selection engine backs every surface:
-
-- **CLI** -- `frameshift <command>` (see below).
-- **Stdio MCP server** -- a JSON-RPC server exposing tools (install, activate, list, select, use, automate, prefs, grow, capabilities, search) and prompts (`active_persona`, `select_persona`, `automate_status`) to MCP-capable hosts.
-- **Watch daemon** -- an optional background service over a peer-authenticated Unix socket, offering install/activate/sync/gc operations to editor integrations.
-- **Registry / marketplace HTTP server** -- publish, search, download, and author/handle registration.
-
-Automate mode itself is applied by the host integration: a session hook (or equivalent) reads the per-project automate flag, calls `frameshift select` for the current task, optionally reranks the candidates with the active model, and activates the selected persona when transition policy allows it.
-
-### Semantic selection
-
-Selection blends language, lexical, intent, capability, and context signals. Built with the optional `embeddings` cargo feature, it adds a semantic channel: a local sentence-embedding model (all-MiniLM-L6-v2 on pure-Rust [candle](https://github.com/huggingface/candle), ~23 MB, downloaded on first use and cached) scores the task description against each persona's description and keywords by cosine similarity. The bonus is additive and capped -- it can lift a meaning-matching persona, never penalize one -- and everything degrades to the lexical channels when the feature is off or the model is unavailable. Default builds ship none of the ML stack.
-
-## CLI
-
-Persona lifecycle:
-
-```
-frameshift install <name>[@<version>] [--from-path <dir>]  Install a pack (a bare name resolves the latest registry version)
-frameshift uninstall <persona>                             Remove a persona from this project (cache is kept for gc)
-frameshift activate <name>                                 Set the active persona for this project
-frameshift use <name> [--from <library>] [--target <agent>] Activate + print output for claude, codex, gemini, or generic
-frameshift list                                            List installed personas and mark the active one
-frameshift sync                                            Reconcile the central store with the lockfile
-frameshift gc                                              Remove unreferenced cache entries
-frameshift migrate                                         Move legacy files into the central store (also migrates growth logs to JSONL)
-```
-
-Selection and automate mode:
-
-```
-frameshift select [--task TEXT] [--library DIR] [--format table|json]   Rank personas by score/confidence/rationale
-frameshift automate on [--sensitivity 0.0-1.0]                          Enable host-driven automate policy
-frameshift automate off | status | lock | unlock                        Disable / inspect / pin / unpin
-frameshift feedback --chosen <name> [--auto-pick <name>]                Record a selection override
-           [--intent <intent>] [--reason <text>]
-frameshift prefs show                                                   View current per-persona bias values
-frameshift prefs bump <persona>                                         Increase a persona's bias
-frameshift prefs decay <persona>                                        Decrease a persona's bias
-frameshift prefs reset                                                  Clear all recorded preferences
-```
-
-Vault and project config:
-
-```
-frameshift vault init                                    Create this project's vault (refuses if one exists)
-frameshift vault set <key> [--value <v>]                 Set a token value (prompts hidden when --value is omitted;
-                                                         prefer the prompt -- --value lands in shell history)
-frameshift vault get <key>                               Print a token's raw value
-frameshift vault rm <key>                                Remove a token
-frameshift vault list                                    List token keys (never values)
-frameshift config get <key>                              Print a key from the project's central config.toml
-frameshift config set <key> <value>                      Set a key (e.g. telemetry_opt_in true)
-```
-
-Authoring and registry:
-
-```
-frameshift rule add <persona> --id <id> --layer <L1|L2|L3> --text <text>   Add a rule to a persona
-frameshift rule remove <persona> --id <id>                                 Remove a rule
-frameshift skill add <persona> --id <id> --text <when>                     Add a skill entry to a persona
-frameshift skill remove <persona> --id <id>                                Remove a skill entry
-frameshift grow append --persona <name> --text <text>                      Append to a persona's growth log
-frameshift grow log --persona <name> [--limit <n>]                         Show recent structured growth entries (default limit: 10)
-frameshift grow summary --persona <name> [--scope project|global]          Summarize growth entries (default scope: project)
-frameshift diff <a> <b>                                                    Semantic diff between two personas
-frameshift render <persona>                                                Render persona source to markdown
-frameshift verify (--persona <name> | --bundle <dir>)                      Run conformance checks (exactly one of the two)
-           [--runner mock|cli] [--model <name>] [--threshold <0.0-1.0>]
-frameshift account grant-role --server <url> --account-id <uuid>           Grant a global platform role
-           --role <moderator|administrator>
-frameshift account revoke-role --server <url> --account-id <uuid>          Revoke a global platform role
-           --role <moderator|administrator>
-frameshift account set-status --server <url> --account-id <uuid>           Set an account lifecycle state
-           --status <active|suspended|disabled>
-frameshift account update-profile --server <url>                          Update account profile metadata
-           [--email <email>] [--display-name <name>]
-frameshift account create-publisher --server <url> --handle <handle>       Create an owned publisher profile
-           --display-name <name> [--biography <text>]
-frameshift account update-publisher --server <url> --handle <handle>       Update an owned publisher profile
-           --display-name <name> [--biography <text> | --clear-biography]
-frameshift account invite-requests --server <url>                          List invitation requests
-           [--status <pending|reviewing|invited|declined>] [--limit <1-200>]
-frameshift account review-invite-request --server <url> --request-id <uuid> Transition an invitation review state
-           --status <pending|reviewing|declined>
-frameshift account issue-invite --server <url> --request-id <uuid>         Issue and display one invitation token
-frameshift register --server <url> --handle <handle> [--display-name <name>]   Claim an author handle
-frameshift publish --persona <name> [--out <dir>]                          Build a persona pack (add --server + --handle to sign and upload)
-           [--server <url> --handle <handle>]
-frameshift publication review --draft <id> --server <url> --publisher <handle>   Review an exact Creator Studio snapshot
-frameshift publication submit --draft <id> --server <url> --publisher <handle>   Submit the confirmed signed snapshot
-frameshift publication status --server <url> --submission-id <uuid>             Inspect an account-backed submission
-frameshift publication withdraw --server <url> --submission-id <uuid>           Withdraw an eligible non-public submission
-           --reason-code <code>
-frameshift publication decisions --server <url> --publisher <handle>             List immutable owner lifecycle evidence
-frameshift publication appeal --server <url> --publisher <handle>                Appeal an adverse moderation decision
-           --decision-id <uuid> --statement <text>
-frameshift publication appeals --server <url> --publisher <handle>               List private appeal cases
-frameshift moderation show --server <url> --submission-id <uuid>                Inspect a quarantined submission
-frameshift moderation artifact --server <url> --submission-id <uuid> --out <file> Download its exact archive without overwriting
-frameshift moderation decide --server <url> --submission-id <uuid>              Record approve, request-changes, or reject
-           --action <action> --reason-code <code>
-frameshift moderation promote --server <url> --submission-id <uuid>             Publish an approved submission
-frameshift moderation suspend-publisher --server <url> --publisher-id <uuid>    Suspend an approved publisher
-           --reason-code <code>
-frameshift moderation tombstone --server <url> --name <pack> --version <semver> Tombstone one active public release
-           --reason <author-request|tos-violation|dmca>
-frameshift moderation decisions --server <url>                                 List global lifecycle evidence
-frameshift moderation appeals --server <url>                                   List global private appeal cases
-frameshift moderation resolve-appeal --server <url> --appeal-id <uuid>          Resolve one publication appeal
-           --disposition <uphold|overturn> --rationale <text>
-frameshift search [QUERY] [--tag <tag>] [--limit <n>]                      Search the registry
-frameshift project-id                                                      Print the hashed project ID
-```
-
-`verify` defaults to `--runner mock` (canned, offline responses) with `--threshold 0.5`; pass `--runner cli` to drive the subscription-backed `agy` runner against `--model` (default `Gemini 3.1 Pro (High)`), which needs a logged-in `agy`. `publish` writes the pack to `--out` (default `publish-output/<persona>`) unconditionally; the upload step only runs when `--server` is set, and `--handle` is then required.
-
-## What this repo contains
-
-- `crates/` -- Rust workspace: CLI, client engine, pack tooling, composition, conformance, catalog, memory, vault, object storage, HTTP server, MCP server, watch daemon, orchestrator, embeddings, growth
-- `personas/` -- pack manifests for the persona library
-
-## Building from source
-
-Source builds are intended for contributors. Most users should install the desktop app or a prebuilt release above.
-
-Frameshift requires Rust 1.88 or newer. The full workspace also requires `libpq` (the PostgreSQL client library) for the Diesel-backed catalog crate:
-
-```bash
-# Debian/Ubuntu
-sudo apt-get install libpq-dev
-
-# macOS
-brew install libpq
-```
+Source builds require Rust 1.88 or newer. The full workspace also requires the PostgreSQL client library used by Diesel (`libpq-dev` on Debian or Ubuntu, `libpq` on macOS).
 
 ```bash
 cargo build --locked --workspace
 cargo test --locked --workspace
 ```
 
-Install the CLI from the workspace:
+Install the CLI from a source checkout with:
 
 ```bash
 cargo install --locked --path crates/frameshift-cli
 ```
 
-The standard test command skips the Docker-backed PostgreSQL integration tests. Run those separately when Docker is available:
+Report security issues through [GitHub private vulnerability reporting](https://github.com/Ghost-Frame/FrameShift/security/advisories/new). Do not include credentials or sensitive user data in a public issue. See [SECURITY.md](SECURITY.md) for the supported reporting process.
 
-```bash
-cargo test --locked -p frameshift-catalog-postgres -- --include-ignored
-```
+## Documentation
 
-To include the semantic-selection channel (downloads a ~23 MB embedding model on first use):
-
-```bash
-cargo build --locked -p frameshift-cli --features embeddings
-```
-
-### Running from source
-
-```bash
-cargo run -p frameshift-cli -- install cryptographic
-cargo run -p frameshift-cli -- use cryptographic
-cargo run -p frameshift-cli -- select --task "optimize a hot loop" --format json
-```
-
-## Configuration
-
-### Client
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `FRAMESHIFT_REGISTRY_URL` | `https://frameshift-api.syntheos.dev` | Registry base URL used by install, search, and telemetry endpoint derivation |
-| `FRAMESHIFT_OIDC_CLIENT_ID` | `frameshift-cli` | Public OAuth client identifier used by `frameshift account login` |
-| `FRAMESHIFT_OIDC_ISSUER` | registry-advertised issuer | Optional exact issuer override for account login |
-| `FRAMESHIFT_TELEMETRY_URL` | registry `/v1/telemetry/selection` route | Optional telemetry endpoint override; telemetry still requires project opt-in |
-| `FRAMESHIFT_VAULT_PASSPHRASE` | interactive CLI prompt | Non-interactive passphrase source for encrypted template values |
-| `FRAMESHIFT_PROJECT_ID` | hash of canonical project path | Explicit project identity override for hosts that cannot expose a stable path |
-| `FRAMESHIFT_ALLOW_CONFORMANCE_INTEGRITY_FAILURE` | unset | Set to `1` to explicitly bypass an upgrade's conformance-bundle integrity failure |
-
-### Server
-
-Most variables are read with no prefix (e.g. `BIND_ADDR`, not `FRAMESHIFT_BIND_ADDR`). Publisher admission deliberately uses `FRAMESHIFT_PUBLISHER_PUBKEYS`. The old `FRAMESHIFT_ADMIN_PUBKEYS` value is parsed only for configuration compatibility and is ignored by account-role administrator routes.
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `BIND_ADDR` | `0.0.0.0:3000` | HTTP bind address |
-| `POSTGRES_URL` | `""` | PostgreSQL connection URL (production must override) |
-| `OBJECT_STORE_ROOT` | `/tmp/frameshift-objects` | Filesystem object store root |
-| `LOG_LEVEL` | `info` | `tracing` subscriber filter string |
-| `LOG_FORMAT` | `text` | `text` or `json` |
-| `MAX_REQUEST_BYTES` | `1048576` | Max request body size |
-| `MAX_SEARCH_LIMIT` | `200` | Max search `limit` |
-| `SHUTDOWN_GRACE` | `30` | Grace period in seconds |
-| `CORS_ALLOWED_ORIGINS` | `""` | Comma-separated allowed CORS origins; empty disables CORS |
-| `DOWNLOAD_SECRET` | `""` | 64-char hex (32 bytes) HMAC key for signed download URLs; empty disables the signed-download endpoints |
-| `DOWNLOAD_TOKEN_TTL` | `300` | Default TTL (seconds) for newly minted download tokens |
-| `DOWNLOAD_MAX_TOKEN_TTL` | `1800` | Hard cap (seconds) on token TTL accepted by the verifier |
-| `DOWNLOAD_RATE_PER_MIN` | `10` | Per-IP rate limit on the mint endpoint (requests/minute); `0` disables |
-| `ABUSE_RATE_PER_MIN` | `60` | Per-IP rate limit on signed writes and telemetry (requests/minute); `0` disables |
-| `METRICS_BEARER_TOKEN` | empty | Bearer token required by `/metrics`; empty disables the endpoint |
-| `FRAMESHIFT_PUBLISHER_PUBKEYS` | empty | Comma-separated admitted base64url-no-pad Ed25519 keys; empty disables writes, `*` admits any valid signer |
-| `MAX_VERSIONS_PER_AUTHOR` | `100` | Maximum retained versions per admitted author; `0` disables |
-| `MAX_BYTES_PER_AUTHOR` | `1073741824` | Maximum retained archive bytes per admitted author; `0` disables |
-| `MAX_TOTAL_BYTES` | `107374182400` | Maximum retained archive bytes across the registry; `0` disables |
-| `OBJECT_STORE_BACKEND` | `fs` | `fs` (filesystem) or `r2` (S3-compatible / Cloudflare R2) |
-| `R2_ENDPOINT` | `""` | S3 endpoint URL for R2 (required when backend is `r2`) |
-| `R2_BUCKET` | `""` | Bucket name (required when backend is `r2`) |
-| `R2_PREFIX` | `objects` | Key prefix for pack blobs inside the bucket |
-| `R2_REGION` | `auto` | S3 region (R2 always uses `auto`) |
-| `R2_ACCESS_KEY_ID` | `""` | Access key ID for the bucket |
-| `R2_SECRET_ACCESS_KEY` | `""` | Secret access key |
-| `QUARANTINE_OBJECT_STORE_BACKEND` | `disabled` | `disabled`, `fs`, or `r2`; any enabled value mounts account-backed publication admission |
-| `QUARANTINE_OBJECT_STORE_ROOT` | `/tmp/frameshift-quarantine` | Isolated filesystem root for quarantined publication archives |
-| `QUARANTINE_R2_ENDPOINT` | `""` | S3-compatible endpoint used only by the quarantine store |
-| `QUARANTINE_R2_BUCKET` | `""` | Bucket used only by the quarantine store |
-| `QUARANTINE_R2_PREFIX` | `quarantine` | Key prefix used only by the quarantine store |
-| `QUARANTINE_R2_REGION` | `auto` | S3-compatible region used by the quarantine store |
-| `QUARANTINE_R2_ACCESS_KEY_ID` | `""` | Access key ID used only by the quarantine store |
-| `QUARANTINE_R2_SECRET_ACCESS_KEY` | `""` | Secret access key used only by the quarantine store |
-| `OIDC_ENABLED` | `false` | Enable account authentication when the remaining OIDC configuration is valid |
-| `OIDC_ISSUER` | `""` | Exact OIDC issuer URL |
-| `OIDC_AUDIENCE` | `""` | Required access-token audience |
-| `OIDC_JWKS_URL` | `""` | Optional explicit JWKS URL; empty uses issuer discovery |
-| `OIDC_ALLOWED_ALGORITHMS` | `RS256` | Comma-separated asymmetric JWT algorithms |
-| `OIDC_JWKS_CACHE_SECS` | `300` | Fresh JWKS cache lifetime |
-| `OIDC_JWKS_STALE_SECS` | `900` | Additional stale-key window during provider outages |
-| `OIDC_CLOCK_SKEW_SECS` | `30` | Token-validation clock skew allowance |
-| `OIDC_FRESH_AUTH_SECS` | `300` | Maximum `auth_time` age for sensitive key operations |
-| `LOCAL_AUTH_PASSWORD_PEPPER` | `""` | Secret deployment pepper for first-party Argon2id passwords; empty disables first-party authentication |
-| `LOCAL_AUTH_PEPPER_VERSION` | `1` | Positive pepper version stored with new password credentials |
-| `LOCAL_AUTH_ISSUER` | `https://frameshift.syntheos.dev/first-party` | Stable issuer stored with first-party account identities |
-| `LOCAL_AUTH_COOKIE_NAME` | `__Host-frameshift_session` | Secure browser session cookie name; must keep the `__Host-` prefix |
-| `LOCAL_AUTH_INVITE_TTL_SECS` | `604800` | Lifetime of reviewer-issued account invitations |
-| `LOCAL_AUTH_BROWSER_IDLE_SECS` | `604800` | Sliding idle lifetime for browser sessions |
-| `LOCAL_AUTH_BEARER_IDLE_SECS` | `2592000` | Sliding idle lifetime for desktop and CLI bearer sessions |
-| `LOCAL_AUTH_ABSOLUTE_SECS` | `7776000` | Non-extendable lifetime for every first-party session |
-| `TRUST_FORWARDED_FOR` | `false` | Trust `X-Forwarded-For` for rate-limit key extraction; set `true` only behind a trusted proxy |
-| `SIGNED_REQUEST_MAX_SKEW_SECS` | `300` | Max clock skew (seconds) allowed between a signed write request's timestamp and server time |
-| `FRAMESHIFT_ADMIN_PUBKEYS` | `""` | Deprecated compatibility value; account-role administrator routes ignore it |
-| `PUBLISHER_OWNERSHIP_READS` | `true` | Add publisher-preferred identity and historical key state to pack responses; set `false` to restore the exact legacy response shape |
-| `MEMORY_BACKEND` | `none` | `none`, `http`, or `sqlite` |
-| `MEMORY_HTTP_ENDPOINT` | `""` | Base URL for the HTTP memory endpoint; used when `MEMORY_BACKEND=http` |
-| `MEMORY_HTTP_AUTH` | `none` | `none` or `bearer:<token>`; used when `MEMORY_BACKEND=http` |
-| `MEMORY_HTTP_TIMEOUT_SECS` | `30` | Per-attempt request timeout for the HTTP memory adapter |
-| `MEMORY_SQLITE_PATH` | `""` | Path to the SQLite database file; required when `MEMORY_BACKEND=sqlite` |
+| Need | Start here |
+| --- | --- |
+| Install and orient | [Getting Started](docs/wiki/Getting-Started.md) · [How It Works](docs/wiki/How-It-Works.md) · [Troubleshooting](docs/wiki/Troubleshooting.md) |
+| Use agents and automation | [MCP Server](docs/wiki/MCP-Server.md) · [Automate Mode](docs/wiki/Automate-Mode.md) · [CLI Reference](docs/wiki/CLI-Reference.md) |
+| Build personas | [Writing Personas](docs/wiki/Writing-Personas.md) · [Pack Format](docs/wiki/Pack-Format.md) · [Composition](docs/wiki/Composition.md) · [Conformance](docs/wiki/Conformance.md) |
+| Understand trust and privacy | [Trust and Security](docs/wiki/Trust-and-Security.md) · [Local Data and Privacy](docs/wiki/Local-Data-and-Privacy.md) · [Known Limits](docs/wiki/Security-Reporting-and-Known-Limits.md) |
+| Publish and manage identity | [Accounts and Publisher Identity](docs/wiki/Accounts-and-Publisher-Identity.md) · [Creator Studio](docs/wiki/Creator-Studio.md) · [Publishing and Moderation](docs/wiki/Publishing-and-Moderation.md) |
+| Operate or extend | [Architecture](docs/wiki/Architecture.md) · [Configuration](docs/wiki/Configuration.md) · [Memory Integration](docs/wiki/Memory-Integration.md) · [Operations](docs/wiki/Operations-and-Observability.md) |
 
 ## License
 
-Elastic License 2.0. See [LICENSE](LICENSE) for details.
+FrameShift source code is available under the [Elastic License 2.0](LICENSE). Persona packs can declare their own licenses.
 
-### Commercial licensing
-
-The Elastic License 2.0 prohibits offering Frameshift to third parties as a
-hosted or managed service. Commercial terms for hosted or managed offerings
-are available from support@syntheos.dev.
+Elastic License 2.0 does not permit offering FrameShift to third parties as a hosted or managed service. Commercial terms for hosted or managed offerings are available from `support@syntheos.dev`.
