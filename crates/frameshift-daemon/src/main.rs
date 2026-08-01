@@ -6,6 +6,7 @@
 
 use frameshift_daemon::{orchestrator, watcher};
 use frameshift_orchestrator::controller::{SwitchController, SwitchPolicy};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use tokio::net::UnixListener;
 use tracing_subscriber::EnvFilter;
@@ -29,6 +30,17 @@ fn derive_project_root_from_path(
         }
     }
     None
+}
+
+/// Derive the distinct project roots affected by a batch of changed paths.
+fn derive_project_roots(
+    data_root: &std::path::Path,
+    changed_paths: impl IntoIterator<Item = std::path::PathBuf>,
+) -> BTreeSet<std::path::PathBuf> {
+    changed_paths
+        .into_iter()
+        .filter_map(|path| derive_project_root_from_path(data_root, &path))
+        .collect()
 }
 
 /// Async entry point.
@@ -96,19 +108,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // and dropped immediately after startup, silently disabling the watcher.
     let _watcher_guard = match watcher::start_watcher(&data_root) {
         Ok((watcher, mut rx)) => {
-            // Spawn a task that reacts to file-change events from the data root.
-            // Each received path is treated as a project-root hint: we derive the
-            // project root by walking up to find a frameshift projects directory,
-            // or fall back to the data root itself. Automate mode is OFF by default
-            // so this task is a no-op until the user explicitly enables it.
+            // Spawn a task that reacts to batches of file-change events from the
+            // data root. Automate mode is OFF by default, so evaluation is a no-op
+            // until the user explicitly enables it.
             let mut controller = SwitchController::new(SwitchPolicy::default());
             tokio::spawn(async move {
-                while let Some(changed_path) = rx.recv().await {
-                    // Derive a candidate project root from the changed path.
-                    // Heuristic: find the "projects/<id>" ancestor under the data root.
-                    // If no projects directory is found, skip (not a project event).
-                    let project_root = derive_project_root_from_path(&data_root, &changed_path);
-                    if let Some(root) = project_root {
+                while let Some(changed_paths) = watcher::recv_path_batch(&mut rx).await {
+                    // One save commonly emits several raw paths. Derive and sort
+                    // distinct roots so each affected project is evaluated once
+                    // per fixed batch while unrelated project changes are kept.
+                    let project_roots = derive_project_roots(&data_root, changed_paths);
+
+                    for root in project_roots {
                         // `evaluate_and_apply` performs synchronous filesystem
                         // reads/writes and full persona re-materialization. Run it
                         // on the blocking pool (mirroring the RPC path in
@@ -157,4 +168,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("daemon shut down cleanly");
 
     Ok(())
+}
+
+/// Unit tests for project-root derivation and batch deduplication.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify that one batch keeps distinct projects and deduplicates each root.
+    #[test]
+    fn project_roots_are_unique_per_batch() {
+        let data_root = std::path::PathBuf::from("/data/frameshift");
+        let changed_paths = [
+            data_root.join("projects/alpha/config.toml"),
+            data_root.join("projects/alpha/rules/policy.toml"),
+            data_root.join("projects/beta/config.toml"),
+            data_root.join("cache/ignored"),
+        ];
+
+        let roots = derive_project_roots(&data_root, changed_paths);
+
+        assert_eq!(
+            roots,
+            BTreeSet::from([
+                data_root.join("projects/alpha"),
+                data_root.join("projects/beta"),
+            ])
+        );
+    }
 }
