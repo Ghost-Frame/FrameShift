@@ -1201,18 +1201,16 @@ impl Client {
     /// Renders a single persona's output into `rendered_root`, using typed
     /// source whenever present and composing declared `extends`/`mixin` bases.
     ///
-    /// Reads `pack.toml` from `cache_path` to decide which render path to
-    /// take:
-    /// - `persona.toml` present without composition: renders the typed source
-    ///   directly for every target.
-    /// - `extends`/`mixin` declared and `persona.toml` present: composes the root
-    ///   with its resolved bases before rendering every target. Composition
-    ///   failures propagate as `ClientError::Compose`.
+    /// Reads `pack.toml` from `cache_path` to decide which render path to take:
+    /// - Split `persona.toml` source or inline `pack.toml` source without
+    ///   composition renders directly for every target.
+    /// - `extends`/`mixin` declared with either typed-source layout composes the
+    ///   root with its resolved bases before rendering every target.
+    ///   Composition failures propagate as `ClientError::Compose`.
     /// - No typed source and no composition: delegates to
     ///   [`materialize_rendered_outputs`] using a Markdown render source.
-    /// - `extends`/`mixin` declared but no `persona.toml`: warns and falls
-    ///   back to the markdown-only render path, since there is no typed
-    ///   source for the composer to operate on.
+    /// - `extends`/`mixin` declared without typed source warns and falls back to
+    ///   the Markdown render path because the composer has no structured input.
     ///
     /// Independently of which path above is taken: if the pack
     /// at `cache_path` ships a `pack.template.toml` manifest, every render
@@ -1243,7 +1241,8 @@ impl Client {
             })?;
 
         let has_composition = manifest.extends.is_some() || !manifest.mixin.is_empty();
-        let has_typed_source = cache_path.join("persona.toml").is_file();
+        let typed_source = frameshift_source::PersonaSource::load_from_dir_or_pack(cache_path)
+            .map_err(frameshift_compose::ComposeError::from)?;
 
         // Loaded once regardless of which render branch runs below, so a
         // templated pack opens its vault a single time per materialize call
@@ -1251,7 +1250,7 @@ impl Client {
         let template_ctx =
             load_template_context(cache_path, vault_path, self.vault.as_ref(), persona_name)?;
 
-        if has_typed_source {
+        if let Some(root) = typed_source {
             let source = if has_composition {
                 // Fail closed on unsupported multi-level composition. The
                 // composer resolves exactly one level and would otherwise drop
@@ -1273,8 +1272,6 @@ impl Client {
                     )?;
                 }
 
-                let root = frameshift_source::PersonaSource::load_from_dir(cache_path)
-                    .map_err(frameshift_compose::ComposeError::from)?;
                 let resolver = compose_support::CacheResolver::new(cache_dir, lockfile);
                 let composed = frameshift_compose::Composer::new(resolver).compose(
                     root,
@@ -1291,8 +1288,7 @@ impl Client {
 
                 composed.into_source()
             } else {
-                frameshift_source::PersonaSource::load_from_dir(cache_path)
-                    .map_err(frameshift_compose::ComposeError::from)?
+                root
             };
 
             materialize_typed_source_outputs(
@@ -1308,7 +1304,7 @@ impl Client {
         if has_composition {
             warn!(
                 persona = persona_name,
-                "pack declares extends/mixin but has no persona.toml; rendering markdown body without composition"
+                "pack declares extends/mixin but has no typed source; rendering markdown body without composition"
             );
         }
 

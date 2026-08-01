@@ -16,6 +16,7 @@ frameshift-catalog-postgres = { path = "../frameshift-catalog-postgres" }
 frameshift-objects = { path = "../frameshift-objects" }
 frameshift-objects-fs = { path = "../frameshift-objects-fs" }
 frameshift-pack = { path = "../frameshift-pack" }
+frameshift-source = { path = "../frameshift-source" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

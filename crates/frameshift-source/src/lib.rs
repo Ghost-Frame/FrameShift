@@ -1,13 +1,14 @@
 //! Structured persona source.
 //!
-//! Persona source is a typed schema (TOML) split across four files:
-//! `persona.toml`, `rules.toml`, `skills.toml`, `patterns.toml`. Markdown
-//! is a *render target* produced from this typed source -- agents and CLIs
-//! operate on typed fields, never on string-replace-in-markdown.
+//! Persona source is a typed TOML schema. It can be split across
+//! `persona.toml`, `rules.toml`, `skills.toml`, and `patterns.toml`, or carried
+//! inline in a pack's `pack.toml`. Markdown is a *render target* produced from
+//! this typed source -- agents and CLIs operate on typed fields, never on
+//! string-replace-in-markdown.
 //!
 //! This crate owns:
 //! - the TOML schema for each file (`persona`, `rules`, `skills`, `patterns`)
-//! - the composite `PersonaSource` with load/write split across the four files
+//! - the composite `PersonaSource` with split-file and inline-pack loading
 //! - deterministic markdown projection (`render`)
 //! - typed patch operations (`patch`)
 //! - semantic diff between two `PersonaSource` snapshots (`diff`)

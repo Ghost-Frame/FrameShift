@@ -39,7 +39,7 @@ Project ID is `sha256(realpath(project_root))`.
 
 When you activate a persona, the engine:
 
-1. Reads the persona source (pack contents). Source files: `persona.toml`, `rules.toml`, `skills.toml`, `patterns.toml`.
+1. Reads typed persona source from an inline `pack.toml` or split `persona.toml`, `rules.toml`, `skills.toml`, and `patterns.toml` files.
 2. Applies any composition layers (base persona via `extends`, overlays via `mixin`).
 3. Renders to per-target markdown. Each target produces different output:
    - **Claude** -- Full output: title, L2 anchor, operating frame, skills, L1 rules, patterns, ambiguity guidance, cascade mid, conflict resolution, self-eval hooks, safety layer, growth, cascade recency, design notes, references.

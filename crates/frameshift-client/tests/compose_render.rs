@@ -1,8 +1,8 @@
 //! Integration tests for render-time persona composition (`extends`/`mixin`).
 //!
 //! These exercise the hook wired into `materialize_project_state`: a pack
-//! that declares `extends`/`mixin` and ships typed source (`persona.toml`)
-//! is composed with its resolved bases before markdown rendering.
+//! that declares `extends`/`mixin` and ships split or inline typed source is
+//! composed with its resolved bases before markdown rendering.
 
 use frameshift_client::{
     Client, ClientError, ClientOptions, InstallRequest, InstallSource, PersonaSpec,
@@ -39,6 +39,30 @@ fn source_with_l1_rule(name: &str, rule_id: &str, rule_text: &str) -> PersonaSou
         }],
     };
     src
+}
+
+/// Writes a runtime-complete pack whose typed source is inline in `pack.toml`.
+fn write_inline_pack(dir: &Path, name: &str, composition: &str, rule_id: &str, rule_text: &str) {
+    let manifest = format!(
+        r#"schema_version = 1
+name = "{name}"
+author_handle = "alice"
+author_pubkey = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+version = "0.1.0"
+{composition}
+[voice]
+tone = "precise"
+
+[[voice.questions]]
+text = "Which layer owns this truth?"
+
+[[rule]]
+id = "{rule_id}"
+layer = "L1"
+text = "{rule_text}"
+"#
+    );
+    write_pack_manifest(dir, &manifest, &[]);
 }
 
 /// Installing standalone typed source renders target-specific Markdown even
@@ -98,6 +122,160 @@ version = "0.1.0"
         let content = fs::read_to_string(rendered).expect("read typed render");
         assert!(content.contains("The server owns consequential state."));
     }
+}
+
+/// Installing one inline `pack.toml` renders every target without auxiliary
+/// source files and preserves the pack as the sole materialized source file.
+#[test]
+fn install_renders_inline_pack_source_without_markdown() {
+    let temp = TempDir::new().expect("tempdir");
+    let data_root = temp.path().join("data-root");
+    let project_root = temp.path().join("project");
+    fs::create_dir_all(&project_root).expect("create project");
+    let client = Client::new(ClientOptions {
+        data_root: data_root.clone(),
+        config_root: None,
+        vault: None,
+    });
+    let pack_dir = temp.path().join("inline-pack");
+    write_inline_pack(
+        &pack_dir,
+        "inline",
+        "",
+        "authority",
+        "The server owns consequential state.",
+    );
+
+    client
+        .install(InstallRequest {
+            project_root: project_root.clone(),
+            spec: PersonaSpec {
+                name: "inline".to_string(),
+                version: "0.1.0".to_string(),
+            },
+            source: InstallSource::LocalPath(pack_dir),
+        })
+        .expect("install inline source");
+
+    let project_id = client.project_id(&project_root).expect("project id");
+    let persona_root = data_root
+        .join("projects")
+        .join(&project_id)
+        .join("personas/inline");
+    let source_entries = fs::read_dir(persona_root.join("source"))
+        .expect("read materialized source")
+        .map(|entry| entry.expect("source entry").file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(source_entries, vec!["pack.toml"]);
+
+    for (target, filename) in [
+        ("claude", "CLAUDE.md"),
+        ("codex", "AGENTS.md"),
+        ("gemini", "GEMINI.md"),
+        ("generic", "AGENTS.md"),
+    ] {
+        let content = fs::read_to_string(persona_root.join("rendered").join(target).join(filename))
+            .expect("read inline render");
+        assert!(content.contains("The server owns consequential state."));
+        assert!(content.contains("Which layer owns this truth?"));
+    }
+}
+
+/// Installing a malformed declared inline source fails instead of falling
+/// through to Markdown discovery.
+#[test]
+fn install_rejects_malformed_inline_pack_source() {
+    let temp = TempDir::new().expect("tempdir");
+    let project_root = temp.path().join("project");
+    fs::create_dir_all(&project_root).expect("create project");
+    let client = Client::new(ClientOptions {
+        data_root: temp.path().join("data-root"),
+        config_root: None,
+        vault: None,
+    });
+    let pack_dir = temp.path().join("broken-inline-pack");
+    write_pack_manifest(
+        &pack_dir,
+        r#"schema_version = 1
+name = "broken-inline"
+author_handle = "alice"
+author_pubkey = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+version = "0.1.0"
+voice = "not-a-table"
+"#,
+        &[],
+    );
+
+    let error = client
+        .install(InstallRequest {
+            project_root,
+            spec: PersonaSpec {
+                name: "broken-inline".to_string(),
+                version: "0.1.0".to_string(),
+            },
+            source: InstallSource::LocalPath(pack_dir),
+        })
+        .expect_err("malformed inline source must fail");
+
+    assert!(
+        matches!(error, ClientError::Compose(_)),
+        "expected typed-source failure, got {error}"
+    );
+}
+
+/// Inline pack composition resolves an inline base from the content cache.
+#[test]
+fn install_composes_inline_pack_base() {
+    let temp = TempDir::new().expect("tempdir");
+    let data_root = temp.path().join("data-root");
+    let project_root = temp.path().join("project");
+    fs::create_dir_all(&project_root).expect("create project");
+    let client = Client::new(ClientOptions {
+        data_root: data_root.clone(),
+        config_root: None,
+        vault: None,
+    });
+
+    let base_dir = temp.path().join("inline-base");
+    write_inline_pack(&base_dir, "inline-base", "", "base-rule", "Base truth.");
+    client
+        .install(InstallRequest {
+            project_root: project_root.clone(),
+            spec: PersonaSpec {
+                name: "inline-base".to_string(),
+                version: "0.1.0".to_string(),
+            },
+            source: InstallSource::LocalPath(base_dir),
+        })
+        .expect("install inline base");
+
+    let child_dir = temp.path().join("inline-child");
+    write_inline_pack(
+        &child_dir,
+        "inline-child",
+        "extends = \"inline-base@0.1.0\"\n",
+        "child-rule",
+        "Child truth.",
+    );
+    client
+        .install(InstallRequest {
+            project_root: project_root.clone(),
+            spec: PersonaSpec {
+                name: "inline-child".to_string(),
+                version: "0.1.0".to_string(),
+            },
+            source: InstallSource::LocalPath(child_dir),
+        })
+        .expect("install inline child");
+
+    let project_id = client.project_id(&project_root).expect("project id");
+    let rendered = data_root
+        .join("projects")
+        .join(project_id)
+        .join("personas/inline-child/rendered/codex/AGENTS.md");
+    let content = fs::read_to_string(rendered).expect("read composed inline output");
+    assert!(content.contains("Base truth."));
+    assert!(content.contains("Child truth."));
 }
 
 /// Installing a child pack that `extends` an already-installed base composes

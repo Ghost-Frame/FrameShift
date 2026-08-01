@@ -4,16 +4,14 @@ Persona packs are content-addressed, signed archives designed for deterministic 
 
 ## Structure
 
-A pack is a directory containing at minimum a `pack.toml` manifest:
+A runtime-complete pack can be a directory containing one `pack.toml`:
 
 ```
 my-persona/
-  pack.toml       # Required: manifest
-  persona.toml    # Optional: typed source (identity, voice, anchors)
-  rules.toml      # Optional: typed source (L1/L2/L3 rules)
-  skills.toml     # Optional: typed source (skill declarations)
-  patterns.toml   # Optional: typed source (code patterns, anti-patterns, examples)
+  pack.toml       # Manifest plus inline typed source
 ```
+
+The same typed schema may be split into `persona.toml`, `rules.toml`, `skills.toml`, and `patterns.toml`. Freeform Markdown bodies also remain supported. Inline source is marked by a top-level `[voice]` table; a `pack.toml` without `[voice]` is metadata-only.
 
 ## Pack manifest schema
 
@@ -21,7 +19,7 @@ my-persona/
 schema_version = 1
 name = "my-persona"
 author_handle = "ghost-frame"
-author_pubkey = "ed25519:<hex>"    # or "UNSIGNED" for local dev
+author_pubkey = "local-unsigned"   # local-path installs only
 version = "0.1.0"
 license = "Elastic-2.0"
 
@@ -59,6 +57,25 @@ score = 0.92
 bundle_hash = "sha256:..."
 ```
 
+## Inline typed source
+
+Manifest fields and typed behavior share the same document. The loader reads each schema view independently, so fields owned by the manifest, persona, rules, skills, and patterns do not need wrapper tables.
+
+```toml
+[voice]
+tone = "precise and evidence-driven"
+
+[[voice.questions]]
+text = "Which layer owns this truth?"
+
+[[rule]]
+id = "single-authority"
+layer = "L1"
+text = "Give each mutable transition exactly one authoritative owner."
+```
+
+An inline pack renders directly to every supported target. If `[voice]` is present but malformed, installation fails instead of falling back to Markdown.
+
 ## Content addressing
 
 Pack contents are hashed deterministically:
@@ -84,12 +101,12 @@ Packs are signed with Ed25519:
 
 ```toml
 author_handle = "ghost-frame"
-author_pubkey = "ed25519:<hex-encoded-public-key>"
+author_pubkey = "<64-lowercase-hex-characters>"
 ```
 
 The signature covers the canonical hash. The signature is stored in `signature.sig` (64 bytes raw) and is verified against the declared public key.
 
-Unsigned packs use `author_pubkey = "UNSIGNED"` -- valid for local development but not for marketplace distribution.
+Unsigned local packs use `author_pubkey = "local-unsigned"`. The sentinel is valid for local-path installation but is rejected at publication and registry trust boundaries.
 
 ## Cache layout
 
@@ -111,7 +128,7 @@ name = "cryptographic"
 version = "0.1.0"
 hash = "sha256:<hex>"
 author_handle = "ghost-frame"
-author_pubkey = "ed25519:<hex>"
+author_pubkey = "<64-lowercase-hex-characters>"
 ```
 
 The lockfile records the exact version, hash, and author identity. `frameshift sync` reconciles the lockfile with the cache.

@@ -13,7 +13,7 @@ my-persona/
 schema_version = 1
 name = "my-persona"
 author_handle = "your-handle"
-author_pubkey = "UNSIGNED"
+author_pubkey = "local-unsigned"
 version = "0.1.0"
 license = "Elastic-2.0"
 
@@ -23,6 +23,14 @@ network_egress = false
 filesystem_scope = "project-only"
 memory_required = "none"
 memory_required_ops = []
+
+[voice]
+tone = "precise and evidence-driven"
+
+[[rule]]
+id = "verify-outcome"
+layer = "L1"
+text = "Verify the requested outcome directly before declaring completion."
 ```
 
 Install it:
@@ -30,6 +38,8 @@ Install it:
 ```bash
 frameshift install my-persona@0.1.0 --from-path ./my-persona
 ```
+
+The top-level `[voice]` table marks `pack.toml` as inline typed source. Without `[voice]`, the file is a metadata-only catalog entry and cannot render by itself.
 
 ## Capability manifest
 
@@ -56,9 +66,11 @@ Declaring primary intents lets automate mode match personas to tasks more accura
 
 Anti-keywords score negatively in the selection pipeline. The penalty is proportional to the fraction of task tokens that match, scaled by 0.5. A cryptographic persona might declare `anti_keywords = ["frontend", "css", "react"]` to avoid being selected for UI work.
 
-## Typed source format (advanced)
+## Typed source format
 
-Beyond the pack manifest, Frameshift supports a structured TOML source format with four files:
+The recommended public layout keeps structured behavior inline in `pack.toml`. Every table shown below can live in that file alongside the manifest fields.
+
+For larger packs, the same schema can be split across four source files:
 
 ```
 my-persona/
@@ -69,7 +81,7 @@ my-persona/
   patterns.toml   # Code patterns, anti-patterns, code examples
 ```
 
-### persona.toml
+### Persona fields
 
 Defines identity, voice, cascade anchors, classification tiers, conflict resolution stance, self-evaluation hooks, growth config, and references.
 
@@ -82,7 +94,7 @@ license = "Elastic-2.0"
 
 [author]
 handle = "your-handle"
-pubkey = "ed25519:UNSIGNED"
+pubkey = "local-unsigned"
 
 [anchor.main]
 tagline = "Short identity statement."
@@ -101,7 +113,7 @@ How the agent communicates. What it prioritizes in expression.
 [[voice.questions]]
 text = "Forced question the agent asks itself."
 
-[[classification_tiers]]
+[[classification_tier]]
 name = "TIER_NAME"
 description = "What this tier means."
 guidance = "How the agent should act at this tier."
@@ -109,15 +121,15 @@ guidance = "How the agent should act at this tier."
 [conflict_resolution]
 stance = "The coherent stance restated for mid-context re-anchoring."
 
-[[cascade_anchors]]
+[[cascade_anchor]]
 position = "mid"
 text = "Re-anchor at the middle of the persona."
 
-[[cascade_anchors]]
+[[cascade_anchor]]
 position = "recency"
 text = "Re-anchor at the end of the persona."
 
-[[self_eval]]
+[[self_eval_step]]
 step = "Checklist item the agent runs before non-trivial actions."
 
 [safety_layer]
@@ -127,12 +139,12 @@ text = "Safety text appended to the prompt."
 dual_write_tags = "context:my-persona"
 dual_write_source = "claude-code:my-persona"
 
-[[references]]
+[[reference_group]]
 category = "specs"
 entries = ["https://example.com/relevant-spec"]
 ```
 
-### rules.toml
+### Rules
 
 Rules use a three-layer enforcement model:
 
@@ -153,7 +165,7 @@ override_inherited = false    # SD6: set true to override an L1 rule from a base
 
 The `override_inherited` flag is relevant during composition. Mixins cannot override L1 rules from a base persona at all. The root persona can override inherited L1 rules only when `override_inherited = true`.
 
-### skills.toml
+### Skills
 
 Skill declarations tell the agent which structured workflows to invoke and when.
 
@@ -166,7 +178,7 @@ invoke_when = "Description of when to invoke this skill."
 mandatory = false
 ```
 
-### patterns.toml
+### Patterns
 
 Code patterns, anti-patterns, approved tech stack, and code examples.
 

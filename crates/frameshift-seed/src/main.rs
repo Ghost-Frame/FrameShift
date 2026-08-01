@@ -1,11 +1,10 @@
 //! One-shot seeder for the frameshift catalog and object store.
 //!
 //! Reads persona directories from a configurable root path, builds a pack for
-//! each directory that carries either typed persona source or a Markdown render
-//! source. A missing `pack.toml` is synthesized; an existing manifest may have
-//! its placeholder `author_pubkey` repaired in place so the strict parser can
-//! load it. Manifest-only source directories in the public catalog are ignored
-//! because clients cannot materialize behavioral output from a manifest alone.
+//! each directory that carries split typed source, inline `pack.toml` source,
+//! or a Markdown render source. A missing `pack.toml` is synthesized; an
+//! existing manifest may have its placeholder `author_pubkey` repaired in place
+//! so the strict parser can load it. Metadata-only catalog entries are ignored.
 //! Complete packs are signed with the Ed25519 key, packaged into a gzipped tar
 //! archive stored in the object store, and registered in the catalog.
 //!
@@ -65,6 +64,9 @@ enum SeedError {
 
     #[error("pack error: {0}")]
     Pack(#[from] frameshift_pack::PackError),
+
+    #[error("persona source error: {0}")]
+    Source(#[from] frameshift_source::SourceError),
 
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
@@ -152,7 +154,7 @@ async fn run() -> Result<(), SeedError> {
             continue;
         }
 
-        if !is_persona_dir(&path) {
+        if !is_persona_dir(&path)? {
             continue;
         }
 
@@ -176,10 +178,9 @@ async fn run() -> Result<(), SeedError> {
                 &verifying_key,
             )?;
         } else {
-            // Curated pack.toml files ship with a placeholder `author_pubkey`
-            // (e.g. "UNSIGNED") that fails PackManifest's strict 64-hex-char
-            // validator. Repair it in place with the real key so `Pack::from_dir`
-            // below can parse the manifest; all other fields are left untouched.
+            // Curated pack.toml files may ship with an unsigned local
+            // `author_pubkey` placeholder. Repair it in place with the real
+            // publication key; all other fields are left untouched.
             repair_placeholder_author_pubkey(&pack_toml_path, &verifying_key)?;
         }
 
@@ -241,11 +242,19 @@ impl SeedConfig {
 
 /// Whether a directory contains enough behavioral source for a runtime pack.
 ///
-/// `pack.toml` is the pack manifest, not a behavioral render source. Eligible
-/// directories must also carry typed source or a Markdown file discoverable by
-/// the client. A missing manifest is synthesized for legacy sources.
-fn is_persona_dir(path: &Path) -> bool {
-    path.join("persona.toml").is_file() || has_markdown_render_source(path)
+/// A `pack.toml` with a top-level `[voice]` table is both manifest and inline
+/// typed source. Metadata-only manifests remain catalog entries and do not pass
+/// this runtime-content gate. A missing manifest is synthesized for legacy
+/// split-source or Markdown personas after this check.
+fn is_persona_dir(path: &Path) -> Result<bool, frameshift_source::SourceError> {
+    if path.join("persona.toml").is_file() || has_markdown_render_source(path) {
+        return Ok(true);
+    }
+    let pack_path = path.join("pack.toml");
+    if !pack_path.is_file() {
+        return Ok(false);
+    }
+    Ok(frameshift_source::PersonaSource::load_from_pack_file(&pack_path)?.is_some())
 }
 
 /// Match the client's legacy Markdown discovery contract for runtime packs.
@@ -487,11 +496,10 @@ fn is_valid_pubkey_hex(s: &str) -> bool {
 
 /// Repair a placeholder `author_pubkey` in an existing `pack.toml`.
 ///
-/// Curated repo personas (`personas/*/pack.toml`) ship with a literal
-/// `"UNSIGNED"` placeholder for `author_pubkey` -- fine for humans reading the
-/// file, but rejected by `PackManifest`'s deserializer, which requires exactly
-/// 64 lowercase hex characters. Left unrepaired, `Pack::from_dir` fails to
-/// parse every one of them.
+/// Curated repo personas (`personas/*/pack.toml`) may carry `"UNSIGNED"` or
+/// the local-install sentinel as an unsigned `author_pubkey`. Registry
+/// publication requires a real 64-character lowercase hex key, so both forms
+/// are replaced before the pack is signed and stored.
 ///
 /// Curated pack.toml files are hand-written persona content: several carry
 /// comments and deliberate key ordering that a parse-and-reserialize round
@@ -860,6 +868,29 @@ memory_required = "none"
 memory_required_ops = []
 "#;
 
+    /// A runtime-complete public pack fixture using the portable local
+    /// signing sentinel and typed source in the manifest document.
+    const INLINE_PACK_TOML: &str = r#"schema_version = 1
+name = "inline-agents"
+author_handle = "ghost-frame"
+author_pubkey = "local-unsigned"
+version = "0.1.0"
+description = "Runtime-complete inline source fixture."
+tags = ["inline", "runtime"]
+license = "Elastic-2.0"
+
+[voice]
+tone = "precise"
+
+[[voice.questions]]
+text = "Which layer owns this truth?"
+
+[[rule]]
+id = "single-owner"
+layer = "L1"
+text = "Assign one authoritative owner to every state transition."
+"#;
+
     /// Deterministic test keypair (mirrors the pattern used in
     /// `frameshift_pack::pack::tests`).
     fn test_verifying_key() -> ed25519_dalek::VerifyingKey {
@@ -867,11 +898,31 @@ memory_required_ops = []
     }
 
     #[test]
-    /// A manifest-only catalog entry must not pass the runtime-content gate.
-    fn is_persona_dir_rejects_pack_toml_only() {
+    /// A metadata-only catalog entry must not pass the runtime-content gate.
+    fn is_persona_dir_rejects_metadata_only_pack_toml() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("pack.toml"), CURATED_PACK_TOML).unwrap();
-        assert!(!is_persona_dir(tmp.path()));
+        assert!(!is_persona_dir(tmp.path()).unwrap());
+    }
+
+    #[test]
+    /// An inline typed pack is complete without auxiliary source files.
+    fn is_persona_dir_accepts_inline_pack_toml() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("pack.toml"), INLINE_PACK_TOML).unwrap();
+        assert!(is_persona_dir(tmp.path()).unwrap());
+    }
+
+    #[test]
+    /// A malformed declared inline source must fail instead of being skipped.
+    fn is_persona_dir_rejects_malformed_inline_source() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("pack.toml"),
+            "schema_version = 1\nname = \"broken\"\nvoice = \"not-a-table\"\n",
+        )
+        .unwrap();
+        assert!(is_persona_dir(tmp.path()).is_err());
     }
 
     #[test]
@@ -880,7 +931,7 @@ memory_required_ops = []
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("pack.toml"), CURATED_PACK_TOML).unwrap();
         std::fs::write(tmp.path().join("AGENTS.md"), "# Agents\n").unwrap();
-        assert!(is_persona_dir(tmp.path()));
+        assert!(is_persona_dir(tmp.path()).unwrap());
     }
 
     #[test]
@@ -889,7 +940,7 @@ memory_required_ops = []
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("pack.toml"), CURATED_PACK_TOML).unwrap();
         std::fs::write(tmp.path().join("BEHAVIOR.md"), "# Behavior\n").unwrap();
-        assert!(is_persona_dir(tmp.path()));
+        assert!(is_persona_dir(tmp.path()).unwrap());
     }
 
     #[test]
@@ -902,7 +953,7 @@ memory_required_ops = []
             "schema_version = 1\nname = \"agents\"\n[voice]\ntone = \"precise\"\n",
         )
         .unwrap();
-        assert!(is_persona_dir(tmp.path()));
+        assert!(is_persona_dir(tmp.path()).unwrap());
     }
 
     #[test]
@@ -911,7 +962,7 @@ memory_required_ops = []
     fn is_persona_dir_rejects_directory_with_no_markers() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("banner.png"), b"not a persona").unwrap();
-        assert!(!is_persona_dir(tmp.path()));
+        assert!(!is_persona_dir(tmp.path()).unwrap());
     }
 
     #[test]
@@ -1032,7 +1083,7 @@ memory_required_ops = []
         .unwrap();
 
         // 1. Gate: must be recognized as a persona dir.
-        assert!(is_persona_dir(tmp.path()));
+        assert!(is_persona_dir(tmp.path()).unwrap());
 
         // 2. Repair: placeholder author_pubkey must be fixed in place.
         let pack_toml_path = tmp.path().join("pack.toml");
@@ -1084,6 +1135,54 @@ memory_required_ops = []
             metadata.tags,
             vec!["agents", "coordination", "delegation", "parallel"]
         );
+    }
+
+    #[test]
+    /// A one-file inline pack validates as typed source and archives without
+    /// any auxiliary persona body file.
+    fn inline_pack_archive_pipeline_end_to_end() {
+        let tmp = TempDir::new().unwrap();
+        let pack_toml_path = tmp.path().join("pack.toml");
+        std::fs::write(&pack_toml_path, INLINE_PACK_TOML).unwrap();
+        assert!(is_persona_dir(tmp.path()).unwrap());
+
+        let signing_key = SigningKey::from_bytes(&[11u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+        repair_placeholder_author_pubkey(&pack_toml_path, &verifying_key).unwrap();
+
+        let repaired = std::fs::read_to_string(&pack_toml_path).unwrap();
+        assert!(repaired.contains(&format!(
+            "author_pubkey = \"{}\"",
+            verifying_key_hex(&verifying_key)
+        )));
+        assert!(!repaired.contains("local-unsigned"));
+
+        let source = frameshift_source::PersonaSource::load_from_pack_file(&pack_toml_path)
+            .expect("inline pack must parse")
+            .expect("voice must mark runtime source");
+        assert_eq!(source.persona.name, "inline-agents");
+        assert_eq!(source.rules.rules[0].id, "single-owner");
+
+        let mut pack = Pack::from_dir(tmp.path()).expect("inline pack must load");
+        pack.sign(&signing_key).expect("inline pack must sign");
+        assert!(pack.verify(&verifying_key).is_ok());
+
+        let bytes = targz_dir(tmp.path()).expect("inline pack archive must build");
+        let mut archive =
+            tar::Archive::new(flate2::read::GzDecoder::new(std::io::Cursor::new(&bytes)));
+        let names = archive
+            .entries()
+            .expect("archive entries")
+            .map(|entry| {
+                entry
+                    .expect("archive entry")
+                    .path()
+                    .expect("archive path")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["pack.toml"]);
     }
 
     #[test]

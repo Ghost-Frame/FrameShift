@@ -75,7 +75,7 @@ frameshift automate on --sensitivity 0.7
 frameshift select --task "review this authentication boundary" --format json
 ```
 
-The public [`personas/`](personas/) directory is a manifest catalog. Install public personas from the registry unless you also have their complete behavioral source. Read [How It Works](docs/wiki/How-It-Works.md), [Pack Format](docs/wiki/Pack-Format.md), and [Automate Mode](docs/wiki/Automate-Mode.md) for the full model.
+The public [`personas/`](personas/) directory is the pack catalog. Entries with inline `[voice]` source are complete one-file packs. A manifest without `[voice]` is metadata-only; authors must add public typed source or a public Markdown body before users can install and render it. Read [How It Works](docs/wiki/How-It-Works.md), [Pack Format](docs/wiki/Pack-Format.md), and [Automate Mode](docs/wiki/Automate-Mode.md) for the full model.
 
 ## Connect an AI agent with MCP
 
@@ -132,7 +132,7 @@ Registry publishing uses signed publisher identity and exact-snapshot review. Ac
 ## Repository and development
 
 - [`crates/`](crates/) contains the Rust workspace: CLI, runtime, pack tooling, composition, conformance, memory, object storage, registry server, MCP server, watch daemon, orchestration, and selection.
-- [`personas/`](personas/) contains the public persona manifest catalog and project artwork.
+- [`personas/`](personas/) contains the public persona pack catalog and project artwork.
 - [`docs/wiki/`](docs/wiki/) contains the maintained user, author, security, and operator documentation.
 
 Source builds require Rust 1.88 or newer. The full workspace also requires the PostgreSQL client library used by Diesel (`libpq-dev` on Debian or Ubuntu, `libpq` on macOS).

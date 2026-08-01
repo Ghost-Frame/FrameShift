@@ -2393,6 +2393,7 @@ dependencies = [
  "frameshift-objects",
  "frameshift-objects-fs",
  "frameshift-pack",
+ "frameshift-source",
  "rand_core 0.6.4",
  "secrecy",
  "serde",

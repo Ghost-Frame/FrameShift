@@ -14,50 +14,54 @@ Each frame is a complete behavioral identity. Not a list of instructions. A cohe
 
 A marketplace and runtime for versioned, composable behavioral personas for AI coding agents.
 
-- **Freeform AGENTS.md format.** Each persona is `AGENTS.md` plus a `pack.toml` manifest. AGENTS.md is the canonical body; the engine composes per-agent rendered output (Claude, Codex, Gemini, generic) at activation time by prepending a host-side overlay and a persona header.
-- **CLI.** `frameshift use`, `install`, `activate`, `select`, `automate`, `sync`, `gc`. Manages a central store outside your project tree. Your repo never gets persona files.
-- **Signed packs.** Content-addressed, Ed25519-signed tarballs. Deterministic canonicalization for reproducible hashes.
-- **Composition.** Extend a base persona, mix in overlays. Conflict detection at install time.
-- **Marketplace server.** Catalog, version resolution, distribution.
-- **Typed-source path (next).** A structured TOML format with semantic diffs and patch operations (`frameshift rule add`, `frameshift skill remove`) lives in the `frameshift-source` crate as the next-generation persona representation; the live install path uses freeform AGENTS.md.
+- **Public packs.** Each catalog entry is defined by its public `pack.toml`. A runtime-complete one-file pack carries typed persona fields alongside its identity, selection signals, and capability manifest.
+- **Portable renders.** Typed source compiles to Claude, Codex, Gemini, and generic Markdown without requiring a separate `AGENTS.md` beside the public pack.
+- **Signed distribution.** Registry releases are content-addressed, Ed25519-signed archives with deterministic canonicalization.
+- **Composition.** Packs can extend a base or mix in overlays. Rule collisions and protected L1 overrides are checked during composition.
+- **Local state.** The CLI manages a central store outside the project tree and keeps growth local to each installed persona.
 
 ## Persona source format
 
-A persona is a directory containing two files:
+A public persona can be complete with one file:
 
 ```
 personas/<name>/
-  AGENTS.md     # Persona body: identity, rules, frame, skills, growth integration
-  pack.toml     # Manifest: name, version, license, author, capability manifest
+  pack.toml     # Manifest, selection signals, capabilities, and typed behavior
 ```
 
-`AGENTS.md` is freeform markdown structured around the L1/L2/L3 behavioral-architecture pattern (see "Why frames beat instruction lists" below). The renderer prepends a per-host overlay and a persona header, then writes one file per target under `rendered/{claude,codex,gemini,generic}/`.
-
-The `pack.toml` manifest declares identity, version, license, signing key, and the capability manifest:
+`pack.toml` is independently decoded as the signed pack manifest and as typed persona source. A top-level `[voice]` table marks inline runtime source; `[[rule]]`, `[[skill]]`, `[[pattern]]`, anchors, and evaluation hooks use the same schemas as split typed-source files.
 
 ```toml
 schema_version = 1
-name = "cryptographic"
+name = "mmo-simulation-engineer"
 version = "0.1.0"
 author_handle = "ghost-frame"
-author_pubkey = "ed25519:<hex>"
+author_pubkey = "local-unsigned"
 license = "Elastic-2.0"
 
 [capability_manifest]
 required_tools = ["Read", "Edit", "Write", "Bash"]
 filesystem_scope = "project-only"
 network_egress = false
+
+[voice]
+tone = "systems-minded and exact about ownership"
+
+[[rule]]
+id = "single-authority"
+layer = "L1"
+text = "Give every mutable state transition exactly one authoritative owner."
 ```
+
+Metadata-only manifests omit `[voice]` and remain catalog entries rather than installable runtime personas. Split typed source and freeform Markdown packs remain supported for compatibility.
 
 ## Installation
 
 ```bash
-# Install + activate + print rendered persona in one call:
-frameshift use cryptographic --from ./personas
-
-# Or, split:
-frameshift install cryptographic@0.1.0 --from-path ./personas/cryptographic
-frameshift activate cryptographic
+# Install the public one-file pack directly from this checkout.
+frameshift install mmo-simulation-engineer@0.1.0 \
+  --from-path ./personas/mmo-simulation-engineer
+frameshift activate mmo-simulation-engineer
 ```
 
 All state lives in `$XDG_DATA_HOME/frameshift/`:
@@ -68,7 +72,7 @@ projects/<project-id>/
   lock.toml                       # Installed personas, versions, hashes
   active                          # Currently active persona
   personas/<name>/
-    source/                       # Pack contents (AGENTS.md + pack.toml)
+    source/                       # Exact installed pack contents
     rendered/{claude,codex,gemini,generic}/
     growth.md                     # Local-only, append-only
   orchestrator/                   # Per-project automate mode + audit state
@@ -78,28 +82,7 @@ Project ID is `sha256(realpath(project_root))`. Your project tree is never writt
 
 ## Pack format
 
-Each persona distributes as a signed pack -- a tarball of `AGENTS.md` plus `pack.toml`:
-
-```toml
-# pack.toml
-schema_version = 1
-name = "cryptographic"
-version = "0.1.0"
-author_handle = "ghost-frame"
-author_pubkey = "ed25519:<hex>"
-license = "Elastic-2.0"
-
-[capability_manifest]
-required_tools = ["Read", "Edit", "Bash"]
-filesystem_scope = "project-only"
-network_egress = false
-
-[conformance_baseline]
-score = 0.92
-bundle_hash = "sha256:..."
-```
-
-Packs are tarballs, canonicalized via recursive dir walk with unicode normalization, SHA256-hashed, Ed25519-signed. The capability manifest declares what tools and access the persona needs. The conformance baseline gates upgrades -- a newer version must meet the score floor.
+Registry releases archive the public pack contents, canonicalize them, hash them with SHA-256, and sign them with Ed25519. Inline packs need only `pack.toml`; split typed-source and Markdown packs archive their additional public files. `local-unsigned` is accepted only for local-path installs and is replaced by a real author key before registry publication.
 
 ## Composition
 
