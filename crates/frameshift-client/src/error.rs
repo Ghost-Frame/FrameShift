@@ -286,6 +286,13 @@ pub enum ClientError {
     #[error("publication review binding does not match the prepared artifact")]
     PublicationReviewBindingMismatch,
 
+    /// A publication lifecycle argument violates a stable client-visible server bound.
+    #[error("invalid publication lifecycle input: {detail}")]
+    InvalidPublicationLifecycleInput {
+        /// Actionable description of the rejected argument and its accepted shape.
+        detail: String,
+    },
+
     #[error("author_pubkey is not a supported ed25519 public key encoding: {0}")]
     InvalidAuthorPublicKey(String),
 

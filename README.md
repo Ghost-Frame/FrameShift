@@ -233,7 +233,7 @@ On registry install, the client verifies the pack signature against the exact ke
 
 ### Admin
 
-The registry server exposes account-authenticated lifecycle controls. Publisher owners can withdraw eligible non-public submissions with `POST /v1/publication-submissions/{id}/withdraw`. Active administrators can suspend a publisher with `POST /v1/admin/publishers/{publisher_id}/suspend` or tombstone an active release with `POST /v1/admin/packs/{name}/{version}/tombstone`. Each accepted transition and its reason are committed atomically to immutable audit evidence. Publisher owners can read their scoped evidence at `GET /v1/publishers/{handle}/publication-decisions`; administrators can read the global stream at `GET /v1/admin/publication-decisions`.
+The registry server exposes account-authenticated lifecycle controls. Publisher owners can withdraw eligible non-public submissions with `frameshift publication withdraw` and read their scoped immutable evidence with `frameshift publication decisions`. Active administrators can suspend a publisher with `POST /v1/admin/publishers/{publisher_id}/suspend` or tombstone an active release with `POST /v1/admin/packs/{name}/{version}/tombstone`. Each accepted transition and its reason are committed atomically to immutable audit evidence. Administrators can read the global stream at `GET /v1/admin/publication-decisions`.
 
 Active moderators and administrators can inspect a known quarantined
 submission with `frameshift moderation show`, download its exact archive with
@@ -241,7 +241,7 @@ submission with `frameshift moderation show`, download its exact archive with
 `decide`, and publish an approved submission with `promote`. The server retains
 the role, lifecycle, and independent-review checks for every operation.
 
-Publisher owners may file one appeal within 30 days of a `request_changes` or `reject` moderation decision using `POST /v1/publishers/{handle}/publication-decisions/{decision_id}/appeal`. Active administrators resolve appeals at `POST /v1/admin/publication-appeals/{appeal_id}/resolution`; an `overturn` approves the exact unchanged submission, while `uphold` preserves its adverse state. The original reviewer cannot resolve the appeal when another active administrator is available. A sole administrator must record a bounded separation exception. Filing and resolution require a caller-supplied UUID `x-request-id`, reject substituted retries, and retain immutable evidence. Owners read their private cases at `GET /v1/publishers/{handle}/publication-appeals`; administrators use `GET /v1/admin/publication-appeals`.
+Publisher owners may file one appeal within 30 days of a `request_changes` or `reject` moderation decision with `frameshift publication appeal` and read private cases with `frameshift publication appeals`. Active administrators resolve appeals at `POST /v1/admin/publication-appeals/{appeal_id}/resolution`; an `overturn` approves the exact unchanged submission, while `uphold` preserves its adverse state. The original reviewer cannot resolve the appeal when another active administrator is available. A sole administrator must record a bounded separation exception. Filing and resolution require a caller-supplied UUID `x-request-id`, reject substituted retries, and retain immutable evidence.
 
 ### Registry safety controls
 
@@ -438,6 +438,12 @@ frameshift publish --persona <name> [--out <dir>]                          Build
 frameshift publication review --draft <id> --server <url> --publisher <handle>   Review an exact Creator Studio snapshot
 frameshift publication submit --draft <id> --server <url> --publisher <handle>   Submit the confirmed signed snapshot
 frameshift publication status --server <url> --submission-id <uuid>             Inspect an account-backed submission
+frameshift publication withdraw --server <url> --submission-id <uuid>           Withdraw an eligible non-public submission
+           --reason-code <code>
+frameshift publication decisions --server <url> --publisher <handle>             List immutable owner lifecycle evidence
+frameshift publication appeal --server <url> --publisher <handle>                Appeal an adverse moderation decision
+           --decision-id <uuid> --statement <text>
+frameshift publication appeals --server <url> --publisher <handle>               List private appeal cases
 frameshift moderation show --server <url> --submission-id <uuid>                Inspect a quarantined submission
 frameshift moderation artifact --server <url> --submission-id <uuid> --out <file> Download its exact archive without overwriting
 frameshift moderation decide --server <url> --submission-id <uuid>              Record approve, request-changes, or reject

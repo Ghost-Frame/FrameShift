@@ -124,7 +124,7 @@ enum Command {
     /// Publish a persona pack to a directory or registry.
     Publish(PublishArgs),
 
-    /// Review and submit Creator Studio drafts through moderated publication.
+    /// Manage Creator Studio submissions, owner lifecycle decisions, and appeals.
     Publication(PublicationArgs),
 
     /// Inspect, decide, and promote quarantined publication submissions.
@@ -634,6 +634,67 @@ mod publication_cli_tests {
             "alice",
             "--confirm-archive-hash",
             "0101010101010101010101010101010101010101010101010101010101010101",
+        ]);
+        assert!(result.is_err());
+    }
+
+    /// Withdrawal parsing accepts explicit retry identifiers for safe replay.
+    #[test]
+    fn parses_publication_withdrawal_retry() {
+        let cli = Cli::try_parse_from([
+            "frameshift",
+            "publication",
+            "withdraw",
+            "--server",
+            "https://registry.example",
+            "--submission-id",
+            "00000000-0000-0000-0000-000000000001",
+            "--reason-code",
+            "author_request",
+            "--decision-id",
+            "00000000-0000-0000-0000-000000000002",
+            "--request-id",
+            "00000000-0000-0000-0000-000000000003",
+        ])
+        .expect("withdrawal arguments should parse");
+        assert!(matches!(
+            cli.command,
+            Command::Publication(PublicationArgs {
+                command: PublicationCommand::Withdraw { .. }
+            })
+        ));
+    }
+
+    /// Decision pagination requires both keyset cursor components.
+    #[test]
+    fn publication_decisions_rejects_partial_cursor() {
+        let result = Cli::try_parse_from([
+            "frameshift",
+            "publication",
+            "decisions",
+            "--server",
+            "https://registry.example",
+            "--publisher",
+            "alice",
+            "--before-id",
+            "00000000-0000-0000-0000-000000000001",
+        ]);
+        assert!(result.is_err());
+    }
+
+    /// Appeal history parsing enforces the server's page-size bound locally.
+    #[test]
+    fn publication_appeals_rejects_oversized_page() {
+        let result = Cli::try_parse_from([
+            "frameshift",
+            "publication",
+            "appeals",
+            "--server",
+            "https://registry.example",
+            "--publisher",
+            "alice",
+            "--limit",
+            "101",
         ]);
         assert!(result.is_err());
     }

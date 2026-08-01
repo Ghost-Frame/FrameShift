@@ -27,6 +27,8 @@ frameshift-embed-candle = { path = "../frameshift-embed-candle", optional = true
 frameshift-vault = { path = "../frameshift-vault" }
 frameshift-vault-local = { path = "../frameshift-vault-local" }
 clap = { workspace = true }
+# Parses RFC 3339 keyset cursors for publication lifecycle history.
+chrono.workspace = true
 # Names the selected signing key while preserving the client key-store boundary.
 ed25519-dalek = { workspace = true }
 # Wraps the vault passphrase/value input so it is never accidentally logged.

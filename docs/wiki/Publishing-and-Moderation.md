@@ -21,9 +21,10 @@ token and an Ed25519-signed request. A local manifest without a valid signature
 cannot enter the account-backed publication pipeline, and the selected signer
 must match the manifest's `author_pubkey`.
 
-The `frameshift publication review`, `submit`, and `status` commands expose the
-account-backed workflow through the CLI. Final submission is not exposed
-through the MCP server.
+The `frameshift publication review`, `submit`, `status`, `withdraw`,
+`decisions`, `appeal`, and `appeals` commands expose the account-backed
+workflow through the CLI. Final submission is not exposed through the MCP
+server.
 
 ## Quarantine and review
 
@@ -70,6 +71,15 @@ Accepted lifecycle transitions and their reasons are recorded as immutable
 decision evidence. Publisher owners can read the decision stream scoped to
 their publisher profile.
 
+```bash
+frameshift publication withdraw --server https://registry.example --submission-id <UUID> --reason-code author_request
+frameshift publication decisions --server https://registry.example --publisher alice
+```
+
+Withdrawal failures include the decision and request UUID flags required for
+an exact retry. Decision history is newest-first and accepts a bounded page
+size plus paired timestamp and UUID cursor flags.
+
 ## Appeals
 
 A publisher owner may file one appeal within 30 days of a `request_changes` or
@@ -82,6 +92,15 @@ The original reviewer cannot resolve the appeal when another active
 administrator is available. A sole administrator must record a bounded
 separation exception. Appeal filing and resolution use caller-generated request
 IDs so retries cannot silently become different actions.
+
+```bash
+frameshift publication appeal --server https://registry.example --publisher alice --decision-id <UUID> --statement "The unchanged artifact meets policy."
+frameshift publication appeals --server https://registry.example --publisher alice
+```
+
+Appeal failures include the appeal and request UUID flags required for an exact
+retry. Appeal history uses the same bounded newest-first pagination contract as
+decision history.
 
 ## Suspension and tombstones
 
