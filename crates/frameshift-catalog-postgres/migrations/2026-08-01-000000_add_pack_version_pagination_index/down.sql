@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS idx_pack_versions_pack_published_version;

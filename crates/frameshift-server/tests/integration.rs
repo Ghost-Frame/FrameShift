@@ -678,10 +678,12 @@ async fn pack_versions_limit_caps_response_size() {
     let body = body_json(resp).await;
     let arr = body.as_array().expect("body must be a JSON array");
     assert_eq!(arr.len(), 2);
+    assert_eq!(arr[0]["version"], "0.0.0");
+    assert_eq!(arr[1]["version"], "0.1.0");
 }
 
-/// `GET /v1/packs/{name}/versions?offset=2` skips the first 2 records (by
-/// whatever order the backend returns them in).
+/// `GET /v1/packs/{name}/versions?offset=2` skips the first two records in
+/// stable publication-time and version order.
 #[tokio::test]
 async fn pack_versions_offset_skips_records() {
     let author = Ed25519PublicKey([32u8; 32]);
@@ -694,6 +696,7 @@ async fn pack_versions_offset_skips_records() {
     let body = body_json(resp).await;
     let arr = body.as_array().expect("body must be a JSON array");
     assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["version"], "0.2.0");
 }
 
 /// `GET /v1/packs/{name}/versions?limit=999999` is clamped to

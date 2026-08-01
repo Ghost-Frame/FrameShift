@@ -4809,11 +4809,13 @@ impl CatalogBackend for PostgresCatalog {
         row.into_record()
     }
 
-    /// List all versions of a pack, ordered by `published_at ASC`.
+    /// List all versions of a pack, ordered by `published_at ASC, version ASC`.
     ///
     /// SQL shape:
     /// ```sql
-    /// SELECT * FROM pack_versions WHERE pack_name = $1 ORDER BY published_at ASC
+    /// SELECT * FROM pack_versions
+    /// WHERE pack_name = $1
+    /// ORDER BY published_at ASC, version ASC
     /// ```
     /// First verifies the pack exists (returns `NotFound` if not), then lists versions.
     #[instrument(skip(self, name), fields(pack = %name))]
@@ -4839,11 +4841,53 @@ impl CatalogBackend for PostgresCatalog {
             .filter(pack_versions::pack_name.eq(name))
             .select(PackVersionRow::as_select())
             .order(pack_versions::published_at.asc())
+            .then_order_by(pack_versions::version.asc())
             .load(&mut *conn)
             .await
             .map_err(|e| map_diesel_error(e, "pack_version", name.to_string()))?;
 
         rows.into_iter().map(|r| r.into_record()).collect()
+    }
+
+    /// List one bounded page of versions in stable publication order.
+    ///
+    /// SQL applies `LIMIT` and `OFFSET` after the deterministic
+    /// `published_at ASC, version ASC` ordering.
+    #[instrument(skip(self, name), fields(pack = %name, limit, offset))]
+    async fn list_pack_versions_page(
+        &self,
+        name: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<PackVersionRecord>, CatalogError> {
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+
+        let pack_exists: bool = diesel::select(diesel::dsl::exists(
+            packs::table.filter(packs::name.eq(name)),
+        ))
+        .get_result(&mut *conn)
+        .await
+        .map_err(|error| map_diesel_error(error, "pack", name.to_string()))?;
+
+        if !pack_exists {
+            return Err(CatalogError::NotFound {
+                kind: "pack",
+                key: name.to_string(),
+            });
+        }
+
+        let rows: Vec<PackVersionRow> = pack_versions::table
+            .filter(pack_versions::pack_name.eq(name))
+            .select(PackVersionRow::as_select())
+            .order(pack_versions::published_at.asc())
+            .then_order_by(pack_versions::version.asc())
+            .limit(i64::from(limit))
+            .offset(i64::from(offset))
+            .load(&mut *conn)
+            .await
+            .map_err(|error| map_diesel_error(error, "pack_version", name.to_string()))?;
+
+        rows.into_iter().map(|row| row.into_record()).collect()
     }
 
     /// Search for packs matching the given filters.

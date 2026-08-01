@@ -1224,7 +1224,7 @@ impl CatalogBackend for MockCatalog {
             })
     }
 
-    /// List all versions for a pack.
+    /// List all versions for a pack in stable publication order.
     async fn list_pack_versions(&self, name: &str) -> Result<Vec<PackVersionRecord>, CatalogError> {
         let state = self
             .state
@@ -1236,12 +1236,17 @@ impl CatalogBackend for MockCatalog {
                 key: name.to_string(),
             });
         }
-        let versions: Vec<_> = state
+        let mut versions: Vec<_> = state
             .versions
             .values()
             .filter(|v| v.pack_name == name)
             .cloned()
             .collect();
+        versions.sort_by(|left, right| {
+            left.published_at
+                .cmp(&right.published_at)
+                .then_with(|| left.version.cmp(&right.version))
+        });
         Ok(versions)
     }
 
