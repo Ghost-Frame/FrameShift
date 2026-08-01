@@ -1,17 +1,19 @@
-//! Interactive account registration, login, status, and logout commands.
+//! Account session and administrator account-control commands.
 //!
 //! OIDC login uses the system browser and a loopback Authorization Code callback
-//! with S256 PKCE. First-party credentials use hidden terminal prompts. No
-//! password, invitation, or token is accepted through arguments or environment.
+//! with S256 PKCE. First-party credentials use hidden terminal prompts. Session
+//! commands accept no password, invitation, or bearer-token argument.
 
 use std::io::{IsTerminal as _, Read as _, Write as _};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
+use frameshift_catalog::{AccountStatus, PlatformRole};
 use frameshift_client::account::{
-    get_account, get_auth_config, login_local_account, logout_local_account,
-    register_local_account, AccountView, LocalAccountSession, NativeAuthClient,
+    assign_account_platform_role, get_account, get_auth_config, login_local_account,
+    logout_local_account, register_local_account, revoke_account_platform_role, set_account_status,
+    AccountView, LocalAccountSession, NativeAuthClient,
 };
 use frameshift_client::session::{AuthenticatedSession, SessionClient, SessionClientConfig};
 use frameshift_client::session_store::{
@@ -20,7 +22,9 @@ use frameshift_client::session_store::{
 use frameshift_client::{registry_base_url, Client, ClientError};
 use secrecy::{ExposeSecret as _, SecretString};
 use url::{Position, Url};
+use uuid::Uuid;
 
+use crate::cmd::keys::resolve_access_token;
 use crate::util::{validate_server_url, CliError};
 
 /// Default public OAuth client identifier for the shipped CLI.
@@ -37,12 +41,12 @@ const REFRESH_MARGIN_SECS: u64 = 30;
 /// Arguments for the `account` command group.
 #[derive(Debug, Args)]
 pub struct AccountArgs {
-    /// Account session operation.
+    /// Account session or administrator operation.
     #[command(subcommand)]
     pub command: AccountCommand,
 }
 
-/// Account session operations.
+/// Account session and administrator operations.
 #[derive(Debug, Subcommand)]
 pub enum AccountCommand {
     /// Authenticate through an advertised provider and save the session securely.
@@ -53,6 +57,85 @@ pub enum AccountCommand {
     Status,
     /// Revoke the provider session when supported and erase local credentials.
     Logout,
+    /// Grant one global platform role under administrator authority.
+    GrantRole {
+        /// Registry API base URL.
+        #[arg(long)]
+        server: String,
+        /// Stable target account UUID.
+        #[arg(long)]
+        account_id: Uuid,
+        /// Global platform role to grant.
+        #[arg(long, value_enum)]
+        role: PlatformRoleArg,
+    },
+    /// Revoke one global platform role under administrator authority.
+    RevokeRole {
+        /// Registry API base URL.
+        #[arg(long)]
+        server: String,
+        /// Stable target account UUID.
+        #[arg(long)]
+        account_id: Uuid,
+        /// Global platform role to revoke.
+        #[arg(long, value_enum)]
+        role: PlatformRoleArg,
+    },
+    /// Set one account lifecycle state under administrator authority.
+    SetStatus {
+        /// Registry API base URL.
+        #[arg(long)]
+        server: String,
+        /// Stable target account UUID.
+        #[arg(long)]
+        account_id: Uuid,
+        /// Account lifecycle state to apply.
+        #[arg(long, value_enum)]
+        status: AccountStatusArg,
+    },
+}
+
+/// CLI spelling for global platform roles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum PlatformRoleArg {
+    /// Authority to review publication submissions.
+    Moderator,
+    /// Authority to administer platform and publication controls.
+    Administrator,
+}
+
+/// Convert a CLI platform role into the shared wire enum.
+impl From<PlatformRoleArg> for PlatformRole {
+    /// Preserve the selected authority exactly.
+    fn from(value: PlatformRoleArg) -> Self {
+        match value {
+            PlatformRoleArg::Moderator => Self::Moderator,
+            PlatformRoleArg::Administrator => Self::Administrator,
+        }
+    }
+}
+
+/// CLI spelling for account lifecycle states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum AccountStatusArg {
+    /// Allow the account to authenticate and use assigned authority.
+    Active,
+    /// Temporarily deny account access while retaining history.
+    Suspended,
+    /// Permanently disable the account while retaining history.
+    Disabled,
+}
+
+/// Convert a CLI account state into the shared wire enum.
+impl From<AccountStatusArg> for AccountStatus {
+    /// Preserve the selected lifecycle state exactly.
+    fn from(value: AccountStatusArg) -> Self {
+        match value {
+            AccountStatusArg::Active => Self::Active,
+            AccountStatusArg::Suspended => Self::Suspended,
+            AccountStatusArg::Disabled => Self::Disabled,
+        }
+    }
 }
 
 /// Account login options.
@@ -109,14 +192,59 @@ struct PendingCallback {
     stream: TcpStream,
 }
 
-/// Execute one account session operation.
+/// Execute one account session or administrator operation.
 pub fn run_account(args: AccountArgs) -> Result<(), CliError> {
     match args.command {
         AccountCommand::Login(args) => run_login(args),
         AccountCommand::Register(args) => run_register(args),
         AccountCommand::Status => run_status(),
         AccountCommand::Logout => run_logout(),
+        AccountCommand::GrantRole {
+            server,
+            account_id,
+            role,
+        } => grant_role(&server, account_id, role),
+        AccountCommand::RevokeRole {
+            server,
+            account_id,
+            role,
+        } => revoke_role(&server, account_id, role),
+        AccountCommand::SetStatus {
+            server,
+            account_id,
+            status,
+        } => set_status(&server, account_id, status),
     }
+}
+
+/// Grant one role through the exact authenticated registry session.
+fn grant_role(server: &str, account_id: Uuid, role: PlatformRoleArg) -> Result<(), CliError> {
+    validate_server_url(server)?;
+    let token = resolve_access_token(server)?;
+    let record = assign_account_platform_role(server, &token, account_id, role.into())
+        .map_err(|error| CliError::Account(error.to_string()))?;
+    println!("{}", serde_json::to_string_pretty(&record)?);
+    Ok(())
+}
+
+/// Revoke one role through the exact authenticated registry session.
+fn revoke_role(server: &str, account_id: Uuid, role: PlatformRoleArg) -> Result<(), CliError> {
+    validate_server_url(server)?;
+    let token = resolve_access_token(server)?;
+    let record = revoke_account_platform_role(server, &token, account_id, role.into())
+        .map_err(|error| CliError::Account(error.to_string()))?;
+    println!("{}", serde_json::to_string_pretty(&record)?);
+    Ok(())
+}
+
+/// Transition one account through the exact authenticated registry session.
+fn set_status(server: &str, account_id: Uuid, status: AccountStatusArg) -> Result<(), CliError> {
+    validate_server_url(server)?;
+    let token = resolve_access_token(server)?;
+    let account = set_account_status(server, &token, account_id, status.into())
+        .map_err(|error| CliError::Account(error.to_string()))?;
+    println!("{}", serde_json::to_string_pretty(&account)?);
+    Ok(())
 }
 
 /// Authenticate through the selected provider and persist the resulting session.
@@ -789,6 +917,146 @@ mod tests {
             "secret",
         ])
         .is_err());
+    }
+
+    /// Administrator role grant parsing preserves the exact target and closed role value.
+    #[test]
+    fn parses_administrator_role_grant() {
+        let parsed = TestCli::try_parse_from([
+            "frameshift",
+            "account",
+            "grant-role",
+            "--server",
+            "https://registry.example",
+            "--account-id",
+            "00000000-0000-0000-0000-000000000001",
+            "--role",
+            "administrator",
+        ])
+        .expect("role grant arguments");
+        let TestCommand::Account(AccountArgs {
+            command:
+                AccountCommand::GrantRole {
+                    server,
+                    account_id,
+                    role,
+                },
+        }) = parsed.command
+        else {
+            panic!("expected administrator role grant");
+        };
+        assert_eq!(server, "https://registry.example");
+        assert_eq!(account_id, Uuid::from_u128(1));
+        assert_eq!(role, PlatformRoleArg::Administrator);
+    }
+
+    /// Administrator role revocation parsing preserves the exact target and role value.
+    #[test]
+    fn parses_administrator_role_revocation() {
+        let parsed = TestCli::try_parse_from([
+            "frameshift",
+            "account",
+            "revoke-role",
+            "--server",
+            "https://registry.example",
+            "--account-id",
+            "00000000-0000-0000-0000-000000000001",
+            "--role",
+            "moderator",
+        ])
+        .expect("role revocation arguments");
+        let TestCommand::Account(AccountArgs {
+            command:
+                AccountCommand::RevokeRole {
+                    server,
+                    account_id,
+                    role,
+                },
+        }) = parsed.command
+        else {
+            panic!("expected administrator role revocation");
+        };
+        assert_eq!(server, "https://registry.example");
+        assert_eq!(account_id, Uuid::from_u128(1));
+        assert_eq!(role, PlatformRoleArg::Moderator);
+    }
+
+    /// Administrator status parsing accepts the closed suspended state.
+    #[test]
+    fn parses_administrator_account_status_transition() {
+        let parsed = TestCli::try_parse_from([
+            "frameshift",
+            "account",
+            "set-status",
+            "--server",
+            "https://registry.example",
+            "--account-id",
+            "00000000-0000-0000-0000-000000000001",
+            "--status",
+            "suspended",
+        ])
+        .expect("account status arguments");
+        let TestCommand::Account(AccountArgs {
+            command:
+                AccountCommand::SetStatus {
+                    server,
+                    account_id,
+                    status,
+                },
+        }) = parsed.command
+        else {
+            panic!("expected administrator account status transition");
+        };
+        assert_eq!(server, "https://registry.example");
+        assert_eq!(account_id, Uuid::from_u128(1));
+        assert_eq!(status, AccountStatusArg::Suspended);
+    }
+
+    /// Administrator role commands reject publisher roles outside the closed platform set.
+    #[test]
+    fn administrator_role_commands_reject_publisher_roles() {
+        let result = TestCli::try_parse_from([
+            "frameshift",
+            "account",
+            "revoke-role",
+            "--server",
+            "https://registry.example",
+            "--account-id",
+            "00000000-0000-0000-0000-000000000001",
+            "--role",
+            "owner",
+        ]);
+        assert!(result.is_err());
+    }
+
+    /// Every CLI platform-role value maps to its exact shared wire value.
+    #[test]
+    fn maps_all_administrator_platform_roles() {
+        assert_eq!(
+            PlatformRole::from(PlatformRoleArg::Moderator),
+            PlatformRole::Moderator
+        );
+        assert_eq!(
+            PlatformRole::from(PlatformRoleArg::Administrator),
+            PlatformRole::Administrator
+        );
+    }
+
+    /// Every CLI account-status value maps to its exact shared wire value.
+    #[test]
+    fn maps_all_administrator_account_statuses() {
+        assert_eq!(
+            AccountStatus::from(AccountStatusArg::Active),
+            AccountStatus::Active
+        );
+        assert_eq!(
+            AccountStatus::from(AccountStatusArg::Suspended),
+            AccountStatus::Suspended
+        );
+        assert_eq!(
+            AccountStatus::from(AccountStatusArg::Disabled),
+            AccountStatus::Disabled
+        );
     }
 
     /// Registry matching ignores a cosmetic trailing slash only.

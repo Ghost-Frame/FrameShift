@@ -128,6 +128,13 @@ frameshift account status
 
 # Revoke the provider session, then erase the exact local credential and metadata.
 frameshift account logout
+
+# Grant or revoke one global platform role as an administrator.
+frameshift account grant-role --server <url> --account-id <uuid> --role <moderator|administrator>
+frameshift account revoke-role --server <url> --account-id <uuid> --role <moderator|administrator>
+
+# Set an account lifecycle state as an administrator.
+frameshift account set-status --server <url> --account-id <uuid> --status <active|suspended|disabled>
 ```
 
 Deployments that register a different public OAuth client set
@@ -136,6 +143,10 @@ discovery, and `--redirect-uri` selects another pre-registered IP-loopback
 callback. Login never accepts a bearer token through arguments, environment
 variables, or command-line values. First-party credentials require an
 interactive terminal and are read through hidden prompts.
+
+Administrator account controls resolve bearer authority for the exact registry
+without accepting a token argument. The registry rejects non-administrators and
+prevents revoking, suspending, or disabling the last active administrator.
 
 ## Automate mode
 
@@ -432,6 +443,12 @@ frameshift diff <a> <b>                                                    Seman
 frameshift render <persona>                                                Render persona source to markdown
 frameshift verify (--persona <name> | --bundle <dir>)                      Run conformance checks (exactly one of the two)
            [--runner mock|cli] [--model <name>] [--threshold <0.0-1.0>]
+frameshift account grant-role --server <url> --account-id <uuid>           Grant a global platform role
+           --role <moderator|administrator>
+frameshift account revoke-role --server <url> --account-id <uuid>          Revoke a global platform role
+           --role <moderator|administrator>
+frameshift account set-status --server <url> --account-id <uuid>           Set an account lifecycle state
+           --status <active|suspended|disabled>
 frameshift register --server <url> --handle <handle> [--display-name <name>]   Claim an author handle
 frameshift publish --persona <name> [--out <dir>]                          Build a persona pack (add --server + --handle to sign and upload)
            [--server <url> --handle <handle>]

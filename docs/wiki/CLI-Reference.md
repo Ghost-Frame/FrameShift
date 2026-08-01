@@ -57,6 +57,19 @@ session. Registration and first-party login collect secrets only through hidden
 interactive prompts. `login --first-party` selects password login when the
 registry also advertises OIDC.
 
+Active administrators can grant or revoke global platform roles and transition
+account lifecycle states. These commands resolve bearer authority for the exact
+registry and do not accept a token argument.
+
+```bash
+frameshift account grant-role --server <url> --account-id <uuid> --role <moderator|administrator>
+frameshift account revoke-role --server <url> --account-id <uuid> --role <moderator|administrator>
+frameshift account set-status --server <url> --account-id <uuid> --status <active|suspended|disabled>
+```
+
+The registry prevents revoking, suspending, or disabling the last active
+administrator.
+
 ### `frameshift install [OPTIONS] <SPEC>`
 
 Install a persona by `name@version`. Use `--from-path <PATH>` to install from a

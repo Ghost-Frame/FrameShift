@@ -1,12 +1,16 @@
-//! Bearer-authenticated account profile operations.
+//! Account authentication, profile, and administrator control operations.
 //!
 //! Access tokens enter only through [`SecretString`] and are attached solely
 //! to the registry request's `Authorization` header.
 
 use chrono::{DateTime, Utc};
-use frameshift_catalog::{AccountRecord, PublisherMembershipRecord, PublisherProfileRecord};
+use frameshift_catalog::{
+    AccountRecord, AccountStatus, PlatformRole, PlatformRoleRecord, PublisherMembershipRecord,
+    PublisherProfileRecord,
+};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::error::ClientError;
@@ -121,6 +125,20 @@ impl Drop for LocalAuthResponse {
 struct LocalLogoutResponse {
     /// Whether the registry accepted the revocation.
     logged_out: bool,
+}
+
+/// Caller-controlled field for one administrator platform-role grant.
+#[derive(Serialize)]
+struct AssignPlatformRoleRequest {
+    /// Global authority being granted to the target account.
+    role: PlatformRole,
+}
+
+/// Caller-controlled field for one administrator account status transition.
+#[derive(Serialize)]
+struct SetAccountStatusRequest {
+    /// Status the target account must hold after the transition.
+    status: AccountStatus,
 }
 
 /// Authenticated account profile and its publisher memberships.
@@ -339,6 +357,100 @@ pub fn get_account(
     }
 }
 
+/// Grant one global platform role under authenticated administrator authority.
+///
+/// # Errors
+///
+/// Returns a registry URL, transport, status, size, JSON serialization, or JSON
+/// response error without including the bearer token in the diagnostic.
+pub fn assign_account_platform_role(
+    server_url: &str,
+    access_token: &SecretString,
+    account_id: Uuid,
+    role: PlatformRole,
+) -> Result<PlatformRoleRecord, ClientError> {
+    let url = administrator_account_url(server_url, account_id, &["platform-roles"])?;
+    send_account_json(
+        crate::registry::http_agent().post(url.as_str()),
+        &url,
+        access_token,
+        &AssignPlatformRoleRequest { role },
+    )
+}
+
+/// Revoke one global platform role under authenticated administrator authority.
+///
+/// # Errors
+///
+/// Returns a registry URL, transport, status, size, or JSON response error
+/// without including the bearer token in the diagnostic.
+pub fn revoke_account_platform_role(
+    server_url: &str,
+    access_token: &SecretString,
+    account_id: Uuid,
+    role: PlatformRole,
+) -> Result<PlatformRoleRecord, ClientError> {
+    let role = match role {
+        PlatformRole::Moderator => "moderator",
+        PlatformRole::Administrator => "administrator",
+    };
+    let url = administrator_account_url(server_url, account_id, &["platform-roles", role])?;
+    let request = crate::publisher::with_bearer(
+        crate::registry::http_agent().delete(url.as_str()),
+        access_token,
+    );
+    crate::publisher::send_and_decode(request.call(), url.as_str())
+}
+
+/// Set one account lifecycle status under authenticated administrator authority.
+///
+/// # Errors
+///
+/// Returns a registry URL, transport, status, size, JSON serialization, or JSON
+/// response error without including the bearer token in the diagnostic.
+pub fn set_account_status(
+    server_url: &str,
+    access_token: &SecretString,
+    account_id: Uuid,
+    status: AccountStatus,
+) -> Result<AccountRecord, ClientError> {
+    let url = administrator_account_url(server_url, account_id, &["status"])?;
+    send_account_json(
+        crate::registry::http_agent().request("PATCH", url.as_str()),
+        &url,
+        access_token,
+        &SetAccountStatusRequest { status },
+    )
+}
+
+/// Build one administrator account endpoint while preserving a registry base path.
+fn administrator_account_url(
+    server_url: &str,
+    account_id: Uuid,
+    suffix: &[&str],
+) -> Result<url::Url, ClientError> {
+    let account = account_id.to_string();
+    let mut segments = vec!["v1", "admin", "accounts", account.as_str()];
+    segments.extend_from_slice(suffix);
+    crate::publisher::registry_endpoint_url(server_url, &segments)
+}
+
+/// Send one bearer-authenticated administrator account JSON mutation.
+fn send_account_json<T: Serialize, R: serde::de::DeserializeOwned>(
+    request: ureq::Request,
+    url: &url::Url,
+    access_token: &SecretString,
+    body: &T,
+) -> Result<R, ClientError> {
+    let bytes =
+        serde_json::to_vec(body).map_err(|error| ClientError::JsonSerialize(error.to_string()))?;
+    let request = crate::publisher::with_bearer(
+        request.set("Content-Type", "application/json"),
+        access_token,
+    );
+    crate::publisher::send_and_decode(request.send_bytes(&bytes), url.as_str())
+}
+
 #[cfg(test)]
 /// Account HTTP client regression tests.
 mod tests {
@@ -497,5 +609,60 @@ mod tests {
         assert!(request.starts_with("POST /v1/auth/logout HTTP/1.1\r\n"));
         assert!(request.contains("\r\nAuthorization: Bearer native-session-token\r\n"));
         assert_eq!(request.matches("native-session-token").count(), 1);
+    }
+
+    /// Administrator account controls preserve exact paths, methods, bearer authority, and bodies.
+    #[test]
+    fn sends_administrator_account_controls() {
+        let role_body = r#"{"account_id":"00000000-0000-0000-0000-000000000001","role":"administrator","state":"active","assigned_by_account_id":"00000000-0000-0000-0000-000000000002","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#;
+        let (server, handle) = serve_json_response(role_body);
+        let server = format!("{server}/registry");
+        let token = SecretString::new("administrator-token".to_string());
+        let role = assign_account_platform_role(
+            &server,
+            &token,
+            uuid::Uuid::from_u128(1),
+            frameshift_catalog::PlatformRole::Administrator,
+        )
+        .expect("role grant response");
+        assert_eq!(role.role, frameshift_catalog::PlatformRole::Administrator);
+        let request = handle.join().expect("test server thread");
+        assert!(request.starts_with(
+            "POST /registry/v1/admin/accounts/00000000-0000-0000-0000-000000000001/platform-roles HTTP/1.1\r\n"
+        ));
+        assert!(request.contains("\r\nAuthorization: Bearer administrator-token\r\n"));
+        assert!(request.contains("\"role\":\"administrator\""));
+
+        let (server, handle) = serve_json_response(role_body);
+        let server = format!("{server}/registry");
+        revoke_account_platform_role(
+            &server,
+            &token,
+            uuid::Uuid::from_u128(1),
+            frameshift_catalog::PlatformRole::Moderator,
+        )
+        .expect("role revocation response");
+        let request = handle.join().expect("test server thread");
+        assert!(request.starts_with(
+            "DELETE /registry/v1/admin/accounts/00000000-0000-0000-0000-000000000001/platform-roles/moderator HTTP/1.1\r\n"
+        ));
+        assert!(request.contains("\r\nAuthorization: Bearer administrator-token\r\n"));
+
+        let (server, handle) = serve_json_response(account_json());
+        let server = format!("{server}/registry");
+        let account = set_account_status(
+            &server,
+            &token,
+            uuid::Uuid::from_u128(1),
+            frameshift_catalog::AccountStatus::Suspended,
+        )
+        .expect("account status response");
+        assert_eq!(account.id, uuid::Uuid::from_u128(1));
+        let request = handle.join().expect("test server thread");
+        assert!(request.starts_with(
+            "PATCH /registry/v1/admin/accounts/00000000-0000-0000-0000-000000000001/status HTTP/1.1\r\n"
+        ));
+        assert!(request.contains("\r\nAuthorization: Bearer administrator-token\r\n"));
+        assert!(request.contains("\"status\":\"suspended\""));
     }
 }

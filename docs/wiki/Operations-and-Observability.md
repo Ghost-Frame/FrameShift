@@ -227,6 +227,15 @@ reads `0`; that is the intended fail-closed behavior, not an outage.
 | `DELETE /v1/admin/accounts/{account_id}/platform-roles/{role}` | Revoke a role, retaining it as auditable history |
 | `PATCH /v1/admin/accounts/{account_id}/status` | Set `active`, `suspended`, or `disabled` |
 
+The account-control routes are available through the CLI with registry-bound
+bearer authority and closed role and status values:
+
+```bash
+frameshift account grant-role --server <url> --account-id <uuid> --role <moderator|administrator>
+frameshift account revoke-role --server <url> --account-id <uuid> --role <moderator|administrator>
+frameshift account set-status --server <url> --account-id <uuid> --status <active|suspended|disabled>
+```
+
 All three require an active administrator and return `403` with a fixed body to
 anyone else, including for a target account that does not exist, so the routes
 cannot be used to test whether an account is present.
