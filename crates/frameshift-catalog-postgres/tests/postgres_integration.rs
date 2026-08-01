@@ -3625,7 +3625,6 @@ async fn test_list_pack_versions() {
 #[ignore = "requires Docker"]
 async fn test_list_pack_versions_page() {
     let (catalog, _container) = setup_catalog().await;
-    let published_at = chrono::Utc::now();
 
     catalog
         .register_author(make_author(73, "version-pager"))
@@ -3633,13 +3632,24 @@ async fn test_list_pack_versions_page() {
         .expect("register author failed");
 
     for (version, hash_seed) in [("1.2.0", 73), ("1.0.0", 74), ("1.1.0", 75)] {
-        let mut record = make_version("page-pack", version, 73, hash_seed);
-        record.published_at = published_at;
         catalog
-            .register_pack_version(record)
+            .register_pack_version(make_version("page-pack", version, 73, hash_seed))
             .await
             .expect("register paginated version failed");
     }
+
+    let published_at = chrono::Utc::now();
+    let mut conn = catalog
+        .pool()
+        .get()
+        .await
+        .expect("get pagination test connection failed");
+    diesel::update(pack_versions::table.filter(pack_versions::pack_name.eq("page-pack")))
+        .set(pack_versions::published_at.eq(published_at))
+        .execute(&mut *conn)
+        .await
+        .expect("align pagination test timestamps failed");
+    drop(conn);
 
     let page = catalog
         .list_pack_versions_page("page-pack", 2, 1)
