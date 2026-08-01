@@ -19,7 +19,7 @@ The binary is named `frameshift`.
 
 | Command | Purpose |
 |---|---|
-| `account` | Log in, inspect, or end an account session |
+| `account` | Register, log in, inspect, or end an account session |
 | `install` | Install a persona pack into the central store |
 | `activate` | Activate an installed persona for the current project |
 | `uninstall` | Remove an installed persona from the current project |
@@ -50,7 +50,10 @@ The binary is named `frameshift`.
 
 ### `frameshift account <ACTION>`
 
-Use `login`, `status`, or `logout` to manage the current account session.
+Use `register`, `login`, `status`, or `logout` to manage the current account
+session. Registration and first-party login collect secrets only through hidden
+interactive prompts. `login --first-party` selects password login when the
+registry also advertises OIDC.
 
 ### `frameshift install [OPTIONS] <SPEC>`
 

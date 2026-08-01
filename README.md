@@ -102,21 +102,31 @@ Registry commands use `https://frameshift-api.syntheos.dev` by default. Set `FRA
 
 ## Account sessions
 
-`frameshift account login` opens the configured OIDC provider in the system
-browser and receives the Authorization Code response on an exact IP-loopback
-callback. The flow uses S256 PKCE, a random state value, and a random nonce.
-Access and refresh tokens are stored only in the operating system's native
-credential store; the owner-only JSON file under the FrameShift data directory
-contains non-secret issuer, client, registry, scope, and expiry metadata.
+FrameShift supports registry-owned first-party accounts and OIDC providers.
+First-party registration and login collect credentials only through hidden
+interactive terminal prompts. OIDC login opens the configured provider in the
+system browser and receives the Authorization Code response on an exact
+IP-loopback callback using S256 PKCE, random state, and a random nonce.
+
+All native bearer credentials are stored only in the operating system's
+credential store. The owner-only JSON file under the FrameShift data directory
+contains provider-tagged public metadata and never contains a token, password,
+or invitation.
 
 ```bash
-# Use the production registry's advertised issuer and the frameshift-cli client ID.
+# Redeem a single-use invitation and create a first-party account.
+frameshift account register
+
+# Use the registry's advertised provider. OIDC remains preferred when both exist.
 frameshift account login
+
+# Explicitly use first-party password login when OIDC is also advertised.
+frameshift account login --first-party
 
 # Confirm the server-validated account and publisher memberships.
 frameshift account status
 
-# Attempt provider revocation, then erase the exact local credential and metadata.
+# Revoke the provider session, then erase the exact local credential and metadata.
 frameshift account logout
 ```
 
@@ -124,7 +134,8 @@ Deployments that register a different public OAuth client set
 `FRAMESHIFT_OIDC_CLIENT_ID`. `FRAMESHIFT_OIDC_ISSUER` overrides registry issuer
 discovery, and `--redirect-uri` selects another pre-registered IP-loopback
 callback. Login never accepts a bearer token through arguments, environment
-variables, stdin, or copy/paste.
+variables, or command-line values. First-party credentials require an
+interactive terminal and are read through hidden prompts.
 
 ## Automate mode
 

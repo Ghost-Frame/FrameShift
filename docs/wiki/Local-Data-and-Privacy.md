@@ -58,14 +58,17 @@ already received by a configured endpoint.
 
 ## Account sessions
 
-Account login uses an OIDC authorization-code flow with S256 PKCE, state, and
-nonce validation. Access and refresh tokens are stored only through the
-operating system's native credential store. The adjacent JSON metadata contains
-non-secret issuer, client, registry, scope, and expiry information.
+Account login supports first-party credentials and OIDC. First-party passwords
+and invitation tokens are accepted only through hidden interactive prompts.
+OIDC uses an authorization-code flow with S256 PKCE, state, and nonce
+validation. All native bearer credentials are stored only through the operating
+system's credential store. The adjacent JSON contains provider-tagged public
+metadata and no token, password, or invitation.
 
-`frameshift account logout` attempts provider revocation, then removes the
-exact local credential and its metadata. A provider being unreachable does not
-turn the token into a local plaintext file.
+`frameshift account logout` requests the matching OIDC or first-party
+revocation operation, then removes the exact local credential and its metadata.
+A provider being unreachable does not turn the token into a local plaintext
+file.
 
 ## Vault privacy
 
