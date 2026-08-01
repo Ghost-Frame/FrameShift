@@ -7,7 +7,7 @@
 
 use frameshift_client::{Client, InstallRequest, InstallSource, PersonaSpec};
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Component, PathBuf};
 
 /// Dispatch a JSON-RPC method call to the appropriate handler function.
 ///
@@ -39,9 +39,9 @@ pub fn dispatch(
 /// Params: `{ "project_root": "<path>" }`
 /// Returns: `{ "project_id": "<hex-id>" }`
 fn handle_project_id(params: Option<Value>, client: &Client) -> Result<Value, (i32, String)> {
-    let root = get_str(&params, "project_root")?;
+    let root = get_path(&params, "project_root")?;
     let project_id = client
-        .project_id(&PathBuf::from(&root))
+        .project_id(&root)
         .map_err(|e| (crate::protocol::INTERNAL_ERROR, e.to_string()))?;
     Ok(serde_json::json!({ "project_id": project_id }))
 }
@@ -52,7 +52,7 @@ fn handle_project_id(params: Option<Value>, client: &Client) -> Result<Value, (i
 /// Returns: `{ "persona": "<name>", "version": "<ver>", "hash": "<hex>" }`
 fn handle_install(params: Option<Value>, client: &Client) -> Result<Value, (i32, String)> {
     let spec_str = get_str(&params, "spec")?;
-    let root = get_str(&params, "project_root")?;
+    let root = get_path(&params, "project_root")?;
 
     let spec: PersonaSpec = spec_str
         .parse()
@@ -65,14 +65,14 @@ fn handle_install(params: Option<Value>, client: &Client) -> Result<Value, (i32,
         .and_then(|p| p.get("from_path"))
         .and_then(|v| v.as_str())
     {
-        InstallSource::LocalPath(PathBuf::from(from_path))
+        InstallSource::LocalPath(validate_path_arg(from_path, "from_path")?)
     } else {
         InstallSource::Registry
     };
 
     let report = client
         .install(InstallRequest {
-            project_root: PathBuf::from(&root),
+            project_root: root,
             spec,
             source,
         })
@@ -99,10 +99,10 @@ fn handle_install(params: Option<Value>, client: &Client) -> Result<Value, (i32,
 /// Returns: `{ "activated": "<name>" }`
 fn handle_activate(params: Option<Value>, client: &Client) -> Result<Value, (i32, String)> {
     let persona = get_str(&params, "persona")?;
-    let root = get_str(&params, "project_root")?;
+    let root = get_path(&params, "project_root")?;
 
     client
-        .activate(&PathBuf::from(&root), &persona)
+        .activate(&root, &persona)
         .map_err(|e| (crate::protocol::INTERNAL_ERROR, e.to_string()))?;
 
     Ok(serde_json::json!({ "activated": persona }))
@@ -113,10 +113,10 @@ fn handle_activate(params: Option<Value>, client: &Client) -> Result<Value, (i32
 /// Params: `{ "project_root": "<path>" }`
 /// Returns: `{ "personas": ["<name>", ...] }`
 fn handle_sync(params: Option<Value>, client: &Client) -> Result<Value, (i32, String)> {
-    let root = get_str(&params, "project_root")?;
+    let root = get_path(&params, "project_root")?;
 
     let report = client
-        .sync(&PathBuf::from(&root))
+        .sync(&root)
         .map_err(|e| (crate::protocol::INTERNAL_ERROR, e.to_string()))?;
 
     // `failures` is additive: locked personas that could not be materialized
@@ -146,12 +146,12 @@ fn handle_gc(_params: Option<Value>, client: &Client) -> Result<Value, (i32, Str
 /// Params: `{ "project_root": "<path>", "persona": "<name>", "text": "<growth-entry>" }`
 /// Returns: `{ "appended": true }`
 fn handle_grow_append(params: Option<Value>, client: &Client) -> Result<Value, (i32, String)> {
-    let root = get_str(&params, "project_root")?;
+    let root = get_path(&params, "project_root")?;
     let persona = get_str(&params, "persona")?;
     let text = get_str(&params, "text")?;
 
     let project_id = client
-        .project_id(&PathBuf::from(&root))
+        .project_id(&root)
         .map_err(|e| (crate::protocol::INTERNAL_ERROR, e.to_string()))?;
 
     frameshift_growth::append(client.data_root(), &project_id, &persona, &text)
@@ -177,7 +177,35 @@ fn get_str(params: &Option<Value>, key: &str) -> Result<String, (i32, String)> {
         })
 }
 
+/// Extract and validate a required absolute filesystem path from the params object.
+fn get_path(params: &Option<Value>, key: &str) -> Result<PathBuf, (i32, String)> {
+    let raw = get_str(params, key)?;
+    validate_path_arg(&raw, key)
+}
+
+/// Reject relative paths and lexical parent-directory traversal at the IPC boundary.
+fn validate_path_arg(raw: &str, key: &str) -> Result<PathBuf, (i32, String)> {
+    let path = PathBuf::from(raw);
+    if !path.is_absolute() {
+        return Err((
+            crate::protocol::INVALID_PARAMS,
+            format!("{key} path must be absolute: {path:?}"),
+        ));
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err((
+            crate::protocol::INVALID_PARAMS,
+            format!("{key} path must not contain '..': {path:?}"),
+        ));
+    }
+    Ok(path)
+}
+
 #[cfg(test)]
+/// Tests JSON-RPC dispatch results and validation at the daemon boundary.
 mod tests {
     use super::*;
     use frameshift_client::{Client, ClientOptions};
@@ -189,6 +217,54 @@ mod tests {
             config_root: None,
             vault: None,
         })
+    }
+
+    /// Build valid method parameters around a supplied project root.
+    fn path_method_params(project_root: &str) -> [(&'static str, Value); 5] {
+        [
+            (
+                "project_id",
+                serde_json::json!({ "project_root": project_root }),
+            ),
+            (
+                "install",
+                serde_json::json!({
+                    "spec": "devtools@1.0.0",
+                    "project_root": project_root
+                }),
+            ),
+            (
+                "activate",
+                serde_json::json!({
+                    "persona": "devtools",
+                    "project_root": project_root
+                }),
+            ),
+            ("sync", serde_json::json!({ "project_root": project_root })),
+            (
+                "grow.append",
+                serde_json::json!({
+                    "project_root": project_root,
+                    "persona": "devtools",
+                    "text": "test entry"
+                }),
+            ),
+        ]
+    }
+
+    /// Assert that every project-scoped daemon method rejects an unsafe path.
+    fn assert_project_path_rejected(project_root: &str, expected_message: &str) {
+        let tmp = tempfile::tempdir().unwrap();
+        let client = test_client(&tmp);
+
+        for (method, params) in path_method_params(project_root) {
+            let (code, message) = dispatch(method, Some(params), &client).unwrap_err();
+            assert_eq!(code, crate::protocol::INVALID_PARAMS, "method: {method}");
+            assert!(
+                message.contains(expected_message),
+                "method {method} returned unexpected message: {message}"
+            );
+        }
     }
 
     /// Verify that dispatching an unknown method returns METHOD_NOT_FOUND.
@@ -220,6 +296,50 @@ mod tests {
             .as_str()
             .expect("project_id should be a string");
         assert!(!id.is_empty());
+    }
+
+    /// Verify that every project-scoped method rejects relative project roots.
+    #[test]
+    fn project_methods_reject_relative_roots() {
+        assert_project_path_rejected("relative/project", "project_root path must be absolute");
+    }
+
+    /// Verify that every project-scoped method rejects lexical parent traversal.
+    #[test]
+    fn project_methods_reject_parent_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let unsafe_root = tmp.path().join("project").join("..").join("outside");
+        assert_project_path_rejected(
+            unsafe_root.to_str().unwrap(),
+            "project_root path must not contain '..'",
+        );
+    }
+
+    /// Verify that install rejects unsafe local pack paths before client operations.
+    #[test]
+    fn install_rejects_unsafe_local_source_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let client = test_client(&tmp);
+        let parent_path = tmp.path().join("pack").join("..").join("outside");
+        let cases = [
+            ("relative/pack", "from_path path must be absolute"),
+            (
+                parent_path.to_str().unwrap(),
+                "from_path path must not contain '..'",
+            ),
+        ];
+
+        for (from_path, expected_message) in cases {
+            let params = serde_json::json!({
+                "spec": "devtools@1.0.0",
+                "project_root": tmp.path(),
+                "from_path": from_path
+            });
+
+            let (code, message) = dispatch("install", Some(params), &client).unwrap_err();
+            assert_eq!(code, crate::protocol::INVALID_PARAMS);
+            assert!(message.contains(expected_message));
+        }
     }
 
     /// Verify that `gc` returns a result containing the `removed` key.
