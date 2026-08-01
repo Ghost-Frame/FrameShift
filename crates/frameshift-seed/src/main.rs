@@ -1,20 +1,20 @@
 //! One-shot seeder for the frameshift catalog and object store.
 //!
 //! Reads persona directories from a configurable root path, builds a pack for
-//! each directory that carries a `pack.toml` manifest, a legacy `persona.toml`,
-//! or an `AGENTS.md` file. A missing `pack.toml` is synthesized; a `pack.toml`
-//! that already exists (as every curated `personas/*` directory does) has its
-//! placeholder `author_pubkey` repaired in place so the strict manifest parser
-//! can load it. The pack is then signed with the seed Ed25519 key, packaged into
-//! a gzipped tar archive stored in the object store, and the pack version and
-//! author are registered in the catalog.
+//! each directory that carries either typed persona source or a Markdown render
+//! source. A missing `pack.toml` is synthesized; an existing manifest may have
+//! its placeholder `author_pubkey` repaired in place so the strict parser can
+//! load it. Manifest-only source directories in the public catalog are ignored
+//! because clients cannot materialize behavioral output from a manifest alone.
+//! Complete packs are signed with the Ed25519 key, packaged into a gzipped tar
+//! archive stored in the object store, and registered in the catalog.
 //!
 //! # Usage
 //!
 //! ```text
 //! POSTGRES_URL=postgres://... \
 //! OBJECT_STORE_ROOT=/tmp/frameshift-objects \
-//! PERSONAS_ROOT=/path/to/personas \
+//! PERSONAS_ROOT=/path/to/complete-personas \
 //! frameshift-seed
 //! ```
 //!
@@ -24,9 +24,10 @@
 //! # Key management
 //!
 //! On first run the seeder generates a fresh Ed25519 signing keypair and writes
-//! the secret seed bytes to `$OBJECT_STORE_ROOT/../seed-signing-key.bin` (32
-//! raw bytes). Subsequent runs that find this file load the same key, producing
-//! stable author pubkey and signatures across re-seeds.
+//! the secret seed bytes to
+//! `$OBJECT_STORE_ROOT/../seed-signing-key-<author>.bin` (32 raw bytes).
+//! Subsequent runs that find this file load the same key, producing stable
+//! author pubkey and signatures across re-seeds.
 //!
 //! # Idempotency
 //!
@@ -238,16 +239,29 @@ impl SeedConfig {
     }
 }
 
-/// Whether a directory looks like a persona pack worth seeding.
+/// Whether a directory contains enough behavioral source for a runtime pack.
 ///
-/// Any of the three marker files is sufficient: `pack.toml` (curated
-/// `personas/*` directories in this repo are pack.toml-only by design),
-/// a legacy `persona.toml`, or an `AGENTS.md`. `pack.toml` is synthesized
-/// from the legacy files when it is the only one absent.
+/// `pack.toml` is the pack manifest, not a behavioral render source. Eligible
+/// directories must also carry typed source or a Markdown file discoverable by
+/// the client. A missing manifest is synthesized for legacy sources.
 fn is_persona_dir(path: &Path) -> bool {
-    path.join("pack.toml").exists()
-        || path.join("persona.toml").exists()
-        || path.join("AGENTS.md").exists()
+    path.join("persona.toml").is_file() || has_markdown_render_source(path)
+}
+
+/// Match the client's legacy Markdown discovery contract for runtime packs.
+fn has_markdown_render_source(path: &Path) -> bool {
+    ["AGENTS.md", "CLAUDE.md", "GEMINI.md", "README.md"]
+        .iter()
+        .any(|name| path.join(name).is_file())
+        || std::fs::read_dir(path).is_ok_and(|entries| {
+            entries.filter_map(Result::ok).any(|entry| {
+                let candidate = entry.path();
+                candidate.is_file()
+                    && candidate
+                        .extension()
+                        .is_some_and(|extension| extension == "md")
+            })
+        })
 }
 
 /// Derive a stable default key path that is namespaced by author handle.
@@ -824,10 +838,9 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use tempfile::TempDir;
 
-    /// A pack.toml fixture shaped exactly like the curated `personas/*`
-    /// directories in this repo: pack.toml-only, with the literal
-    /// `"UNSIGNED"` author_pubkey placeholder and first-class
-    /// description/tags (commit b75344d).
+    /// A pack.toml fixture shaped like the manifest-only public catalog, with
+    /// the literal `"UNSIGNED"` author_pubkey placeholder and first-class
+    /// description and tags.
     const CURATED_PACK_TOML: &str = r#"# Curated persona pack manifest.
 schema_version = 1
 name = "agents"
@@ -854,18 +867,47 @@ memory_required_ops = []
     }
 
     #[test]
-    /// A pack.toml-only directory (no persona.toml, no AGENTS.md) must pass
-    /// the persona-directory gate -- this is the exact shape of every
-    /// `personas/*` directory in the repo.
-    fn is_persona_dir_accepts_pack_toml_only() {
+    /// A manifest-only catalog entry must not pass the runtime-content gate.
+    fn is_persona_dir_rejects_pack_toml_only() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("pack.toml"), CURATED_PACK_TOML).unwrap();
+        assert!(!is_persona_dir(tmp.path()));
+    }
+
+    #[test]
+    /// A Markdown-backed pack is complete enough for runtime distribution.
+    fn is_persona_dir_accepts_markdown_source() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("pack.toml"), CURATED_PACK_TOML).unwrap();
+        std::fs::write(tmp.path().join("AGENTS.md"), "# Agents\n").unwrap();
         assert!(is_persona_dir(tmp.path()));
     }
 
     #[test]
-    /// A directory with none of the three marker files is not a persona dir
-    /// (this is the shape of `personas/assets/`, which holds only images).
+    /// An arbitrary Markdown filename remains compatible with legacy clients.
+    fn is_persona_dir_accepts_legacy_markdown_fallback() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("pack.toml"), CURATED_PACK_TOML).unwrap();
+        std::fs::write(tmp.path().join("BEHAVIOR.md"), "# Behavior\n").unwrap();
+        assert!(is_persona_dir(tmp.path()));
+    }
+
+    #[test]
+    /// Typed source is client-renderable runtime content even without Markdown.
+    fn is_persona_dir_accepts_typed_source() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("pack.toml"), CURATED_PACK_TOML).unwrap();
+        std::fs::write(
+            tmp.path().join("persona.toml"),
+            "schema_version = 1\nname = \"agents\"\n[voice]\ntone = \"precise\"\n",
+        )
+        .unwrap();
+        assert!(is_persona_dir(tmp.path()));
+    }
+
+    #[test]
+    /// A directory without a typed or Markdown render source is not a persona
+    /// directory (this is the shape of `personas/assets/`, which holds images).
     fn is_persona_dir_rejects_directory_with_no_markers() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("banner.png"), b"not a persona").unwrap();
@@ -978,13 +1020,16 @@ memory_required_ops = []
     }
 
     #[test]
-    /// End-to-end: a pack.toml-only persona directory shaped exactly like a
-    /// curated `personas/*` entry must survive the full pre-seed pipeline --
-    /// gate, pubkey repair, and `Pack::from_dir` + sign -- without the
-    /// missing persona.toml/AGENTS.md ever being required.
-    fn pack_toml_only_persona_seeds_end_to_end() {
+    /// End-to-end: a complete Markdown-backed persona survives the build
+    /// pipeline and produces an archive with behavioral content.
+    fn markdown_persona_seeds_end_to_end() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("pack.toml"), CURATED_PACK_TOML).unwrap();
+        std::fs::write(
+            tmp.path().join("AGENTS.md"),
+            "# Agents\n\nCoordinate work.\n",
+        )
+        .unwrap();
 
         // 1. Gate: must be recognized as a persona dir.
         assert!(is_persona_dir(tmp.path()));
@@ -996,7 +1041,7 @@ memory_required_ops = []
         repair_placeholder_author_pubkey(&pack_toml_path, &verifying_key).unwrap();
 
         // 3. Load: Pack::from_dir must now succeed against the repaired manifest.
-        let mut pack = Pack::from_dir(tmp.path()).expect("pack.toml-only persona must load");
+        let mut pack = Pack::from_dir(tmp.path()).expect("complete persona must load");
         assert_eq!(pack.manifest().name, "agents");
 
         // 4. Sign: the loaded pack must be signable, exactly as seed_persona does.
@@ -1009,12 +1054,27 @@ memory_required_ops = []
             bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b,
             "object-store payload must be a gzip stream"
         );
+        let mut archive =
+            tar::Archive::new(flate2::read::GzDecoder::new(std::io::Cursor::new(&bytes)));
+        let names = archive
+            .entries()
+            .expect("archive entries")
+            .map(|entry| {
+                entry
+                    .expect("archive entry")
+                    .path()
+                    .expect("archive path")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        assert!(names.iter().any(|name| name == "AGENTS.md"));
 
         // 6. Metadata: the marketplace description/tags must come straight from
         //    pack.toml, not from a nonexistent persona.toml/AGENTS.md fallback.
         let metadata = derive_pack_metadata(tmp.path(), "agents")
             .expect("metadata derivation must not error")
-            .expect("pack.toml-only dir must yield metadata");
+            .expect("complete persona dir must yield metadata");
         assert_eq!(metadata.name, "agents");
         assert_eq!(
             metadata.description,

@@ -41,6 +41,65 @@ fn source_with_l1_rule(name: &str, rule_id: &str, rule_text: &str) -> PersonaSou
     src
 }
 
+/// Installing standalone typed source renders target-specific Markdown even
+/// when the pack carries no pre-rendered Markdown and declares no composition.
+#[test]
+fn install_renders_standalone_typed_source_without_markdown() {
+    let temp = TempDir::new().expect("tempdir");
+    let data_root = temp.path().join("data-root");
+    let project_root = temp.path().join("project");
+    fs::create_dir_all(&project_root).expect("create project");
+
+    let client = Client::new(ClientOptions {
+        data_root: data_root.clone(),
+        config_root: None,
+        vault: None,
+    });
+    let pack_dir = temp.path().join("typed-pack");
+    write_pack_manifest(
+        &pack_dir,
+        r#"
+schema_version = 1
+name = "typed"
+author_handle = "alice"
+author_pubkey = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+version = "0.1.0"
+"#,
+        &[],
+    );
+    source_with_l1_rule("typed", "authority", "The server owns consequential state.")
+        .write_to_dir(&pack_dir)
+        .expect("write typed source");
+
+    client
+        .install(InstallRequest {
+            project_root: project_root.clone(),
+            spec: PersonaSpec {
+                name: "typed".to_string(),
+                version: "0.1.0".to_string(),
+            },
+            source: InstallSource::LocalPath(pack_dir),
+        })
+        .expect("install standalone typed source");
+
+    let project_id = client.project_id(&project_root).expect("project id");
+    for (target, filename) in [
+        ("claude", "CLAUDE.md"),
+        ("codex", "AGENTS.md"),
+        ("gemini", "GEMINI.md"),
+        ("generic", "AGENTS.md"),
+    ] {
+        let rendered = data_root
+            .join("projects")
+            .join(&project_id)
+            .join("personas/typed/rendered")
+            .join(target)
+            .join(filename);
+        let content = fs::read_to_string(rendered).expect("read typed render");
+        assert!(content.contains("The server owns consequential state."));
+    }
+}
+
 /// Installing a child pack that `extends` an already-installed base composes
 /// the base's rules into the child's rendered output.
 #[test]
@@ -67,9 +126,7 @@ author_handle = "alice"
 author_pubkey = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 version = "0.1.0"
 "#,
-        // Base does not itself declare extends/mixin, so it takes the unchanged
-        // markdown render path, which requires a renderable markdown source.
-        &[("AGENTS.md", "# base\n")],
+        &[],
     );
     source_with_l1_rule("base", "base-rule", "Base rule text.")
         .write_to_dir(&base_dir)
@@ -162,7 +219,7 @@ author_handle = "alice"
 author_pubkey = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 version = "0.1.0"
 "#,
-        &[("AGENTS.md", "# grandparent\n")],
+        &[],
     );
     source_with_l1_rule("grandparent", "grandparent-rule", "Grandparent rule text.")
         .write_to_dir(&grandparent_dir)
@@ -325,9 +382,7 @@ author_handle = "alice"
 author_pubkey = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 version = "0.1.0"
 "#,
-        // Base does not itself declare extends/mixin, so it takes the unchanged
-        // markdown render path, which requires a renderable markdown source.
-        &[("AGENTS.md", "# base\n")],
+        &[],
     );
     source_with_l1_rule("base", "no-panic", "Never panic.")
         .write_to_dir(&base_dir)
@@ -355,9 +410,7 @@ author_handle = "alice"
 author_pubkey = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 version = "0.1.0"
 "#,
-        // Mixin does not itself declare extends/mixin, so it also takes the
-        // unchanged markdown render path.
-        &[("AGENTS.md", "# strictmixin\n")],
+        &[],
     );
     source_with_l1_rule("strictmixin", "no-panic", "Never panic (mixin).")
         .write_to_dir(&mixin_dir)

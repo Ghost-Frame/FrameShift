@@ -1198,29 +1198,29 @@ impl Client {
         })
     }
 
-    /// Renders a single persona's output into `rendered_root`, composing with
-    /// its declared `extends`/`mixin` bases when the pack has typed source.
+    /// Renders a single persona's output into `rendered_root`, using typed
+    /// source whenever present and composing declared `extends`/`mixin` bases.
     ///
-    /// Reads `pack.toml` from `cache_path` to decide which of three paths to
+    /// Reads `pack.toml` from `cache_path` to decide which render path to
     /// take:
-    /// - No `extends`/`mixin` declared: unchanged behavior, delegates to
-    ///   [`materialize_rendered_outputs`] (markdown render source).
-    /// - `extends`/`mixin` declared AND `persona.toml` present: composes the
-    ///   root with its resolved bases via `frameshift_compose::Composer`,
-    ///   renders the composed result for every target, and applies the same
-    ///   infra overlay as the non-composition path. Composition failures
-    ///   (missing base, L1 override) propagate as `ClientError::Compose`.
+    /// - `persona.toml` present without composition: renders the typed source
+    ///   directly for every target.
+    /// - `extends`/`mixin` declared and `persona.toml` present: composes the root
+    ///   with its resolved bases before rendering every target. Composition
+    ///   failures propagate as `ClientError::Compose`.
+    /// - No typed source and no composition: delegates to
+    ///   [`materialize_rendered_outputs`] using a Markdown render source.
     /// - `extends`/`mixin` declared but no `persona.toml`: warns and falls
     ///   back to the markdown-only render path, since there is no typed
     ///   source for the composer to operate on.
     ///
-    /// Independently of which of the three paths above is taken: if the pack
+    /// Independently of which path above is taken: if the pack
     /// at `cache_path` ships a `pack.template.toml` manifest, every render
     /// target's markdown is additionally passed through `{{token}}`
     /// substitution (see [`load_template_context`] / [`substitute_tokens`])
     /// before being written. The vault is opened at most once per call
-    /// (not once per render target). Packs that ship no such manifest render
-    /// byte-identically to how they did before this feature existed.
+    /// (not once per render target). Packs without that manifest do not open
+    /// the vault or run template substitution.
     fn materialize_persona_rendered_outputs(
         &self,
         cache_dir: &Path,
@@ -1251,76 +1251,57 @@ impl Client {
         let template_ctx =
             load_template_context(cache_path, vault_path, self.vault.as_ref(), persona_name)?;
 
-        if has_composition && has_typed_source {
-            // Fail closed on unsupported multi-level composition. The composer
-            // invoked just below resolves exactly one level: this pack's own
-            // `extends`/`mixin` against their cached bases. It does not recurse
-            // into a base's *own* declared `extends`/`mixin`, so if a resolved
-            // base itself declares composition, the grandparent's rules would
-            // be silently dropped rather than composed in -- most dangerous
-            // when the dropped layer carries inherited L1 safety rules. Detect
-            // that case up front and hard-error instead of attempting full
-            // recursive multi-level composition (out of scope; see
-            // `reject_unsupported_multi_level_base`).
-            if let Some(extends_spec) = manifest.extends.as_deref() {
-                reject_unsupported_multi_level_base(
-                    cache_dir,
-                    lockfile,
-                    persona_name,
-                    extends_spec,
+        if has_typed_source {
+            let source = if has_composition {
+                // Fail closed on unsupported multi-level composition. The
+                // composer resolves exactly one level and would otherwise drop
+                // a grandparent's inherited rules.
+                if let Some(extends_spec) = manifest.extends.as_deref() {
+                    reject_unsupported_multi_level_base(
+                        cache_dir,
+                        lockfile,
+                        persona_name,
+                        extends_spec,
+                    )?;
+                }
+                for mixin_spec in &manifest.mixin {
+                    reject_unsupported_multi_level_base(
+                        cache_dir,
+                        lockfile,
+                        persona_name,
+                        mixin_spec,
+                    )?;
+                }
+
+                let root = frameshift_source::PersonaSource::load_from_dir(cache_path)
+                    .map_err(frameshift_compose::ComposeError::from)?;
+                let resolver = compose_support::CacheResolver::new(cache_dir, lockfile);
+                let composed = frameshift_compose::Composer::new(resolver).compose(
+                    root,
+                    manifest.extends.clone(),
+                    &manifest.mixin,
                 )?;
-            }
-            for mixin_spec in &manifest.mixin {
-                reject_unsupported_multi_level_base(cache_dir, lockfile, persona_name, mixin_spec)?;
-            }
 
-            let root = frameshift_source::PersonaSource::load_from_dir(cache_path)
-                .map_err(frameshift_compose::ComposeError::from)?;
-            let resolver = compose_support::CacheResolver::new(cache_dir, lockfile);
-            let composed = frameshift_compose::Composer::new(resolver).compose(
-                root,
-                manifest.extends.clone(),
-                &manifest.mixin,
+                for collision in &composed.rule_collisions {
+                    warn!(persona = persona_name, id = %collision.id, layers = ?collision.layers, "rule id collision during composition");
+                }
+                for collision in &composed.skill_collisions {
+                    warn!(persona = persona_name, id = %collision.id, layers = ?collision.layers, "skill id collision during composition");
+                }
+
+                composed.into_source()
+            } else {
+                frameshift_source::PersonaSource::load_from_dir(cache_path)
+                    .map_err(frameshift_compose::ComposeError::from)?
+            };
+
+            materialize_typed_source_outputs(
+                &source,
+                rendered_root,
+                persona_name,
+                self.config_root.as_deref(),
+                template_ctx.as_ref(),
             )?;
-
-            for collision in &composed.rule_collisions {
-                warn!(persona = persona_name, id = %collision.id, layers = ?collision.layers, "rule id collision during composition");
-            }
-            for collision in &composed.skill_collisions {
-                warn!(persona = persona_name, id = %collision.id, layers = ?collision.layers, "skill id collision during composition");
-            }
-
-            let src = composed.into_source();
-            for (target_dir, filename, target) in [
-                (
-                    "claude",
-                    "CLAUDE.md",
-                    frameshift_source::RenderTarget::Claude,
-                ),
-                ("codex", "AGENTS.md", frameshift_source::RenderTarget::Codex),
-                (
-                    "gemini",
-                    "GEMINI.md",
-                    frameshift_source::RenderTarget::Gemini,
-                ),
-                (
-                    "generic",
-                    "AGENTS.md",
-                    frameshift_source::RenderTarget::Generic,
-                ),
-            ] {
-                let markdown = frameshift_source::render_to_markdown(&src, target);
-                let composed_content =
-                    compose_rendered_content(persona_name, &markdown, self.config_root.as_deref());
-                let context =
-                    format!("rendered markdown for persona {persona_name:?} (target {target_dir})");
-                let final_content =
-                    substitute_tokens(&composed_content, &context, template_ctx.as_ref())?;
-                let dir = rendered_root.join(target_dir);
-                ensure_dir(&dir)?;
-                write_file(&dir.join(filename), final_content.as_bytes())?;
-            }
-
             return Ok(());
         }
 
@@ -1339,6 +1320,45 @@ impl Client {
             template_ctx.as_ref(),
         )
     }
+}
+
+/// Render typed persona source into each supported agent target.
+fn materialize_typed_source_outputs(
+    source: &frameshift_source::PersonaSource,
+    rendered_root: &Path,
+    persona_name: &str,
+    config_root: Option<&Path>,
+    template_ctx: Option<&(frameshift_template::TemplateManifest, VaultData)>,
+) -> Result<(), ClientError> {
+    for (target_dir, filename, target) in [
+        (
+            "claude",
+            "CLAUDE.md",
+            frameshift_source::RenderTarget::Claude,
+        ),
+        ("codex", "AGENTS.md", frameshift_source::RenderTarget::Codex),
+        (
+            "gemini",
+            "GEMINI.md",
+            frameshift_source::RenderTarget::Gemini,
+        ),
+        (
+            "generic",
+            "AGENTS.md",
+            frameshift_source::RenderTarget::Generic,
+        ),
+    ] {
+        let markdown = frameshift_source::render_to_markdown(source, target);
+        let composed = compose_rendered_content(persona_name, &markdown, config_root);
+        let context =
+            format!("rendered markdown for persona {persona_name:?} (target {target_dir})");
+        let final_content = substitute_tokens(&composed, &context, template_ctx)?;
+        let dir = rendered_root.join(target_dir);
+        ensure_dir(&dir)?;
+        write_file(&dir.join(filename), final_content.as_bytes())?;
+    }
+
+    Ok(())
 }
 
 /// Fail closed if the persona `spec` (an `extends` or `mixin` entry, in
