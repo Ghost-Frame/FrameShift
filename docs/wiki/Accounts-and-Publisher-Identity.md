@@ -73,6 +73,14 @@ A publisher profile is the durable owner shown with account-backed releases.
 Its handle is the public name; its UUID is the stable identity used for
 ownership checks even if display metadata changes.
 
+Anyone can inspect the public profile without an account session:
+
+```bash
+frameshift account show-publisher \
+  --server https://frameshift-api.syntheos.dev \
+  --handle PUBLISHER_HANDLE
+```
+
 Publisher operations require an active account membership with the appropriate
 role. Create the profile from the authenticated CLI session:
 

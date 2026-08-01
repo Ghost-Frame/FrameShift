@@ -458,6 +458,38 @@ pub fn get_account(
     }
 }
 
+/// Fetch one public publisher profile by handle.
+///
+/// This endpoint is intentionally unauthenticated because publisher profiles
+/// are public registry metadata.
+///
+/// # Errors
+///
+/// Returns a registry URL, transport, status, size, or JSON error.
+pub fn get_publisher_profile(
+    server_url: &str,
+    handle: &str,
+) -> Result<PublisherProfileRecord, ClientError> {
+    let url = crate::publisher::registry_endpoint_url(server_url, &["v1", "publishers", handle])?;
+    let request = ureq::AgentBuilder::new()
+        .redirects(0)
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .get(url.as_str());
+    match request.call() {
+        Ok(response) => crate::registry::response_json_bounded(response, url.as_str()),
+        Err(ureq::Error::Status(status, response)) => Err(ClientError::RegistryRejected {
+            url: url.to_string(),
+            status,
+            message: crate::registry::response_text_bounded(response, url.as_str()),
+        }),
+        Err(error) => Err(ClientError::RegistryHttp {
+            url: url.to_string(),
+            detail: error.to_string(),
+        }),
+    }
+}
+
 /// Update mutable metadata for the authenticated account.
 ///
 /// Omitted fields retain their current values. Text validation remains owned
@@ -854,6 +886,19 @@ mod tests {
         assert!(request.starts_with("GET /v1/account HTTP/1.1\r\n"));
         assert!(request.contains("\r\nAuthorization: Bearer test-access-token\r\n"));
         assert_eq!(request.matches("test-access-token").count(), 1);
+    }
+
+    /// Public publisher lookup preserves base paths without adding authority.
+    #[test]
+    fn fetches_public_publisher_profile_without_authorization() {
+        let (server, handle) = serve_json_response(publisher_json());
+        let server = format!("{server}/registry");
+        let publisher =
+            get_publisher_profile(&server, "gatekeeper").expect("publisher profile response");
+        assert_eq!(publisher.handle, "gatekeeper");
+        let request = handle.join().expect("publisher request thread");
+        assert!(request.starts_with("GET /registry/v1/publishers/gatekeeper HTTP/1.1\r\n"));
+        assert!(!request.to_ascii_lowercase().contains("authorization:"));
     }
 
     /// Profile mutations preserve base paths, bearer authority, and exact JSON fields.
