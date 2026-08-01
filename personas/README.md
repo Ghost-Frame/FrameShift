@@ -142,6 +142,7 @@ Resolution order: base -> mixins (in order) -> root persona. Conflicting rule ID
 | `lab/` | Experimenter. Speed over polish, findings over artifacts |
 | `memory/` | Memory architect. Vector search, embedding pipelines, recall fidelity over latency |
 | `mobile-dev/` | Mobile developer. iOS, Android, React Native, Flutter, native feel where it matters |
+| `mmo-simulation-engineer/` | MMO simulation engineer. Keeps authoritative gameplay deterministic across servers, clients, persistence, and headless worlds |
 | `orchestrator/` | Task decomposer. Dispatches subagents in parallel, supervises, integrates results |
 | `performance/` | Performance analyst. Profiles before optimizing, benchmarks before claiming |
 | `pr-author/` | PR author. Descriptions, reviewer selection, draft management, follow-up tracking |
