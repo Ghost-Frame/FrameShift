@@ -169,7 +169,7 @@ fn run_oidc_login(
             authentication: SessionAuthentication::Oidc {
                 issuer,
                 client_id,
-                redirect_uri,
+                redirect_uri: Box::new(redirect_uri),
                 scopes: args.scopes,
             },
             registry_url,
@@ -633,7 +633,7 @@ fn session_client_for(stored: &StoredSession) -> Result<SessionClient, CliError>
     SessionClient::discover(SessionClientConfig {
         issuer: issuer.clone(),
         client_id: client_id.clone(),
-        redirect_uri: redirect_uri.clone(),
+        redirect_uri: redirect_uri.as_ref().clone(),
         scopes: scopes.clone(),
     })
     .map_err(|error| CliError::Account(error.to_string()))

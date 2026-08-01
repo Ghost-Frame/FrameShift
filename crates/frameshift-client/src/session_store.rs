@@ -86,8 +86,8 @@ pub enum SessionAuthentication {
         issuer: Url,
         /// Public OAuth client identifier.
         client_id: String,
-        /// Registered callback URI.
-        redirect_uri: Url,
+        /// Boxed registered callback URI that keeps the provider enum compact.
+        redirect_uri: Box<Url>,
         /// Requested OIDC scopes.
         scopes: Vec<String>,
     },
@@ -575,7 +575,7 @@ fn migrate_legacy_metadata(
         authentication: SessionAuthentication::Oidc {
             issuer: metadata.issuer,
             client_id: metadata.client_id,
-            redirect_uri: metadata.redirect_uri,
+            redirect_uri: Box::new(metadata.redirect_uri),
             scopes: metadata.scopes,
         },
         registry_url: metadata.registry_url,
@@ -827,7 +827,9 @@ mod tests {
             authentication: SessionAuthentication::Oidc {
                 issuer: Url::parse("https://issuer.example").expect("issuer URL"),
                 client_id: "frameshift-cli".to_string(),
-                redirect_uri: Url::parse("http://127.0.0.1:8765/callback").expect("redirect URL"),
+                redirect_uri: Box::new(
+                    Url::parse("http://127.0.0.1:8765/callback").expect("redirect URL"),
+                ),
                 scopes: vec!["openid".to_string(), "profile".to_string()],
             },
             registry_url: Url::parse("https://registry.example").expect("registry URL"),
@@ -918,7 +920,7 @@ mod tests {
         if let SessionAuthentication::Oidc { redirect_uri, .. } =
             &mut remote_http_redirect.authentication
         {
-            *redirect_uri = Url::parse("http://192.0.2.1:8765/callback").expect("redirect URL");
+            **redirect_uri = Url::parse("http://192.0.2.1:8765/callback").expect("redirect URL");
         }
         cases.push(remote_http_redirect);
 
