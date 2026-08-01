@@ -5,8 +5,14 @@
 //! file-change events without blocking.
 
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
-use std::path::Path;
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 use tokio::sync::mpsc;
+
+/// Fixed window used to coalesce filesystem notifications from one save.
+const WATCH_EVENT_BATCH_WINDOW: Duration = Duration::from_millis(100);
 
 /// Start a recursive file watcher on `watch_dir`.
 ///
@@ -53,7 +59,24 @@ pub fn start_watcher(
     Ok((w, rx))
 }
 
+/// Receive one path and collect every additional path queued during the batch window.
+///
+/// A fixed window bounds latency even when the watched tree changes continuously.
+/// The final queued batch is returned after sender closure; `None` is returned only
+/// when the channel is closed and empty.
+pub async fn recv_path_batch(rx: &mut mpsc::UnboundedReceiver<PathBuf>) -> Option<Vec<PathBuf>> {
+    let first_path = rx.recv().await?;
+    tokio::time::sleep(WATCH_EVENT_BATCH_WINDOW).await;
+
+    let mut paths = vec![first_path];
+    while let Ok(path) = rx.try_recv() {
+        paths.push(path);
+    }
+    Some(paths)
+}
+
 #[cfg(test)]
+/// Tests for raw watcher delivery and fixed-window path batching.
 mod tests {
     use super::*;
     use std::time::Duration;
@@ -76,5 +99,25 @@ mod tests {
             event.is_ok() && event.unwrap().is_some(),
             "expected a file-change event within 2 seconds"
         );
+    }
+
+    /// Verify that paths queued during the fixed window are returned together.
+    #[tokio::test]
+    async fn path_batch_collects_burst_and_preserves_final_queue() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(PathBuf::from("first")).unwrap();
+
+        let delayed_tx = tx.clone();
+        let delayed_send = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            delayed_tx.send(PathBuf::from("second")).unwrap();
+        });
+        drop(tx);
+
+        let batch = recv_path_batch(&mut rx).await.expect("batch should arrive");
+        delayed_send.await.unwrap();
+
+        assert_eq!(batch, vec![PathBuf::from("first"), PathBuf::from("second")]);
+        assert!(recv_path_batch(&mut rx).await.is_none());
     }
 }
