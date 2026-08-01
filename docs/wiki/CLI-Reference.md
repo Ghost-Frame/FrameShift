@@ -35,6 +35,8 @@ The binary is named `frameshift`.
 | `grow` | Append, inspect, or summarize local growth |
 | `verify` | Run persona conformance checks |
 | `publish` | Package a persona locally or publish it to a registry |
+| `publication` | Review, submit, and inspect account-backed publications |
+| `moderation` | Inspect, decide, and promote quarantined submissions |
 | `register` | Register this machine's author key under a registry handle |
 | `keys` | Manage local and account-enrolled publisher keys |
 | `search` | Search the registry pack catalog |
@@ -199,6 +201,33 @@ mutation.
 
 Package a persona into `--out <DIR>` or publish it through `--server <URL>`
 under `--handle <HANDLE>`.
+
+### `frameshift publication <ACTION>`
+
+Use `review` to bind human confirmation to an exact Creator Studio snapshot,
+`submit` to create the authenticated publication intent and upload that signed
+snapshot, and `status` to inspect the resulting submission. The submit command
+requires separate confirmations for the archive hash, publisher, signer key,
+and submission intent.
+
+### `frameshift moderation <ACTION>`
+
+Active moderators and administrators can inspect a known submission UUID with
+`show`, download its exact quarantine archive with `artifact`, apply `approve`,
+`request-changes`, or `reject` with `decide`, and publish an approved submission
+with `promote`. The server enforces role membership, lifecycle transitions, and
+independent-review separation.
+
+```bash
+frameshift moderation show --server https://registry.example --submission-id <UUID>
+frameshift moderation artifact --server https://registry.example --submission-id <UUID> --out submission.tar.gz
+frameshift moderation decide --server https://registry.example --submission-id <UUID> --action approve --reason-code reviewed
+frameshift moderation promote --server https://registry.example --submission-id <UUID>
+```
+
+`artifact` refuses to overwrite its destination. Decision and promotion
+failures print the generated operation and request UUID flags so an ambiguous
+request can be retried with the same identifiers.
 
 ## Project configuration and vault
 

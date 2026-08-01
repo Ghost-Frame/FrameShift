@@ -991,6 +991,14 @@ pub(crate) fn response_json_bounded<T: serde::de::DeserializeOwned>(
     })
 }
 
+/// Read a registry archive response under the shared compressed-body limit.
+pub(crate) fn response_archive_bytes_bounded(
+    response: ureq::Response,
+    url: &str,
+) -> Result<Vec<u8>, ClientError> {
+    response_bytes_bounded(response, url, MAX_ARCHIVE_BYTES)
+}
+
 /// Read a bounded registry error body as UTF-8 text.
 pub(crate) fn response_text_bounded(response: ureq::Response, url: &str) -> String {
     response_bytes_bounded(response, url, MAX_ERROR_RESPONSE_BYTES)
