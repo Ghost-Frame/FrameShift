@@ -2073,6 +2073,7 @@ dependencies = [
 name = "frameshift-cli"
 version = "0.10.0"
 dependencies = [
+ "chrono",
  "clap",
  "ed25519-dalek",
  "frameshift-catalog",

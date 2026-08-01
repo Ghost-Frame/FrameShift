@@ -1,16 +1,21 @@
 //! Human-reviewed Creator Studio publication commands.
 //!
-//! Review prepares and displays one exact artifact without persisting approval.
-//! Submit requires the displayed artifact, publisher, and key identifiers before
-//! it records local approval and crosses the authenticated quarantine boundary.
+//! Review and submission bind one exact artifact before quarantine admission.
+//! Owner lifecycle commands then expose withdrawal, immutable decision evidence,
+//! and appeals without weakening the authenticated server boundary.
 
+use chrono::{DateTime, Utc};
 use clap::{Args, Subcommand};
 use ed25519_dalek::SigningKey;
-use frameshift_catalog::{MembershipState, ObjectHash, PublisherRole};
+use frameshift_catalog::{
+    MembershipState, ObjectHash, PublicationAppealCursor, PublicationLifecycleCursor, PublisherRole,
+};
 use frameshift_client::account::{self, AccountView};
 use frameshift_client::identity::public_key_b64;
 use frameshift_client::publication::{
-    create_publication_intent, get_publication_submission, prepare_publication, submit_publication,
+    create_publication_intent, file_publication_appeal, get_publication_submission,
+    list_publication_appeals, list_publication_decisions, prepare_publication, submit_publication,
+    withdraw_publication_submission,
 };
 use frameshift_client::{
     Client, EnrolledPublisherKey, EnrolledPublisherKeyState, PublicationReviewBinding,
@@ -81,6 +86,81 @@ pub enum PublicationCommand {
         #[arg(long)]
         submission_id: Uuid,
     },
+    /// Withdraw one eligible account-owned submission before publication.
+    Withdraw {
+        /// Registry base URL.
+        #[arg(long)]
+        server: String,
+        /// Stable submission UUID returned by the submission command.
+        #[arg(long)]
+        submission_id: Uuid,
+        /// Stable 1-64 character private reason code.
+        #[arg(long)]
+        reason_code: String,
+        /// Stable decision UUID to reuse after an ambiguous network failure.
+        #[arg(long)]
+        decision_id: Option<Uuid>,
+        /// Stable request UUID to reuse after an ambiguous network failure.
+        #[arg(long)]
+        request_id: Option<Uuid>,
+    },
+    /// List immutable lifecycle decisions for one owned publisher profile.
+    Decisions {
+        /// Registry base URL.
+        #[arg(long)]
+        server: String,
+        /// Account-owned publisher handle.
+        #[arg(long)]
+        publisher: String,
+        /// RFC 3339 timestamp from the final record of the preceding page.
+        #[arg(long, requires = "before_id")]
+        before_created_at: Option<DateTime<Utc>>,
+        /// UUID from the final record of the preceding page.
+        #[arg(long, requires = "before_created_at")]
+        before_id: Option<Uuid>,
+        /// Number of newest-first records to return.
+        #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..=100))]
+        limit: u32,
+    },
+    /// File one appeal against an adverse moderation decision.
+    Appeal {
+        /// Registry base URL.
+        #[arg(long)]
+        server: String,
+        /// Account-owned publisher handle.
+        #[arg(long)]
+        publisher: String,
+        /// Adverse moderation decision UUID.
+        #[arg(long)]
+        decision_id: Uuid,
+        /// Private appeal statement of at most 4000 characters.
+        #[arg(long)]
+        statement: String,
+        /// Stable appeal UUID to reuse after an ambiguous network failure.
+        #[arg(long)]
+        appeal_id: Option<Uuid>,
+        /// Stable request UUID to reuse after an ambiguous network failure.
+        #[arg(long)]
+        request_id: Option<Uuid>,
+    },
+    /// List private appeal cases for one owned publisher profile.
+    Appeals {
+        /// Registry base URL.
+        #[arg(long)]
+        server: String,
+        /// Account-owned publisher handle.
+        #[arg(long)]
+        publisher: String,
+        /// RFC 3339 timestamp from the final record of the preceding page.
+        #[arg(long, requires = "before_id")]
+        before_created_at: Option<DateTime<Utc>>,
+        /// UUID from the final record of the preceding page.
+        #[arg(long, requires = "before_created_at")]
+        before_id: Option<Uuid>,
+        /// Number of newest-first appeal cases to return.
+        #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..=100))]
+        limit: u32,
+    },
 }
 
 /// One exact review report paired with the key that produced its artifact.
@@ -122,6 +202,58 @@ pub fn run_publication(args: PublicationArgs) -> Result<(), CliError> {
             server,
             submission_id,
         } => status(&server, submission_id),
+        PublicationCommand::Withdraw {
+            server,
+            submission_id,
+            reason_code,
+            decision_id,
+            request_id,
+        } => withdraw(
+            &server,
+            submission_id,
+            &reason_code,
+            decision_id,
+            request_id,
+        ),
+        PublicationCommand::Decisions {
+            server,
+            publisher,
+            before_created_at,
+            before_id,
+            limit,
+        } => decisions(
+            &server,
+            &publisher,
+            publication_lifecycle_cursor(before_created_at, before_id)?,
+            limit,
+        ),
+        PublicationCommand::Appeal {
+            server,
+            publisher,
+            decision_id,
+            statement,
+            appeal_id,
+            request_id,
+        } => appeal(
+            &server,
+            &publisher,
+            decision_id,
+            &statement,
+            appeal_id,
+            request_id,
+        ),
+        PublicationCommand::Appeals {
+            server,
+            publisher,
+            before_created_at,
+            before_id,
+            limit,
+        } => appeals(
+            &server,
+            &publisher,
+            publication_appeal_cursor(before_created_at, before_id)?,
+            limit,
+        ),
     }
 }
 
@@ -209,6 +341,132 @@ fn status(server: &str, submission_id: Uuid) -> Result<(), CliError> {
     let submission = get_publication_submission(server, &token, submission_id)?;
     println!("{}", serde_json::to_string_pretty(&submission)?);
     Ok(())
+}
+
+/// Withdraw one eligible non-public submission while preserving retry identifiers.
+fn withdraw(
+    server: &str,
+    submission_id: Uuid,
+    reason_code: &str,
+    decision_id: Option<Uuid>,
+    request_id: Option<Uuid>,
+) -> Result<(), CliError> {
+    validate_server_url(server)?;
+    let token = resolve_access_token(server)?;
+    let decision_id = decision_id.unwrap_or_else(Uuid::new_v4);
+    let request_id = request_id.unwrap_or_else(Uuid::new_v4);
+    let decision = withdraw_publication_submission(
+        server,
+        &token,
+        submission_id,
+        decision_id,
+        request_id,
+        reason_code,
+    )
+    .map_err(|error| {
+        retryable_owner_mutation_error(
+            "publication withdrawal",
+            error,
+            "decision-id",
+            decision_id,
+            request_id,
+        )
+    })?;
+    println!("{}", serde_json::to_string_pretty(&decision)?);
+    Ok(())
+}
+
+/// Print one bounded newest-first page of publisher lifecycle decisions.
+fn decisions(
+    server: &str,
+    publisher: &str,
+    before: Option<PublicationLifecycleCursor>,
+    limit: u32,
+) -> Result<(), CliError> {
+    validate_server_url(server)?;
+    let token = resolve_access_token(server)?;
+    let records = list_publication_decisions(server, &token, publisher, before, limit)
+        .map_err(|error| publication_transport_error("publication decision listing", error))?;
+    println!("{}", serde_json::to_string_pretty(&records)?);
+    Ok(())
+}
+
+/// File one appeal while preserving both retry identifiers in any failure.
+fn appeal(
+    server: &str,
+    publisher: &str,
+    decision_id: Uuid,
+    statement: &str,
+    appeal_id: Option<Uuid>,
+    request_id: Option<Uuid>,
+) -> Result<(), CliError> {
+    validate_server_url(server)?;
+    let token = resolve_access_token(server)?;
+    let appeal_id = appeal_id.unwrap_or_else(Uuid::new_v4);
+    let request_id = request_id.unwrap_or_else(Uuid::new_v4);
+    let record = file_publication_appeal(
+        server,
+        &token,
+        publisher,
+        decision_id,
+        appeal_id,
+        request_id,
+        statement,
+    )
+    .map_err(|error| {
+        retryable_owner_mutation_error(
+            "publication appeal",
+            error,
+            "appeal-id",
+            appeal_id,
+            request_id,
+        )
+    })?;
+    println!("{}", serde_json::to_string_pretty(&record)?);
+    Ok(())
+}
+
+/// Print one bounded newest-first page of publisher appeal cases.
+fn appeals(
+    server: &str,
+    publisher: &str,
+    before: Option<PublicationAppealCursor>,
+    limit: u32,
+) -> Result<(), CliError> {
+    validate_server_url(server)?;
+    let token = resolve_access_token(server)?;
+    let records = list_publication_appeals(server, &token, publisher, before, limit)
+        .map_err(|error| publication_transport_error("publication appeal listing", error))?;
+    println!("{}", serde_json::to_string_pretty(&records)?);
+    Ok(())
+}
+
+/// Construct a lifecycle cursor after Clap has enforced the paired flags.
+fn publication_lifecycle_cursor(
+    created_at: Option<DateTime<Utc>>,
+    id: Option<Uuid>,
+) -> Result<Option<PublicationLifecycleCursor>, CliError> {
+    match (created_at, id) {
+        (None, None) => Ok(None),
+        (Some(created_at), Some(id)) => Ok(Some(PublicationLifecycleCursor { created_at, id })),
+        _ => Err(CliError::Publish(
+            "--before-created-at and --before-id must be supplied together".to_string(),
+        )),
+    }
+}
+
+/// Construct an appeal cursor after Clap has enforced the paired flags.
+fn publication_appeal_cursor(
+    created_at: Option<DateTime<Utc>>,
+    id: Option<Uuid>,
+) -> Result<Option<PublicationAppealCursor>, CliError> {
+    match (created_at, id) {
+        (None, None) => Ok(None),
+        (Some(created_at), Some(id)) => Ok(Some(PublicationAppealCursor { created_at, id })),
+        _ => Err(CliError::Publish(
+            "--before-created-at and --before-id must be supplied together".to_string(),
+        )),
+    }
 }
 
 /// Open the canonical Creator Studio draft store below the managed data root.
@@ -363,6 +621,24 @@ fn retryable_transport_error(
     ))
 }
 
+/// Preserve owner-mutation idempotency identifiers in an actionable retry command.
+fn retryable_owner_mutation_error(
+    stage: &str,
+    error: frameshift_client::ClientError,
+    operation_id_flag: &str,
+    operation_id: Uuid,
+    request_id: Uuid,
+) -> CliError {
+    CliError::Publish(format!(
+        "{stage} failed: {error}; retry with --{operation_id_flag} {operation_id} --request-id {request_id}"
+    ))
+}
+
+/// Wrap one read-only publication transport failure with its failed operation.
+fn publication_transport_error(stage: &str, error: frameshift_client::ClientError) -> CliError {
+    CliError::Publish(format!("{stage} failed: {error}"))
+}
+
 /// Map Creator Studio failures into the publication command's public error surface.
 fn publication_draft_error(error: frameshift_studio::StudioError) -> CliError {
     CliError::Publish(format!("publication draft error: {error}"))
@@ -498,5 +774,32 @@ mod tests {
     fn manifest_handle_must_match_selected_publisher() {
         assert!(require_manifest_publisher("alice", "alice").is_ok());
         assert!(require_manifest_publisher("mallory", "alice").is_err());
+    }
+
+    /// Owner mutation failures retain both UUID flags required for an exact retry.
+    #[test]
+    fn owner_mutation_error_preserves_retry_ids() {
+        let operation_id = Uuid::from_u128(20);
+        let request_id = Uuid::from_u128(21);
+        let error = retryable_owner_mutation_error(
+            "publication appeal",
+            frameshift_client::ClientError::RegistryHttp {
+                url: "https://registry.example".to_string(),
+                detail: "connection closed".to_string(),
+            },
+            "appeal-id",
+            operation_id,
+            request_id,
+        );
+        let message = error.to_string();
+        assert!(message.contains(&format!("--appeal-id {operation_id}")));
+        assert!(message.contains(&format!("--request-id {request_id}")));
+    }
+
+    /// Programmatic callers cannot construct a partial keyset cursor.
+    #[test]
+    fn cursor_construction_rejects_partial_components() {
+        assert!(publication_lifecycle_cursor(None, Some(Uuid::from_u128(1))).is_err());
+        assert!(publication_appeal_cursor(None, Some(Uuid::from_u128(1))).is_err());
     }
 }

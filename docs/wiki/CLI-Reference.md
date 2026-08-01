@@ -35,7 +35,7 @@ The binary is named `frameshift`.
 | `grow` | Append, inspect, or summarize local growth |
 | `verify` | Run persona conformance checks |
 | `publish` | Package a persona locally or publish it to a registry |
-| `publication` | Review, submit, and inspect account-backed publications |
+| `publication` | Review, submit, inspect, withdraw, and appeal account-backed publications |
 | `moderation` | Inspect, decide, and promote quarantined submissions |
 | `register` | Register this machine's author key under a registry handle |
 | `keys` | Manage local and account-enrolled publisher keys |
@@ -206,9 +206,23 @@ under `--handle <HANDLE>`.
 
 Use `review` to bind human confirmation to an exact Creator Studio snapshot,
 `submit` to create the authenticated publication intent and upload that signed
-snapshot, and `status` to inspect the resulting submission. The submit command
-requires separate confirmations for the archive hash, publisher, signer key,
-and submission intent.
+snapshot, and `status` to inspect the resulting submission. Use `withdraw` for
+an eligible non-public submission, `decisions` for immutable publisher-scoped
+lifecycle evidence, `appeal` for one adverse moderation decision, and `appeals`
+for private appeal history. The submit command requires separate confirmations
+for the archive hash, publisher, signer key, and submission intent.
+
+```bash
+frameshift publication withdraw --server https://registry.example --submission-id <UUID> --reason-code author_request
+frameshift publication decisions --server https://registry.example --publisher alice
+frameshift publication appeal --server https://registry.example --publisher alice --decision-id <UUID> --statement "The unchanged artifact meets policy."
+frameshift publication appeals --server https://registry.example --publisher alice
+```
+
+Withdrawal and appeal failures print the generated operation and request UUID
+flags so an ambiguous request can be retried exactly. Decision and appeal
+history use newest-first keyset pagination with a bounded `--limit`; supply
+`--before-created-at` and `--before-id` together to request the next page.
 
 ### `frameshift moderation <ACTION>`
 

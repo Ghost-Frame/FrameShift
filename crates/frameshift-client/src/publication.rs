@@ -9,7 +9,11 @@ use std::fs;
 
 use ed25519_dalek::{Signer as _, SigningKey};
 use flate2::{Compression, GzBuilder};
-use frameshift_catalog::{PublicationIntentRecord, PublicationSubmissionRecord};
+use frameshift_catalog::{
+    PublicationAppealCaseRecord, PublicationAppealCursor, PublicationAppealRecord,
+    PublicationIntentRecord, PublicationLifecycleCursor, PublicationLifecycleDecisionRecord,
+    PublicationSubmissionRecord,
+};
 use frameshift_pack::{ObjectHash, Pack};
 use frameshift_studio::DraftSnapshot;
 pub use frameshift_studio::{PublicationBinding, PublicationReviewBinding};
@@ -44,6 +48,24 @@ struct CreatePublicationIntentRequest {
     file_inventory_hash: ObjectHash,
     /// Positive shared scanner contract version.
     scan_schema_version: u32,
+}
+
+/// JSON body accepted by one owner submission withdrawal.
+#[derive(Serialize)]
+struct WithdrawPublicationSubmissionRequest<'a> {
+    /// Stable lifecycle decision identifier and primary idempotency key.
+    id: Uuid,
+    /// Stable bounded private reason code.
+    reason_code: &'a str,
+}
+
+/// JSON body accepted by one publisher-owner appeal filing.
+#[derive(Serialize)]
+struct FilePublicationAppealRequest<'a> {
+    /// Stable appeal identifier and primary idempotency key.
+    id: Uuid,
+    /// Bounded private statement explaining the appeal.
+    statement: &'a str,
 }
 
 /// Read-only accessors for a prepared publication.
@@ -198,6 +220,181 @@ pub fn get_publication_submission(
     crate::publisher::send_and_decode(request.call(), url.as_str())
 }
 
+/// Withdraw one eligible account-owned non-public submission idempotently.
+pub fn withdraw_publication_submission(
+    server_url: &str,
+    access_token: &SecretString,
+    submission_id: Uuid,
+    decision_id: Uuid,
+    request_id: Uuid,
+    reason_code: &str,
+) -> Result<PublicationLifecycleDecisionRecord, ClientError> {
+    validate_lifecycle_reason_code(reason_code)?;
+    let id = submission_id.to_string();
+    let url = crate::publisher::registry_endpoint_url(
+        server_url,
+        &["v1", "publication-submissions", &id, "withdraw"],
+    )?;
+    let body = WithdrawPublicationSubmissionRequest {
+        id: decision_id,
+        reason_code,
+    };
+    post_publication_json(&url, access_token, request_id, &body)
+}
+
+/// List immutable lifecycle decisions scoped to one owned publisher profile.
+pub fn list_publication_decisions(
+    server_url: &str,
+    access_token: &SecretString,
+    publisher_handle: &str,
+    before: Option<PublicationLifecycleCursor>,
+    limit: u32,
+) -> Result<Vec<PublicationLifecycleDecisionRecord>, ClientError> {
+    let mut url = crate::publisher::registry_endpoint_url(
+        server_url,
+        &[
+            "v1",
+            "publishers",
+            publisher_handle,
+            "publication-decisions",
+        ],
+    )?;
+    append_publication_page_query(
+        &mut url,
+        before.map(|cursor| (cursor.created_at, cursor.id)),
+        limit,
+    )?;
+    let request = crate::publisher::with_bearer(
+        crate::registry::http_agent().get(url.as_str()),
+        access_token,
+    );
+    crate::publisher::send_and_decode(request.call(), url.as_str())
+}
+
+/// File one idempotent appeal against an adverse publisher moderation decision.
+pub fn file_publication_appeal(
+    server_url: &str,
+    access_token: &SecretString,
+    publisher_handle: &str,
+    decision_id: Uuid,
+    appeal_id: Uuid,
+    request_id: Uuid,
+    statement: &str,
+) -> Result<PublicationAppealRecord, ClientError> {
+    validate_appeal_statement(statement)?;
+    let decision = decision_id.to_string();
+    let url = crate::publisher::registry_endpoint_url(
+        server_url,
+        &[
+            "v1",
+            "publishers",
+            publisher_handle,
+            "publication-decisions",
+            &decision,
+            "appeal",
+        ],
+    )?;
+    let body = FilePublicationAppealRequest {
+        id: appeal_id,
+        statement,
+    };
+    post_publication_json(&url, access_token, request_id, &body)
+}
+
+/// List private appeal cases scoped to one owned publisher profile.
+pub fn list_publication_appeals(
+    server_url: &str,
+    access_token: &SecretString,
+    publisher_handle: &str,
+    before: Option<PublicationAppealCursor>,
+    limit: u32,
+) -> Result<Vec<PublicationAppealCaseRecord>, ClientError> {
+    let mut url = crate::publisher::registry_endpoint_url(
+        server_url,
+        &["v1", "publishers", publisher_handle, "publication-appeals"],
+    )?;
+    append_publication_page_query(
+        &mut url,
+        before.map(|cursor| (cursor.created_at, cursor.id)),
+        limit,
+    )?;
+    let request = crate::publisher::with_bearer(
+        crate::registry::http_agent().get(url.as_str()),
+        access_token,
+    );
+    crate::publisher::send_and_decode(request.call(), url.as_str())
+}
+
+/// Send one bearer-authenticated idempotent publication JSON mutation.
+fn post_publication_json<T: Serialize, R: serde::de::DeserializeOwned>(
+    url: &url::Url,
+    access_token: &SecretString,
+    request_id: Uuid,
+    body: &T,
+) -> Result<R, ClientError> {
+    let bytes =
+        serde_json::to_vec(body).map_err(|error| ClientError::JsonSerialize(error.to_string()))?;
+    let request = crate::publisher::with_bearer(
+        crate::registry::http_agent()
+            .post(url.as_str())
+            .set("Content-Type", "application/json")
+            .set("x-request-id", &request_id.to_string()),
+        access_token,
+    );
+    crate::publisher::send_and_decode(request.send_bytes(&bytes), url.as_str())
+}
+
+/// Append a validated newest-first publication page query to one endpoint.
+fn append_publication_page_query(
+    url: &mut url::Url,
+    before: Option<(chrono::DateTime<chrono::Utc>, Uuid)>,
+    limit: u32,
+) -> Result<(), ClientError> {
+    if !(1..=100).contains(&limit) {
+        return Err(ClientError::InvalidPublicationLifecycleInput {
+            detail: "--limit must be between 1 and 100".to_string(),
+        });
+    }
+    let mut query = url.query_pairs_mut();
+    if let Some((created_at, id)) = before {
+        query.append_pair("before_created_at", &created_at.to_rfc3339());
+        query.append_pair("before_id", &id.to_string());
+    }
+    query.append_pair("limit", &limit.to_string());
+    drop(query);
+    Ok(())
+}
+
+/// Validate the server's stable lifecycle reason-code grammar before transport.
+fn validate_lifecycle_reason_code(reason_code: &str) -> Result<(), ClientError> {
+    let reason = reason_code.as_bytes();
+    let valid_head = !reason.is_empty()
+        && reason.len() <= 64
+        && reason
+            .first()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit());
+    let valid_tail = reason.iter().skip(1).all(|byte| {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'.' | b'-')
+    });
+    if valid_head && valid_tail {
+        return Ok(());
+    }
+    Err(ClientError::InvalidPublicationLifecycleInput {
+        detail: "--reason-code must use 1-64 lowercase ASCII letters, digits, '.', '_', or '-'"
+            .to_string(),
+    })
+}
+
+/// Validate the server's stable private appeal statement bound before transport.
+fn validate_appeal_statement(statement: &str) -> Result<(), ClientError> {
+    if !statement.trim().is_empty() && statement.chars().count() <= 4_000 {
+        return Ok(());
+    }
+    Err(ClientError::InvalidPublicationLifecycleInput {
+        detail: "--statement must be non-blank and at most 4000 characters".to_string(),
+    })
+}
+
 /// Build a reproducible gzip-tar from sorted snapshot files plus its signature.
 fn deterministic_archive(
     snapshot: &DraftSnapshot,
@@ -274,6 +471,12 @@ fn append_text_part(body: &mut Vec<u8>, boundary: &str, name: &str, value: &str)
 #[cfg(test)]
 /// Tests for deterministic preparation and exact public request bindings.
 mod tests {
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::thread;
+
+    use chrono::{TimeZone as _, Utc};
+    use frameshift_catalog::{PublicationAppealCursor, PublicationLifecycleCursor};
     use frameshift_studio::Studio;
 
     use super::*;
@@ -303,6 +506,75 @@ mod tests {
         studio
             .snapshot_for_review("fixture", &inventory_hash)
             .unwrap()
+    }
+
+    /// Read one complete HTTP request from the blocking client under test.
+    fn read_request(stream: &mut std::net::TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            let count = stream.read(&mut buffer).expect("read request");
+            if count == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..count]);
+            let Some(headers_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let headers_end = headers_end + 4;
+            let headers = String::from_utf8_lossy(&request[..headers_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':').and_then(|(name, value)| {
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                })
+                .unwrap_or(0);
+            if request.len() >= headers_end + content_length {
+                break;
+            }
+        }
+        String::from_utf8(request).expect("request UTF-8")
+    }
+
+    /// Serve one fixed JSON response and return the captured request.
+    fn serve_json_response(body: Vec<u8>) -> (String, thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let request = read_request(&mut stream);
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(headers.as_bytes()).expect("write headers");
+            stream.write_all(&body).expect("write response");
+            request
+        });
+        (format!("http://{address}/registry"), handle)
+    }
+
+    /// Return one complete owner lifecycle decision wire fixture.
+    fn lifecycle_decision_json(decision_id: Uuid, request_id: Uuid) -> serde_json::Value {
+        serde_json::json!({
+            "id": decision_id,
+            "action": "withdraw_submission",
+            "actor_account_id": Uuid::from_u128(2),
+            "publisher_id": Uuid::from_u128(3),
+            "submission_id": Uuid::from_u128(1),
+            "pack_name": null,
+            "version": null,
+            "from_state": "quarantined",
+            "to_state": "withdrawn",
+            "reason_code": "author_request",
+            "request_id": request_id,
+            "created_at": "2026-01-01T00:00:00Z"
+        })
     }
 
     /// Repeated preparation produces byte-identical archives and valid pack signatures.
@@ -443,5 +715,169 @@ mod tests {
         assert!(text.contains(&intent_id.to_string()));
         assert!(text.contains("name=\"archive\""));
         assert!(text.contains(&format!("--{boundary}--")));
+    }
+
+    /// Withdrawal transport binds the submission path and both retry identifiers.
+    #[test]
+    fn sends_idempotent_owner_withdrawal() {
+        let decision_id = Uuid::from_u128(6);
+        let request_id = Uuid::from_u128(7);
+        let response = serde_json::to_vec(&lifecycle_decision_json(decision_id, request_id))
+            .expect("serialize decision fixture");
+        let (server, handle) = serve_json_response(response);
+        let token = SecretString::new("owner-token".to_string());
+
+        let decision = withdraw_publication_submission(
+            &server,
+            &token,
+            Uuid::from_u128(1),
+            decision_id,
+            request_id,
+            "author_request",
+        )
+        .expect("withdrawal response");
+
+        assert_eq!(decision.id, decision_id);
+        let request = handle.join().expect("test server thread");
+        let lowercase_request = request.to_ascii_lowercase();
+        assert!(request.starts_with(
+            "POST /registry/v1/publication-submissions/00000000-0000-0000-0000-000000000001/withdraw HTTP/1.1\r\n"
+        ));
+        assert!(lowercase_request.contains(&format!("\r\nx-request-id: {request_id}\r\n")));
+        assert!(request.contains(&format!("\"id\":\"{decision_id}\"")));
+        assert!(request.contains("\"reason_code\":\"author_request\""));
+        assert!(request.contains("\r\nAuthorization: Bearer owner-token\r\n"));
+    }
+
+    /// Lifecycle decision reads encode both keyset cursor components and the page bound.
+    #[test]
+    fn lists_owner_decisions_with_keyset_cursor() {
+        let response = serde_json::to_vec(&vec![lifecycle_decision_json(
+            Uuid::from_u128(6),
+            Uuid::from_u128(7),
+        )])
+        .expect("serialize decision page");
+        let (server, handle) = serve_json_response(response);
+        let token = SecretString::new("owner-token".to_string());
+        let cursor = PublicationLifecycleCursor {
+            created_at: Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap(),
+            id: Uuid::from_u128(9),
+        };
+
+        let decisions =
+            list_publication_decisions(&server, &token, "alice/admin", Some(cursor), 25)
+                .expect("decision page");
+
+        assert_eq!(decisions.len(), 1);
+        let request = handle.join().expect("test server thread");
+        assert!(
+            request.starts_with("GET /registry/v1/publishers/alice%2Fadmin/publication-decisions?")
+        );
+        assert!(request.contains("before_created_at=2026-01-02T03%3A04%3A05%2B00%3A00"));
+        assert!(request.contains("before_id=00000000-0000-0000-0000-000000000009"));
+        assert!(request.contains("limit=25"));
+    }
+
+    /// Appeal filing binds the publisher path, adverse decision, and stable retry IDs.
+    #[test]
+    fn files_idempotent_owner_appeal() {
+        let appeal_id = Uuid::from_u128(10);
+        let decision_id = Uuid::from_u128(11);
+        let request_id = Uuid::from_u128(12);
+        let response = serde_json::to_vec(&serde_json::json!({
+            "id": appeal_id,
+            "decision_id": decision_id,
+            "submission_id": Uuid::from_u128(1),
+            "publisher_id": Uuid::from_u128(3),
+            "actor_account_id": Uuid::from_u128(2),
+            "statement": "The unchanged artifact meets policy.",
+            "request_id": request_id,
+            "created_at": "2026-01-01T00:00:00Z"
+        }))
+        .expect("serialize appeal fixture");
+        let (server, handle) = serve_json_response(response);
+        let token = SecretString::new("owner-token".to_string());
+
+        let appeal = file_publication_appeal(
+            &server,
+            &token,
+            "alice",
+            decision_id,
+            appeal_id,
+            request_id,
+            "The unchanged artifact meets policy.",
+        )
+        .expect("appeal response");
+
+        assert_eq!(appeal.id, appeal_id);
+        let request = handle.join().expect("test server thread");
+        let lowercase_request = request.to_ascii_lowercase();
+        assert!(request.starts_with(&format!(
+            "POST /registry/v1/publishers/alice/publication-decisions/{decision_id}/appeal HTTP/1.1\r\n"
+        )));
+        assert!(lowercase_request.contains(&format!("\r\nx-request-id: {request_id}\r\n")));
+        assert!(request.contains(&format!("\"id\":\"{appeal_id}\"")));
+        assert!(request.contains("\"statement\":\"The unchanged artifact meets policy.\""));
+    }
+
+    /// Appeal case reads preserve the publisher path and bounded page query.
+    #[test]
+    fn lists_owner_appeals_with_keyset_cursor() {
+        let response =
+            serde_json::to_vec(&serde_json::json!([])).expect("serialize empty appeal page");
+        let (server, handle) = serve_json_response(response);
+        let token = SecretString::new("owner-token".to_string());
+        let cursor = PublicationAppealCursor {
+            created_at: Utc.with_ymd_and_hms(2026, 2, 3, 4, 5, 6).unwrap(),
+            id: Uuid::from_u128(13),
+        };
+
+        let appeals = list_publication_appeals(&server, &token, "alice", Some(cursor), 100)
+            .expect("appeal page");
+
+        assert!(appeals.is_empty());
+        let request = handle.join().expect("test server thread");
+        assert!(request.starts_with("GET /registry/v1/publishers/alice/publication-appeals?"));
+        assert!(request.contains("before_created_at=2026-02-03T04%3A05%3A06%2B00%3A00"));
+        assert!(request.contains("before_id=00000000-0000-0000-0000-00000000000d"));
+        assert!(request.contains("limit=100"));
+    }
+
+    /// Invalid lifecycle mutation fields fail before opening an HTTP connection.
+    #[test]
+    fn rejects_invalid_owner_mutation_fields_locally() {
+        let token = SecretString::new("owner-token".to_string());
+        let reason_error = withdraw_publication_submission(
+            "https://registry.example",
+            &token,
+            Uuid::from_u128(1),
+            Uuid::from_u128(2),
+            Uuid::from_u128(3),
+            "Invalid Reason",
+        )
+        .expect_err("invalid reason code should fail");
+        assert!(reason_error.to_string().contains("--reason-code"));
+
+        let statement_error = file_publication_appeal(
+            "https://registry.example",
+            &token,
+            "alice",
+            Uuid::from_u128(4),
+            Uuid::from_u128(5),
+            Uuid::from_u128(6),
+            "   ",
+        )
+        .expect_err("blank statement should fail");
+        assert!(statement_error.to_string().contains("--statement"));
+    }
+
+    /// Invalid page bounds fail locally with the accepted range.
+    #[test]
+    fn rejects_invalid_owner_page_limit_locally() {
+        let token = SecretString::new("owner-token".to_string());
+        let error =
+            list_publication_decisions("https://registry.example", &token, "alice", None, 101)
+                .expect_err("oversized page should fail");
+        assert!(error.to_string().contains("between 1 and 100"));
     }
 }
