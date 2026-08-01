@@ -4233,6 +4233,75 @@ async fn security_shared_nonce_claim_is_atomic() {
     );
 }
 
+/// Expired nonce cleanup is bounded and preserves unexpired replay claims.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn security_expired_nonce_cleanup_is_bounded() {
+    let (catalog, _container) = setup_catalog().await;
+    let pubkey = make_pubkey(72);
+    let now = chrono::Utc::now();
+
+    for (nonce, expires_at) in [
+        ("expired-nonce-oldest", now - chrono::Duration::minutes(2)),
+        ("expired-nonce-newest", now - chrono::Duration::minutes(1)),
+        ("active-nonce", now + chrono::Duration::minutes(10)),
+    ] {
+        assert!(
+            catalog
+                .claim_signed_request_nonce(&pubkey, nonce, expires_at)
+                .await
+                .expect("nonce setup claim failed"),
+            "each setup nonce must be inserted once"
+        );
+    }
+
+    assert_eq!(
+        catalog
+            .cleanup_expired_signed_request_nonces(1)
+            .await
+            .expect("bounded nonce cleanup failed"),
+        1,
+        "one cleanup batch must honor its row limit"
+    );
+    assert_eq!(
+        catalog
+            .cleanup_expired_signed_request_nonces(10)
+            .await
+            .expect("remaining nonce cleanup failed"),
+        1,
+        "only the remaining expired nonce must be removed"
+    );
+    assert_eq!(
+        catalog
+            .cleanup_expired_signed_request_nonces(10)
+            .await
+            .expect("empty nonce cleanup failed"),
+        0,
+        "cleanup must stop after all expired rows are gone"
+    );
+
+    for nonce in ["expired-nonce-oldest", "expired-nonce-newest"] {
+        assert!(
+            catalog
+                .claim_signed_request_nonce(&pubkey, nonce, now + chrono::Duration::minutes(10),)
+                .await
+                .expect("reclaimed nonce failed"),
+            "an expired and cleaned nonce must be reusable"
+        );
+    }
+    assert!(
+        !catalog
+            .claim_signed_request_nonce(
+                &pubkey,
+                "active-nonce",
+                now + chrono::Duration::minutes(10),
+            )
+            .await
+            .expect("active nonce replay check failed"),
+        "cleanup must preserve unexpired replay claims"
+    );
+}
+
 /// Active-hash lookup stops authorizing a version immediately after tombstoning.
 #[tokio::test]
 #[ignore = "requires Docker"]

@@ -713,6 +713,48 @@ impl PostgresCatalog {
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
+
+    /// Delete at most `batch_size` expired signed-request nonce rows.
+    ///
+    /// Row selection uses `FOR UPDATE SKIP LOCKED` so maintenance workers on
+    /// multiple server instances can clean separate batches without waiting on
+    /// each other. The nonce table's expiration index keeps selection bounded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogError::InvalidArgument`] when `batch_size` is not
+    /// positive, or a backend error when the connection or deletion fails.
+    pub async fn cleanup_expired_signed_request_nonces(
+        &self,
+        batch_size: i64,
+    ) -> Result<usize, CatalogError> {
+        if batch_size <= 0 {
+            return Err(CatalogError::InvalidArgument(
+                "signed-request nonce cleanup batch size must be positive".to_string(),
+            ));
+        }
+
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        diesel::sql_query(
+            "DELETE FROM signed_request_nonces AS target \
+             USING ( \
+                 SELECT pubkey, nonce \
+                 FROM signed_request_nonces \
+                 WHERE expires_at < NOW() \
+                 ORDER BY expires_at \
+                 LIMIT $1 \
+                 FOR UPDATE SKIP LOCKED \
+             ) AS expired \
+             WHERE target.pubkey = expired.pubkey \
+               AND target.nonce = expired.nonce",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(batch_size)
+        .execute(&mut *conn)
+        .await
+        .map_err(|error| {
+            map_diesel_error(error, "signed_request_nonce", "expired cleanup".to_string())
+        })
+    }
 }
 
 /// Serialize platform-role mutations so coverage checks cannot race.
@@ -5332,13 +5374,6 @@ impl CatalogBackend for PostgresCatalog {
         expires_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<bool, CatalogError> {
         let mut conn = self.pool.get().await.map_err(map_pool_error)?;
-
-        diesel::delete(
-            signed_request_nonces::table.filter(signed_request_nonces::expires_at.lt(Utc::now())),
-        )
-        .execute(&mut *conn)
-        .await
-        .map_err(|e| map_diesel_error(e, "signed_request_nonce", "expired".to_string()))?;
 
         let inserted = diesel::insert_into(signed_request_nonces::table)
             .values((
