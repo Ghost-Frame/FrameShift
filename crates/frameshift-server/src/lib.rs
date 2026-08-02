@@ -52,6 +52,8 @@ pub mod mcp;
 pub mod metrics;
 pub mod middleware;
 pub mod password_auth;
+/// Compromised and deployment-specific password rejection data.
+mod password_blocklist;
 pub mod publication;
 pub mod router;
 pub mod routes;

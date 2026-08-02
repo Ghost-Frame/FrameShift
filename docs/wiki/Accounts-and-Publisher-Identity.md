@@ -35,6 +35,36 @@ writes. Desktop and CLI clients request an explicit bearer session. The
 registry stores only SHA-256 token digests, so it cannot recover an issued
 invite or session token from the database.
 
+## Password policy
+
+New first-party passwords must contain at least 15 Unicode scalar values and
+at most 1,024 UTF-8 bytes. FrameShift does not impose character-class or
+composition rules. It preserves the accepted password bytes exactly for
+Argon2id hashing.
+
+Password creation also rejects known compromised values and expected
+FrameShift-specific variants. Comparison ignores outer whitespace and ASCII
+case, but that normalization is used only for the blocklist lookup. Login does
+not apply creation policy, so a credential created under an older policy can
+still be verified and migrated safely.
+
+The embedded baseline comes from [SecLists commit
+`e5e49caa6fb648476f3bca391b26a45a4f5d3f13`](https://github.com/danielmiessler/SecLists/blob/e5e49caa6fb648476f3bca391b26a45a4f5d3f13/Passwords/Common-Credentials/xato-net-10-million-passwords-100.txt), file
+`Passwords/Common-Credentials/xato-net-10-million-passwords-100.txt`. The
+source file SHA-256 is
+`3b9909eacc7322317399992a2d308b04be3ab903f06bfc935fc4c5796235531e`.
+FrameShift stores only sorted SHA-256 digests of lowercase comparison values
+in `crates/frameshift-server/src/password_blocklist.txt`. Reviewable
+FrameShift-specific values remain explicit in `password_blocklist.rs`.
+
+To update the baseline, pin a reviewed SecLists commit, fetch that exact file,
+verify and record its SHA-256, remove blank lines, lowercase ASCII, append the
+reviewed FrameShift-specific variants in the Rust source when needed, hash each
+source-list value without a trailing newline, then sort and deduplicate the
+digest lines. Update the commit, source hash, and provenance here in the same
+change. Run the server password-policy tests and review both blocklist diffs
+before committing.
+
 ## Sign in securely
 
 ```bash
