@@ -202,6 +202,11 @@ enum QuarantineMode {
     R2,
 }
 
+/// Return whether at least one supported account-authentication mechanism is ready.
+fn account_auth_available(oidc_verifier_available: bool, first_party_auth_enabled: bool) -> bool {
+    oidc_verifier_available || first_party_auth_enabled
+}
+
 /// Validate the quarantine selector and its account-authentication prerequisite.
 fn quarantine_mode(
     backend: &str,
@@ -220,7 +225,7 @@ fn quarantine_mode(
 
     if !account_auth_enabled {
         return Err(ServerError::Startup(
-            "publication quarantine requires valid OIDC configuration".to_string(),
+            "publication quarantine requires enabled account authentication".to_string(),
         ));
     }
 
@@ -461,7 +466,11 @@ async fn main() {
         }
     };
 
-    let quarantine = match build_quarantine_store(&config, state.account_auth.is_some()).await {
+    let account_auth_enabled = account_auth_available(
+        state.account_auth.is_some(),
+        config.first_party_auth.enabled(),
+    );
+    let quarantine = match build_quarantine_store(&config, account_auth_enabled).await {
         Ok(store) => store,
         Err(e) => {
             tracing::error!("startup failed: {e}");
@@ -500,7 +509,7 @@ mod tests {
     use super::*;
 
     #[test]
-    /// The default selector keeps publication admission disabled without OIDC.
+    /// The default selector keeps publication admission disabled without account authentication.
     fn quarantine_mode_accepts_disabled_without_account_auth() {
         assert_eq!(
             quarantine_mode("disabled", false).expect("disabled mode"),
@@ -513,12 +522,21 @@ mod tests {
     fn quarantine_mode_requires_account_auth() {
         assert!(matches!(
             quarantine_mode("fs", false),
-            Err(ServerError::Startup(message)) if message.contains("OIDC")
+            Err(ServerError::Startup(message)) if message.contains("account authentication")
         ));
         assert!(matches!(
             quarantine_mode("r2", false),
-            Err(ServerError::Startup(message)) if message.contains("OIDC")
+            Err(ServerError::Startup(message)) if message.contains("account authentication")
         ));
+    }
+
+    #[test]
+    /// Either supported authentication mechanism satisfies the quarantine prerequisite.
+    fn account_auth_availability_accepts_oidc_or_first_party() {
+        assert!(!account_auth_available(false, false));
+        assert!(account_auth_available(true, false));
+        assert!(account_auth_available(false, true));
+        assert!(account_auth_available(true, true));
     }
 
     #[test]
