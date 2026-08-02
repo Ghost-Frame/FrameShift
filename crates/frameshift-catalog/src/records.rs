@@ -204,6 +204,130 @@ pub struct AccountPasswordRehashRequest {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Stable purpose attached to one encrypted password-recovery delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PasswordRecoveryDeliveryKind {
+    /// A message carrying the single-use password-reset link.
+    Reset,
+    /// A notification confirming that the account password changed.
+    PasswordChanged,
+}
+
+/// Caller-encrypted payload and immutable metadata for one recovery delivery.
+///
+/// The catalog never receives the plaintext payload or encryption key. The
+/// caller binds `id`, the operation-specific delivery kind, and `key_version`
+/// into its authenticated encryption associated data before constructing this
+/// envelope.
+#[derive(Clone, PartialEq, Eq)]
+pub struct EncryptedPasswordRecoveryDelivery {
+    /// Stable outbox identifier and provider idempotency key.
+    pub id: Uuid,
+    /// Opaque authenticated ciphertext containing the delivery payload.
+    pub ciphertext: Vec<u8>,
+    /// Random 192-bit XChaCha20-Poly1305 nonce.
+    pub nonce: [u8; 24],
+    /// Deployment-managed encryption-key version used for this ciphertext.
+    pub key_version: i16,
+    /// Exclusive deadline after which a worker must not send this payload.
+    pub expires_at: DateTime<Utc>,
+}
+
+/// Atomic input for creating a password-reset token and encrypted delivery.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PasswordRecoveryEnqueueRequest {
+    /// Stable internal identifier for the digest-only reset-token row.
+    pub token_id: Uuid,
+    /// Lowercase, trimmed email used for an indistinguishable account lookup.
+    pub normalized_email: String,
+    /// SHA-256 digest of the raw reset token retained only by the requester.
+    pub token_digest: Vec<u8>,
+    /// UTC timestamp at which the request was admitted.
+    pub requested_at: DateTime<Utc>,
+    /// Exclusive deadline for consuming the reset token.
+    pub token_expires_at: DateTime<Utc>,
+    /// Requests newer than this timestamp suppress this enqueue operation.
+    pub cooldown_cutoff: DateTime<Utc>,
+    /// Encrypted reset-link delivery stored in the same transaction.
+    pub delivery: EncryptedPasswordRecoveryDelivery,
+}
+
+/// Atomic input for consuming a reset token and replacing its credential.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PasswordRecoveryCompletionRequest {
+    /// SHA-256 digest of the reset token presented by the caller.
+    pub token_digest: Vec<u8>,
+    /// Fresh Argon2id PHC string produced under the current password policy.
+    pub new_password_hash: String,
+    /// Application credential-record version for the fresh hash.
+    pub new_password_version: i16,
+    /// Deployment-pepper version used to produce the fresh hash.
+    pub new_pepper_version: i16,
+    /// UTC timestamp committed as the password-change and revocation time.
+    pub completed_at: DateTime<Utc>,
+    /// Encrypted password-changed notice stored in the same transaction.
+    pub delivery: EncryptedPasswordRecoveryDelivery,
+}
+
+/// One encrypted password-recovery delivery and its durable worker lifecycle.
+///
+/// This record deliberately contains no plaintext message body, reset URL, or
+/// bearer token. `claim_id` fences worker acknowledgements and is present only
+/// while the row has an active lease.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PasswordRecoveryDeliveryRecord {
+    /// Stable outbox identifier and provider idempotency key.
+    pub id: Uuid,
+    /// Account receiving the recovery-related message.
+    pub account_id: Uuid,
+    /// Stable message purpose used in authenticated encryption metadata.
+    pub kind: PasswordRecoveryDeliveryKind,
+    /// Lowercase, trimmed destination email derived from the credential row.
+    pub recipient: String,
+    /// Opaque authenticated ciphertext containing the message payload.
+    pub ciphertext: Vec<u8>,
+    /// Random 192-bit XChaCha20-Poly1305 nonce.
+    pub nonce: [u8; 24],
+    /// Deployment-managed encryption-key version required to decrypt the payload.
+    pub key_version: i16,
+    /// Number of leases issued for this row, including stale reclaims.
+    pub attempt_count: u32,
+    /// Most recent time a worker acquired this row, retained after lease release.
+    pub last_attempt_at: Option<DateTime<Utc>>,
+    /// UUID fencing the currently active worker lease.
+    pub claim_id: Option<Uuid>,
+    /// Time at which the currently active worker lease began.
+    pub claimed_at: Option<DateTime<Utc>>,
+    /// Earliest time at which an unclaimed worker may acquire this row.
+    pub next_attempt_at: DateTime<Utc>,
+    /// Exclusive deadline after which no worker may acquire this row.
+    pub expires_at: DateTime<Utc>,
+    /// Time at which a fenced worker acknowledged successful delivery.
+    pub sent_at: Option<DateTime<Utc>>,
+    /// Provider-assigned message identifier retained after successful delivery.
+    pub provider_message_id: Option<String>,
+    /// Time at which a fenced worker marked the delivery permanently failed.
+    pub failed_at: Option<DateTime<Utc>>,
+    /// Bounded static diagnostic code from the most recent failed attempt.
+    pub last_error_code: Option<String>,
+    /// UTC timestamp at which the transaction created this row.
+    pub created_at: DateTime<Utc>,
+}
+
+/// Bounded request for leasing pending recovery deliveries to one worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PasswordRecoveryDeliveryClaimRequest {
+    /// UUID shared by every delivery leased in this batch.
+    pub claim_id: Uuid,
+    /// UTC timestamp recorded for this lease attempt.
+    pub claimed_at: DateTime<Utc>,
+    /// Existing claims at or before this timestamp may be reclaimed as stale.
+    pub stale_before: DateTime<Utc>,
+    /// Maximum number of rows to lease in this batch.
+    pub limit: u32,
+}
+
 /// Client class receiving a first-party account session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]

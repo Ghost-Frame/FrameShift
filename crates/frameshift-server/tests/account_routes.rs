@@ -2,9 +2,9 @@
 
 mod mocks;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -17,14 +17,21 @@ use chrono::Utc;
 use ed25519_dalek::{Signer as _, SigningKey};
 use frameshift_catalog::{
     AccountInviteIntent, AccountInviteRecord, AccountInviteRequestRecord, AccountInviteStatus,
-    AccountStatus, Ed25519PublicKey, MembershipState, PlatformRole, PlatformRoleRecord,
-    PlatformRoleState, PublisherKeyRecord, PublisherKeyState, PublisherMembershipRecord,
-    PublisherModerationStatus, PublisherProfileRecord, PublisherRole,
+    AccountStatus, Ed25519PublicKey, MembershipState, PasswordRecoveryDeliveryKind,
+    PasswordRecoveryDeliveryRecord, PlatformRole, PlatformRoleRecord, PlatformRoleState,
+    PublisherKeyRecord, PublisherKeyState, PublisherMembershipRecord, PublisherModerationStatus,
+    PublisherProfileRecord, PublisherRole,
 };
 use frameshift_server::account_auth::{BearerTokenVerifier, OidcAuthError, VerifiedOidcIdentity};
 use frameshift_server::metrics::Metrics;
+use frameshift_server::recovery_delivery::{
+    parse_recovery_delivery_payload, run_recovery_delivery_worker, RecoveryDeliveryCipher,
+    RecoveryDeliveryDispatcher, RecoveryDeliveryPayload, RecoveryDeliveryWorkerConfig,
+    RecoveryDispatchError, RecoveryDispatchReceipt,
+};
 use frameshift_server::{
-    app, AppState, FirstPartyAuthConfig, InviteRequestConfig, LogFormat, OidcConfig, ServerConfig,
+    app, AppState, FirstPartyAuthConfig, InviteRequestConfig, LogFormat, OidcConfig,
+    PasswordRecoveryConfig, ServerConfig,
 };
 use http_body_util::BodyExt as _;
 use secrecy::SecretString;
@@ -86,6 +93,69 @@ impl BearerTokenVerifier for FakeVerifier {
             .get(token)
             .cloned()
             .unwrap_or(Err(OidcAuthError::InvalidToken))
+    }
+}
+
+/// Deterministic provider outcome consumed by the recovery worker test double.
+#[derive(Clone, Copy)]
+enum FakeRecoveryOutcome {
+    /// Return one successful provider acknowledgement.
+    Success,
+    /// Return one retryable transport classification.
+    Retryable,
+    /// Return one terminal provider rejection.
+    Permanent,
+}
+
+/// Scripted recovery dispatcher that records only non-secret delivery metadata.
+#[derive(Clone)]
+struct FakeRecoveryDispatcher {
+    /// Ordered outcomes returned by subsequent provider calls.
+    outcomes: Arc<Mutex<VecDeque<FakeRecoveryOutcome>>>,
+    /// Outbox identifiers observed at the provider boundary.
+    observed_ids: Arc<Mutex<Vec<Uuid>>>,
+}
+
+/// Constructors for the scripted recovery dispatcher.
+impl FakeRecoveryDispatcher {
+    /// Build a dispatcher with an ordered outcome script.
+    fn new(outcomes: impl IntoIterator<Item = FakeRecoveryOutcome>) -> Self {
+        Self {
+            outcomes: Arc::new(Mutex::new(outcomes.into_iter().collect())),
+            observed_ids: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+/// Scripted implementation of the recovery provider boundary.
+#[async_trait]
+impl RecoveryDeliveryDispatcher for FakeRecoveryDispatcher {
+    /// Record the stable idempotency identifier and return the next scripted outcome.
+    async fn deliver(
+        &self,
+        outbox_id: Uuid,
+        _recipient: &str,
+        _payload: RecoveryDeliveryPayload<'_>,
+    ) -> Result<RecoveryDispatchReceipt, RecoveryDispatchError> {
+        self.observed_ids.lock().unwrap().push(outbox_id);
+        match self
+            .outcomes
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(FakeRecoveryOutcome::Success)
+        {
+            FakeRecoveryOutcome::Success => Ok(RecoveryDispatchReceipt {
+                provider_message_id: format!("provider-{outbox_id}"),
+            }),
+            FakeRecoveryOutcome::Retryable => Err(RecoveryDispatchError::Retryable {
+                reason: "test_retry",
+                retry_after: None,
+            }),
+            FakeRecoveryOutcome::Permanent => Err(RecoveryDispatchError::Permanent {
+                reason: "test_permanent",
+            }),
+        }
     }
 }
 
@@ -166,6 +236,22 @@ fn first_party_test_config() -> Arc<ServerConfig> {
     config.first_party_auth = FirstPartyAuthConfig {
         password_pepper: SecretString::new("integration-test-password-pepper".to_string()),
         ..FirstPartyAuthConfig::disabled()
+    };
+    Arc::new(config)
+}
+
+/// Build deterministic enabled password-recovery configuration for route tests.
+fn password_recovery_test_config() -> Arc<ServerConfig> {
+    let mut config = (*first_party_test_config()).clone();
+    config.first_party_auth.recovery = PasswordRecoveryConfig {
+        enabled: true,
+        provider_api_key: SecretString::new("re_test_provider_key".to_string()),
+        from_address: "FrameShift <recovery@frameshift.test>".to_string(),
+        reset_url: "https://frameshift.test/recover/".to_string(),
+        delivery_key: SecretString::new(URL_SAFE_NO_PAD.encode([29_u8; 32])),
+        key_version: 7,
+        token_ttl: Duration::from_secs(60 * 60),
+        request_cooldown: Duration::from_secs(15 * 60),
     };
     Arc::new(config)
 }
@@ -384,6 +470,156 @@ fn fixture_bootstrap_invite(catalog: &MockCatalog, email: &str) -> String {
         .account_invites
         .insert(invite.id, invite);
     token
+}
+
+/// Decrypt the single mock reset delivery and return its caller-held token.
+fn fixture_recovery_token(catalog: &MockCatalog, config: &ServerConfig) -> String {
+    let delivery = catalog
+        .state
+        .read()
+        .unwrap()
+        .password_recovery_deliveries
+        .values()
+        .find(|delivery| delivery.kind == frameshift_catalog::PasswordRecoveryDeliveryKind::Reset)
+        .cloned()
+        .expect("one reset delivery");
+    let cipher = RecoveryDeliveryCipher::from_config(config)
+        .unwrap()
+        .expect("enabled recovery cipher");
+    let plaintext = cipher
+        .decrypt(
+            delivery.id,
+            delivery.kind,
+            delivery.key_version,
+            &delivery.nonce,
+            &delivery.ciphertext,
+        )
+        .unwrap();
+    match parse_recovery_delivery_payload(&plaintext).unwrap() {
+        RecoveryDeliveryPayload::Reset { token, .. } => token.to_string(),
+        RecoveryDeliveryPayload::PasswordChanged => panic!("expected reset payload"),
+    }
+}
+
+/// Wait until the detached recovery request has durably populated the mock catalog.
+async fn wait_for_recovery_enqueue(catalog: &MockCatalog) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if !catalog
+                .state
+                .read()
+                .unwrap()
+                .password_recovery_deliveries
+                .is_empty()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("recovery enqueue deadline");
+}
+
+/// Seed one encrypted pending reset delivery for focused worker tests.
+fn fixture_worker_delivery(catalog: &MockCatalog, config: &ServerConfig, tampered: bool) -> Uuid {
+    let cipher = RecoveryDeliveryCipher::from_config(config)
+        .unwrap()
+        .expect("enabled recovery cipher");
+    let id = Uuid::new_v4();
+    let now = Utc::now();
+    let mut encrypted = cipher
+        .encrypt_reset(
+            id,
+            &config.first_party_auth.recovery.reset_url,
+            &URL_SAFE_NO_PAD.encode([43_u8; 32]),
+        )
+        .unwrap();
+    if tampered {
+        encrypted.ciphertext[0] ^= 0x01;
+    }
+    catalog
+        .state
+        .write()
+        .unwrap()
+        .password_recovery_deliveries
+        .insert(
+            id,
+            PasswordRecoveryDeliveryRecord {
+                id,
+                account_id: Uuid::new_v4(),
+                kind: PasswordRecoveryDeliveryKind::Reset,
+                recipient: "worker@example.test".to_string(),
+                ciphertext: encrypted.ciphertext,
+                nonce: encrypted.nonce,
+                key_version: encrypted.key_version,
+                attempt_count: 0,
+                last_attempt_at: None,
+                claim_id: None,
+                claimed_at: None,
+                next_attempt_at: now,
+                expires_at: now + chrono::Duration::hours(1),
+                sent_at: None,
+                provider_message_id: None,
+                failed_at: None,
+                last_error_code: None,
+                created_at: now,
+            },
+        );
+    id
+}
+
+/// Run one focused worker until the selected row reaches a terminal settlement.
+async fn run_worker_fixture(
+    catalog: MockCatalog,
+    config: &ServerConfig,
+    dispatcher: FakeRecoveryDispatcher,
+    delivery_id: Uuid,
+) -> PasswordRecoveryDeliveryRecord {
+    let cipher = RecoveryDeliveryCipher::from_config(config)
+        .unwrap()
+        .expect("enabled recovery cipher");
+    let catalog_backend: Arc<dyn frameshift_catalog::CatalogBackend> = Arc::new(catalog.clone());
+    let provider: Arc<dyn RecoveryDeliveryDispatcher> = Arc::new(dispatcher);
+    let (stop_sender, stop_receiver) = tokio::sync::watch::channel(false);
+    let worker = tokio::spawn(run_recovery_delivery_worker(
+        catalog_backend,
+        provider,
+        cipher,
+        RecoveryDeliveryWorkerConfig {
+            poll_interval: Duration::from_millis(2),
+            claim_ttl: Duration::from_secs(1),
+            batch_size: 1,
+            retry_initial: Duration::from_millis(2),
+            retry_max: Duration::from_millis(8),
+            max_attempts: 3,
+        },
+        stop_receiver,
+    ));
+    let settled = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(delivery) = catalog
+                .state
+                .read()
+                .unwrap()
+                .password_recovery_deliveries
+                .get(&delivery_id)
+                .filter(|delivery| delivery.sent_at.is_some() || delivery.failed_at.is_some())
+                .cloned()
+            {
+                return delivery;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("worker settlement deadline");
+    let _ = stop_sender.send(true);
+    tokio::time::timeout(Duration::from_secs(1), worker)
+        .await
+        .expect("worker stop deadline")
+        .expect("worker task");
+    settled
 }
 
 /// Seed one pending invite application for administrator route tests.
@@ -714,6 +950,275 @@ async fn invite_redemption_creates_one_browser_account_and_logout_revokes_it() {
 
     let revoked = send_browser(state, Method::GET, "/v1/account", None, Some(&cookie), None).await;
     assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// Recovery stays unavailable without complete configuration and always requires exact Origin.
+#[tokio::test]
+async fn password_recovery_fails_closed_before_catalog_access() {
+    let catalog = MockCatalog::new();
+    let disabled_state = test_state_with_config(catalog.clone(), None, first_party_test_config());
+    let disabled = send_browser(
+        disabled_state,
+        Method::POST,
+        "/v1/auth/password-recovery/request",
+        Some("https://frameshift.test"),
+        None,
+        Some(json!({"email": "member@example.test"})),
+    )
+    .await;
+    assert_eq!(disabled.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let enabled_state =
+        test_state_with_config(catalog.clone(), None, password_recovery_test_config());
+    let missing_origin = send_browser(
+        enabled_state,
+        Method::POST,
+        "/v1/auth/password-recovery/request",
+        None,
+        None,
+        Some(json!({"email": "member@example.test"})),
+    )
+    .await;
+    assert_eq!(missing_origin.status(), StatusCode::FORBIDDEN);
+    let stored = catalog.state.read().unwrap();
+    assert!(stored.password_recovery_tokens.is_empty());
+    assert!(stored.password_recovery_deliveries.is_empty());
+}
+
+/// Known and unknown recovery requests return the same acknowledgement without plaintext storage.
+#[tokio::test]
+async fn password_recovery_request_is_indistinguishable_and_encrypted() {
+    let catalog = MockCatalog::new();
+    catalog.delay_password_recovery_enqueue("recover@example.test", Duration::from_secs(1));
+    let invite_token = fixture_bootstrap_invite(&catalog, "recover@example.test");
+    let config = password_recovery_test_config();
+    let state = test_state_with_config(catalog.clone(), None, Arc::clone(&config));
+    let registered = send(
+        state.clone(),
+        Method::POST,
+        "/v1/auth/register",
+        None,
+        Some(json!({
+            "invite_token": invite_token,
+            "email": "recover@example.test",
+            "password": "correct horse battery staple",
+            "client_kind": "desktop"
+        })),
+    )
+    .await;
+    assert_eq!(registered.status(), StatusCode::OK);
+
+    let known_started_at = tokio::time::Instant::now();
+    let known = send_browser(
+        state.clone(),
+        Method::POST,
+        "/v1/auth/password-recovery/request",
+        Some("https://frameshift.test"),
+        None,
+        Some(json!({"email": " Recover@Example.Test "})),
+    )
+    .await;
+    let known_duration = known_started_at.elapsed();
+    assert_eq!(known.status(), StatusCode::ACCEPTED);
+    assert!(known_duration >= Duration::from_millis(200));
+    assert!(known_duration < Duration::from_millis(750));
+    let known_body = response_json(known).await;
+    let unknown = send_browser(
+        state,
+        Method::POST,
+        "/v1/auth/password-recovery/request",
+        Some("https://frameshift.test"),
+        None,
+        Some(json!({"email": "unknown@example.test"})),
+    )
+    .await;
+    assert_eq!(unknown.status(), StatusCode::ACCEPTED);
+    assert_eq!(response_json(unknown).await, known_body);
+
+    wait_for_recovery_enqueue(&catalog).await;
+    let token = fixture_recovery_token(&catalog, &config);
+    let decoded_token = URL_SAFE_NO_PAD.decode(&token).unwrap();
+    let stored = catalog.state.read().unwrap();
+    assert_eq!(stored.password_recovery_tokens.len(), 1);
+    assert_eq!(stored.password_recovery_deliveries.len(), 1);
+    let token_record = stored.password_recovery_tokens.values().next().unwrap();
+    assert_eq!(
+        token_record.token_digest,
+        Sha256::digest(decoded_token).to_vec()
+    );
+    let delivery = stored.password_recovery_deliveries.values().next().unwrap();
+    assert!(!delivery
+        .ciphertext
+        .windows(token.len())
+        .any(|window| window == token.as_bytes()));
+    assert!(!delivery
+        .ciphertext
+        .windows(config.first_party_auth.recovery.reset_url.len())
+        .any(|window| window == config.first_party_auth.recovery.reset_url.as_bytes()));
+}
+
+/// A valid reset token changes the password, revokes sessions, and is single use.
+#[tokio::test]
+async fn password_recovery_completion_is_atomic_and_generic_on_replay() {
+    let catalog = MockCatalog::new();
+    let invite_token = fixture_bootstrap_invite(&catalog, "complete@example.test");
+    let config = password_recovery_test_config();
+    let state = test_state_with_config(catalog.clone(), None, Arc::clone(&config));
+    let registered = send(
+        state.clone(),
+        Method::POST,
+        "/v1/auth/register",
+        None,
+        Some(json!({
+            "invite_token": invite_token,
+            "email": "complete@example.test",
+            "password": "correct horse battery staple",
+            "client_kind": "desktop"
+        })),
+    )
+    .await;
+    assert_eq!(registered.status(), StatusCode::OK);
+    let original_hash = catalog.state.read().unwrap().account_password_credentials
+        ["complete@example.test"]
+        .password_hash
+        .clone();
+
+    let requested = send_browser(
+        state.clone(),
+        Method::POST,
+        "/v1/auth/password-recovery/request",
+        Some("https://frameshift.test"),
+        None,
+        Some(json!({"email": "complete@example.test"})),
+    )
+    .await;
+    assert_eq!(requested.status(), StatusCode::ACCEPTED);
+    wait_for_recovery_enqueue(&catalog).await;
+    let token = fixture_recovery_token(&catalog, &config);
+    let replacement = "violet moons remember every careful promise";
+    let completed = send_browser(
+        state.clone(),
+        Method::POST,
+        "/v1/auth/password-recovery/complete",
+        Some("https://frameshift.test"),
+        None,
+        Some(json!({"token": token.clone(), "password": replacement})),
+    )
+    .await;
+    assert_eq!(completed.status(), StatusCode::NO_CONTENT);
+
+    {
+        let stored = catalog.state.read().unwrap();
+        let credential = &stored.account_password_credentials["complete@example.test"];
+        assert_ne!(credential.password_hash, original_hash);
+        assert!(stored
+            .account_sessions
+            .values()
+            .all(|session| session.revoked_at.is_some()));
+        assert!(stored
+            .password_recovery_tokens
+            .values()
+            .all(|token| token.consumed_at.is_some() || token.revoked_at.is_some()));
+        assert_eq!(stored.password_recovery_deliveries.len(), 2);
+        let changed = stored
+            .password_recovery_deliveries
+            .values()
+            .find(|delivery| {
+                delivery.kind == frameshift_catalog::PasswordRecoveryDeliveryKind::PasswordChanged
+            })
+            .unwrap();
+        let cipher = RecoveryDeliveryCipher::from_config(&config)
+            .unwrap()
+            .expect("enabled recovery cipher");
+        let plaintext = cipher
+            .decrypt(
+                changed.id,
+                changed.kind,
+                changed.key_version,
+                &changed.nonce,
+                &changed.ciphertext,
+            )
+            .unwrap();
+        assert!(matches!(
+            parse_recovery_delivery_payload(&plaintext).unwrap(),
+            RecoveryDeliveryPayload::PasswordChanged
+        ));
+    }
+
+    let replay = send_browser(
+        state.clone(),
+        Method::POST,
+        "/v1/auth/password-recovery/complete",
+        Some("https://frameshift.test"),
+        None,
+        Some(json!({"token": token, "password": replacement})),
+    )
+    .await;
+    assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
+    let replay_body = response_json(replay).await;
+    let invalid = send_browser(
+        state,
+        Method::POST,
+        "/v1/auth/password-recovery/complete",
+        Some("https://frameshift.test"),
+        None,
+        Some(json!({
+            "token": URL_SAFE_NO_PAD.encode([99_u8; 32]),
+            "password": replacement
+        })),
+    )
+    .await;
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response_json(invalid).await, replay_body);
+}
+
+/// The worker retries transient failures with the same provider idempotency identifier.
+#[tokio::test]
+async fn password_recovery_worker_retries_then_acknowledges() {
+    let catalog = MockCatalog::new();
+    let config = password_recovery_test_config();
+    let delivery_id = fixture_worker_delivery(&catalog, &config, false);
+    let dispatcher =
+        FakeRecoveryDispatcher::new([FakeRecoveryOutcome::Retryable, FakeRecoveryOutcome::Success]);
+    let observed_ids = Arc::clone(&dispatcher.observed_ids);
+    let settled = run_worker_fixture(catalog, &config, dispatcher, delivery_id).await;
+
+    assert!(settled.sent_at.is_some());
+    assert!(settled.failed_at.is_none());
+    assert_eq!(settled.attempt_count, 2);
+    assert_eq!(
+        *observed_ids.lock().unwrap(),
+        vec![delivery_id, delivery_id]
+    );
+}
+
+/// The worker terminally settles provider rejection and authenticated-data tampering.
+#[tokio::test]
+async fn password_recovery_worker_fails_permanent_and_tampered_deliveries() {
+    let config = password_recovery_test_config();
+
+    let rejected_catalog = MockCatalog::new();
+    let rejected_id = fixture_worker_delivery(&rejected_catalog, &config, false);
+    let rejected_dispatcher = FakeRecoveryDispatcher::new([FakeRecoveryOutcome::Permanent]);
+    let rejected =
+        run_worker_fixture(rejected_catalog, &config, rejected_dispatcher, rejected_id).await;
+    assert!(rejected.sent_at.is_none());
+    assert!(rejected.failed_at.is_some());
+    assert_eq!(rejected.last_error_code.as_deref(), Some("test_permanent"));
+
+    let tampered_catalog = MockCatalog::new();
+    let tampered_id = fixture_worker_delivery(&tampered_catalog, &config, true);
+    let tampered_dispatcher = FakeRecoveryDispatcher::new([]);
+    let observed_ids = Arc::clone(&tampered_dispatcher.observed_ids);
+    let tampered =
+        run_worker_fixture(tampered_catalog, &config, tampered_dispatcher, tampered_id).await;
+    assert!(tampered.sent_at.is_none());
+    assert!(tampered.failed_at.is_some());
+    assert_eq!(
+        tampered.last_error_code.as_deref(),
+        Some("authentication_failed")
+    );
+    assert!(observed_ids.lock().unwrap().is_empty());
 }
 
 /// Desktop login returns an explicit bearer and rejects a short wrong password generically.

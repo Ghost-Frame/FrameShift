@@ -71,6 +71,14 @@
 //! | `LOCAL_AUTH_BROWSER_IDLE_SECS` | `604800` | Browser session inactivity lifetime |
 //! | `LOCAL_AUTH_BEARER_IDLE_SECS` | `2592000` | Desktop and CLI session inactivity lifetime |
 //! | `LOCAL_AUTH_ABSOLUTE_SECS` | `7776000` | Non-extendable lifetime for every local session |
+//! | `LOCAL_AUTH_RECOVERY_ENABLED` | `false` | Enable fail-closed first-party password recovery when every remaining recovery setting is valid |
+//! | `LOCAL_AUTH_RECOVERY_API_KEY` | `""` | Dedicated Resend sending key supplied by the credential broker |
+//! | `LOCAL_AUTH_RECOVERY_FROM` | `""` | Verified FrameShift sender identity used for recovery mail |
+//! | `LOCAL_AUTH_RECOVERY_RESET_URL` | `""` | HTTPS marketplace recovery page URL; reset bearers are appended only as URL fragments |
+//! | `LOCAL_AUTH_RECOVERY_DELIVERY_KEY` | `""` | Base64url-no-padding encoded 256-bit key used only for delivery-payload AEAD |
+//! | `LOCAL_AUTH_RECOVERY_KEY_VERSION` | `1` | Positive key version bound into recovery outbox ciphertext AAD |
+//! | `LOCAL_AUTH_RECOVERY_TOKEN_TTL_SECS` | `3600` | Single-use reset-token lifetime, capped at 24 hours |
+//! | `LOCAL_AUTH_RECOVERY_COOLDOWN_SECS` | `900` | Minimum interval between reset deliveries for one account |
 //!
 //! Env var names match the struct field names verbatim (figment maps
 //! `download_secret` <-> `DOWNLOAD_SECRET`); shorter aliases would require an
@@ -87,6 +95,12 @@ use figment::providers::{Env, Serialized};
 use figment::Figment;
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
+
+/// Maximum lifetime allowed for an emailed password-recovery bearer.
+const MAX_RECOVERY_TOKEN_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// Maximum accepted Resend API credential size before header construction.
+const MAX_RECOVERY_PROVIDER_KEY_BYTES: usize = 512;
 
 /// Log output format.
 ///
@@ -192,7 +206,132 @@ impl std::fmt::Debug for InviteRequestConfig {
     }
 }
 
-/// First-party password, invitation, and session configuration.
+/// Fail-closed password-recovery and delivery configuration.
+#[derive(Clone)]
+pub struct PasswordRecoveryConfig {
+    /// Whether public recovery endpoints and the delivery worker may operate.
+    pub enabled: bool,
+    /// Dedicated Resend API credential supplied by the credential broker.
+    pub provider_api_key: SecretString,
+    /// Verified sender identity used for reset and password-change mail.
+    pub from_address: String,
+    /// HTTPS marketplace page that consumes a reset token from its URL fragment.
+    pub reset_url: String,
+    /// Base64url-no-padding encoded 256-bit XChaCha20-Poly1305 key.
+    pub delivery_key: SecretString,
+    /// Positive version bound into encrypted delivery-payload AAD.
+    pub key_version: i16,
+    /// Exclusive lifetime of a single-use password-reset token.
+    pub token_ttl: Duration,
+    /// Minimum interval between reset deliveries for one account.
+    pub request_cooldown: Duration,
+}
+
+/// Constructors and strict validation for password-recovery configuration.
+impl PasswordRecoveryConfig {
+    /// Return a disabled configuration suitable for tests and deployments without mail.
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            provider_api_key: SecretString::new(String::new()),
+            from_address: String::new(),
+            reset_url: String::new(),
+            delivery_key: SecretString::new(String::new()),
+            key_version: 1,
+            token_ttl: Duration::from_secs(60 * 60),
+            request_cooldown: Duration::from_secs(15 * 60),
+        }
+    }
+
+    /// Validate all enabled settings and decode the active 256-bit delivery key.
+    pub fn decoded_delivery_key(&self) -> Result<Option<[u8; 32]>, String> {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine as _;
+        use secrecy::ExposeSecret as _;
+
+        if !self.enabled {
+            return Ok(None);
+        }
+        let provider_api_key = self.provider_api_key.expose_secret();
+        if provider_api_key.trim().is_empty()
+            || provider_api_key.trim() != provider_api_key
+            || provider_api_key.len() > MAX_RECOVERY_PROVIDER_KEY_BYTES
+            || provider_api_key.chars().any(char::is_control)
+        {
+            return Err(
+                "LOCAL_AUTH_RECOVERY_API_KEY must be a bounded canonical credential".into(),
+            );
+        }
+        if self.from_address.trim().is_empty()
+            || self.from_address.trim() != self.from_address
+            || !self.from_address.contains('@')
+            || self.from_address.len() > 320
+            || self.from_address.chars().any(char::is_control)
+        {
+            return Err("LOCAL_AUTH_RECOVERY_FROM must be a bounded sender identity".into());
+        }
+        let reset_url = url::Url::parse(&self.reset_url)
+            .map_err(|error| format!("LOCAL_AUTH_RECOVERY_RESET_URL is invalid: {error}"))?;
+        if reset_url.scheme() != "https"
+            || reset_url.host_str().is_none()
+            || !reset_url.username().is_empty()
+            || reset_url.password().is_some()
+            || reset_url.query().is_some()
+            || reset_url.fragment().is_some()
+        {
+            return Err(
+                "LOCAL_AUTH_RECOVERY_RESET_URL must be an HTTPS URL without credentials, query, or fragment"
+                    .into(),
+            );
+        }
+        if self.key_version <= 0 {
+            return Err("LOCAL_AUTH_RECOVERY_KEY_VERSION must be positive".into());
+        }
+        if self.token_ttl.is_zero() || self.token_ttl > MAX_RECOVERY_TOKEN_TTL {
+            return Err("LOCAL_AUTH_RECOVERY_TOKEN_TTL_SECS must be between 1 and 86400".into());
+        }
+        if self.request_cooldown.is_zero() || self.request_cooldown > self.token_ttl {
+            return Err(
+                "LOCAL_AUTH_RECOVERY_COOLDOWN_SECS must be positive and no greater than the token TTL"
+                    .into(),
+            );
+        }
+
+        let encoded_key = self.delivery_key.expose_secret();
+        let decoded = Zeroizing::new(URL_SAFE_NO_PAD.decode(encoded_key).map_err(|error| {
+            format!("LOCAL_AUTH_RECOVERY_DELIVERY_KEY base64url decode failed: {error}")
+        })?);
+        if decoded.len() != 32 || URL_SAFE_NO_PAD.encode(decoded.as_slice()) != encoded_key.as_str()
+        {
+            return Err(
+                "LOCAL_AUTH_RECOVERY_DELIVERY_KEY must be canonical base64url for exactly 32 bytes"
+                    .into(),
+            );
+        }
+        let mut key = [0_u8; 32];
+        key.copy_from_slice(decoded.as_slice());
+        Ok(Some(key))
+    }
+}
+
+/// Redacted formatting for password-recovery configuration.
+impl std::fmt::Debug for PasswordRecoveryConfig {
+    /// Format non-secret recovery settings while replacing both credentials with markers.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PasswordRecoveryConfig")
+            .field("enabled", &self.enabled)
+            .field("provider_api_key", &"[REDACTED]")
+            .field("from_address", &self.from_address)
+            .field("reset_url", &self.reset_url)
+            .field("delivery_key", &"[REDACTED]")
+            .field("key_version", &self.key_version)
+            .field("token_ttl", &self.token_ttl)
+            .field("request_cooldown", &self.request_cooldown)
+            .finish()
+    }
+}
+
+/// First-party password, invitation, session, and recovery configuration.
 #[derive(Clone)]
 pub struct FirstPartyAuthConfig {
     /// Deployment pepper supplied by the credential broker.
@@ -222,6 +361,8 @@ pub struct FirstPartyAuthConfig {
     pub bearer_idle_ttl: Duration,
     /// Non-extendable maximum session lifetime.
     pub absolute_ttl: Duration,
+    /// Optional password-recovery and mail-delivery settings.
+    pub recovery: PasswordRecoveryConfig,
 }
 
 /// Constructors and readiness checks for first-party account authentication.
@@ -238,6 +379,7 @@ impl FirstPartyAuthConfig {
             browser_idle_ttl: Duration::from_secs(7 * 24 * 60 * 60),
             bearer_idle_ttl: Duration::from_secs(30 * 24 * 60 * 60),
             absolute_ttl: Duration::from_secs(90 * 24 * 60 * 60),
+            recovery: PasswordRecoveryConfig::disabled(),
         }
     }
 
@@ -275,6 +417,7 @@ impl std::fmt::Debug for FirstPartyAuthConfig {
             .field("browser_idle_ttl", &self.browser_idle_ttl)
             .field("bearer_idle_ttl", &self.bearer_idle_ttl)
             .field("absolute_ttl", &self.absolute_ttl)
+            .field("recovery", &self.recovery)
             .finish()
     }
 }
@@ -599,6 +742,32 @@ impl ServerConfig {
         out.copy_from_slice(&bytes);
         Ok(Some(out))
     }
+
+    /// Validate enabled recovery against first-party auth and the trusted web origin.
+    pub fn password_recovery_key(&self) -> Result<Option<[u8; 32]>, String> {
+        let key = self.first_party_auth.recovery.decoded_delivery_key()?;
+        if key.is_none() {
+            return Ok(None);
+        }
+        if !self.first_party_auth.enabled() {
+            return Err(
+                "LOCAL_AUTH_RECOVERY_ENABLED requires valid first-party authentication".into(),
+            );
+        }
+        let reset_url = url::Url::parse(&self.first_party_auth.recovery.reset_url)
+            .map_err(|error| format!("LOCAL_AUTH_RECOVERY_RESET_URL is invalid: {error}"))?;
+        let reset_origin = reset_url.origin().ascii_serialization();
+        if !self
+            .cors_origins()
+            .any(|configured| configured == reset_origin)
+        {
+            return Err(
+                "LOCAL_AUTH_RECOVERY_RESET_URL origin must appear exactly in CORS_ALLOWED_ORIGINS"
+                    .into(),
+            );
+        }
+        Ok(key)
+    }
 }
 
 /// Manual `Debug` implementation that redacts `postgres_url`.
@@ -847,6 +1016,22 @@ struct RawConfig {
     local_auth_bearer_idle_secs: u64,
     /// Non-extendable session lifetime in seconds.
     local_auth_absolute_secs: u64,
+    /// Whether the complete password-recovery subsystem is enabled.
+    local_auth_recovery_enabled: bool,
+    /// Dedicated Resend API credential for recovery mail.
+    local_auth_recovery_api_key: String,
+    /// Verified sender identity for recovery mail.
+    local_auth_recovery_from: String,
+    /// HTTPS marketplace page that consumes reset-token fragments.
+    local_auth_recovery_reset_url: String,
+    /// Base64url-no-padding encoded 256-bit delivery-encryption key.
+    local_auth_recovery_delivery_key: String,
+    /// Positive delivery-encryption key version.
+    local_auth_recovery_key_version: i16,
+    /// Single-use reset-token lifetime in seconds.
+    local_auth_recovery_token_ttl_secs: u64,
+    /// Minimum interval between reset deliveries for one account.
+    local_auth_recovery_cooldown_secs: u64,
 
     /// Memory backend selector.
     memory_backend: String,
@@ -991,6 +1176,16 @@ impl RawConfig {
                 browser_idle_ttl: Duration::from_secs(self.local_auth_browser_idle_secs),
                 bearer_idle_ttl: Duration::from_secs(self.local_auth_bearer_idle_secs),
                 absolute_ttl: Duration::from_secs(self.local_auth_absolute_secs),
+                recovery: PasswordRecoveryConfig {
+                    enabled: self.local_auth_recovery_enabled,
+                    provider_api_key: SecretString::new(self.local_auth_recovery_api_key),
+                    from_address: self.local_auth_recovery_from,
+                    reset_url: self.local_auth_recovery_reset_url,
+                    delivery_key: SecretString::new(self.local_auth_recovery_delivery_key),
+                    key_version: self.local_auth_recovery_key_version,
+                    token_ttl: Duration::from_secs(self.local_auth_recovery_token_ttl_secs),
+                    request_cooldown: Duration::from_secs(self.local_auth_recovery_cooldown_secs),
+                },
             },
             memory_backend: self.memory_backend,
             memory_http_endpoint: self.memory_http_endpoint,
@@ -1071,6 +1266,14 @@ fn default_raw_config() -> RawConfig {
         local_auth_browser_idle_secs: 7 * 24 * 60 * 60,
         local_auth_bearer_idle_secs: 30 * 24 * 60 * 60,
         local_auth_absolute_secs: 90 * 24 * 60 * 60,
+        local_auth_recovery_enabled: false,
+        local_auth_recovery_api_key: String::new(),
+        local_auth_recovery_from: String::new(),
+        local_auth_recovery_reset_url: String::new(),
+        local_auth_recovery_delivery_key: String::new(),
+        local_auth_recovery_key_version: 1,
+        local_auth_recovery_token_ttl_secs: 60 * 60,
+        local_auth_recovery_cooldown_secs: 15 * 60,
         memory_backend: "none".to_string(),
         memory_http_endpoint: String::new(),
         memory_http_auth: "none".to_string(),
@@ -1362,6 +1565,112 @@ mod tests {
             config.quarantine_object_store_root,
             PathBuf::from("/tmp/frameshift-quarantine")
         );
+    }
+
+    #[test]
+    /// Password recovery defaults off without requiring provider or encryption secrets.
+    fn password_recovery_defaults_disabled() {
+        let config = default_raw_config().into_server_config();
+        assert!(matches!(config.password_recovery_key(), Ok(None)));
+    }
+
+    #[test]
+    /// Complete recovery settings decode one canonical key and match the trusted origin.
+    fn password_recovery_accepts_complete_configuration() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine as _;
+
+        let mut raw = default_raw_config();
+        raw.cors_allowed_origins = "https://frameshift.test".to_string();
+        raw.local_auth_password_pepper = "test-password-pepper".to_string();
+        raw.local_auth_recovery_enabled = true;
+        raw.local_auth_recovery_api_key = "re_test_provider_key".to_string();
+        raw.local_auth_recovery_from = "FrameShift <recovery@frameshift.test>".to_string();
+        raw.local_auth_recovery_reset_url = "https://frameshift.test/recover/".to_string();
+        raw.local_auth_recovery_delivery_key = URL_SAFE_NO_PAD.encode([7_u8; 32]);
+        let config = raw.into_server_config();
+
+        assert_eq!(
+            config
+                .password_recovery_key()
+                .expect("complete recovery configuration")
+                .expect("recovery enabled"),
+            [7_u8; 32]
+        );
+    }
+
+    #[test]
+    /// Enabled recovery rejects missing secrets, untrusted origins, and excessive token TTLs.
+    fn password_recovery_rejects_partial_or_unsafe_configuration() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine as _;
+
+        let mut partial = default_raw_config();
+        partial.local_auth_recovery_enabled = true;
+        assert!(partial
+            .into_server_config()
+            .password_recovery_key()
+            .is_err());
+
+        let mut unsafe_config = default_raw_config();
+        unsafe_config.cors_allowed_origins = "https://other.frameshift.test".to_string();
+        unsafe_config.local_auth_password_pepper = "test-password-pepper".to_string();
+        unsafe_config.local_auth_recovery_enabled = true;
+        unsafe_config.local_auth_recovery_api_key = "re_test_provider_key".to_string();
+        unsafe_config.local_auth_recovery_from =
+            "FrameShift <recovery@frameshift.test>".to_string();
+        unsafe_config.local_auth_recovery_reset_url =
+            "https://frameshift.test/recover/".to_string();
+        unsafe_config.local_auth_recovery_delivery_key = URL_SAFE_NO_PAD.encode([9_u8; 32]);
+        unsafe_config.local_auth_recovery_token_ttl_secs = 24 * 60 * 60 + 1;
+        assert!(unsafe_config
+            .into_server_config()
+            .password_recovery_key()
+            .is_err());
+
+        let mut padded_provider_key = default_raw_config();
+        padded_provider_key.cors_allowed_origins = "https://frameshift.test".to_string();
+        padded_provider_key.local_auth_password_pepper = "test-password-pepper".to_string();
+        padded_provider_key.local_auth_recovery_enabled = true;
+        padded_provider_key.local_auth_recovery_api_key = " re_test_provider_key".to_string();
+        padded_provider_key.local_auth_recovery_from =
+            "FrameShift <recovery@frameshift.test>".to_string();
+        padded_provider_key.local_auth_recovery_reset_url =
+            "https://frameshift.test/recover/".to_string();
+        padded_provider_key.local_auth_recovery_delivery_key = URL_SAFE_NO_PAD.encode([9_u8; 32]);
+        assert!(padded_provider_key
+            .into_server_config()
+            .password_recovery_key()
+            .is_err());
+
+        let mut padded_delivery_key = default_raw_config();
+        padded_delivery_key.cors_allowed_origins = "https://frameshift.test".to_string();
+        padded_delivery_key.local_auth_password_pepper = "test-password-pepper".to_string();
+        padded_delivery_key.local_auth_recovery_enabled = true;
+        padded_delivery_key.local_auth_recovery_api_key = "re_test_provider_key".to_string();
+        padded_delivery_key.local_auth_recovery_from =
+            "FrameShift <recovery@frameshift.test>".to_string();
+        padded_delivery_key.local_auth_recovery_reset_url =
+            "https://frameshift.test/recover/".to_string();
+        padded_delivery_key.local_auth_recovery_delivery_key =
+            format!(" {}", URL_SAFE_NO_PAD.encode([9_u8; 32]));
+        assert!(padded_delivery_key
+            .into_server_config()
+            .password_recovery_key()
+            .is_err());
+    }
+
+    #[test]
+    /// Recovery Debug formatting never exposes provider or delivery-key material.
+    fn password_recovery_debug_redacts_secrets() {
+        let mut recovery = PasswordRecoveryConfig::disabled();
+        recovery.provider_api_key = SecretString::new("RAW_RECOVERY_API_KEY".to_string());
+        recovery.delivery_key = SecretString::new("RAW_RECOVERY_DELIVERY_KEY".to_string());
+        let debug = format!("{recovery:?}");
+
+        assert!(!debug.contains("RAW_RECOVERY_API_KEY"));
+        assert!(!debug.contains("RAW_RECOVERY_DELIVERY_KEY"));
+        assert!(debug.contains("[REDACTED]"));
     }
 
     /// Build a [`ServerConfig`] populated with test-friendly defaults and the

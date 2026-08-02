@@ -21,23 +21,27 @@ use frameshift_catalog::{
     AccountInviteStatus, AccountPasswordCredentialRecord, AccountPasswordRehashRequest,
     AccountRecord, AccountSessionClientKind, AccountSessionRecord, AccountStatus,
     AccountStatusChangeRequest, AuthorRecord, CatalogBackend, CatalogError, Ed25519PublicKey,
-    LocalAccountRegistrationRequest, MembershipState, ObjectHash, PackSearchFilters, PackStatus,
-    PackVersionRecord, PlatformRole, PlatformRoleAssignmentRequest, PlatformRoleRevocationRequest,
-    PlatformRoleState, PublicationAppealDisposition, PublicationAppealRequest,
-    PublicationAppealResolutionRequest, PublicationIntentClaim, PublicationIntentRecord,
-    PublicationLifecycleAction, PublicationLifecycleCursor, PublicationModerationAction,
-    PublicationModerationDecisionRequest, PublicationPromotionRequest,
-    PublicationSubmissionRequest, PublicationSubmissionState, PublicationTombstoneRequest,
-    PublicationWithdrawalRequest, PublishQuota, PublisherAuditEventRecord, PublisherKeyRecord,
-    PublisherKeyState, PublisherMembershipRecord, PublisherModerationStatus,
-    PublisherProfileRecord, PublisherRole, PublisherSuspensionRequest, SortMode, TombstoneReason,
-    TombstoneRecord,
+    EncryptedPasswordRecoveryDelivery, LocalAccountRegistrationRequest, MembershipState,
+    ObjectHash, PackSearchFilters, PackStatus, PackVersionRecord,
+    PasswordRecoveryCompletionRequest, PasswordRecoveryDeliveryClaimRequest,
+    PasswordRecoveryDeliveryKind, PasswordRecoveryEnqueueRequest, PlatformRole,
+    PlatformRoleAssignmentRequest, PlatformRoleRevocationRequest, PlatformRoleState,
+    PublicationAppealDisposition, PublicationAppealRequest, PublicationAppealResolutionRequest,
+    PublicationIntentClaim, PublicationIntentRecord, PublicationLifecycleAction,
+    PublicationLifecycleCursor, PublicationModerationAction, PublicationModerationDecisionRequest,
+    PublicationPromotionRequest, PublicationSubmissionRequest, PublicationSubmissionState,
+    PublicationTombstoneRequest, PublicationWithdrawalRequest, PublishQuota,
+    PublisherAuditEventRecord, PublisherKeyRecord, PublisherKeyState, PublisherMembershipRecord,
+    PublisherModerationStatus, PublisherProfileRecord, PublisherRole, PublisherSuspensionRequest,
+    SortMode, TombstoneReason, TombstoneRecord,
 };
 use frameshift_catalog_postgres::schema::{
-    account_invites, account_password_credentials, account_platform_roles, accounts, pack_versions,
-    publication_appeal_resolutions, publication_appeals, publication_lifecycle_decisions,
-    publication_moderation_decisions, publication_promotions, publication_submissions,
-    publisher_audit_events, publisher_keys, publisher_memberships, publisher_profiles,
+    account_invites, account_password_credentials, account_password_recovery_outbox,
+    account_password_recovery_tokens, account_platform_roles, account_sessions, accounts,
+    pack_versions, publication_appeal_resolutions, publication_appeals,
+    publication_lifecycle_decisions, publication_moderation_decisions, publication_promotions,
+    publication_submissions, publisher_audit_events, publisher_keys, publisher_memberships,
+    publisher_profiles,
 };
 use frameshift_catalog_postgres::{
     OwnershipBackfillApplied, OwnershipBackfillManifest, OwnershipBackfillMode,
@@ -198,6 +202,43 @@ fn make_local_registration(
     }
 }
 
+/// Build one deterministic encrypted recovery-delivery fixture.
+fn make_password_recovery_delivery(
+    id: uuid::Uuid,
+    seed: u8,
+    expires_at: chrono::DateTime<chrono::Utc>,
+) -> EncryptedPasswordRecoveryDelivery {
+    EncryptedPasswordRecoveryDelivery {
+        id,
+        ciphertext: vec![seed; 32],
+        nonce: [seed.wrapping_add(1); 24],
+        key_version: 1,
+        expires_at,
+    }
+}
+
+/// Build one reset-token enqueue fixture with a one-hour validity window.
+fn make_password_recovery_enqueue(
+    normalized_email: &str,
+    token_id: uuid::Uuid,
+    delivery_id: uuid::Uuid,
+    token_digest: Vec<u8>,
+    requested_at: chrono::DateTime<chrono::Utc>,
+    cooldown_cutoff: chrono::DateTime<chrono::Utc>,
+    seed: u8,
+) -> PasswordRecoveryEnqueueRequest {
+    let token_expires_at = requested_at + chrono::Duration::hours(1);
+    PasswordRecoveryEnqueueRequest {
+        token_id,
+        normalized_email: normalized_email.to_string(),
+        token_digest,
+        requested_at,
+        token_expires_at,
+        cooldown_cutoff,
+        delivery: make_password_recovery_delivery(delivery_id, seed, token_expires_at),
+    }
+}
+
 /// Verify PostgreSQL applies password rehashes only to the exact observed credential.
 #[tokio::test]
 #[ignore]
@@ -267,6 +308,635 @@ async fn password_rehash_is_compare_and_swap() {
     assert_eq!(credential.pepper_version, 2);
     assert_eq!(credential.password_changed_at, now);
     assert_eq!(credential.updated_at, updated_at);
+}
+
+/// Verify recovery mutations are atomic, single-use, digest-only, and claim-fenced.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn password_recovery_is_atomic_digest_only_and_claim_fenced() {
+    let (catalog, _container) = setup_catalog().await;
+    let account = make_account(uuid::Uuid::new_v4(), "password-recovery");
+    catalog
+        .create_account(account.clone())
+        .await
+        .expect("create password recovery account failed");
+    let now = chrono::DateTime::from_timestamp_micros(chrono::Utc::now().timestamp_micros())
+        .expect("current timestamp must fit");
+    let normalized_email = "password-recovery@example.test";
+    let original_hash = "$argon2id$v=19$m=19456,t=2,p=1$b2xk$cGFzcw";
+    let mut connection = catalog
+        .pool()
+        .get()
+        .await
+        .expect("password recovery fixture connection failed");
+    diesel::insert_into(account_password_credentials::table)
+        .values((
+            account_password_credentials::account_id.eq(account.id),
+            account_password_credentials::normalized_email.eq(normalized_email),
+            account_password_credentials::password_hash.eq(original_hash),
+            account_password_credentials::password_version.eq(1_i16),
+            account_password_credentials::pepper_version.eq(1_i16),
+            account_password_credentials::email_verified_at.eq(Some(now)),
+            account_password_credentials::created_at.eq(now),
+            account_password_credentials::password_changed_at.eq(now),
+            account_password_credentials::updated_at.eq(now),
+        ))
+        .execute(&mut connection)
+        .await
+        .expect("insert password recovery credential failed");
+    for (seed, client_kind) in [(31_u8, "browser"), (32_u8, "desktop")] {
+        diesel::insert_into(account_sessions::table)
+            .values((
+                account_sessions::id.eq(uuid::Uuid::new_v4()),
+                account_sessions::account_id.eq(account.id),
+                account_sessions::token_digest.eq(vec![seed; 32]),
+                account_sessions::client_kind.eq(client_kind),
+                account_sessions::created_at.eq(now),
+                account_sessions::last_seen_at.eq(now),
+                account_sessions::idle_expires_at.eq(now + chrono::Duration::hours(1)),
+                account_sessions::absolute_expires_at.eq(now + chrono::Duration::hours(2)),
+                account_sessions::revoked_at.eq(None::<chrono::DateTime<chrono::Utc>>),
+            ))
+            .execute(&mut connection)
+            .await
+            .expect("insert password recovery session failed");
+    }
+
+    diesel::update(accounts::table.find(account.id))
+        .set(accounts::status.eq("suspended"))
+        .execute(&mut connection)
+        .await
+        .expect("suspend password recovery account failed");
+    drop(connection);
+    let suspended = make_password_recovery_enqueue(
+        normalized_email,
+        uuid::Uuid::new_v4(),
+        uuid::Uuid::new_v4(),
+        Sha256::digest(b"suspended-token").to_vec(),
+        now,
+        now - chrono::Duration::minutes(5),
+        40,
+    );
+    assert!(
+        !catalog
+            .enqueue_account_password_recovery(suspended)
+            .await
+            .expect("suspended recovery lookup failed"),
+        "a suspended account must be indistinguishable from a missing account"
+    );
+
+    let mut connection = catalog
+        .pool()
+        .get()
+        .await
+        .expect("password recovery eligibility connection failed");
+    diesel::update(accounts::table.find(account.id))
+        .set(accounts::status.eq("active"))
+        .execute(&mut connection)
+        .await
+        .expect("reactivate password recovery account failed");
+    diesel::update(account_password_credentials::table.find(account.id))
+        .set(
+            account_password_credentials::email_verified_at
+                .eq(None::<chrono::DateTime<chrono::Utc>>),
+        )
+        .execute(&mut connection)
+        .await
+        .expect("clear recovery email verification failed");
+    drop(connection);
+    let unverified = make_password_recovery_enqueue(
+        normalized_email,
+        uuid::Uuid::new_v4(),
+        uuid::Uuid::new_v4(),
+        Sha256::digest(b"unverified-token").to_vec(),
+        now + chrono::Duration::seconds(1),
+        now - chrono::Duration::minutes(5),
+        41,
+    );
+    assert!(
+        !catalog
+            .enqueue_account_password_recovery(unverified)
+            .await
+            .expect("unverified recovery lookup failed"),
+        "an unverified account must be indistinguishable from a missing account"
+    );
+
+    let mut connection = catalog
+        .pool()
+        .get()
+        .await
+        .expect("password recovery verification connection failed");
+    diesel::update(account_password_credentials::table.find(account.id))
+        .set(account_password_credentials::email_verified_at.eq(Some(now)))
+        .execute(&mut connection)
+        .await
+        .expect("verify recovery email failed");
+    drop(connection);
+
+    let raw_token = b"raw-password-reset-token";
+    let first_token_id = uuid::Uuid::new_v4();
+    let first_delivery_id = uuid::Uuid::new_v4();
+    let first_requested_at = now + chrono::Duration::seconds(2);
+    let first = make_password_recovery_enqueue(
+        normalized_email,
+        first_token_id,
+        first_delivery_id,
+        Sha256::digest(raw_token).to_vec(),
+        first_requested_at,
+        first_requested_at - chrono::Duration::minutes(5),
+        42,
+    );
+    assert!(catalog
+        .enqueue_account_password_recovery(first)
+        .await
+        .expect("first recovery enqueue failed"));
+
+    let second_requested_at = now + chrono::Duration::minutes(12);
+    let broken_token_digest = Sha256::digest(b"rollback-token").to_vec();
+    let broken_supersede = make_password_recovery_enqueue(
+        normalized_email,
+        uuid::Uuid::new_v4(),
+        first_delivery_id,
+        broken_token_digest.clone(),
+        second_requested_at,
+        second_requested_at - chrono::Duration::minutes(5),
+        43,
+    );
+    assert!(
+        catalog
+            .enqueue_account_password_recovery(broken_supersede)
+            .await
+            .is_err(),
+        "an outbox conflict must fail the complete enqueue transaction"
+    );
+    let mut connection = catalog
+        .pool()
+        .get()
+        .await
+        .expect("password recovery rollback connection failed");
+    let first_revoked_at = account_password_recovery_tokens::table
+        .find(first_token_id)
+        .select(account_password_recovery_tokens::revoked_at)
+        .first::<Option<chrono::DateTime<chrono::Utc>>>(&mut connection)
+        .await
+        .expect("load first recovery token after rollback failed");
+    assert_eq!(
+        first_revoked_at, None,
+        "failed enqueue must roll back revocation"
+    );
+    let broken_token_count = account_password_recovery_tokens::table
+        .filter(account_password_recovery_tokens::token_digest.eq(&broken_token_digest))
+        .count()
+        .get_result::<i64>(&mut connection)
+        .await
+        .expect("count rolled-back recovery token failed");
+    assert_eq!(
+        broken_token_count, 0,
+        "failed enqueue must not retain a token"
+    );
+    drop(connection);
+
+    let second_token_id = uuid::Uuid::new_v4();
+    let second_delivery_id = uuid::Uuid::new_v4();
+    let second_token_digest = Sha256::digest(b"active-reset-token").to_vec();
+    let second = make_password_recovery_enqueue(
+        normalized_email,
+        second_token_id,
+        second_delivery_id,
+        second_token_digest.clone(),
+        second_requested_at,
+        second_requested_at - chrono::Duration::minutes(5),
+        44,
+    );
+    assert!(catalog
+        .enqueue_account_password_recovery(second.clone())
+        .await
+        .expect("second recovery enqueue failed"));
+    let cooling_down = make_password_recovery_enqueue(
+        normalized_email,
+        uuid::Uuid::new_v4(),
+        uuid::Uuid::new_v4(),
+        Sha256::digest(b"cooldown-token").to_vec(),
+        second_requested_at + chrono::Duration::minutes(1),
+        second_requested_at - chrono::Duration::minutes(4),
+        45,
+    );
+    assert!(
+        !catalog
+            .enqueue_account_password_recovery(cooling_down)
+            .await
+            .expect("cooldown recovery enqueue failed"),
+        "cooldown must use the same generic false result"
+    );
+
+    let mut connection = catalog
+        .pool()
+        .get()
+        .await
+        .expect("password recovery token assertion connection failed");
+    let token_states = account_password_recovery_tokens::table
+        .filter(account_password_recovery_tokens::id.eq_any([first_token_id, second_token_id]))
+        .order(account_password_recovery_tokens::created_at.asc())
+        .select((
+            account_password_recovery_tokens::id,
+            account_password_recovery_tokens::token_digest,
+            account_password_recovery_tokens::consumed_at,
+            account_password_recovery_tokens::revoked_at,
+        ))
+        .load::<(
+            uuid::Uuid,
+            Vec<u8>,
+            Option<chrono::DateTime<chrono::Utc>>,
+            Option<chrono::DateTime<chrono::Utc>>,
+        )>(&mut connection)
+        .await
+        .expect("load recovery token states failed");
+    assert_eq!(token_states.len(), 2);
+    assert_eq!(token_states[0].0, first_token_id);
+    assert!(
+        token_states[0].3.is_some(),
+        "superseded token must be revoked"
+    );
+    assert_eq!(token_states[1].0, second_token_id);
+    assert_eq!(token_states[1].2, None);
+    assert_eq!(token_states[1].3, None);
+    assert!(token_states.iter().all(|(_, digest, _, _)| {
+        !digest
+            .windows(raw_token.len())
+            .any(|window| window == raw_token)
+    }));
+    drop(connection);
+
+    let completed_at = second_requested_at + chrono::Duration::minutes(2);
+    let changed_hash = "$argon2id$v=19$m=65536,t=3,p=1$bmV3$cGFzcw".to_string();
+    let conflicting_completion = PasswordRecoveryCompletionRequest {
+        token_digest: second_token_digest.clone(),
+        new_password_hash: changed_hash.clone(),
+        new_password_version: 2,
+        new_pepper_version: 3,
+        completed_at,
+        delivery: make_password_recovery_delivery(
+            first_delivery_id,
+            46,
+            completed_at + chrono::Duration::hours(24),
+        ),
+    };
+    assert!(
+        catalog
+            .complete_account_password_recovery(conflicting_completion)
+            .await
+            .is_err(),
+        "a completion outbox conflict must roll back every credential mutation"
+    );
+    let credential = catalog
+        .get_account_password_credential(normalized_email)
+        .await
+        .expect("load credential after rolled-back completion failed");
+    assert_eq!(credential.password_hash, original_hash);
+    let mut connection = catalog
+        .pool()
+        .get()
+        .await
+        .expect("password recovery completion rollback connection failed");
+    let active_token_count = account_password_recovery_tokens::table
+        .find(second_token_id)
+        .filter(account_password_recovery_tokens::consumed_at.is_null())
+        .filter(account_password_recovery_tokens::revoked_at.is_null())
+        .count()
+        .get_result::<i64>(&mut connection)
+        .await
+        .expect("count active token after completion rollback failed");
+    assert_eq!(active_token_count, 1);
+    let pre_completion_revocations = account_sessions::table
+        .filter(account_sessions::account_id.eq(account.id))
+        .filter(account_sessions::revoked_at.is_not_null())
+        .count()
+        .get_result::<i64>(&mut connection)
+        .await
+        .expect("count sessions after completion rollback failed");
+    assert_eq!(pre_completion_revocations, 0);
+    drop(connection);
+
+    let completion_delivery_id = uuid::Uuid::new_v4();
+    let completion = PasswordRecoveryCompletionRequest {
+        token_digest: second_token_digest,
+        new_password_hash: changed_hash.clone(),
+        new_password_version: 2,
+        new_pepper_version: 3,
+        completed_at,
+        delivery: make_password_recovery_delivery(
+            completion_delivery_id,
+            47,
+            completed_at + chrono::Duration::hours(24),
+        ),
+    };
+    let (first_completion, concurrent_completion) = tokio::join!(
+        catalog.complete_account_password_recovery(completion.clone()),
+        catalog.complete_account_password_recovery(completion.clone()),
+    );
+    let completion_results = [first_completion, concurrent_completion];
+    assert_eq!(
+        completion_results
+            .iter()
+            .filter(|result| matches!(result, Ok(true)))
+            .count(),
+        1,
+        "exactly one concurrent reset completion may consume the token"
+    );
+    assert_eq!(
+        completion_results
+            .iter()
+            .filter(|result| matches!(result, Ok(false)))
+            .count(),
+        1,
+        "the concurrent loser must receive the generic false result"
+    );
+    assert!(
+        !catalog
+            .complete_account_password_recovery(completion)
+            .await
+            .expect("replayed recovery completion failed"),
+        "a consumed token must remain single-use"
+    );
+
+    let credential = catalog
+        .get_account_password_credential(normalized_email)
+        .await
+        .expect("load completed password credential failed");
+    assert_eq!(credential.password_hash, changed_hash);
+    assert_eq!(credential.password_version, 2);
+    assert_eq!(credential.pepper_version, 3);
+    assert_eq!(credential.password_changed_at, completed_at);
+    let mut connection = catalog
+        .pool()
+        .get()
+        .await
+        .expect("password recovery outcome connection failed");
+    let revoked_sessions = account_sessions::table
+        .filter(account_sessions::account_id.eq(account.id))
+        .select(account_sessions::revoked_at)
+        .load::<Option<chrono::DateTime<chrono::Utc>>>(&mut connection)
+        .await
+        .expect("load recovery session revocations failed");
+    assert_eq!(revoked_sessions.len(), 2);
+    assert!(revoked_sessions.iter().all(Option::is_some));
+    let persisted_ciphertexts = account_password_recovery_outbox::table
+        .select(account_password_recovery_outbox::ciphertext)
+        .load::<Vec<u8>>(&mut connection)
+        .await
+        .expect("load encrypted recovery payloads failed");
+    assert_eq!(persisted_ciphertexts.len(), 3);
+    assert!(persisted_ciphertexts.iter().all(|ciphertext| {
+        !ciphertext
+            .windows(raw_token.len())
+            .any(|window| window == raw_token)
+    }));
+    drop(connection);
+
+    let first_claim_id = uuid::Uuid::new_v4();
+    let first_claimed_at = completed_at + chrono::Duration::seconds(1);
+    let claimed = catalog
+        .claim_password_recovery_deliveries(PasswordRecoveryDeliveryClaimRequest {
+            claim_id: first_claim_id,
+            claimed_at: first_claimed_at,
+            stale_before: first_claimed_at - chrono::Duration::minutes(1),
+            limit: 10,
+        })
+        .await
+        .expect("claim recovery delivery batch failed");
+    assert_eq!(
+        claimed.len(),
+        1,
+        "superseded and consumed reset deliveries must not remain claimable"
+    );
+    assert!(claimed.iter().all(|delivery| {
+        delivery.claim_id == Some(first_claim_id) && delivery.attempt_count == 1
+    }));
+    let completion_delivery = claimed
+        .iter()
+        .find(|delivery| delivery.id == completion_delivery_id)
+        .expect("completion delivery must be claimed");
+    assert_eq!(
+        completion_delivery.kind,
+        PasswordRecoveryDeliveryKind::PasswordChanged
+    );
+    assert!(
+        !catalog
+            .mark_password_recovery_delivery_sent(
+                completion_delivery_id,
+                uuid::Uuid::new_v4(),
+                first_claimed_at + chrono::Duration::seconds(1),
+                "provider-wrong-claim".to_string(),
+            )
+            .await
+            .expect("wrong-claim acknowledgement failed"),
+        "an obsolete claim must not acknowledge a delivery"
+    );
+    let retry_at = first_claimed_at + chrono::Duration::seconds(10);
+    assert!(catalog
+        .retry_password_recovery_delivery(
+            completion_delivery_id,
+            first_claim_id,
+            retry_at,
+            "provider_500".to_string(),
+        )
+        .await
+        .expect("release reset delivery for retry failed"));
+    let too_early = catalog
+        .claim_password_recovery_deliveries(PasswordRecoveryDeliveryClaimRequest {
+            claim_id: uuid::Uuid::new_v4(),
+            claimed_at: retry_at - chrono::Duration::seconds(1),
+            stale_before: retry_at - chrono::Duration::minutes(1),
+            limit: 10,
+        })
+        .await
+        .expect("early recovery delivery claim failed");
+    assert!(too_early.is_empty(), "retry delay must be durable");
+
+    let second_claim_id = uuid::Uuid::new_v4();
+    let second_claim = catalog
+        .claim_password_recovery_deliveries(PasswordRecoveryDeliveryClaimRequest {
+            claim_id: second_claim_id,
+            claimed_at: retry_at,
+            stale_before: retry_at - chrono::Duration::minutes(1),
+            limit: 10,
+        })
+        .await
+        .expect("retry recovery delivery claim failed");
+    assert_eq!(second_claim.len(), 1);
+    assert_eq!(second_claim[0].id, completion_delivery_id);
+    assert_eq!(second_claim[0].attempt_count, 2);
+
+    let stale_reclaim_at = retry_at + chrono::Duration::minutes(2);
+    let third_claim_id = uuid::Uuid::new_v4();
+    let stale_reclaim = catalog
+        .claim_password_recovery_deliveries(PasswordRecoveryDeliveryClaimRequest {
+            claim_id: third_claim_id,
+            claimed_at: stale_reclaim_at,
+            stale_before: stale_reclaim_at - chrono::Duration::minutes(1),
+            limit: 10,
+        })
+        .await
+        .expect("stale recovery delivery reclaim failed");
+    assert_eq!(stale_reclaim.len(), 1);
+    assert_eq!(stale_reclaim[0].id, completion_delivery_id);
+    assert_eq!(stale_reclaim[0].claim_id, Some(third_claim_id));
+    assert_eq!(stale_reclaim[0].attempt_count, 3);
+    assert!(
+        !catalog
+            .mark_password_recovery_delivery_sent(
+                completion_delivery_id,
+                second_claim_id,
+                stale_reclaim_at + chrono::Duration::seconds(1),
+                "provider-obsolete-claim".to_string(),
+            )
+            .await
+            .expect("obsolete recovery delivery acknowledgement failed"),
+        "a stale worker must be fenced after reclaim"
+    );
+    assert!(catalog
+        .mark_password_recovery_delivery_sent(
+            completion_delivery_id,
+            third_claim_id,
+            stale_reclaim_at + chrono::Duration::seconds(1),
+            "provider-message-123".to_string(),
+        )
+        .await
+        .expect("acknowledge reclaimed completion delivery failed"));
+
+    let third_requested_at = second_requested_at + chrono::Duration::minutes(30);
+    let third_delivery_id = uuid::Uuid::new_v4();
+    let third = make_password_recovery_enqueue(
+        normalized_email,
+        uuid::Uuid::new_v4(),
+        third_delivery_id,
+        Sha256::digest(b"provider-failure-token").to_vec(),
+        third_requested_at,
+        third_requested_at - chrono::Duration::minutes(5),
+        48,
+    );
+    assert!(catalog
+        .enqueue_account_password_recovery(third)
+        .await
+        .expect("enqueue permanent-failure recovery fixture failed"));
+    let failure_claim_id = uuid::Uuid::new_v4();
+    let failure_claimed_at = third_requested_at + chrono::Duration::seconds(1);
+    let failure_claim = catalog
+        .claim_password_recovery_deliveries(PasswordRecoveryDeliveryClaimRequest {
+            claim_id: failure_claim_id,
+            claimed_at: failure_claimed_at,
+            stale_before: failure_claimed_at - chrono::Duration::minutes(1),
+            limit: 10,
+        })
+        .await
+        .expect("claim permanent-failure recovery fixture failed");
+    assert_eq!(failure_claim.len(), 1);
+    assert_eq!(failure_claim[0].id, third_delivery_id);
+    assert!(
+        !catalog
+            .fail_password_recovery_delivery(
+                third_delivery_id,
+                uuid::Uuid::new_v4(),
+                failure_claimed_at + chrono::Duration::seconds(1),
+                "provider_rejected".to_string(),
+            )
+            .await
+            .expect("wrong-claim permanent failure update failed"),
+        "a non-owning claim must not permanently fail a delivery"
+    );
+    assert!(catalog
+        .fail_password_recovery_delivery(
+            third_delivery_id,
+            failure_claim_id,
+            failure_claimed_at + chrono::Duration::seconds(1),
+            "provider_rejected".to_string(),
+        )
+        .await
+        .expect("permanently fail recovery delivery failed"));
+
+    let mut connection = catalog
+        .pool()
+        .get()
+        .await
+        .expect("password recovery lifecycle assertion connection failed");
+    let completion_state = account_password_recovery_outbox::table
+        .find(completion_delivery_id)
+        .select((
+            account_password_recovery_outbox::sent_at,
+            account_password_recovery_outbox::provider_message_id,
+            account_password_recovery_outbox::failed_at,
+        ))
+        .first::<(
+            Option<chrono::DateTime<chrono::Utc>>,
+            Option<String>,
+            Option<chrono::DateTime<chrono::Utc>>,
+        )>(&mut connection)
+        .await
+        .expect("load completion delivery lifecycle failed");
+    assert!(completion_state.0.is_some());
+    assert_eq!(completion_state.1.as_deref(), Some("provider-message-123"));
+    assert_eq!(completion_state.2, None);
+    let reset_state = account_password_recovery_outbox::table
+        .find(third_delivery_id)
+        .select((
+            account_password_recovery_outbox::attempt_count,
+            account_password_recovery_outbox::claim_id,
+            account_password_recovery_outbox::failed_at,
+            account_password_recovery_outbox::last_error_code,
+        ))
+        .first::<(
+            i32,
+            Option<uuid::Uuid>,
+            Option<chrono::DateTime<chrono::Utc>>,
+            Option<String>,
+        )>(&mut connection)
+        .await
+        .expect("load failed reset delivery lifecycle failed");
+    assert_eq!(reset_state.0, 1);
+    assert_eq!(reset_state.1, None);
+    assert!(reset_state.2.is_some());
+    assert_eq!(reset_state.3.as_deref(), Some("provider_rejected"));
+    let cancelled_reset_codes = account_password_recovery_outbox::table
+        .filter(
+            account_password_recovery_outbox::id.eq_any([first_delivery_id, second_delivery_id]),
+        )
+        .order(account_password_recovery_outbox::created_at.asc())
+        .select(account_password_recovery_outbox::last_error_code)
+        .load::<Option<String>>(&mut connection)
+        .await
+        .expect("load cancelled reset delivery codes failed");
+    assert_eq!(
+        cancelled_reset_codes,
+        vec![
+            Some("token_superseded".to_string()),
+            Some("token_consumed".to_string()),
+        ]
+    );
+}
+
+/// Prove the recovery migration can be reverted and reapplied on a migrated database.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn password_recovery_migration_down_and_up_are_reversible() {
+    let (catalog, _container) = setup_catalog().await;
+    let mut connection = catalog
+        .pool()
+        .get()
+        .await
+        .expect("password recovery migration connection failed");
+
+    connection
+        .batch_execute(include_str!(
+            "../migrations/2026-08-02-000000_add_account_password_recovery/down.sql"
+        ))
+        .await
+        .expect("password recovery migration down failed");
+    connection
+        .batch_execute(include_str!(
+            "../migrations/2026-08-02-000000_add_account_password_recovery/up.sql"
+        ))
+        .await
+        .expect("password recovery migration reapply failed");
 }
 
 /// Create one approved publisher with an active deterministic signing key.
