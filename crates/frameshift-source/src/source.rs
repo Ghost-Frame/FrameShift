@@ -11,6 +11,7 @@ const PERSONA_FILE: &str = "persona.toml";
 const RULES_FILE: &str = "rules.toml";
 const SKILLS_FILE: &str = "skills.toml";
 const PATTERNS_FILE: &str = "patterns.toml";
+const PACK_FILE: &str = "pack.toml";
 
 /// Configuration for loading persona source files with safety limits.
 ///
@@ -28,7 +29,7 @@ pub struct LoadOptions {
     pub max_patterns: usize,
 }
 
-/// Provides bounded defaults for local persona-source loading.
+/// Supplies bounded defaults for local persona source loading.
 impl Default for LoadOptions {
     /// Returns default load options suitable for local development use.
     fn default() -> Self {
@@ -41,8 +42,8 @@ impl Default for LoadOptions {
     }
 }
 
-/// Composite persona source. Read from / written to a directory containing
-/// `persona.toml`, `rules.toml`, `skills.toml`, `patterns.toml`.
+/// Composite persona source loaded from split TOML files or one inline
+/// `pack.toml`. Writing always emits the four-file split layout.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PersonaSource {
     /// Core persona identity, voice, anchors, and classification config.
@@ -55,7 +56,7 @@ pub struct PersonaSource {
     pub patterns: PatternSet,
 }
 
-/// Loads, validates, constructs, and writes composite persona sources.
+/// Creates, loads, validates, and writes composite typed persona source.
 impl PersonaSource {
     /// Constructs a new `PersonaSource` with the given persona and empty rules, skills, and patterns.
     pub fn new(persona: Persona) -> Self {
@@ -76,6 +77,62 @@ impl PersonaSource {
         Self::load_from_dir_with_options(dir, &LoadOptions::default())
     }
 
+    /// Load typed source from split files or an inline `pack.toml`.
+    ///
+    /// Split source takes precedence when `persona.toml` is present. Otherwise,
+    /// `pack.toml` is inspected for a top-level `[voice]` table. A manifest
+    /// without `[voice]` returns `Ok(None)` because it contains metadata only.
+    pub fn load_from_dir_or_pack(dir: &Path) -> Result<Option<Self>, SourceError> {
+        Self::load_from_dir_or_pack_with_options(dir, &LoadOptions::default())
+    }
+
+    /// Load split or inline typed source with explicit safety limits.
+    ///
+    /// A declared inline source that fails to deserialize returns an error;
+    /// callers must not silently fall back to Markdown in that case.
+    pub fn load_from_dir_or_pack_with_options(
+        dir: &Path,
+        opts: &LoadOptions,
+    ) -> Result<Option<Self>, SourceError> {
+        if dir.join(PERSONA_FILE).is_file() {
+            return Self::load_from_dir_with_options(dir, opts).map(Some);
+        }
+        Self::load_from_pack_file_with_options(&dir.join(PACK_FILE), opts)
+    }
+
+    /// Load inline typed source from one `pack.toml` using default limits.
+    ///
+    /// The file remains independently deserializable as a pack manifest. This
+    /// loader reads the same document as persona, rule, skill, and pattern
+    /// views, ignoring fields owned by the other views.
+    pub fn load_from_pack_file(path: &Path) -> Result<Option<Self>, SourceError> {
+        Self::load_from_pack_file_with_options(path, &LoadOptions::default())
+    }
+
+    /// Load inline typed source from one `pack.toml` with explicit limits.
+    ///
+    /// A top-level `[voice]` table marks the manifest as runtime source. Files
+    /// without that marker are metadata-only and return `Ok(None)`.
+    pub fn load_from_pack_file_with_options(
+        path: &Path,
+        opts: &LoadOptions,
+    ) -> Result<Option<Self>, SourceError> {
+        let raw = read_toml_raw_with_limit(path, opts.max_file_size)?;
+        let document: toml::Value = deserialize_toml(&raw, path)?;
+        if document.get("voice").is_none() {
+            return Ok(None);
+        }
+
+        let source = Self {
+            persona: deserialize_toml(&raw, path)?,
+            rules: deserialize_toml(&raw, path)?,
+            skills: deserialize_toml(&raw, path)?,
+            patterns: deserialize_toml(&raw, path)?,
+        };
+        validate_collection_limits(&source.rules, &source.skills, &source.patterns, opts)?;
+        Ok(Some(source))
+    }
+
     /// Load a persona source from a directory with explicit size and count limits.
     ///
     /// Checks each file's size against `opts.max_file_size` before reading it.
@@ -94,37 +151,7 @@ impl PersonaSource {
             load_optional_with_limit::<PatternSet>(&dir.join(PATTERNS_FILE), opts.max_file_size)?
                 .unwrap_or_default();
 
-        // Validate counts against configured limits.
-        if rules.rules.len() > opts.max_rules {
-            return Err(SourceError::ContentLimitExceeded {
-                detail: format!(
-                    "rules count {} exceeds max_rules {}",
-                    rules.rules.len(),
-                    opts.max_rules
-                ),
-            });
-        }
-        if skills.skills.len() > opts.max_skills {
-            return Err(SourceError::ContentLimitExceeded {
-                detail: format!(
-                    "skills count {} exceeds max_skills {}",
-                    skills.skills.len(),
-                    opts.max_skills
-                ),
-            });
-        }
-        let pattern_count = patterns.stack.len()
-            + patterns.antipatterns.len()
-            + patterns.examples.len()
-            + patterns.patterns.len();
-        if pattern_count > opts.max_patterns {
-            return Err(SourceError::ContentLimitExceeded {
-                detail: format!(
-                    "pattern entry count {pattern_count} exceeds max_patterns {}",
-                    opts.max_patterns
-                ),
-            });
-        }
+        validate_collection_limits(&rules, &skills, &patterns, opts)?;
 
         Ok(Self {
             persona,
@@ -150,6 +177,46 @@ impl PersonaSource {
         write_toml(&dir.join(PATTERNS_FILE), &self.patterns)?;
         Ok(())
     }
+}
+
+/// Validate typed collection counts against configured source limits.
+fn validate_collection_limits(
+    rules: &RuleSet,
+    skills: &SkillSet,
+    patterns: &PatternSet,
+    opts: &LoadOptions,
+) -> Result<(), SourceError> {
+    if rules.rules.len() > opts.max_rules {
+        return Err(SourceError::ContentLimitExceeded {
+            detail: format!(
+                "rules count {} exceeds max_rules {}",
+                rules.rules.len(),
+                opts.max_rules
+            ),
+        });
+    }
+    if skills.skills.len() > opts.max_skills {
+        return Err(SourceError::ContentLimitExceeded {
+            detail: format!(
+                "skills count {} exceeds max_skills {}",
+                skills.skills.len(),
+                opts.max_skills
+            ),
+        });
+    }
+    let pattern_count = patterns.stack.len()
+        + patterns.antipatterns.len()
+        + patterns.examples.len()
+        + patterns.patterns.len();
+    if pattern_count > opts.max_patterns {
+        return Err(SourceError::ContentLimitExceeded {
+            detail: format!(
+                "pattern entry count {pattern_count} exceeds max_patterns {}",
+                opts.max_patterns
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Loads a required TOML file with a file-size pre-check. Returns `MissingFile`
@@ -182,6 +249,12 @@ fn read_toml_with_limit<T: serde::de::DeserializeOwned>(
     path: &Path,
     max_bytes: usize,
 ) -> Result<T, SourceError> {
+    let raw = read_toml_raw_with_limit(path, max_bytes)?;
+    deserialize_toml(&raw, path)
+}
+
+/// Read one bounded TOML file without choosing a schema view.
+fn read_toml_raw_with_limit(path: &Path, max_bytes: usize) -> Result<String, SourceError> {
     let metadata = fs::metadata(path).map_err(|source| SourceError::Io {
         path: path.to_path_buf(),
         source,
@@ -199,7 +272,15 @@ fn read_toml_with_limit<T: serde::de::DeserializeOwned>(
         path: path.to_path_buf(),
         source,
     })?;
-    toml::from_str(&raw).map_err(|source| SourceError::TomlDeserialize {
+    Ok(raw)
+}
+
+/// Deserialize one TOML schema view while preserving the source path in errors.
+fn deserialize_toml<T: serde::de::DeserializeOwned>(
+    raw: &str,
+    path: &Path,
+) -> Result<T, SourceError> {
+    toml::from_str(raw).map_err(|source| SourceError::TomlDeserialize {
         path: path.to_path_buf(),
         source,
     })
@@ -216,7 +297,7 @@ fn write_toml<T: serde::Serialize>(path: &PathBuf, value: &T) -> Result<(), Sour
 }
 
 #[cfg(test)]
-/// Verifies persona-source persistence and loading failures.
+/// Exercises split and inline source loading, persistence, and safety limits.
 mod tests {
     use super::*;
     use crate::patterns::{AntiPattern, PatternSet, StackCategory};
@@ -225,7 +306,7 @@ mod tests {
     use crate::skills::{Skill, SkillSet};
     use std::collections::BTreeMap;
 
-    /// Builds a populated persona source shared by persistence tests.
+    /// Builds a representative split-source fixture for loader round trips.
     fn sample() -> PersonaSource {
         let mut anchor = BTreeMap::new();
         anchor.insert(
@@ -289,7 +370,7 @@ mod tests {
     }
 
     #[test]
-    /// Round-trips a persona source directory through disk.
+    /// Verifies writing and reloading split source preserves every field.
     fn write_then_load_roundtrip() {
         let tmp = tempfile_dir();
         let original = sample();
@@ -300,7 +381,7 @@ mod tests {
     }
 
     #[test]
-    /// Rejects a source directory without its required persona file.
+    /// Verifies split source requires its primary `persona.toml` file.
     fn missing_persona_file_errors() {
         let tmp = tempfile_dir();
         let err = PersonaSource::load_from_dir(&tmp).unwrap_err();
@@ -353,6 +434,116 @@ mod tests {
         let loaded =
             PersonaSource::load_from_dir_with_options(&tmp, &LoadOptions::default()).unwrap();
         assert_eq!(loaded, original);
+    }
+
+    /// Verify one pack file can carry every typed-source schema view.
+    #[test]
+    fn inline_pack_loads_persona_rules_skills_and_patterns() {
+        let tmp = tempfile_dir();
+        let pack_path = tmp.join("pack.toml");
+        fs::write(
+            &pack_path,
+            r#"schema_version = 1
+name = "inline-demo"
+author_handle = "example"
+author_pubkey = "local-unsigned"
+version = "0.1.0"
+description = "Inline source fixture."
+tags = ["inline"]
+
+[voice]
+tone = "precise"
+
+[[voice.questions]]
+text = "Which layer owns this truth?"
+
+[anchor.l2]
+text = "Keep one authoritative state transition."
+
+[[rule]]
+id = "single-owner"
+layer = "L1"
+text = "Assign one authoritative owner to every state transition."
+
+[[skill]]
+id = "state-trace"
+invoke_when = "A state transition crosses a process boundary."
+mandatory = true
+
+[[stack]]
+category = "simulation"
+items = ["deterministic-step"]
+
+[[pattern]]
+id = "replay-first"
+text = "Reproduce divergence from the event stream before patching it."
+"#,
+        )
+        .unwrap();
+
+        let loaded = PersonaSource::load_from_pack_file(&pack_path)
+            .unwrap()
+            .expect("voice marks inline typed source");
+
+        assert_eq!(loaded.persona.name, "inline-demo");
+        assert_eq!(loaded.rules.rules[0].id, "single-owner");
+        assert_eq!(loaded.skills.skills[0].id, "state-trace");
+        assert_eq!(loaded.patterns.stack[0].category, "simulation");
+        assert_eq!(loaded.patterns.patterns[0].id, "replay-first");
+    }
+
+    /// Verify a catalog-only manifest remains distinguishable from runtime source.
+    #[test]
+    fn metadata_only_pack_returns_none() {
+        let tmp = tempfile_dir();
+        let pack_path = tmp.join("pack.toml");
+        fs::write(
+            &pack_path,
+            "schema_version = 1\nname = \"catalog-entry\"\nauthor_handle = \"example\"\n",
+        )
+        .unwrap();
+
+        assert!(PersonaSource::load_from_pack_file(&pack_path)
+            .unwrap()
+            .is_none());
+    }
+
+    /// Verify a declared but malformed inline voice fails closed.
+    #[test]
+    fn malformed_inline_pack_returns_error() {
+        let tmp = tempfile_dir();
+        let pack_path = tmp.join("pack.toml");
+        fs::write(
+            &pack_path,
+            "schema_version = 1\nname = \"broken\"\nvoice = \"not-a-table\"\n",
+        )
+        .unwrap();
+
+        let error = PersonaSource::load_from_pack_file(&pack_path).unwrap_err();
+        assert!(matches!(error, SourceError::TomlDeserialize { .. }));
+    }
+
+    /// Verify inline rules use the same count limits as split source files.
+    #[test]
+    fn inline_pack_enforces_collection_limits() {
+        let tmp = tempfile_dir();
+        let pack_path = tmp.join("pack.toml");
+        fs::write(
+            &pack_path,
+            "schema_version = 1\nname = \"bounded\"\n[voice]\ntone = \"precise\"\n\
+             [[rule]]\nid = \"one\"\nlayer = \"L1\"\ntext = \"One rule.\"\n",
+        )
+        .unwrap();
+        let opts = LoadOptions {
+            max_rules: 0,
+            ..LoadOptions::default()
+        };
+
+        let error = PersonaSource::load_from_pack_file_with_options(&pack_path, &opts).unwrap_err();
+        assert!(
+            matches!(&error, SourceError::ContentLimitExceeded { detail } if detail.contains("max_rules")),
+            "unexpected error: {error}"
+        );
     }
 
     /// Verify that loading with max_rules=0 fails with ContentLimitExceeded

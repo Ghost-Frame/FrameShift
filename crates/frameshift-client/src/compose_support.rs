@@ -31,6 +31,7 @@ pub(crate) struct CacheResolver<'a> {
     by_name: BTreeMap<&'a str, &'a str>,
 }
 
+/// Builds cache-backed source resolvers for one project lockfile.
 impl<'a> CacheResolver<'a> {
     /// Builds a resolver from every persona currently locked for the project.
     /// Later entries win on duplicate names (the lockfile itself is kept
@@ -45,6 +46,7 @@ impl<'a> CacheResolver<'a> {
     }
 }
 
+/// Resolves composition specs to split or inline typed source in the cache.
 impl SourceResolver for CacheResolver<'_> {
     /// Resolves `spec` to a `PersonaSource` loaded from the cache entry for
     /// the name portion of `spec` (the part before an optional `@version`).
@@ -64,7 +66,11 @@ impl SourceResolver for CacheResolver<'_> {
                 reason: "base/mixin persona is not installed in this project".to_string(),
             })?;
 
-        let source = PersonaSource::load_from_dir(&self.cache_dir.join(hash))?;
-        Ok(source)
+        PersonaSource::load_from_dir_or_pack(&self.cache_dir.join(hash))?.ok_or_else(|| {
+            ComposeError::Unresolved {
+                spec: spec.to_string(),
+                reason: "base/mixin pack has no typed source".to_string(),
+            }
+        })
     }
 }

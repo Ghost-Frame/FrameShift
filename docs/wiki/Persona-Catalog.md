@@ -1,6 +1,6 @@
 # Persona Catalog
 
-41 personas ship with Frameshift. Each is backed by a `pack.toml` manifest declaring identity, capabilities, and behavioral scope.
+42 personas ship with Frameshift. Each is defined by a public `pack.toml` declaring identity, capabilities, selection signals, and behavioral scope.
 
 ## Domain engineering
 
@@ -16,6 +16,7 @@
 | `desktop/` | Desktop and TUI engineer. Tauri, ratatui, wgpu, native feel over web-wrapper convenience |
 | `database/` | Database engineer. Schema design, query optimization, migrations, indexing strategy |
 | `data/` | Data engineer. Idempotent, observable, recoverable pipelines |
+| `mmo-simulation-engineer/` | MMO simulation engineer. Deterministic, server-authoritative gameplay across clients, persistence, and headless worlds |
 | `unreal/` | Unreal developer. Blueprint plus C++ hybrid. Verifies API names before using them |
 | `cryptographic/` | Cryptographer. Spec-anchored, constant-time aware, never invents primitives |
 | `bots/` | Discord bot personality engineer. Character fidelity across thousands of turns |
@@ -85,6 +86,7 @@ Exceptions:
 | `incident-commander/` | `network_egress = true`; `memory_required = "soft"` (search, store) |
 | `product-strategist/` | `network_egress = true`; `memory_required = "soft"` (search, store) |
 | `visual-director/` | `network_egress = true`; `memory_required = "soft"` (search, store) |
+| `mmo-simulation-engineer/` | `memory_required = "soft"` (search, store) |
 | `security/` | `filesystem_scope = "system"` |
 | `orchestrator/` | `filesystem_scope = "system"` |
 | `daily-planner/` | `memory_required = "soft"` (search, recall) |
