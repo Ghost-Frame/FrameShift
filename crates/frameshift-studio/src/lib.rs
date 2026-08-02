@@ -26,6 +26,15 @@ pub const DRAFT_SCHEMA_VERSION: u32 = 1;
 /// Current schema version for serialized exact-draft validation reports.
 pub const DRAFT_VALIDATION_SCHEMA_VERSION: u32 = 1;
 
+/// Minimum conformance threshold that can authorize publication review.
+pub const MIN_PUBLICATION_CONFORMANCE_THRESHOLD: f32 = 0.8;
+
+/// Current schema version for persisted publication-validation attestations.
+const VALIDATION_ATTESTATION_SCHEMA_VERSION: u32 = 1;
+
+/// Current policy version required by exact publication review.
+const PUBLICATION_VALIDATION_POLICY_VERSION: u32 = 1;
+
 /// Filename holding private Creator Studio draft metadata.
 const METADATA_FILENAME: &str = "draft.json";
 
@@ -53,10 +62,26 @@ pub struct Draft {
     pub title: String,
     /// Monotonic local mutation counter.
     pub revision: u64,
+    /// Successful publication validation bound to the exact current inventory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation: Option<ValidationConfirmation>,
     /// Human confirmation bound to an exact valid file inventory.
     pub review: Option<ReviewConfirmation>,
     /// Explicit publish intent bound to the same reviewed inventory.
     pub submission_intent: Option<SubmissionIntent>,
+}
+
+/// Minimal path-free proof that exact draft bytes passed publication validation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidationConfirmation {
+    /// Version of this private attestation's serialized contract.
+    pub schema_version: u32,
+    /// Publication-review policy version applied to the successful result.
+    pub policy_version: u32,
+    /// Draft revision whose exact bytes passed validation.
+    pub revision: u64,
+    /// Deterministic hash of the validated public file inventory.
+    pub inventory_hash: String,
 }
 
 /// Human confirmation of the exact files represented by an inventory hash.
@@ -350,6 +375,9 @@ pub enum StudioError {
     /// Review requires a fully valid publication report.
     #[error("draft is not valid for review")]
     InvalidForReview,
+    /// Review requires a current successful validation of the exact draft bytes.
+    #[error("draft validation is not current for review")]
+    ValidationNotCurrent,
     /// Confirmation did not match the exact inventory presented for review.
     #[error("review inventory hash does not match current content")]
     ReviewHashMismatch,
@@ -796,6 +824,7 @@ impl Studio {
         if status.publication.inventory_hash != expected_inventory_hash {
             return Err(StudioError::ReviewHashMismatch);
         }
+        require_current_validation(&status)?;
         self.freeze_status(id, status)
     }
 
@@ -807,6 +836,7 @@ impl Studio {
     ) -> Result<DraftReviewReport, StudioError> {
         let status = self.status(id)?;
         validate_review_binding(&status.publication, &binding)?;
+        require_current_validation(&status)?;
         let snapshot = self.freeze_status(id, status)?;
         let manifest_file = snapshot
             .files
@@ -836,6 +866,7 @@ impl Studio {
             return Err(StudioError::InvalidForReview);
         }
         validate_review_binding(&status.publication, &binding)?;
+        require_current_validation(&status)?;
         status.draft.review = Some(ReviewConfirmation {
             revision: status.draft.revision,
             inventory_hash: status.publication.inventory_hash.clone(),
@@ -854,6 +885,7 @@ impl Studio {
         binding: PublicationReviewBinding,
     ) -> Result<DraftStatus, StudioError> {
         let mut status = self.status(id)?;
+        require_current_validation(&status)?;
         if !status.review_current {
             return Err(StudioError::ReviewNotCurrent);
         }
@@ -883,6 +915,7 @@ impl Studio {
         binding: PublicationReviewBinding,
     ) -> Result<DraftSnapshot, StudioError> {
         let status = self.status(id)?;
+        require_current_validation(&status)?;
         if !status.submission_intent_current {
             return Err(StudioError::SubmissionIntentNotCurrent);
         }
@@ -923,8 +956,7 @@ impl Studio {
                     "publication policy must pass before conformance execution",
                 ),
             );
-            self.ensure_status_current(id, report.revision, &report.publication)?;
-            return Ok(report);
+            return self.finish_validation(id, report);
         }
 
         let snapshot = self.freeze_status(id, status)?;
@@ -964,14 +996,17 @@ impl Studio {
                     {
                         Some(bundle) => bundle,
                         None => {
-                            return Ok(validation_report_from_snapshot(
-                                &snapshot,
-                                blocked_conformance(
-                                    threshold,
-                                    "conformance.bundle_invalid",
-                                    "conformance bundle does not match the shared schema",
+                            return self.finish_validation(
+                                id,
+                                validation_report_from_snapshot(
+                                    &snapshot,
+                                    blocked_conformance(
+                                        threshold,
+                                        "conformance.bundle_invalid",
+                                        "conformance bundle does not match the shared schema",
+                                    ),
                                 ),
-                            ));
+                            );
                         }
                     };
                     if bundle.name != manifest.name || bundle.version != manifest.version {
@@ -1016,8 +1051,37 @@ impl Studio {
                 }
             };
 
-        self.ensure_status_current(id, snapshot.revision, &snapshot.publication)?;
-        Ok(validation_report_from_snapshot(&snapshot, conformance))
+        self.finish_validation(id, validation_report_from_snapshot(&snapshot, conformance))
+    }
+
+    /// Persist or clear publication authority for one exact completed validation.
+    fn finish_validation(
+        &self,
+        id: &str,
+        report: DraftValidationReport,
+    ) -> Result<DraftValidationReport, StudioError> {
+        let mut current = self.status(id)?;
+        if current.draft.revision != report.revision || current.publication != report.publication {
+            return Err(StudioError::SnapshotChanged);
+        }
+
+        let authorizes_publication =
+            report.valid && report.conformance.threshold >= MIN_PUBLICATION_CONFORMANCE_THRESHOLD;
+        current.draft.validation = authorizes_publication.then(|| ValidationConfirmation {
+            schema_version: VALIDATION_ATTESTATION_SCHEMA_VERSION,
+            policy_version: PUBLICATION_VALIDATION_POLICY_VERSION,
+            revision: report.revision,
+            inventory_hash: report.inventory_hash.clone(),
+        });
+        if !authorizes_publication {
+            current.draft.review = None;
+            current.draft.submission_intent = None;
+        }
+
+        let paths = self.draft_paths(id)?;
+        write_json_atomic(&paths.metadata, &current.draft, true)?;
+        self.ensure_status_current(id, report.revision, &report.publication)?;
+        Ok(report)
     }
 
     /// Freeze every scanner-inventoried regular file from one fresh status.
@@ -1107,6 +1171,7 @@ impl Studio {
             id: id.to_string(),
             title: title.to_string(),
             revision: 0,
+            validation: None,
             review: None,
             submission_intent: None,
         };
@@ -1440,14 +1505,35 @@ fn invalidate_before_mutation(draft: &mut Draft) -> Result<(), StudioError> {
         .revision
         .checked_add(1)
         .ok_or_else(|| StudioError::InvalidMetadata("revision overflow".to_string()))?;
+    draft.validation = None;
     draft.review = None;
     draft.submission_intent = None;
     Ok(())
 }
 
+/// Return whether persisted validation authorizes the exact current inventory.
+fn validation_matches(draft: &Draft, report: &PublicationReport) -> bool {
+    report.valid
+        && draft.validation.as_ref().is_some_and(|validation| {
+            validation.schema_version == VALIDATION_ATTESTATION_SCHEMA_VERSION
+                && validation.policy_version == PUBLICATION_VALIDATION_POLICY_VERSION
+                && validation.revision == draft.revision
+                && validation.inventory_hash == report.inventory_hash
+        })
+}
+
+/// Require publication validation authority for the exact current draft bytes.
+fn require_current_validation(status: &DraftStatus) -> Result<(), StudioError> {
+    if validation_matches(&status.draft, &status.publication) {
+        Ok(())
+    } else {
+        Err(StudioError::ValidationNotCurrent)
+    }
+}
+
 /// Return whether review metadata binds to the exact fresh inventory.
 fn review_matches(draft: &Draft, report: &PublicationReport) -> bool {
-    report.valid
+    validation_matches(draft, report)
         && draft.review.as_ref().is_some_and(|review| {
             review.revision == draft.revision
                 && review.inventory_hash == report.inventory_hash
@@ -1616,6 +1702,18 @@ mod tests {
             publisher_id: Uuid::from_u128(1),
             publisher_key_id: Uuid::from_u128(2),
         }
+    }
+
+    /// Persist publication authority for one valid no-bundle test draft.
+    async fn validate_for_publication(studio: &Studio, id: &str) -> DraftValidationReport {
+        studio
+            .validate_draft(
+                id,
+                MIN_PUBLICATION_CONFORMANCE_THRESHOLD,
+                &frameshift_conformance::MockRunner::new("unused"),
+            )
+            .await
+            .unwrap()
     }
 
     /// Write one valid pack with a single built-in conformance test.
@@ -1817,6 +1915,15 @@ mod tests {
         let serialized = serde_json::to_string(&report).unwrap();
         assert!(!serialized.contains("private response"));
         assert!(!serialized.contains(temporary.path().to_string_lossy().as_ref()));
+        let metadata = fs::read_to_string(
+            temporary
+                .path()
+                .join("studio/draft")
+                .join(METADATA_FILENAME),
+        )
+        .unwrap();
+        assert!(!metadata.contains("private response"));
+        assert!(!metadata.contains(temporary.path().to_string_lossy().as_ref()));
     }
 
     /// Packs without a conformance contract remain explicit and non-blocking.
@@ -1846,6 +1953,50 @@ mod tests {
             report.conformance.findings[0].code,
             "conformance.not_provided"
         );
+    }
+
+    /// Review entry points reject valid bytes until exact publication validation is current.
+    #[tokio::test]
+    async fn review_requires_current_publication_validation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        write_valid_pack(&source);
+        let studio = Studio::open(temporary.path().join("studio")).unwrap();
+        let imported = studio.import("draft", "Draft", &source).unwrap();
+        let binding = review_binding(&imported.publication);
+
+        assert!(matches!(
+            studio.snapshot_for_review("draft", &imported.publication.inventory_hash),
+            Err(StudioError::ValidationNotCurrent)
+        ));
+        assert!(matches!(
+            studio.review_report("draft", binding),
+            Err(StudioError::ValidationNotCurrent)
+        ));
+        assert!(matches!(
+            studio.confirm_review("draft", binding),
+            Err(StudioError::ValidationNotCurrent)
+        ));
+
+        let low_threshold = studio
+            .validate_draft(
+                "draft",
+                MIN_PUBLICATION_CONFORMANCE_THRESHOLD - 0.1,
+                &frameshift_conformance::MockRunner::new("unused"),
+            )
+            .await
+            .unwrap();
+        assert!(low_threshold.valid);
+        assert!(studio.status("draft").unwrap().draft.validation.is_none());
+        assert!(matches!(
+            studio.confirm_review("draft", binding),
+            Err(StudioError::ValidationNotCurrent)
+        ));
+
+        let authorized = validate_for_publication(&studio, "draft").await;
+        assert!(authorized.valid);
+        assert!(studio.status("draft").unwrap().draft.validation.is_some());
+        assert!(studio.review_report("draft", binding).is_ok());
     }
 
     /// Bundle identity must match the exact pack manifest identity.
@@ -1897,6 +2048,45 @@ mod tests {
             .findings
             .iter()
             .any(|finding| finding.code == "conformance.baseline_score_unmet"));
+    }
+
+    /// A later failed validation revokes prior validation, review, and submission authority.
+    #[tokio::test]
+    async fn failed_validation_clears_prior_publication_authority() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        write_conformance_pack(&source, "test", "0.1.0", "substring", None);
+        let studio = Studio::open(temporary.path().join("studio")).unwrap();
+        let imported = studio.import("draft", "Draft", &source).unwrap();
+        let binding = review_binding(&imported.publication);
+
+        let passing = studio
+            .validate_draft(
+                "draft",
+                MIN_PUBLICATION_CONFORMANCE_THRESHOLD,
+                &frameshift_conformance::MockRunner::new("hello"),
+            )
+            .await
+            .unwrap();
+        assert!(passing.valid);
+        studio.confirm_review("draft", binding).unwrap();
+        studio.confirm_submission_intent("draft", binding).unwrap();
+
+        let failing = studio
+            .validate_draft(
+                "draft",
+                MIN_PUBLICATION_CONFORMANCE_THRESHOLD,
+                &frameshift_conformance::MockRunner::new("goodbye"),
+            )
+            .await
+            .unwrap();
+        assert!(!failing.valid);
+        let status = studio.status("draft").unwrap();
+        assert!(status.draft.validation.is_none());
+        assert!(status.draft.review.is_none());
+        assert!(status.draft.submission_intent.is_none());
+        assert!(!status.review_current);
+        assert!(!status.submission_intent_current);
     }
 
     /// Caller scorers fail closed when no explicit scoring implementation exists.
@@ -2111,8 +2301,8 @@ mod tests {
     }
 
     /// Create, reload, review, and submit a valid draft across store instances.
-    #[test]
-    fn lifecycle_persists_across_restarts() {
+    #[tokio::test]
+    async fn lifecycle_persists_across_restarts() {
         let temporary = tempfile::tempdir().unwrap();
         let studio = Studio::open(temporary.path().join("studio")).unwrap();
         studio.create("test-draft", "Test draft").unwrap();
@@ -2131,6 +2321,7 @@ mod tests {
             .unwrap();
         let status = studio.status("test-draft").unwrap();
         let binding = review_binding(&status.publication);
+        validate_for_publication(&studio, "test-draft").await;
         let reviewed = studio.confirm_review("test-draft", binding).unwrap();
         assert!(reviewed.review_current);
         let intended = studio
@@ -2146,8 +2337,8 @@ mod tests {
     }
 
     /// Final review data exposes the full public manifest and exact artifact without local paths.
-    #[test]
-    fn review_report_exposes_path_free_exact_artifact_details() {
+    #[tokio::test]
+    async fn review_report_exposes_path_free_exact_artifact_details() {
         let temporary = tempfile::tempdir().unwrap();
         let source = temporary.path().join("source");
         write_valid_pack(&source);
@@ -2165,6 +2356,7 @@ mod tests {
         let studio = Studio::open(&studio_root).unwrap();
         let imported = studio.import("draft", "Draft", &source).unwrap();
         let binding = review_binding(&imported.publication);
+        validate_for_publication(&studio, "draft").await;
         let snapshot = studio
             .snapshot_for_review("draft", &imported.publication.inventory_hash)
             .unwrap();
@@ -2192,14 +2384,15 @@ mod tests {
     }
 
     /// Submission intent and snapshots reject any artifact or publisher substitution.
-    #[test]
-    fn reviewed_binding_rejects_artifact_and_publisher_substitution() {
+    #[tokio::test]
+    async fn reviewed_binding_rejects_artifact_and_publisher_substitution() {
         let temporary = tempfile::tempdir().unwrap();
         let source = temporary.path().join("source");
         write_valid_pack(&source);
         let studio = Studio::open(temporary.path().join("studio")).unwrap();
         let imported = studio.import("draft", "Draft", &source).unwrap();
         let binding = review_binding(&imported.publication);
+        validate_for_publication(&studio, "draft").await;
         studio.confirm_review("draft", binding).unwrap();
 
         let mut changed_archive = binding;
@@ -2231,8 +2424,8 @@ mod tests {
     }
 
     /// Legacy inventory-only confirmations load safely but never count as current authority.
-    #[test]
-    fn legacy_inventory_only_confirmation_is_stale() {
+    #[tokio::test]
+    async fn legacy_inventory_only_confirmation_is_stale() {
         let temporary = tempfile::tempdir().unwrap();
         let source = temporary.path().join("source");
         write_valid_pack(&source);
@@ -2240,12 +2433,14 @@ mod tests {
         let studio = Studio::open(&studio_root).unwrap();
         let imported = studio.import("draft", "Draft", &source).unwrap();
         let binding = review_binding(&imported.publication);
+        validate_for_publication(&studio, "draft").await;
         studio.confirm_review("draft", binding).unwrap();
         studio.confirm_submission_intent("draft", binding).unwrap();
 
         let metadata = studio_root.join("draft").join(METADATA_FILENAME);
         let mut persisted: serde_json::Value =
             serde_json::from_slice(&fs::read(&metadata).unwrap()).unwrap();
+        persisted.as_object_mut().unwrap().remove("validation");
         persisted["review"]
             .as_object_mut()
             .unwrap()
@@ -2288,8 +2483,8 @@ mod tests {
     }
 
     /// Snapshotting requires current intent and returns only the reviewed public bytes.
-    #[test]
-    fn snapshot_requires_current_intent_and_freezes_public_bytes() {
+    #[tokio::test]
+    async fn snapshot_requires_current_intent_and_freezes_public_bytes() {
         let temporary = tempfile::tempdir().unwrap();
         let source = temporary.path().join("source");
         write_valid_pack(&source);
@@ -2302,7 +2497,12 @@ mod tests {
             Ok(_) => panic!("unreviewed draft must not freeze"),
             Err(error) => error,
         };
-        assert!(matches!(error, StudioError::SubmissionIntentNotCurrent));
+        assert!(matches!(error, StudioError::ValidationNotCurrent));
+        validate_for_publication(&studio, "draft").await;
+        assert!(matches!(
+            studio.snapshot_for_submission("draft", binding),
+            Err(StudioError::SubmissionIntentNotCurrent)
+        ));
         studio.confirm_review("draft", binding).unwrap();
         studio.confirm_submission_intent("draft", binding).unwrap();
 
@@ -2426,14 +2626,15 @@ mod tests {
     }
 
     /// Any content mutation clears review and submission intent before saving.
-    #[test]
-    fn edit_invalidates_review_and_submission_intent() {
+    #[tokio::test]
+    async fn edit_invalidates_review_and_submission_intent() {
         let temporary = tempfile::tempdir().unwrap();
         let source = temporary.path().join("source");
         write_valid_pack(&source);
         let studio = Studio::open(temporary.path().join("studio")).unwrap();
         let imported = studio.import("draft", "Draft", &source).unwrap();
         let binding = review_binding(&imported.publication);
+        validate_for_publication(&studio, "draft").await;
         studio.confirm_review("draft", binding).unwrap();
         studio.confirm_submission_intent("draft", binding).unwrap();
 
@@ -2442,6 +2643,7 @@ mod tests {
             .unwrap();
         assert!(!status.review_current);
         assert!(!status.submission_intent_current);
+        assert!(status.draft.validation.is_none());
         assert!(status.draft.review.is_none());
         assert!(status.draft.submission_intent.is_none());
     }
