@@ -12,12 +12,17 @@ use mimalloc::MiMalloc;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
+use frameshift_catalog::CatalogBackend;
 use frameshift_catalog_postgres::{PostgresCatalog, PostgresCatalogConfig};
 use frameshift_memory::MemoryAdapter;
 use frameshift_objects::PackStore;
 use frameshift_objects_fs::{FsPackStore, FsPackStoreConfig};
 use frameshift_objects_r2::{R2PackStore, R2PackStoreConfig};
 use frameshift_server::metrics::Metrics;
+use frameshift_server::recovery_delivery::{
+    run_recovery_delivery_worker, RecoveryDeliveryCipher, RecoveryDeliveryDispatcher,
+    RecoveryDeliveryWorkerConfig, ResendRecoveryDispatcher,
+};
 use frameshift_server::{AppState, LogFormat, ServerConfig, ServerError};
 
 /// Delay between bounded signed-request nonce cleanup batches.
@@ -67,6 +72,14 @@ fn init_tracing(config: &ServerConfig) {
 /// runtime failures after the server is already accepting connections.
 async fn build_state(config: Arc<ServerConfig>) -> Result<InitializedState, ServerError> {
     use secrecy::ExposeSecret as _;
+    use zeroize::Zeroize as _;
+
+    if let Some(mut delivery_key) = config
+        .password_recovery_key()
+        .map_err(ServerError::Startup)?
+    {
+        delivery_key.zeroize();
+    }
 
     let catalog_config = PostgresCatalogConfig {
         url: secrecy::SecretString::new(config.postgres_url.expose_secret().to_string()),
@@ -440,6 +453,24 @@ fn parse_memory_http_auth(raw: &str) -> Result<frameshift_memory_http::HttpAuth,
     )))
 }
 
+/// Matching cryptographic and provider components required by the recovery worker.
+type RecoveryDeliveryComponents = (RecoveryDeliveryCipher, Arc<dyn RecoveryDeliveryDispatcher>);
+
+/// Build matching recovery cipher and provider components for the background worker.
+fn build_recovery_delivery_components(
+    config: &ServerConfig,
+) -> Result<Option<RecoveryDeliveryComponents>, ServerError> {
+    let cipher = RecoveryDeliveryCipher::from_config(config).map_err(ServerError::Startup)?;
+    let dispatcher = ResendRecoveryDispatcher::from_config(config).map_err(ServerError::Startup)?;
+    match (cipher, dispatcher) {
+        (None, None) => Ok(None),
+        (Some(cipher), Some(dispatcher)) => Ok(Some((cipher, Arc::new(dispatcher)))),
+        _ => Err(ServerError::Startup(
+            "password recovery components resolved inconsistently".to_string(),
+        )),
+    }
+}
+
 #[tokio::main]
 /// Resolve configuration, initialize backends, and run the HTTP server.
 async fn main() {
@@ -478,6 +509,30 @@ async fn main() {
         }
     };
 
+    let recovery_delivery = match build_recovery_delivery_components(&config) {
+        Ok(components) => components,
+        Err(error) => {
+            tracing::error!("startup failed: {error}");
+            std::process::exit(3);
+        }
+    };
+
+    let (recovery_stop, recovery_task) = match recovery_delivery {
+        Some((cipher, dispatcher)) => {
+            let (stop_sender, stop_receiver) = tokio::sync::watch::channel(false);
+            let catalog: Arc<dyn CatalogBackend> = postgres_catalog.clone();
+            let task = tokio::spawn(run_recovery_delivery_worker(
+                catalog,
+                dispatcher,
+                cipher,
+                RecoveryDeliveryWorkerConfig::default(),
+                stop_receiver,
+            ));
+            (Some(stop_sender), Some(task))
+        }
+        None => (None, None),
+    };
+
     let nonce_cleanup = tokio::spawn(run_signed_request_nonce_cleanup(postgres_catalog));
 
     let server_result = match quarantine {
@@ -489,6 +544,23 @@ async fn main() {
     if let Err(error) = nonce_cleanup.await {
         if !error.is_cancelled() {
             tracing::warn!(%error, "signed-request nonce cleanup task stopped unexpectedly");
+        }
+    }
+
+    if let Some(stop_sender) = recovery_stop {
+        let _ = stop_sender.send(true);
+    }
+    if let Some(mut task) = recovery_task {
+        match tokio::time::timeout(Duration::from_secs(15), &mut task).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "recovery delivery worker stopped unexpectedly");
+            }
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+                tracing::warn!("recovery delivery worker exceeded its stop deadline");
+            }
         }
     }
 

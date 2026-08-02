@@ -20,18 +20,19 @@ use frameshift_catalog::{
     AccountInviteIntent, AccountInviteRecord, AccountInviteRequestRecord, AccountInviteStatus,
     AccountPasswordCredentialRecord, AccountRecord, AccountSessionClientKind, AccountSessionRecord,
     AccountStatus, AuthorRecord, CatalogError, Ed25519PublicKey, MembershipState, OauthLink,
-    ObjectHash, PackRecord, PackStatus, PackVersionRecord, PlatformRole, PlatformRoleRecord,
-    PlatformRoleState, PublicationAppealDisposition, PublicationAppealRecord,
-    PublicationAppealResolutionRecord, PublicationIntentRecord, PublicationLifecycleAction,
-    PublicationLifecycleDecisionRecord, PublicationModerationAction,
-    PublicationModerationDecisionRecord, PublicationPromotionRecord, PublicationSubmissionRecord,
-    PublicationSubmissionState, PublisherKeyRecord, PublisherKeyState, PublisherMembershipRecord,
-    PublisherModerationStatus, PublisherProfileRecord, PublisherRole,
+    ObjectHash, PackRecord, PackStatus, PackVersionRecord, PasswordRecoveryDeliveryKind,
+    PasswordRecoveryDeliveryRecord, PlatformRole, PlatformRoleRecord, PlatformRoleState,
+    PublicationAppealDisposition, PublicationAppealRecord, PublicationAppealResolutionRecord,
+    PublicationIntentRecord, PublicationLifecycleAction, PublicationLifecycleDecisionRecord,
+    PublicationModerationAction, PublicationModerationDecisionRecord, PublicationPromotionRecord,
+    PublicationSubmissionRecord, PublicationSubmissionState, PublisherKeyRecord, PublisherKeyState,
+    PublisherMembershipRecord, PublisherModerationStatus, PublisherProfileRecord, PublisherRole,
 };
 use uuid::Uuid;
 
 use crate::schema::{
-    account_invite_requests, account_invites, account_password_credentials, account_platform_roles,
+    account_invite_requests, account_invites, account_password_credentials,
+    account_password_recovery_outbox, account_password_recovery_tokens, account_platform_roles,
     account_sessions, accounts, authors, handles, pack_downloads, pack_versions, packs,
     publication_appeal_resolutions, publication_appeals, publication_intents,
     publication_lifecycle_decisions, publication_moderation_decisions, publication_promotions,
@@ -301,6 +302,111 @@ pub(crate) struct NewAccountSessionRow {
     pub absolute_expires_at: DateTime<Utc>,
     /// Explicit revocation timestamp.
     pub revoked_at: Option<DateTime<Utc>>,
+}
+
+/// Insertable digest-only password-recovery token row.
+#[derive(Insertable)]
+#[diesel(table_name = account_password_recovery_tokens)]
+pub(crate) struct NewAccountPasswordRecoveryTokenRow {
+    /// Stable internal recovery-token identifier.
+    pub id: Uuid,
+    /// Local account authorized by the token.
+    pub account_id: Uuid,
+    /// SHA-256 digest of the raw bearer token.
+    pub token_digest: Vec<u8>,
+    /// Token creation timestamp.
+    pub created_at: DateTime<Utc>,
+    /// Exclusive token-consumption deadline.
+    pub expires_at: DateTime<Utc>,
+    /// Successful one-time consumption timestamp.
+    pub consumed_at: Option<DateTime<Utc>>,
+    /// Explicit supersession or revocation timestamp.
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+/// Queryable encrypted password-recovery delivery row.
+#[derive(Queryable, Selectable)]
+#[diesel(table_name = account_password_recovery_outbox)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub(crate) struct AccountPasswordRecoveryDeliveryRow {
+    /// Stable outbox identifier and provider idempotency key.
+    pub id: Uuid,
+    /// Local account receiving the message.
+    pub account_id: Uuid,
+    /// Stable delivery purpose encoded as snake case.
+    pub kind: String,
+    /// Lowercase, trimmed destination email.
+    pub recipient: String,
+    /// Opaque authenticated ciphertext containing the message payload.
+    pub ciphertext: Vec<u8>,
+    /// Random 192-bit XChaCha20-Poly1305 nonce.
+    pub nonce: Vec<u8>,
+    /// Deployment-managed encryption-key version.
+    pub key_version: i16,
+    /// Number of leases issued for this delivery.
+    pub attempt_count: i32,
+    /// Most recent lease-acquisition timestamp.
+    pub last_attempt_at: Option<DateTime<Utc>>,
+    /// UUID fencing the currently active worker lease.
+    pub claim_id: Option<Uuid>,
+    /// Timestamp at which the current worker lease began.
+    pub claimed_at: Option<DateTime<Utc>>,
+    /// Earliest timestamp at which an unclaimed worker may acquire the row.
+    pub next_attempt_at: DateTime<Utc>,
+    /// Exclusive deadline after which the delivery must not be sent.
+    pub expires_at: DateTime<Utc>,
+    /// Successful provider acknowledgement timestamp.
+    pub sent_at: Option<DateTime<Utc>>,
+    /// Bounded provider-assigned message identifier.
+    pub provider_message_id: Option<String>,
+    /// Permanent failure timestamp.
+    pub failed_at: Option<DateTime<Utc>>,
+    /// Bounded static diagnostic code from the latest failed attempt.
+    pub last_error_code: Option<String>,
+    /// Outbox row creation timestamp.
+    pub created_at: DateTime<Utc>,
+}
+
+/// Insertable encrypted password-recovery delivery row.
+#[derive(Insertable)]
+#[diesel(table_name = account_password_recovery_outbox)]
+pub(crate) struct NewAccountPasswordRecoveryDeliveryRow {
+    /// Stable outbox identifier and provider idempotency key.
+    pub id: Uuid,
+    /// Local account receiving the message.
+    pub account_id: Uuid,
+    /// Stable delivery purpose encoded as snake case.
+    pub kind: String,
+    /// Lowercase, trimmed destination email.
+    pub recipient: String,
+    /// Opaque authenticated ciphertext containing the message payload.
+    pub ciphertext: Vec<u8>,
+    /// Random 192-bit XChaCha20-Poly1305 nonce.
+    pub nonce: Vec<u8>,
+    /// Deployment-managed encryption-key version.
+    pub key_version: i16,
+    /// Number of leases issued for this delivery.
+    pub attempt_count: i32,
+    /// Most recent lease-acquisition timestamp.
+    pub last_attempt_at: Option<DateTime<Utc>>,
+    /// UUID fencing the currently active worker lease.
+    pub claim_id: Option<Uuid>,
+    /// Timestamp at which the current worker lease began.
+    pub claimed_at: Option<DateTime<Utc>>,
+    /// Earliest timestamp at which an unclaimed worker may acquire the row.
+    pub next_attempt_at: DateTime<Utc>,
+    /// Exclusive deadline after which the delivery must not be sent.
+    pub expires_at: DateTime<Utc>,
+    /// Successful provider acknowledgement timestamp.
+    pub sent_at: Option<DateTime<Utc>>,
+    /// Bounded provider-assigned message identifier.
+    pub provider_message_id: Option<String>,
+    /// Permanent failure timestamp.
+    pub failed_at: Option<DateTime<Utc>>,
+    /// Bounded static diagnostic code from the latest failed attempt.
+    pub last_error_code: Option<String>,
+    /// Outbox row creation timestamp.
+    pub created_at: DateTime<Utc>,
 }
 
 /// Queryable public publisher profile row.
@@ -1051,6 +1157,19 @@ pub(crate) fn vec_to_hash(bytes: Vec<u8>) -> Result<ObjectHash, CatalogError> {
     Ok(ObjectHash::from_bytes(arr))
 }
 
+/// Convert a raw BYTEA value into a fixed XChaCha20-Poly1305 nonce.
+///
+/// A length mismatch indicates database corruption because the migration also
+/// enforces the 24-byte nonce length.
+pub(crate) fn vec_to_recovery_nonce(bytes: Vec<u8>) -> Result<[u8; 24], CatalogError> {
+    bytes.try_into().map_err(|value: Vec<u8>| {
+        CatalogError::BackendError(Box::new(std::io::Error::other(format!(
+            "password recovery nonce in DB has wrong length: {} bytes",
+            value.len()
+        ))))
+    })
+}
+
 /// Decode a serde string enum stored in a PostgreSQL TEXT column.
 fn parse_text_enum<T>(value: String, kind: &str) -> Result<T, CatalogError>
 where
@@ -1167,6 +1286,41 @@ impl AccountSessionRow {
             idle_expires_at: self.idle_expires_at,
             absolute_expires_at: self.absolute_expires_at,
             revoked_at: self.revoked_at,
+        })
+    }
+}
+
+/// Conversion helpers for encrypted password-recovery delivery rows.
+impl AccountPasswordRecoveryDeliveryRow {
+    /// Convert this database row into a typed delivery worker record.
+    pub(crate) fn into_record(self) -> Result<PasswordRecoveryDeliveryRecord, CatalogError> {
+        let attempt_count = u32::try_from(self.attempt_count).map_err(|_| {
+            CatalogError::BackendError(Box::new(std::io::Error::other(
+                "password recovery attempt_count in DB is negative",
+            )))
+        })?;
+        Ok(PasswordRecoveryDeliveryRecord {
+            id: self.id,
+            account_id: self.account_id,
+            kind: parse_text_enum::<PasswordRecoveryDeliveryKind>(
+                self.kind,
+                "password recovery delivery kind",
+            )?,
+            recipient: self.recipient,
+            ciphertext: self.ciphertext,
+            nonce: vec_to_recovery_nonce(self.nonce)?,
+            key_version: self.key_version,
+            attempt_count,
+            last_attempt_at: self.last_attempt_at,
+            claim_id: self.claim_id,
+            claimed_at: self.claimed_at,
+            next_attempt_at: self.next_attempt_at,
+            expires_at: self.expires_at,
+            sent_at: self.sent_at,
+            provider_message_id: self.provider_message_id,
+            failed_at: self.failed_at,
+            last_error_code: self.last_error_code,
+            created_at: self.created_at,
         })
     }
 }

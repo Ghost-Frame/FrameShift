@@ -29,9 +29,12 @@ use frameshift_catalog::{
     AccountInviteIssueRequest, AccountInviteRecord, AccountInviteRequestRecord,
     AccountInviteReviewRequest, AccountInviteStatus, AccountPasswordCredentialRecord,
     AccountPasswordRehashRequest, AccountRecord, AccountSessionRecord, AccountStatusChangeRequest,
-    AuthorRecord, CatalogBackend, CatalogError, Ed25519PublicKey, HealthStatus,
-    LocalAccountRegistrationRequest, LocalAccountRegistrationResult, MembershipState, PackRecord,
-    PackSearchFilters, PackSearchResult, PackStatus, PackVersionRecord, PlatformRole,
+    AuthorRecord, CatalogBackend, CatalogError, Ed25519PublicKey,
+    EncryptedPasswordRecoveryDelivery, HealthStatus, LocalAccountRegistrationRequest,
+    LocalAccountRegistrationResult, MembershipState, PackRecord, PackSearchFilters,
+    PackSearchResult, PackStatus, PackVersionRecord, PasswordRecoveryCompletionRequest,
+    PasswordRecoveryDeliveryClaimRequest, PasswordRecoveryDeliveryKind,
+    PasswordRecoveryDeliveryRecord, PasswordRecoveryEnqueueRequest, PlatformRole,
     PlatformRoleAssignmentRequest, PlatformRoleRecord, PlatformRoleRevocationRequest,
     PublicationAppealCaseRecord, PublicationAppealCursor, PublicationAppealDisposition,
     PublicationAppealRecord, PublicationAppealRequest, PublicationAppealResolutionRecord,
@@ -51,21 +54,23 @@ use crate::config::PostgresCatalogConfig;
 use crate::errors::{map_diesel_error, map_migration_error, map_pool_error};
 use crate::models::{
     encode_text_enum, vec_to_pubkey, AccountInviteRequestRow, AccountInviteRow,
-    AccountPasswordCredentialRow, AccountRow, AccountSessionRow, AuthorRow, HandleRow,
-    NewAccountInviteRequestRow, NewAccountInviteRow, NewAccountPasswordCredentialRow,
-    NewAccountRow, NewAccountSessionRow, NewAuthorRow, NewHandleRow, NewPackDownloadRow,
-    NewPackRow, NewPackVersionRow, NewPublicationAppealResolutionRow, NewPublicationAppealRow,
-    NewPublicationIntentRow, NewPublicationLifecycleDecisionRow,
-    NewPublicationModerationDecisionRow, NewPublicationPromotionRow, NewPublicationSubmissionRow,
-    NewPublisherAuditEventRow, NewPublisherKeyRow, NewPublisherMembershipRow,
-    NewPublisherProfileRow, PackRow, PackVersionRow, PlatformRoleRow,
-    PublicationAppealResolutionRow, PublicationAppealRow, PublicationIntentRow,
+    AccountPasswordCredentialRow, AccountPasswordRecoveryDeliveryRow, AccountRow,
+    AccountSessionRow, AuthorRow, HandleRow, NewAccountInviteRequestRow, NewAccountInviteRow,
+    NewAccountPasswordCredentialRow, NewAccountPasswordRecoveryDeliveryRow,
+    NewAccountPasswordRecoveryTokenRow, NewAccountRow, NewAccountSessionRow, NewAuthorRow,
+    NewHandleRow, NewPackDownloadRow, NewPackRow, NewPackVersionRow,
+    NewPublicationAppealResolutionRow, NewPublicationAppealRow, NewPublicationIntentRow,
+    NewPublicationLifecycleDecisionRow, NewPublicationModerationDecisionRow,
+    NewPublicationPromotionRow, NewPublicationSubmissionRow, NewPublisherAuditEventRow,
+    NewPublisherKeyRow, NewPublisherMembershipRow, NewPublisherProfileRow, PackRow, PackVersionRow,
+    PlatformRoleRow, PublicationAppealResolutionRow, PublicationAppealRow, PublicationIntentRow,
     PublicationLifecycleDecisionRow, PublicationModerationDecisionRow, PublicationPromotionRow,
     PublicationSubmissionRow, PublisherKeyRow, PublisherMembershipRow, PublisherProfileRow,
 };
 use crate::pool::{build_pool, PgPool};
 use crate::schema::{
-    account_invite_requests, account_invites, account_password_credentials, account_platform_roles,
+    account_invite_requests, account_invites, account_password_credentials,
+    account_password_recovery_outbox, account_password_recovery_tokens, account_platform_roles,
     account_sessions, accounts, authors, handles, pack_downloads, pack_versions, packs,
     publication_appeal_resolutions, publication_appeals, publication_intents,
     publication_lifecycle_decisions, publication_moderation_decisions, publication_promotions,
@@ -136,6 +141,108 @@ impl From<diesel::result::Error> for CatalogTransactionError {
     fn from(error: diesel::result::Error) -> Self {
         Self::Diesel(error)
     }
+}
+
+/// Validate the normalized email shape accepted by recovery persistence.
+fn validate_password_recovery_email(normalized_email: &str) -> Result<(), CatalogError> {
+    let bytes = normalized_email.as_bytes();
+    if bytes.len() < 3
+        || bytes.len() > 320
+        || normalized_email.trim() != normalized_email
+        || normalized_email.to_lowercase() != normalized_email
+        || !normalized_email.contains('@')
+        || normalized_email.chars().any(char::is_control)
+    {
+        return Err(CatalogError::Validation(
+            "password recovery email must be a normalized address".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate an opaque encrypted recovery payload before opening a transaction.
+fn validate_password_recovery_delivery(
+    delivery: &EncryptedPasswordRecoveryDelivery,
+    created_at: DateTime<Utc>,
+) -> Result<(), CatalogError> {
+    if delivery.id.is_nil()
+        || !(16..=262_144).contains(&delivery.ciphertext.len())
+        || delivery.key_version <= 0
+        || delivery.expires_at <= created_at
+    {
+        return Err(CatalogError::Validation(
+            "encrypted password recovery delivery is invalid".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate one bounded provider message identifier without exposing payload data.
+fn validate_password_recovery_provider_message_id(
+    provider_message_id: &str,
+) -> Result<(), CatalogError> {
+    if provider_message_id.is_empty()
+        || provider_message_id.len() > 256
+        || provider_message_id.trim() != provider_message_id
+        || provider_message_id.chars().any(char::is_control)
+    {
+        return Err(CatalogError::Validation(
+            "password recovery provider message id is invalid".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate one bounded static delivery error code.
+fn validate_password_recovery_error_code(last_error_code: &str) -> Result<(), CatalogError> {
+    let bytes = last_error_code.as_bytes();
+    let valid_head = !bytes.is_empty()
+        && bytes.len() <= 64
+        && bytes
+            .first()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit());
+    let valid_tail = bytes.iter().skip(1).all(|byte| {
+        byte.is_ascii_lowercase()
+            || byte.is_ascii_digit()
+            || matches!(byte, b'_' | b'.' | b':' | b'-')
+    });
+    if !valid_head || !valid_tail {
+        return Err(CatalogError::Validation(
+            "password recovery error code must use 1-64 lowercase ASCII letters, digits, '.', '_', ':', or '-'"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Convert an encrypted delivery envelope into a new outbox row.
+fn new_password_recovery_delivery_row(
+    account_id: uuid::Uuid,
+    recipient: String,
+    kind: PasswordRecoveryDeliveryKind,
+    delivery: EncryptedPasswordRecoveryDelivery,
+    created_at: DateTime<Utc>,
+) -> Result<NewAccountPasswordRecoveryDeliveryRow, CatalogError> {
+    Ok(NewAccountPasswordRecoveryDeliveryRow {
+        id: delivery.id,
+        account_id,
+        kind: encode_text_enum(kind)?,
+        recipient,
+        ciphertext: delivery.ciphertext,
+        nonce: delivery.nonce.to_vec(),
+        key_version: delivery.key_version,
+        attempt_count: 0,
+        last_attempt_at: None,
+        claim_id: None,
+        claimed_at: None,
+        next_attempt_at: created_at,
+        expires_at: delivery.expires_at,
+        sent_at: None,
+        provider_message_id: None,
+        failed_at: None,
+        last_error_code: None,
+        created_at,
+    })
 }
 
 /// Validate and convert a catalog audit record into its insertable row.
@@ -1674,6 +1781,499 @@ impl CatalogBackend for PostgresCatalog {
             map_diesel_error(error, "account_password_credential", account_id.to_string())
         })?;
         Ok(rows_affected == 1)
+    }
+
+    /// Atomically create a digest-only reset token and encrypted delivery.
+    async fn enqueue_account_password_recovery(
+        &self,
+        request: PasswordRecoveryEnqueueRequest,
+    ) -> Result<bool, CatalogError> {
+        validate_password_recovery_email(&request.normalized_email)?;
+        validate_password_recovery_delivery(&request.delivery, request.requested_at)?;
+        let maximum_expiry = request
+            .requested_at
+            .checked_add_signed(Duration::hours(24))
+            .ok_or_else(|| {
+                CatalogError::Validation(
+                    "password recovery request timestamp cannot represent its expiry".to_string(),
+                )
+            })?;
+        if request.token_id.is_nil()
+            || request.token_digest.len() != 32
+            || request.cooldown_cutoff > request.requested_at
+            || request.token_expires_at <= request.requested_at
+            || request.token_expires_at > maximum_expiry
+            || request.delivery.expires_at != request.token_expires_at
+        {
+            return Err(CatalogError::Validation(
+                "password recovery enqueue request is invalid".to_string(),
+            ));
+        }
+
+        let token_id = request.token_id;
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        use diesel_async::AsyncConnection as _;
+        let result = conn
+            .transaction::<bool, CatalogTransactionError, _>(async move |conn| {
+                let credential = account_password_credentials::table
+                    .inner_join(accounts::table)
+                    .filter(
+                        account_password_credentials::normalized_email
+                            .eq(&request.normalized_email),
+                    )
+                    .filter(account_password_credentials::email_verified_at.is_not_null())
+                    .filter(accounts::status.eq("active"))
+                    .for_update()
+                    .select((
+                        account_password_credentials::account_id,
+                        account_password_credentials::normalized_email,
+                    ))
+                    .first::<(uuid::Uuid, String)>(conn)
+                    .await
+                    .optional()?;
+                let Some((account_id, recipient)) = credential else {
+                    return Ok(false);
+                };
+
+                let cooling_down = account_password_recovery_tokens::table
+                    .filter(account_password_recovery_tokens::account_id.eq(account_id))
+                    .filter(
+                        account_password_recovery_tokens::created_at.ge(request.cooldown_cutoff),
+                    )
+                    .select(account_password_recovery_tokens::id)
+                    .first::<uuid::Uuid>(conn)
+                    .await
+                    .optional()?
+                    .is_some();
+                if cooling_down {
+                    return Ok(false);
+                }
+
+                diesel::update(
+                    account_password_recovery_outbox::table
+                        .filter(account_password_recovery_outbox::account_id.eq(account_id))
+                        .filter(account_password_recovery_outbox::kind.eq("reset"))
+                        .filter(account_password_recovery_outbox::sent_at.is_null())
+                        .filter(account_password_recovery_outbox::failed_at.is_null()),
+                )
+                .set((
+                    account_password_recovery_outbox::failed_at.eq(request.requested_at),
+                    account_password_recovery_outbox::last_error_code.eq("token_superseded"),
+                    account_password_recovery_outbox::claim_id.eq(None::<uuid::Uuid>),
+                    account_password_recovery_outbox::claimed_at.eq(None::<DateTime<Utc>>),
+                ))
+                .execute(conn)
+                .await?;
+                diesel::update(
+                    account_password_recovery_tokens::table
+                        .filter(account_password_recovery_tokens::account_id.eq(account_id))
+                        .filter(account_password_recovery_tokens::consumed_at.is_null())
+                        .filter(account_password_recovery_tokens::revoked_at.is_null()),
+                )
+                .set(account_password_recovery_tokens::revoked_at.eq(request.requested_at))
+                .execute(conn)
+                .await?;
+
+                diesel::insert_into(account_password_recovery_tokens::table)
+                    .values(NewAccountPasswordRecoveryTokenRow {
+                        id: request.token_id,
+                        account_id,
+                        token_digest: request.token_digest,
+                        created_at: request.requested_at,
+                        expires_at: request.token_expires_at,
+                        consumed_at: None,
+                        revoked_at: None,
+                    })
+                    .execute(conn)
+                    .await?;
+
+                let delivery = new_password_recovery_delivery_row(
+                    account_id,
+                    recipient,
+                    PasswordRecoveryDeliveryKind::Reset,
+                    request.delivery,
+                    request.requested_at,
+                )
+                .map_err(CatalogTransactionError::Catalog)?;
+                diesel::insert_into(account_password_recovery_outbox::table)
+                    .values(delivery)
+                    .execute(conn)
+                    .await?;
+                Ok(true)
+            })
+            .await;
+        match result {
+            Ok(enqueued) => Ok(enqueued),
+            Err(CatalogTransactionError::Catalog(error)) => Err(error),
+            Err(CatalogTransactionError::Diesel(error)) => Err(map_diesel_error(
+                error,
+                "account_password_recovery",
+                token_id.to_string(),
+            )),
+        }
+    }
+
+    /// Atomically consume a reset token, replace the credential, revoke every
+    /// active session, and enqueue an encrypted password-changed notice.
+    async fn complete_account_password_recovery(
+        &self,
+        request: PasswordRecoveryCompletionRequest,
+    ) -> Result<bool, CatalogError> {
+        if request.token_digest.len() != 32 {
+            return Ok(false);
+        }
+        validate_password_recovery_delivery(&request.delivery, request.completed_at)?;
+        let required_delivery_expiry = request
+            .completed_at
+            .checked_add_signed(Duration::hours(24))
+            .ok_or_else(|| {
+                CatalogError::Validation(
+                    "password recovery completion timestamp cannot represent its expiry"
+                        .to_string(),
+                )
+            })?;
+        if !request.new_password_hash.starts_with("$argon2id$")
+            || request.new_password_hash.len() > 512
+            || request.new_password_version <= 0
+            || request.new_pepper_version <= 0
+            || request.delivery.expires_at != required_delivery_expiry
+        {
+            return Err(CatalogError::Validation(
+                "password recovery completion request is invalid".to_string(),
+            ));
+        }
+
+        let delivery_id = request.delivery.id;
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        use diesel_async::AsyncConnection as _;
+        let result = conn
+            .transaction::<bool, CatalogTransactionError, _>(async move |conn| {
+                let account_id = account_password_recovery_tokens::table
+                    .filter(
+                        account_password_recovery_tokens::token_digest.eq(&request.token_digest),
+                    )
+                    .filter(account_password_recovery_tokens::consumed_at.is_null())
+                    .filter(account_password_recovery_tokens::revoked_at.is_null())
+                    .filter(account_password_recovery_tokens::created_at.le(request.completed_at))
+                    .filter(account_password_recovery_tokens::expires_at.gt(request.completed_at))
+                    .select(account_password_recovery_tokens::account_id)
+                    .first::<uuid::Uuid>(conn)
+                    .await
+                    .optional()?;
+                let Some(account_id) = account_id else {
+                    return Ok(false);
+                };
+
+                let credential = account_password_credentials::table
+                    .inner_join(accounts::table)
+                    .filter(account_password_credentials::account_id.eq(account_id))
+                    .filter(account_password_credentials::email_verified_at.is_not_null())
+                    .filter(accounts::status.eq("active"))
+                    .for_update()
+                    .select((
+                        account_password_credentials::account_id,
+                        account_password_credentials::normalized_email,
+                    ))
+                    .first::<(uuid::Uuid, String)>(conn)
+                    .await
+                    .optional()?;
+                let Some((account_id, recipient)) = credential else {
+                    return Ok(false);
+                };
+
+                let token_id = account_password_recovery_tokens::table
+                    .filter(
+                        account_password_recovery_tokens::token_digest.eq(&request.token_digest),
+                    )
+                    .filter(account_password_recovery_tokens::account_id.eq(account_id))
+                    .filter(account_password_recovery_tokens::consumed_at.is_null())
+                    .filter(account_password_recovery_tokens::revoked_at.is_null())
+                    .filter(account_password_recovery_tokens::created_at.le(request.completed_at))
+                    .filter(account_password_recovery_tokens::expires_at.gt(request.completed_at))
+                    .for_update()
+                    .select(account_password_recovery_tokens::id)
+                    .first::<uuid::Uuid>(conn)
+                    .await
+                    .optional()?;
+                let Some(token_id) = token_id else {
+                    return Ok(false);
+                };
+
+                diesel::update(account_password_credentials::table.find(account_id))
+                    .set((
+                        account_password_credentials::password_hash.eq(request.new_password_hash),
+                        account_password_credentials::password_version
+                            .eq(request.new_password_version),
+                        account_password_credentials::pepper_version.eq(request.new_pepper_version),
+                        account_password_credentials::password_changed_at.eq(request.completed_at),
+                        account_password_credentials::updated_at.eq(request.completed_at),
+                    ))
+                    .execute(conn)
+                    .await?;
+                diesel::update(account_password_recovery_tokens::table.find(token_id))
+                    .set(account_password_recovery_tokens::consumed_at.eq(request.completed_at))
+                    .execute(conn)
+                    .await?;
+                diesel::update(
+                    account_sessions::table
+                        .filter(account_sessions::account_id.eq(account_id))
+                        .filter(account_sessions::revoked_at.is_null()),
+                )
+                .set(account_sessions::revoked_at.eq(request.completed_at))
+                .execute(conn)
+                .await?;
+
+                diesel::update(
+                    account_password_recovery_outbox::table
+                        .filter(account_password_recovery_outbox::account_id.eq(account_id))
+                        .filter(account_password_recovery_outbox::kind.eq("reset"))
+                        .filter(account_password_recovery_outbox::sent_at.is_null())
+                        .filter(account_password_recovery_outbox::failed_at.is_null()),
+                )
+                .set((
+                    account_password_recovery_outbox::failed_at.eq(request.completed_at),
+                    account_password_recovery_outbox::last_error_code.eq("token_consumed"),
+                    account_password_recovery_outbox::claim_id.eq(None::<uuid::Uuid>),
+                    account_password_recovery_outbox::claimed_at.eq(None::<DateTime<Utc>>),
+                ))
+                .execute(conn)
+                .await?;
+
+                let delivery = new_password_recovery_delivery_row(
+                    account_id,
+                    recipient,
+                    PasswordRecoveryDeliveryKind::PasswordChanged,
+                    request.delivery,
+                    request.completed_at,
+                )
+                .map_err(CatalogTransactionError::Catalog)?;
+                diesel::insert_into(account_password_recovery_outbox::table)
+                    .values(delivery)
+                    .execute(conn)
+                    .await?;
+                Ok(true)
+            })
+            .await;
+        match result {
+            Ok(completed) => Ok(completed),
+            Err(CatalogTransactionError::Catalog(error)) => Err(error),
+            Err(CatalogTransactionError::Diesel(error)) => Err(map_diesel_error(
+                error,
+                "account_password_recovery",
+                delivery_id.to_string(),
+            )),
+        }
+    }
+
+    /// Lease a bounded batch of ready encrypted deliveries under one claim UUID.
+    async fn claim_password_recovery_deliveries(
+        &self,
+        request: PasswordRecoveryDeliveryClaimRequest,
+    ) -> Result<Vec<PasswordRecoveryDeliveryRecord>, CatalogError> {
+        if request.claim_id.is_nil()
+            || request.stale_before > request.claimed_at
+            || !(1..=100).contains(&request.limit)
+        {
+            return Err(CatalogError::Validation(
+                "password recovery delivery claim request is invalid".to_string(),
+            ));
+        }
+
+        let claim_id = request.claim_id;
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        use diesel_async::AsyncConnection as _;
+        let result = conn
+            .transaction::<Vec<AccountPasswordRecoveryDeliveryRow>, CatalogTransactionError, _>(
+                async move |conn| {
+                    let ids = account_password_recovery_outbox::table
+                        .filter(account_password_recovery_outbox::sent_at.is_null())
+                        .filter(account_password_recovery_outbox::failed_at.is_null())
+                        .filter(
+                            account_password_recovery_outbox::next_attempt_at
+                                .le(request.claimed_at),
+                        )
+                        .filter(account_password_recovery_outbox::expires_at.gt(request.claimed_at))
+                        .filter(account_password_recovery_outbox::attempt_count.lt(1000))
+                        .filter(account_password_recovery_outbox::claim_id.is_null().or(
+                            account_password_recovery_outbox::claimed_at.le(request.stale_before),
+                        ))
+                        .order((
+                            account_password_recovery_outbox::next_attempt_at.asc(),
+                            account_password_recovery_outbox::created_at.asc(),
+                            account_password_recovery_outbox::id.asc(),
+                        ))
+                        .limit(i64::from(request.limit))
+                        .for_update()
+                        .skip_locked()
+                        .select(account_password_recovery_outbox::id)
+                        .load::<uuid::Uuid>(conn)
+                        .await?;
+                    if ids.is_empty() {
+                        return Ok(Vec::new());
+                    }
+
+                    diesel::update(
+                        account_password_recovery_outbox::table
+                            .filter(account_password_recovery_outbox::id.eq_any(ids)),
+                    )
+                    .set((
+                        account_password_recovery_outbox::attempt_count
+                            .eq(account_password_recovery_outbox::attempt_count + 1),
+                        account_password_recovery_outbox::last_attempt_at.eq(request.claimed_at),
+                        account_password_recovery_outbox::claim_id.eq(request.claim_id),
+                        account_password_recovery_outbox::claimed_at.eq(request.claimed_at),
+                    ))
+                    .returning(AccountPasswordRecoveryDeliveryRow::as_returning())
+                    .get_results(conn)
+                    .await
+                    .map_err(CatalogTransactionError::from)
+                },
+            )
+            .await;
+        match result {
+            Ok(rows) => {
+                let mut records = rows
+                    .into_iter()
+                    .map(AccountPasswordRecoveryDeliveryRow::into_record)
+                    .collect::<Result<Vec<_>, _>>()?;
+                records
+                    .sort_by_key(|record| (record.next_attempt_at, record.created_at, record.id));
+                Ok(records)
+            }
+            Err(CatalogTransactionError::Catalog(error)) => Err(error),
+            Err(CatalogTransactionError::Diesel(error)) => Err(map_diesel_error(
+                error,
+                "account_password_recovery_delivery",
+                claim_id.to_string(),
+            )),
+        }
+    }
+
+    /// Acknowledge one successful delivery only for its current fenced claim.
+    async fn mark_password_recovery_delivery_sent(
+        &self,
+        delivery_id: uuid::Uuid,
+        claim_id: uuid::Uuid,
+        sent_at: DateTime<Utc>,
+        provider_message_id: String,
+    ) -> Result<bool, CatalogError> {
+        if delivery_id.is_nil() || claim_id.is_nil() {
+            return Err(CatalogError::Validation(
+                "password recovery delivery identifiers must be non-nil".to_string(),
+            ));
+        }
+        validate_password_recovery_provider_message_id(&provider_message_id)?;
+
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        let rows = diesel::update(
+            account_password_recovery_outbox::table
+                .find(delivery_id)
+                .filter(account_password_recovery_outbox::claim_id.eq(claim_id))
+                .filter(account_password_recovery_outbox::claimed_at.le(sent_at))
+                .filter(account_password_recovery_outbox::sent_at.is_null())
+                .filter(account_password_recovery_outbox::failed_at.is_null()),
+        )
+        .set((
+            account_password_recovery_outbox::sent_at.eq(sent_at),
+            account_password_recovery_outbox::provider_message_id.eq(provider_message_id),
+            account_password_recovery_outbox::claim_id.eq(None::<uuid::Uuid>),
+            account_password_recovery_outbox::claimed_at.eq(None::<DateTime<Utc>>),
+        ))
+        .execute(&mut conn)
+        .await
+        .map_err(|error| {
+            map_diesel_error(
+                error,
+                "account_password_recovery_delivery",
+                delivery_id.to_string(),
+            )
+        })?;
+        Ok(rows == 1)
+    }
+
+    /// Release one fenced claim for a later retry with a sanitized error code.
+    async fn retry_password_recovery_delivery(
+        &self,
+        delivery_id: uuid::Uuid,
+        claim_id: uuid::Uuid,
+        next_attempt_at: DateTime<Utc>,
+        last_error_code: String,
+    ) -> Result<bool, CatalogError> {
+        if delivery_id.is_nil() || claim_id.is_nil() {
+            return Err(CatalogError::Validation(
+                "password recovery delivery identifiers must be non-nil".to_string(),
+            ));
+        }
+        validate_password_recovery_error_code(&last_error_code)?;
+
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        let rows = diesel::update(
+            account_password_recovery_outbox::table
+                .find(delivery_id)
+                .filter(account_password_recovery_outbox::claim_id.eq(claim_id))
+                .filter(account_password_recovery_outbox::claimed_at.lt(next_attempt_at))
+                .filter(account_password_recovery_outbox::expires_at.gt(next_attempt_at))
+                .filter(account_password_recovery_outbox::sent_at.is_null())
+                .filter(account_password_recovery_outbox::failed_at.is_null()),
+        )
+        .set((
+            account_password_recovery_outbox::next_attempt_at.eq(next_attempt_at),
+            account_password_recovery_outbox::last_error_code.eq(last_error_code),
+            account_password_recovery_outbox::claim_id.eq(None::<uuid::Uuid>),
+            account_password_recovery_outbox::claimed_at.eq(None::<DateTime<Utc>>),
+        ))
+        .execute(&mut conn)
+        .await
+        .map_err(|error| {
+            map_diesel_error(
+                error,
+                "account_password_recovery_delivery",
+                delivery_id.to_string(),
+            )
+        })?;
+        Ok(rows == 1)
+    }
+
+    /// Permanently fail one delivery only for its current fenced claim.
+    async fn fail_password_recovery_delivery(
+        &self,
+        delivery_id: uuid::Uuid,
+        claim_id: uuid::Uuid,
+        failed_at: DateTime<Utc>,
+        last_error_code: String,
+    ) -> Result<bool, CatalogError> {
+        if delivery_id.is_nil() || claim_id.is_nil() {
+            return Err(CatalogError::Validation(
+                "password recovery delivery identifiers must be non-nil".to_string(),
+            ));
+        }
+        validate_password_recovery_error_code(&last_error_code)?;
+
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        let rows = diesel::update(
+            account_password_recovery_outbox::table
+                .find(delivery_id)
+                .filter(account_password_recovery_outbox::claim_id.eq(claim_id))
+                .filter(account_password_recovery_outbox::claimed_at.le(failed_at))
+                .filter(account_password_recovery_outbox::sent_at.is_null())
+                .filter(account_password_recovery_outbox::failed_at.is_null()),
+        )
+        .set((
+            account_password_recovery_outbox::failed_at.eq(failed_at),
+            account_password_recovery_outbox::last_error_code.eq(last_error_code),
+            account_password_recovery_outbox::claim_id.eq(None::<uuid::Uuid>),
+            account_password_recovery_outbox::claimed_at.eq(None::<DateTime<Utc>>),
+        ))
+        .execute(&mut conn)
+        .await
+        .map_err(|error| {
+            map_diesel_error(
+                error,
+                "account_password_recovery_delivery",
+                delivery_id.to_string(),
+            )
+        })?;
+        Ok(rows == 1)
     }
 
     /// Create one revocable first-party session after successful authentication.

@@ -90,6 +90,68 @@ diesel::table! {
 }
 
 diesel::table! {
+    /// Single-use password-reset capabilities stored only as SHA-256 digests.
+    account_password_recovery_tokens (id) {
+        /// Stable internal recovery-token identifier.
+        id -> Uuid,
+        /// Local account authorized by the token.
+        account_id -> Uuid,
+        /// SHA-256 digest of the raw bearer token.
+        token_digest -> Binary,
+        /// Token creation timestamp.
+        created_at -> Timestamptz,
+        /// Exclusive token-consumption deadline.
+        expires_at -> Timestamptz,
+        /// Successful one-time consumption timestamp.
+        consumed_at -> Nullable<Timestamptz>,
+        /// Explicit supersession or revocation timestamp.
+        revoked_at -> Nullable<Timestamptz>,
+    }
+}
+
+diesel::table! {
+    /// Encrypted recovery deliveries leased to background workers.
+    account_password_recovery_outbox (id) {
+        /// Stable outbox identifier and provider idempotency key.
+        id -> Uuid,
+        /// Local account receiving the recovery-related message.
+        account_id -> Uuid,
+        /// Stable reset or password-changed delivery purpose.
+        kind -> Text,
+        /// Lowercase, trimmed destination email.
+        recipient -> Text,
+        /// Opaque authenticated ciphertext containing the message payload.
+        ciphertext -> Binary,
+        /// Random 192-bit XChaCha20-Poly1305 nonce.
+        nonce -> Binary,
+        /// Deployment-managed encryption-key version.
+        key_version -> SmallInt,
+        /// Number of leases issued for this delivery.
+        attempt_count -> Integer,
+        /// Most recent lease-acquisition timestamp.
+        last_attempt_at -> Nullable<Timestamptz>,
+        /// UUID fencing the currently active worker lease.
+        claim_id -> Nullable<Uuid>,
+        /// Timestamp at which the current worker lease began.
+        claimed_at -> Nullable<Timestamptz>,
+        /// Earliest timestamp at which an unclaimed worker may acquire the row.
+        next_attempt_at -> Timestamptz,
+        /// Exclusive deadline after which the delivery must not be sent.
+        expires_at -> Timestamptz,
+        /// Successful provider acknowledgement timestamp.
+        sent_at -> Nullable<Timestamptz>,
+        /// Bounded provider-assigned message identifier.
+        provider_message_id -> Nullable<Text>,
+        /// Permanent failure timestamp.
+        failed_at -> Nullable<Timestamptz>,
+        /// Bounded static diagnostic code from the latest failed attempt.
+        last_error_code -> Nullable<Text>,
+        /// Outbox row creation timestamp.
+        created_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     /// Public artifact publisher profiles.
     publisher_profiles (id) {
         /// Internal stable publisher identifier.
@@ -566,6 +628,9 @@ diesel::joinable!(publisher_memberships -> publisher_profiles (publisher_id));
 // Allow Diesel join inference for first-party credentials and sessions.
 diesel::joinable!(account_password_credentials -> accounts (account_id));
 diesel::joinable!(account_sessions -> accounts (account_id));
+// Recovery rows are anchored to the first-party credential primary key.
+diesel::joinable!(account_password_recovery_tokens -> account_password_credentials (account_id));
+diesel::joinable!(account_password_recovery_outbox -> account_password_credentials (account_id));
 // Account invitation joins are written explicitly where both optional foreign keys are needed.
 diesel::joinable!(account_invites -> account_invite_requests (request_id));
 // Allow Diesel join inference for publisher keys.
@@ -600,6 +665,8 @@ diesel::allow_tables_to_appear_in_same_query!(
     accounts,
     account_password_credentials,
     account_sessions,
+    account_password_recovery_tokens,
+    account_password_recovery_outbox,
     account_invite_requests,
     account_invites,
     account_platform_roles,

@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::time::Duration as StdDuration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -24,9 +25,11 @@ use frameshift_catalog::records::{
     AccountInviteIssueRequest, AccountInviteRecord, AccountInviteRequestRecord,
     AccountInviteReviewRequest, AccountInviteStatus, AccountPasswordCredentialRecord,
     AccountPasswordRehashRequest, AccountRecord, AccountSessionRecord, AccountStatus,
-    AccountStatusChangeRequest, AuthorRecord, LocalAccountRegistrationRequest,
-    LocalAccountRegistrationResult, MembershipState, PackRecord, PackVersionRecord, PlatformRole,
-    PlatformRoleAssignmentRequest, PlatformRoleRecord, PlatformRoleRevocationRequest,
+    AccountStatusChangeRequest, AuthorRecord, EncryptedPasswordRecoveryDelivery,
+    LocalAccountRegistrationRequest, LocalAccountRegistrationResult, MembershipState, PackRecord,
+    PackVersionRecord, PasswordRecoveryCompletionRequest, PasswordRecoveryDeliveryClaimRequest,
+    PasswordRecoveryDeliveryKind, PasswordRecoveryDeliveryRecord, PasswordRecoveryEnqueueRequest,
+    PlatformRole, PlatformRoleAssignmentRequest, PlatformRoleRecord, PlatformRoleRevocationRequest,
     PlatformRoleState, PublicationAppealCaseRecord, PublicationAppealCursor,
     PublicationAppealDisposition, PublicationAppealRecord, PublicationAppealRequest,
     PublicationAppealResolutionRecord, PublicationAppealResolutionRequest, PublicationIntentRecord,
@@ -47,6 +50,25 @@ use frameshift_catalog::PublishQuota;
 use frameshift_catalog_postgres::backend::semver_gt;
 use frameshift_pack::ObjectHash;
 
+/// Digest-only reset-token lifecycle retained by the in-memory catalog double.
+#[derive(Clone)]
+pub struct MockPasswordRecoveryToken {
+    /// Stable token-row identifier.
+    pub id: uuid::Uuid,
+    /// Account authorized by this reset token.
+    pub account_id: uuid::Uuid,
+    /// SHA-256 digest of the caller-held bearer.
+    pub token_digest: Vec<u8>,
+    /// Exclusive token consumption deadline.
+    pub expires_at: DateTime<Utc>,
+    /// Successful one-time consumption timestamp.
+    pub consumed_at: Option<DateTime<Utc>>,
+    /// Explicit supersession timestamp.
+    pub revoked_at: Option<DateTime<Utc>>,
+    /// Request admission timestamp.
+    pub created_at: DateTime<Utc>,
+}
+
 /// Shared mutable state for [`MockCatalog`].
 ///
 /// Wrapped in `Arc<RwLock<MockState>>` so that the catalog can be cloned
@@ -64,6 +86,12 @@ pub struct MockState {
 
     /// Revocable first-party sessions keyed by stable identifier.
     pub account_sessions: HashMap<uuid::Uuid, AccountSessionRecord>,
+
+    /// Digest-only password reset tokens keyed by stable identifier.
+    pub password_recovery_tokens: HashMap<uuid::Uuid, MockPasswordRecoveryToken>,
+
+    /// Encrypted recovery outbox rows keyed by provider idempotency identifier.
+    pub password_recovery_deliveries: HashMap<uuid::Uuid, PasswordRecoveryDeliveryRecord>,
 
     /// OIDC-backed accounts keyed by internal identifier.
     pub accounts: HashMap<uuid::Uuid, AccountRecord>,
@@ -164,6 +192,8 @@ pub struct MockState {
 pub struct MockCatalog {
     /// The shared mutable fake catalog state.
     pub state: Arc<RwLock<MockState>>,
+    /// Per-email enqueue latency used to prove response timing independence.
+    password_recovery_enqueue_delays: Arc<RwLock<HashMap<String, StdDuration>>>,
 }
 
 /// Constructors for the in-memory catalog test double.
@@ -172,7 +202,17 @@ impl MockCatalog {
     pub fn new() -> Self {
         Self {
             state: Arc::new(RwLock::new(MockState::default())),
+            password_recovery_enqueue_delays: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Delay one normalized recovery-email enqueue without blocking mock state access.
+    #[allow(dead_code)]
+    pub fn delay_password_recovery_enqueue(&self, normalized_email: &str, delay: StdDuration) {
+        self.password_recovery_enqueue_delays
+            .write()
+            .unwrap()
+            .insert(normalized_email.to_string(), delay);
     }
 }
 
@@ -203,6 +243,36 @@ fn validate_audit(
         ));
     }
     Ok(())
+}
+
+/// Expand a caller-encrypted envelope into one pending mock outbox record.
+fn mock_recovery_delivery(
+    account_id: uuid::Uuid,
+    recipient: String,
+    kind: PasswordRecoveryDeliveryKind,
+    delivery: EncryptedPasswordRecoveryDelivery,
+    created_at: DateTime<Utc>,
+) -> PasswordRecoveryDeliveryRecord {
+    PasswordRecoveryDeliveryRecord {
+        id: delivery.id,
+        account_id,
+        kind,
+        recipient,
+        ciphertext: delivery.ciphertext,
+        nonce: delivery.nonce,
+        key_version: delivery.key_version,
+        attempt_count: 0,
+        last_attempt_at: None,
+        claim_id: None,
+        claimed_at: None,
+        next_attempt_at: created_at,
+        expires_at: delivery.expires_at,
+        sent_at: None,
+        provider_message_id: None,
+        failed_at: None,
+        last_error_code: None,
+        created_at,
+    }
 }
 
 #[async_trait]
@@ -433,6 +503,299 @@ impl CatalogBackend for MockCatalog {
         credential.password_version = request.new_password_version;
         credential.pepper_version = request.new_pepper_version;
         credential.updated_at = request.updated_at;
+        Ok(true)
+    }
+
+    /// Atomically create one eligible mock reset token and encrypted delivery.
+    async fn enqueue_account_password_recovery(
+        &self,
+        request: PasswordRecoveryEnqueueRequest,
+    ) -> Result<bool, CatalogError> {
+        let delay = self
+            .password_recovery_enqueue_delays
+            .read()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?
+            .get(&request.normalized_email)
+            .copied();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        let mut state = self
+            .state
+            .write()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        let Some(credential) = state
+            .account_password_credentials
+            .get(&request.normalized_email)
+            .cloned()
+        else {
+            return Ok(false);
+        };
+        let eligible = credential.email_verified_at.is_some()
+            && state
+                .accounts
+                .get(&credential.account_id)
+                .is_some_and(|account| account.status == AccountStatus::Active);
+        if !eligible
+            || state.password_recovery_tokens.values().any(|token| {
+                token.account_id == credential.account_id
+                    && token.created_at > request.cooldown_cutoff
+            })
+        {
+            return Ok(false);
+        }
+        if state
+            .password_recovery_tokens
+            .contains_key(&request.token_id)
+            || state
+                .password_recovery_deliveries
+                .contains_key(&request.delivery.id)
+        {
+            return Err(CatalogError::Conflict {
+                kind: "password_recovery",
+                key: request.token_id.to_string(),
+            });
+        }
+
+        for token in state.password_recovery_tokens.values_mut() {
+            if token.account_id == credential.account_id
+                && token.consumed_at.is_none()
+                && token.revoked_at.is_none()
+            {
+                token.revoked_at = Some(request.requested_at);
+            }
+        }
+        let token = MockPasswordRecoveryToken {
+            id: request.token_id,
+            account_id: credential.account_id,
+            token_digest: request.token_digest,
+            expires_at: request.token_expires_at,
+            consumed_at: None,
+            revoked_at: None,
+            created_at: request.requested_at,
+        };
+        let delivery = mock_recovery_delivery(
+            credential.account_id,
+            credential.normalized_email,
+            PasswordRecoveryDeliveryKind::Reset,
+            request.delivery,
+            request.requested_at,
+        );
+        state.password_recovery_tokens.insert(token.id, token);
+        state
+            .password_recovery_deliveries
+            .insert(delivery.id, delivery);
+        Ok(true)
+    }
+
+    /// Atomically consume one mock token, replace its password, revoke sessions, and enqueue notice.
+    async fn complete_account_password_recovery(
+        &self,
+        request: PasswordRecoveryCompletionRequest,
+    ) -> Result<bool, CatalogError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        let Some(token) = state
+            .password_recovery_tokens
+            .values()
+            .find(|token| token.token_digest == request.token_digest)
+            .cloned()
+        else {
+            return Ok(false);
+        };
+        if token.consumed_at.is_some()
+            || token.revoked_at.is_some()
+            || token.expires_at <= request.completed_at
+            || !state
+                .accounts
+                .get(&token.account_id)
+                .is_some_and(|account| account.status == AccountStatus::Active)
+        {
+            return Ok(false);
+        }
+        let Some(normalized_email) = state
+            .account_password_credentials
+            .iter()
+            .find(|(_, credential)| {
+                credential.account_id == token.account_id && credential.email_verified_at.is_some()
+            })
+            .map(|(email, _)| email.clone())
+        else {
+            return Ok(false);
+        };
+        if state
+            .password_recovery_deliveries
+            .contains_key(&request.delivery.id)
+        {
+            return Err(CatalogError::Conflict {
+                kind: "password_recovery_delivery",
+                key: request.delivery.id.to_string(),
+            });
+        }
+
+        for candidate in state.password_recovery_tokens.values_mut() {
+            if candidate.account_id != token.account_id {
+                continue;
+            }
+            if candidate.id == token.id {
+                candidate.consumed_at = Some(request.completed_at);
+            } else if candidate.consumed_at.is_none() && candidate.revoked_at.is_none() {
+                candidate.revoked_at = Some(request.completed_at);
+            }
+        }
+        let credential = state
+            .account_password_credentials
+            .get_mut(&normalized_email)
+            .expect("credential identity was resolved while holding the write lock");
+        credential.password_hash = request.new_password_hash;
+        credential.password_version = request.new_password_version;
+        credential.pepper_version = request.new_pepper_version;
+        credential.password_changed_at = request.completed_at;
+        credential.updated_at = request.completed_at;
+        for session in state.account_sessions.values_mut() {
+            if session.account_id == token.account_id && session.revoked_at.is_none() {
+                session.revoked_at = Some(request.completed_at);
+            }
+        }
+        let delivery = mock_recovery_delivery(
+            token.account_id,
+            normalized_email,
+            PasswordRecoveryDeliveryKind::PasswordChanged,
+            request.delivery,
+            request.completed_at,
+        );
+        state
+            .password_recovery_deliveries
+            .insert(delivery.id, delivery);
+        Ok(true)
+    }
+
+    /// Lease a bounded deterministic batch of ready mock recovery deliveries.
+    async fn claim_password_recovery_deliveries(
+        &self,
+        request: PasswordRecoveryDeliveryClaimRequest,
+    ) -> Result<Vec<PasswordRecoveryDeliveryRecord>, CatalogError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        let mut ids: Vec<_> = state
+            .password_recovery_deliveries
+            .values()
+            .filter(|delivery| {
+                delivery.sent_at.is_none()
+                    && delivery.failed_at.is_none()
+                    && delivery.expires_at > request.claimed_at
+                    && delivery.next_attempt_at <= request.claimed_at
+                    && (delivery.claim_id.is_none()
+                        || delivery
+                            .claimed_at
+                            .is_some_and(|claimed_at| claimed_at <= request.stale_before))
+            })
+            .map(|delivery| delivery.id)
+            .collect();
+        ids.sort_by_key(|id| {
+            let delivery = &state.password_recovery_deliveries[id];
+            (delivery.next_attempt_at, delivery.created_at, delivery.id)
+        });
+        ids.truncate(request.limit as usize);
+
+        let mut claimed = Vec::with_capacity(ids.len());
+        for id in ids {
+            let delivery = state.password_recovery_deliveries.get_mut(&id).unwrap();
+            delivery.claim_id = Some(request.claim_id);
+            delivery.claimed_at = Some(request.claimed_at);
+            delivery.last_attempt_at = Some(request.claimed_at);
+            delivery.attempt_count = delivery.attempt_count.saturating_add(1);
+            claimed.push(delivery.clone());
+        }
+        Ok(claimed)
+    }
+
+    /// Acknowledge one successful mock delivery under its exact claim fence.
+    async fn mark_password_recovery_delivery_sent(
+        &self,
+        delivery_id: uuid::Uuid,
+        claim_id: uuid::Uuid,
+        sent_at: DateTime<Utc>,
+        provider_message_id: String,
+    ) -> Result<bool, CatalogError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        let Some(delivery) = state.password_recovery_deliveries.get_mut(&delivery_id) else {
+            return Ok(false);
+        };
+        if delivery.claim_id != Some(claim_id)
+            || delivery.sent_at.is_some()
+            || delivery.failed_at.is_some()
+        {
+            return Ok(false);
+        }
+        delivery.claim_id = None;
+        delivery.claimed_at = None;
+        delivery.sent_at = Some(sent_at);
+        delivery.provider_message_id = Some(provider_message_id);
+        delivery.last_error_code = None;
+        Ok(true)
+    }
+
+    /// Release one mock delivery claim for a scheduled retry.
+    async fn retry_password_recovery_delivery(
+        &self,
+        delivery_id: uuid::Uuid,
+        claim_id: uuid::Uuid,
+        next_attempt_at: DateTime<Utc>,
+        last_error_code: String,
+    ) -> Result<bool, CatalogError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        let Some(delivery) = state.password_recovery_deliveries.get_mut(&delivery_id) else {
+            return Ok(false);
+        };
+        if delivery.claim_id != Some(claim_id)
+            || delivery.sent_at.is_some()
+            || delivery.failed_at.is_some()
+        {
+            return Ok(false);
+        }
+        delivery.claim_id = None;
+        delivery.claimed_at = None;
+        delivery.next_attempt_at = next_attempt_at;
+        delivery.last_error_code = Some(last_error_code);
+        Ok(true)
+    }
+
+    /// Mark one mock delivery terminal under its exact claim fence.
+    async fn fail_password_recovery_delivery(
+        &self,
+        delivery_id: uuid::Uuid,
+        claim_id: uuid::Uuid,
+        failed_at: DateTime<Utc>,
+        last_error_code: String,
+    ) -> Result<bool, CatalogError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        let Some(delivery) = state.password_recovery_deliveries.get_mut(&delivery_id) else {
+            return Ok(false);
+        };
+        if delivery.claim_id != Some(claim_id)
+            || delivery.sent_at.is_some()
+            || delivery.failed_at.is_some()
+        {
+            return Ok(false);
+        }
+        delivery.claim_id = None;
+        delivery.claimed_at = None;
+        delivery.failed_at = Some(failed_at);
+        delivery.last_error_code = Some(last_error_code);
         Ok(true)
     }
 

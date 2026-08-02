@@ -1,5 +1,7 @@
 //! Invite-bound first-party registration, password login, and session logout.
 
+use std::sync::Arc;
+
 use axum::extract::State;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -11,19 +13,22 @@ use chrono::{DateTime, Duration, Utc};
 use frameshift_catalog::{
     AccountPasswordCredentialRecord, AccountPasswordRehashRequest, AccountRecord,
     AccountSessionClientKind, AccountSessionRecord, AccountStatus, CatalogError,
-    LocalAccountRegistrationRequest,
+    EncryptedPasswordRecoveryDelivery, LocalAccountRegistrationRequest,
+    PasswordRecoveryCompletionRequest, PasswordRecoveryEnqueueRequest,
 };
 use rand_core::{OsRng, RngCore as _};
-use secrecy::SecretString;
+use secrecy::{ExposeSecret as _, SecretString};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tokio::sync::{Semaphore, SemaphorePermit};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::error::AppError;
 use crate::middleware::account::AuthenticatedAccount;
 use crate::password_auth::{PasswordAuthError, PasswordService};
 use crate::password_blocklist;
+use crate::recovery_delivery::RecoveryDeliveryCipher;
 use crate::routes::invite_requests::{normalize_email, normalize_optional_display_name};
 use crate::state::AppState;
 
@@ -37,6 +42,10 @@ const MAX_LOCAL_AUTH_BYTES: usize = 8 * 1_024;
 const PASSWORD_VERSION: i16 = 1;
 /// Process-wide cap on concurrent 64 MiB Argon2id operations.
 static PASSWORD_WORK_SLOTS: Semaphore = Semaphore::const_new(2);
+/// Minimum wall-clock duration for every valid recovery-request response.
+const MIN_RECOVERY_REQUEST_DURATION: std::time::Duration = std::time::Duration::from_millis(250);
+/// Maximum time allowed for delivery of the post-change notification.
+const PASSWORD_CHANGED_DELIVERY_TTL: Duration = Duration::hours(24);
 
 /// Browser or explicit bearer presentation selected by the client.
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -78,6 +87,31 @@ pub struct LoginLocalAccountRequest {
     pub client_kind: LocalAuthClientKind,
 }
 
+/// Browser request for an indistinguishable password-recovery email response.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestPasswordRecoveryRequest {
+    /// Account email normalized only inside the server boundary.
+    pub email: String,
+}
+
+/// Browser submission of one reset bearer and replacement password.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompletePasswordRecoveryRequest {
+    /// Opaque single-use reset bearer received in an email URL fragment.
+    pub token: String,
+    /// Replacement password processed under the new-password policy.
+    pub password: String,
+}
+
+/// Generic recovery-request acknowledgement shared by known and unknown emails.
+#[derive(Debug, Serialize)]
+pub struct PasswordRecoveryAcceptedResponse {
+    /// Stable indication that the bounded request was accepted for processing.
+    pub accepted: bool,
+}
+
 /// Successful local registration or login response.
 #[derive(Debug, Serialize)]
 pub struct LocalAuthResponse {
@@ -101,6 +135,14 @@ pub fn local_auth_public_router() -> Router<AppState> {
     Router::new()
         .route("/register", post(register_local_account))
         .route("/login", post(login_local_account))
+        .route(
+            "/password-recovery/request",
+            post(request_password_recovery),
+        )
+        .route(
+            "/password-recovery/complete",
+            post(complete_password_recovery),
+        )
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             MAX_LOCAL_AUTH_BYTES,
         ))
@@ -217,6 +259,109 @@ async fn login_local_account(
     local_auth_response(&state, account, session, request.client_kind, session_token)
 }
 
+/// Enqueue one encrypted reset delivery without disclosing account existence.
+async fn request_password_recovery(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<RequestPasswordRecoveryRequest>,
+) -> Result<Response, AppError> {
+    require_local_auth_enabled(&state)?;
+    require_trusted_browser_origin(&state, &headers)?;
+    let cipher = require_password_recovery_enabled(&state)?;
+    let started_at = tokio::time::Instant::now();
+    let normalized_email = normalize_email(&request.email)?;
+    let (raw_token, token_digest) = generate_token();
+    let raw_token = Zeroizing::new(raw_token);
+    let token_id = Uuid::new_v4();
+    let delivery_id = Uuid::new_v4();
+    let encrypted = cipher
+        .encrypt_reset(
+            delivery_id,
+            &state.config.first_party_auth.recovery.reset_url,
+            raw_token.as_str(),
+        )
+        .map_err(|_| AppError::Internal("password recovery encryption failed".to_string()))?;
+    let requested_at = Utc::now();
+    let token_ttl = Duration::from_std(state.config.first_party_auth.recovery.token_ttl)
+        .map_err(|_| AppError::Internal("password recovery token TTL is invalid".to_string()))?;
+    let cooldown = Duration::from_std(state.config.first_party_auth.recovery.request_cooldown)
+        .map_err(|_| AppError::Internal("password recovery cooldown is invalid".to_string()))?;
+    let token_expires_at = requested_at + token_ttl;
+    let catalog = Arc::clone(&state.catalog);
+    tokio::spawn(async move {
+        if catalog
+            .enqueue_account_password_recovery(PasswordRecoveryEnqueueRequest {
+                token_id,
+                normalized_email,
+                token_digest,
+                requested_at,
+                token_expires_at,
+                cooldown_cutoff: requested_at - cooldown,
+                delivery: EncryptedPasswordRecoveryDelivery {
+                    id: delivery_id,
+                    ciphertext: encrypted.ciphertext,
+                    nonce: encrypted.nonce,
+                    key_version: encrypted.key_version,
+                    expires_at: token_expires_at,
+                },
+            })
+            .await
+            .is_err()
+        {
+            tracing::warn!("password recovery enqueue failed");
+        }
+    });
+    tokio::time::sleep_until(started_at + MIN_RECOVERY_REQUEST_DURATION).await;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(PasswordRecoveryAcceptedResponse { accepted: true }),
+    )
+        .into_response())
+}
+
+/// Consume one reset bearer, change its credential, and revoke every session.
+async fn complete_password_recovery(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CompletePasswordRecoveryRequest>,
+) -> Result<Response, AppError> {
+    require_local_auth_enabled(&state)?;
+    require_trusted_browser_origin(&state, &headers)?;
+    let cipher = require_password_recovery_enabled(&state)?;
+    let raw_token = Zeroizing::new(request.token);
+    let token_digest =
+        decode_and_digest_token(raw_token.as_str()).map_err(|_| invalid_recovery_token_error())?;
+    let password = protected_new_password(request.password)?;
+    let new_password_hash = hash_password(&state, password).await?;
+    let completed_at = Utc::now();
+    let delivery_id = Uuid::new_v4();
+    let encrypted = cipher
+        .encrypt_password_changed(delivery_id)
+        .map_err(|_| AppError::Internal("password recovery encryption failed".to_string()))?;
+    let completed = state
+        .catalog
+        .complete_account_password_recovery(PasswordRecoveryCompletionRequest {
+            token_digest,
+            new_password_hash,
+            new_password_version: PASSWORD_VERSION,
+            new_pepper_version: state.config.first_party_auth.pepper_version,
+            completed_at,
+            delivery: EncryptedPasswordRecoveryDelivery {
+                id: delivery_id,
+                ciphertext: encrypted.ciphertext,
+                nonce: encrypted.nonce,
+                key_version: encrypted.key_version,
+                expires_at: completed_at + PASSWORD_CHANGED_DELIVERY_TTL,
+            },
+        })
+        .await
+        .map_err(map_recovery_catalog_error)?;
+    if !completed {
+        return Err(invalid_recovery_token_error());
+    }
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
 /// Revoke the current local session and clear its browser cookie when applicable.
 async fn logout_local_account(
     State(state): State<AppState>,
@@ -260,6 +405,16 @@ fn require_local_auth_enabled(state: &AppState) -> Result<(), AppError> {
     }
 }
 
+/// Return a validated recovery cipher or one uniform unavailable response.
+fn require_password_recovery_enabled(state: &AppState) -> Result<RecoveryDeliveryCipher, AppError> {
+    RecoveryDeliveryCipher::from_config(&state.config)
+        .ok()
+        .flatten()
+        .ok_or_else(|| {
+            AppError::ServiceUnavailable("password recovery is not configured".to_string())
+        })
+}
+
 /// Require an exact configured browser origin before cookie creation.
 fn require_trusted_browser_origin(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
     let origin = headers
@@ -280,28 +435,31 @@ fn require_trusted_browser_origin(state: &AppState, headers: &HeaderMap) -> Resu
 
 /// Validate a newly created password and move its exact bytes into protected memory.
 pub(crate) fn protected_new_password(password: String) -> Result<SecretString, AppError> {
-    let character_count = password.chars().count();
-    if character_count < MIN_PASSWORD_CHARS || password.len() > MAX_PASSWORD_BYTES {
+    let password = SecretString::new(password);
+    let exposed = password.expose_secret();
+    let character_count = exposed.chars().count();
+    if character_count < MIN_PASSWORD_CHARS || exposed.len() > MAX_PASSWORD_BYTES {
         return Err(AppError::BadRequest(format!(
             "password must contain at least {MIN_PASSWORD_CHARS} characters and at most {MAX_PASSWORD_BYTES} bytes"
         )));
     }
-    if password_blocklist::is_blocklisted(&password) {
+    if password_blocklist::is_blocklisted(exposed) {
         return Err(AppError::BadRequest(
             "password is too common or specific to FrameShift".to_string(),
         ));
     }
-    Ok(SecretString::new(password))
+    Ok(password)
 }
 
 /// Bound a login password without applying creation policy to legacy credentials.
 fn protected_login_password(password: String) -> Result<SecretString, AppError> {
-    if password.len() > MAX_PASSWORD_BYTES {
+    let password = SecretString::new(password);
+    if password.expose_secret().len() > MAX_PASSWORD_BYTES {
         return Err(AppError::BadRequest(format!(
             "password must contain at most {MAX_PASSWORD_BYTES} bytes"
         )));
     }
-    Ok(SecretString::new(password))
+    Ok(password)
 }
 
 /// Hash one password on the blocking pool using the deployment pepper.
@@ -450,11 +608,24 @@ fn map_registration_error(error: CatalogError) -> AppError {
     }
 }
 
+/// Hide all catalog details from the public recovery surface.
+fn map_recovery_catalog_error(_error: CatalogError) -> AppError {
+    AppError::Internal("password recovery catalog operation failed".to_string())
+}
+
+/// Return the single public error shared by every unusable recovery bearer.
+fn invalid_recovery_token_error() -> AppError {
+    AppError::BadRequest("password recovery token is invalid or expired".to_string())
+}
+
 /// Generate one random 256-bit token and its SHA-256 digest.
 pub(crate) fn generate_token() -> (String, Vec<u8>) {
-    let mut raw = [0_u8; 32];
-    OsRng.fill_bytes(&mut raw);
-    (URL_SAFE_NO_PAD.encode(raw), Sha256::digest(raw).to_vec())
+    let mut raw = Zeroizing::new([0_u8; 32]);
+    OsRng.fill_bytes(raw.as_mut_slice());
+    (
+        URL_SAFE_NO_PAD.encode(raw.as_slice()),
+        Sha256::digest(raw.as_slice()).to_vec(),
+    )
 }
 
 /// Decode one canonical 256-bit token and return its SHA-256 digest.
@@ -464,15 +635,17 @@ pub(crate) fn decode_and_digest_token(token: &str) -> Result<Vec<u8>, AppError> 
             "token is invalid or expired".to_string(),
         ));
     }
-    let raw = URL_SAFE_NO_PAD
-        .decode(token)
-        .map_err(|_| AppError::Unauthorized("token is invalid or expired".to_string()))?;
-    if raw.len() != 32 || URL_SAFE_NO_PAD.encode(&raw) != token {
+    let raw = Zeroizing::new(
+        URL_SAFE_NO_PAD
+            .decode(token)
+            .map_err(|_| AppError::Unauthorized("token is invalid or expired".to_string()))?,
+    );
+    if raw.len() != 32 || URL_SAFE_NO_PAD.encode(raw.as_slice()) != token {
         return Err(AppError::Unauthorized(
             "token is invalid or expired".to_string(),
         ));
     }
-    Ok(Sha256::digest(raw).to_vec())
+    Ok(Sha256::digest(raw.as_slice()).to_vec())
 }
 
 /// Build one session with transport-specific idle duration and a shared absolute cap.

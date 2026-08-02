@@ -55,6 +55,7 @@ pub mod password_auth;
 /// Compromised and deployment-specific password rejection data.
 mod password_blocklist;
 pub mod publication;
+pub mod recovery_delivery;
 pub mod router;
 pub mod routes;
 pub mod state;
@@ -64,7 +65,10 @@ use std::sync::Arc;
 
 use frameshift_objects::PackStore;
 
-pub use config::{FirstPartyAuthConfig, InviteRequestConfig, LogFormat, OidcConfig, ServerConfig};
+pub use config::{
+    FirstPartyAuthConfig, InviteRequestConfig, LogFormat, OidcConfig, PasswordRecoveryConfig,
+    ServerConfig,
+};
 pub use error::AppError;
 pub use router::{app, app_with_publication_admission};
 pub use state::AppState;

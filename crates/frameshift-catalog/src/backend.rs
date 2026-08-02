@@ -17,11 +17,12 @@ use crate::records::{
     AccountInviteReviewRequest, AccountInviteStatus, AccountPasswordCredentialRecord,
     AccountPasswordRehashRequest, AccountRecord, AccountSessionRecord, AccountStatusChangeRequest,
     AuthorRecord, LocalAccountRegistrationRequest, LocalAccountRegistrationResult, PackRecord,
-    PackVersionRecord, PlatformRoleAssignmentRequest, PlatformRoleRecord,
-    PlatformRoleRevocationRequest, PublicationAppealCaseRecord, PublicationAppealCursor,
-    PublicationAppealRecord, PublicationAppealRequest, PublicationAppealResolutionRecord,
-    PublicationAppealResolutionRequest, PublicationIntentClaim, PublicationIntentRecord,
-    PublicationLifecycleCursor, PublicationLifecycleDecisionRecord,
+    PackVersionRecord, PasswordRecoveryCompletionRequest, PasswordRecoveryDeliveryClaimRequest,
+    PasswordRecoveryDeliveryRecord, PasswordRecoveryEnqueueRequest, PlatformRoleAssignmentRequest,
+    PlatformRoleRecord, PlatformRoleRevocationRequest, PublicationAppealCaseRecord,
+    PublicationAppealCursor, PublicationAppealRecord, PublicationAppealRequest,
+    PublicationAppealResolutionRecord, PublicationAppealResolutionRequest, PublicationIntentClaim,
+    PublicationIntentRecord, PublicationLifecycleCursor, PublicationLifecycleDecisionRecord,
     PublicationModerationDecisionRecord, PublicationModerationDecisionRequest,
     PublicationModerationSnapshot, PublicationPromotionRecord, PublicationPromotionRequest,
     PublicationSubmissionRecord, PublicationSubmissionRequest, PublicationTombstoneRequest,
@@ -177,6 +178,89 @@ pub trait CatalogBackend: Send + Sync {
             kind: "account_password_credential",
             key: request.account_id.to_string(),
         })
+    }
+
+    /// Atomically create a digest-only reset token and encrypted delivery.
+    ///
+    /// Returns `true` only when an active, verified local account was eligible
+    /// and outside the configured cooldown. A `false` result deliberately
+    /// collapses absent, inactive, unverified, and cooling-down identities.
+    async fn enqueue_account_password_recovery(
+        &self,
+        request: PasswordRecoveryEnqueueRequest,
+    ) -> Result<bool, CatalogError> {
+        let _ = request;
+        Err(CatalogError::Validation(
+            "password recovery is not supported by this backend".to_string(),
+        ))
+    }
+
+    /// Atomically consume one active token, replace its credential, revoke all
+    /// account sessions, and enqueue an encrypted password-changed notice.
+    ///
+    /// Returns `false` for every missing, expired, consumed, revoked, inactive,
+    /// or otherwise ineligible token so callers can render one public error.
+    async fn complete_account_password_recovery(
+        &self,
+        request: PasswordRecoveryCompletionRequest,
+    ) -> Result<bool, CatalogError> {
+        let _ = request;
+        Err(CatalogError::Validation(
+            "password recovery is not supported by this backend".to_string(),
+        ))
+    }
+
+    /// Lease a bounded batch of ready encrypted deliveries under one claim UUID.
+    async fn claim_password_recovery_deliveries(
+        &self,
+        request: PasswordRecoveryDeliveryClaimRequest,
+    ) -> Result<Vec<PasswordRecoveryDeliveryRecord>, CatalogError> {
+        let _ = request;
+        Err(CatalogError::Validation(
+            "password recovery delivery is not supported by this backend".to_string(),
+        ))
+    }
+
+    /// Acknowledge one successful delivery only for its current fenced claim.
+    async fn mark_password_recovery_delivery_sent(
+        &self,
+        delivery_id: uuid::Uuid,
+        claim_id: uuid::Uuid,
+        sent_at: DateTime<Utc>,
+        provider_message_id: String,
+    ) -> Result<bool, CatalogError> {
+        let _ = (delivery_id, claim_id, sent_at, provider_message_id);
+        Err(CatalogError::Validation(
+            "password recovery delivery is not supported by this backend".to_string(),
+        ))
+    }
+
+    /// Release one fenced claim for a later retry with a sanitized error code.
+    async fn retry_password_recovery_delivery(
+        &self,
+        delivery_id: uuid::Uuid,
+        claim_id: uuid::Uuid,
+        next_attempt_at: DateTime<Utc>,
+        last_error_code: String,
+    ) -> Result<bool, CatalogError> {
+        let _ = (delivery_id, claim_id, next_attempt_at, last_error_code);
+        Err(CatalogError::Validation(
+            "password recovery delivery is not supported by this backend".to_string(),
+        ))
+    }
+
+    /// Permanently fail one delivery only for its current fenced claim.
+    async fn fail_password_recovery_delivery(
+        &self,
+        delivery_id: uuid::Uuid,
+        claim_id: uuid::Uuid,
+        failed_at: DateTime<Utc>,
+        last_error_code: String,
+    ) -> Result<bool, CatalogError> {
+        let _ = (delivery_id, claim_id, failed_at, last_error_code);
+        Err(CatalogError::Validation(
+            "password recovery delivery is not supported by this backend".to_string(),
+        ))
     }
 
     /// Create a revocable session after successful first-party authentication.
