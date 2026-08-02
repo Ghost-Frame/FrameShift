@@ -273,6 +273,30 @@ async fn send_browser(
         .unwrap()
 }
 
+/// Retry a password-login request only while parallel tests occupy every Argon slot.
+async fn send_password_login_when_capacity_is_available(
+    state: AppState,
+    body: Value,
+) -> axum::http::Response<axum::body::Body> {
+    let mut last_response = None;
+    for _ in 0..100 {
+        let response = send(
+            state.clone(),
+            Method::POST,
+            "/v1/auth/login",
+            None,
+            Some(body.clone()),
+        )
+        .await;
+        if response.status() != StatusCode::SERVICE_UNAVAILABLE {
+            return response;
+        }
+        last_response = Some(response);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    last_response.expect("the bounded capacity retry loop always sends at least one request")
+}
+
 /// Decode one JSON response body after its status has been asserted.
 async fn response_json(response: axum::http::Response<axum::body::Body>) -> Value {
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
@@ -585,6 +609,20 @@ async fn invite_redemption_creates_one_browser_account_and_logout_revokes_it() {
     .await;
     assert_eq!(untrusted.status(), StatusCode::FORBIDDEN);
 
+    let mut blocklisted_registration = registration.clone();
+    blocklisted_registration["password"] = json!("  FrameShiftPassword  ");
+    let blocklisted = send_browser(
+        state.clone(),
+        Method::POST,
+        "/v1/auth/register",
+        Some("https://frameshift.test"),
+        None,
+        Some(blocklisted_registration),
+    )
+    .await;
+    assert_eq!(blocklisted.status(), StatusCode::BAD_REQUEST);
+    assert!(catalog.state.read().unwrap().accounts.is_empty());
+
     let registered = send_browser(
         state.clone(),
         Method::POST,
@@ -678,7 +716,7 @@ async fn invite_redemption_creates_one_browser_account_and_logout_revokes_it() {
     assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
 }
 
-/// Desktop login returns an explicit bearer token and rejects the wrong password.
+/// Desktop login returns an explicit bearer and rejects a short wrong password generically.
 #[tokio::test]
 async fn desktop_password_login_uses_explicit_revocable_bearer_sessions() {
     let catalog = MockCatalog::new();
@@ -703,30 +741,24 @@ async fn desktop_password_login_uses_explicit_revocable_bearer_sessions() {
         .unwrap()
         .to_string();
 
-    let wrong_password = send(
+    let wrong_password = send_password_login_when_capacity_is_available(
         state.clone(),
-        Method::POST,
-        "/v1/auth/login",
-        None,
-        Some(json!({
+        json!({
             "email": "desktop@example.test",
-            "password": "incorrect horse battery staple",
+            "password": "wrong",
             "client_kind": "desktop"
-        })),
+        }),
     )
     .await;
     assert_eq!(wrong_password.status(), StatusCode::UNAUTHORIZED);
 
-    let logged_in = send(
+    let logged_in = send_password_login_when_capacity_is_available(
         state.clone(),
-        Method::POST,
-        "/v1/auth/login",
-        None,
-        Some(json!({
+        json!({
             "email": " DESKTOP@example.test ",
             "password": "correct horse battery staple",
             "client_kind": "desktop"
-        })),
+        }),
     )
     .await;
     assert_eq!(logged_in.status(), StatusCode::OK);

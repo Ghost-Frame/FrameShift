@@ -23,11 +23,12 @@ use uuid::Uuid;
 use crate::error::AppError;
 use crate::middleware::account::AuthenticatedAccount;
 use crate::password_auth::{PasswordAuthError, PasswordService};
+use crate::password_blocklist;
 use crate::routes::invite_requests::{normalize_email, normalize_optional_display_name};
 use crate::state::AppState;
 
 /// Minimum accepted password length in Unicode scalar values.
-const MIN_PASSWORD_CHARS: usize = 12;
+const MIN_PASSWORD_CHARS: usize = 15;
 /// Maximum accepted password size before Argon2 processing.
 const MAX_PASSWORD_BYTES: usize = 1_024;
 /// Tight body limit for registration and login credentials.
@@ -123,7 +124,7 @@ async fn register_local_account(
     let invite_digest = decode_and_digest_token(&request.invite_token)?;
     let normalized_email = normalize_email(&request.email)?;
     let display_name = normalize_optional_display_name(request.display_name)?;
-    let password = protected_password(request.password)?;
+    let password = protected_new_password(request.password)?;
     let password_hash = hash_password(&state, password).await?;
     let (session_token, session_digest) = generate_token();
     let now = Utc::now();
@@ -179,7 +180,7 @@ async fn login_local_account(
         require_trusted_browser_origin(&state, &headers)?;
     }
     let normalized_email = normalize_email(&request.email)?;
-    let password = protected_password(request.password)?;
+    let password = protected_login_password(request.password)?;
     let credential = match state
         .catalog
         .get_account_password_credential(&normalized_email)
@@ -277,12 +278,27 @@ fn require_trusted_browser_origin(state: &AppState, headers: &HeaderMap) -> Resu
     Ok(())
 }
 
-/// Validate password bounds and move the value into protected memory.
-fn protected_password(password: String) -> Result<SecretString, AppError> {
+/// Validate a newly created password and move its exact bytes into protected memory.
+pub(crate) fn protected_new_password(password: String) -> Result<SecretString, AppError> {
     let character_count = password.chars().count();
     if character_count < MIN_PASSWORD_CHARS || password.len() > MAX_PASSWORD_BYTES {
         return Err(AppError::BadRequest(format!(
             "password must contain at least {MIN_PASSWORD_CHARS} characters and at most {MAX_PASSWORD_BYTES} bytes"
+        )));
+    }
+    if password_blocklist::is_blocklisted(&password) {
+        return Err(AppError::BadRequest(
+            "password is too common or specific to FrameShift".to_string(),
+        ));
+    }
+    Ok(SecretString::new(password))
+}
+
+/// Bound a login password without applying creation policy to legacy credentials.
+fn protected_login_password(password: String) -> Result<SecretString, AppError> {
+    if password.len() > MAX_PASSWORD_BYTES {
+        return Err(AppError::BadRequest(format!(
+            "password must contain at most {MAX_PASSWORD_BYTES} bytes"
         )));
     }
     Ok(SecretString::new(password))
@@ -551,11 +567,27 @@ mod tests {
         assert!(decode_and_digest_token(&format!("{}=", "a".repeat(43))).is_err());
     }
 
-    /// Password bounds reject short and oversized inputs.
+    /// New-password bounds count Unicode scalars and cap UTF-8 bytes independently.
     #[test]
-    fn password_bounds_are_enforced() {
-        assert!(protected_password("short".to_string()).is_err());
-        assert!(protected_password("x".repeat(MAX_PASSWORD_BYTES + 1)).is_err());
-        assert!(protected_password("correct horse battery staple".to_string()).is_ok());
+    fn new_password_bounds_are_enforced() {
+        assert!(protected_new_password("é".repeat(MIN_PASSWORD_CHARS - 1)).is_err());
+        assert!(protected_new_password("é".repeat(MIN_PASSWORD_CHARS)).is_ok());
+        assert!(protected_new_password("x".repeat(MAX_PASSWORD_BYTES)).is_ok());
+        assert!(protected_new_password("x".repeat(MAX_PASSWORD_BYTES + 1)).is_err());
+    }
+
+    /// New-password policy rejects blocklisted values after comparison normalization.
+    #[test]
+    fn new_password_blocklist_is_enforced() {
+        assert!(protected_new_password("  FrameShiftPassword  ".to_string()).is_err());
+        assert!(protected_new_password("correct horse battery staple".to_string()).is_ok());
+    }
+
+    /// Login accepts legacy short inputs but retains the Argon2 abuse bound.
+    #[test]
+    fn login_password_preserves_legacy_length_compatibility() {
+        assert!(protected_login_password(String::new()).is_ok());
+        assert!(protected_login_password("short".to_string()).is_ok());
+        assert!(protected_login_password("x".repeat(MAX_PASSWORD_BYTES + 1)).is_err());
     }
 }
