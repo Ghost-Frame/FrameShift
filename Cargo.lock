@@ -2072,7 +2072,7 @@ dependencies = [
 
 [[package]]
 name = "frameshift-cli"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "chrono",
  "clap",
@@ -2216,7 +2216,7 @@ dependencies = [
 
 [[package]]
 name = "frameshift-mcp"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "frameshift-capabilities",
  "frameshift-client",

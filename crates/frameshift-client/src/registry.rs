@@ -599,20 +599,11 @@ fn check_or_create_registry_trust(
         &record.publisher_key,
         record.publisher_key_id.as_deref(),
     ) {
-        (None, None, _) => {
-            if record
-                .legacy_author
-                .as_ref()
-                .is_some_and(|legacy| legacy.handle != author)
-            {
-                return Err(ClientError::RegistryOwnershipInvalid {
-                    pack,
-                    detail: "legacy author handle does not match the signed pack manifest"
-                        .to_string(),
-                });
-            }
-            check_or_create_author_pin(data_root, registry, author, pubkey)
-        }
+        // Legacy author summaries are current presentation metadata, not
+        // immutable signing evidence. Historical archives may retain an older
+        // signed handle after the registry profile is renamed; exact signer-key
+        // continuity remains enforced by the author pin below.
+        (None, None, _) => check_or_create_author_pin(data_root, registry, author, pubkey),
         (Some(publisher), None, None) => {
             let legacy_author = record.legacy_author.as_ref().ok_or_else(|| {
                 ClientError::RegistryOwnershipInvalid {
@@ -1316,6 +1307,47 @@ mod tests {
             &legacy_only,
         )
         .expect("legacy response with the pinned signer must retain continuity");
+    }
+
+    /// A renamed legacy profile cannot invalidate an immutable signed archive.
+    #[test]
+    fn legacy_author_presentation_rename_retains_signer_key_continuity() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut legacy = ownership_version_record(
+            "4a128e72-cc91-4721-b452-943ce736799b",
+            "cc56ea2b-991d-46eb-a94f-936a9b071a4a",
+            EnrolledPublisherKeyState::Active,
+            [7_u8; 32],
+        );
+        legacy.publisher = None;
+        legacy.publisher_key_id = None;
+        legacy.publisher_key = None;
+        legacy.legacy_author = Some(RegistryLegacyAuthorSummary {
+            handle: "renamed-profile".to_string(),
+            display_name: Some("Renamed Profile".to_string()),
+        });
+
+        check_or_create_registry_trust(
+            temp.path(),
+            "https://registry.example",
+            "historical-signed-handle",
+            &[7_u8; 32],
+            &legacy,
+        )
+        .expect("legacy presentation rename must preserve the verified signer");
+
+        let error = check_or_create_registry_trust(
+            temp.path(),
+            "https://registry.example",
+            "historical-signed-handle",
+            &[8_u8; 32],
+            &legacy,
+        )
+        .expect_err("legacy presentation rename must not permit signer substitution");
+        assert!(matches!(
+            error,
+            ClientError::RegistryAuthorKeyChanged { .. }
+        ));
     }
 
     /// A linked pack may retain exact legacy trust for an unlinked historical version.

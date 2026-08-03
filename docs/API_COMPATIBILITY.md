@@ -75,6 +75,14 @@ JSON location. They add these optional objects:
 - Successful account-backed publish responses may add `publisher` and
   `publisher_key`.
 
+`legacy_author` is current presentation metadata for a legacy signing key. It is
+not immutable authority for a historical version because a profile handle can
+change after an archive is signed. Clients authenticate an unlinked legacy
+version with the requested record identity, archive content hash, Ed25519
+signature, exact manifest-to-record signer key, and the locally pinned signer
+key. A changed `legacy_author` handle does not rewrite or invalidate that signed
+history.
+
 Released v0.10 clients continue to browse, install, and verify because they ignore
 unknown response fields and still verify the retained `author_pubkey`, signature,
 and content hash. `PUBLISHER_OWNERSHIP_READS=false` disables read enrichment and
