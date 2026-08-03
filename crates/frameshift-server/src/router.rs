@@ -67,7 +67,7 @@ use tower_http::request_id::{PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::set_header::SetResponseHeaderLayer;
 
 use crate::mcp::mcp_router;
-use crate::middleware::account::{require_account, resolve_optional_account};
+use crate::middleware::account::{require_account, require_fresh_mfa, resolve_optional_account};
 use crate::middleware::auth::require_signed_request;
 use crate::middleware::identity_limit::{
     enforce_account_rate_limit, enforce_signer_rate_limit, IdentityRateLimits,
@@ -85,7 +85,9 @@ use crate::routes::invite_admin::invite_admin_router;
 use crate::routes::invite_requests::invite_request_router;
 use crate::routes::local_auth::{local_auth_protected_router, local_auth_public_router};
 use crate::routes::memory::memory_router;
+use crate::routes::mfa::{mfa_fresh_router, mfa_protected_router, mfa_public_router};
 use crate::routes::moderation::moderation_router;
+use crate::routes::native_auth::{native_auth_protected_router, native_auth_public_router};
 use crate::routes::ops::ops_router;
 use crate::routes::packs::{packs_router, publish_pack};
 use crate::routes::publication_intents::publication_intent_router;
@@ -240,7 +242,9 @@ fn build_app(
 
     if state.config.first_party_auth.enabled() {
         let local_auth = apply_ip_rate_limit(
-            local_auth_public_router(),
+            local_auth_public_router()
+                .merge(mfa_public_router())
+                .merge(native_auth_public_router()),
             &state,
             state.config.abuse_rate_per_min,
         );
@@ -249,20 +253,43 @@ fn build_app(
 
     if state.account_auth.is_some() || state.config.first_party_auth.enabled() {
         let account_layer = axum::middleware::from_fn_with_state(state.clone(), require_account);
+        let fresh_mfa_layer =
+            axum::middleware::from_fn_with_state(state.clone(), require_fresh_mfa);
+        let fresh_auth_routes = mfa_fresh_router()
+            .merge(native_auth_protected_router())
+            .route_layer(fresh_mfa_layer.clone());
+        let local_protected_auth = local_auth_protected_router()
+            .merge(mfa_protected_router())
+            .merge(fresh_auth_routes);
         let mut account_routes = account_write_router()
-            .merge(Router::new().nest("/auth", local_auth_protected_router()))
-            .merge(Router::new().nest("/admin", admin_router().merge(invite_admin_router())))
-            .merge(Router::new().nest("/publish-intents", publication_intent_router()))
+            .route_layer(fresh_mfa_layer.clone())
+            .merge(Router::new().nest("/auth", local_protected_auth))
+            .merge(
+                Router::new().nest(
+                    "/admin",
+                    admin_router()
+                        .merge(invite_admin_router())
+                        .route_layer(fresh_mfa_layer.clone()),
+                ),
+            )
             .merge(Router::new().nest(
-                "/publication-submissions",
-                publication_submission_read_router(),
+                "/publish-intents",
+                publication_intent_router().route_layer(fresh_mfa_layer.clone()),
             ))
             .merge(Router::new().nest(
-                "/moderation/publication-submissions",
-                moderation_router(quarantine_review, publication_promotion),
-            ));
+                "/publication-submissions",
+                publication_submission_read_router().route_layer(fresh_mfa_layer.clone()),
+            ))
+            .merge(
+                Router::new().nest(
+                    "/moderation/publication-submissions",
+                    moderation_router(quarantine_review, publication_promotion)
+                        .route_layer(fresh_mfa_layer.clone()),
+                ),
+            );
         if let Some(admission) = publication_admission {
             let submission_writes = publication_submission_write_router(admission)
+                .route_layer(fresh_mfa_layer.clone())
                 .route_layer(signer_limit.clone())
                 .route_layer(signed.clone());
             let submission_writes =

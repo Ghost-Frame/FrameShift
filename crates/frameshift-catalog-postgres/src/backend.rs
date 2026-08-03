@@ -17,25 +17,33 @@
 //! Pool checkout failures are mapped by [`crate::errors::map_pool_error`].
 
 use async_trait::async_trait;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Duration, Utc};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 use diesel_migrations::{embed_migrations, EmbeddedMigrations, MigrationHarness as _};
 use tracing::{debug, error, instrument};
+use uuid::Uuid;
 
 use frameshift_catalog::{
+    AccountAuthAuditEventKind, AccountAuthAuditEventRecord, AccountAuthAuditOutcome,
     AccountInviteIssueRequest, AccountInviteRecord, AccountInviteRequestRecord,
-    AccountInviteReviewRequest, AccountInviteStatus, AccountPasswordCredentialRecord,
-    AccountPasswordRehashRequest, AccountRecord, AccountSessionRecord, AccountStatusChangeRequest,
-    AuthorRecord, CatalogBackend, CatalogError, Ed25519PublicKey,
+    AccountInviteReviewRequest, AccountInviteStatus, AccountMfaActivationRequest,
+    AccountMfaAuthenticatorRecord, AccountMfaAuthenticatorState,
+    AccountMfaChallengeCompletionRequest, AccountMfaChallengeCompletionResult,
+    AccountMfaChallengeCreationRequest, AccountMfaChallengeProof, AccountMfaDisableRequest,
+    AccountMfaEnrollmentRequest, AccountPasswordCredentialRecord, AccountPasswordRehashRequest,
+    AccountRecord, AccountSessionCreationRequest, AccountSessionIssuance, AccountSessionRecord,
+    AccountSessionRefreshRequest, AccountSessionRefreshResult, AccountStatus,
+    AccountStatusChangeRequest, AuthorRecord, CatalogBackend, CatalogError, Ed25519PublicKey,
     EncryptedPasswordRecoveryDelivery, HealthStatus, LocalAccountRegistrationRequest,
-    LocalAccountRegistrationResult, MembershipState, PackRecord, PackSearchFilters,
-    PackSearchResult, PackStatus, PackVersionRecord, PasswordRecoveryCompletionRequest,
-    PasswordRecoveryDeliveryClaimRequest, PasswordRecoveryDeliveryKind,
-    PasswordRecoveryDeliveryRecord, PasswordRecoveryEnqueueRequest, PlatformRole,
-    PlatformRoleAssignmentRequest, PlatformRoleRecord, PlatformRoleRevocationRequest,
+    LocalAccountRegistrationResult, MembershipState, NativeAuthorizationCodeCreationRequest,
+    NativeAuthorizationCodeExchangeRequest, NativeAuthorizationCodeExchangeResult, PackRecord,
+    PackSearchFilters, PackSearchResult, PackStatus, PackVersionRecord,
+    PasswordRecoveryCompletionRequest, PasswordRecoveryDeliveryClaimRequest,
+    PasswordRecoveryDeliveryKind, PasswordRecoveryDeliveryRecord, PasswordRecoveryEnqueueRequest,
+    PlatformRole, PlatformRoleAssignmentRequest, PlatformRoleRecord, PlatformRoleRevocationRequest,
     PublicationAppealCaseRecord, PublicationAppealCursor, PublicationAppealDisposition,
     PublicationAppealRecord, PublicationAppealRequest, PublicationAppealResolutionRecord,
     PublicationAppealResolutionRequest, PublicationIntentClaim, PublicationIntentRecord,
@@ -54,25 +62,31 @@ use crate::config::PostgresCatalogConfig;
 use crate::errors::{map_diesel_error, map_migration_error, map_pool_error};
 use crate::models::{
     encode_text_enum, vec_to_pubkey, AccountInviteRequestRow, AccountInviteRow,
-    AccountPasswordCredentialRow, AccountPasswordRecoveryDeliveryRow, AccountRow,
-    AccountSessionRow, AuthorRow, HandleRow, NewAccountInviteRequestRow, NewAccountInviteRow,
+    AccountMfaAuthenticatorRow, AccountMfaLoginChallengeRow, AccountPasswordCredentialRow,
+    AccountPasswordRecoveryDeliveryRow, AccountRow, AccountSessionRefreshTokenRow,
+    AccountSessionRow, AuthorRow, HandleRow, NativeAuthorizationCodeRow,
+    NewAccountAuthAuditEventRow, NewAccountInviteRequestRow, NewAccountInviteRow,
+    NewAccountMfaAuthenticatorRow, NewAccountMfaLoginChallengeRow, NewAccountMfaRecoveryCodeRow,
     NewAccountPasswordCredentialRow, NewAccountPasswordRecoveryDeliveryRow,
-    NewAccountPasswordRecoveryTokenRow, NewAccountRow, NewAccountSessionRow, NewAuthorRow,
-    NewHandleRow, NewPackDownloadRow, NewPackRow, NewPackVersionRow,
-    NewPublicationAppealResolutionRow, NewPublicationAppealRow, NewPublicationIntentRow,
-    NewPublicationLifecycleDecisionRow, NewPublicationModerationDecisionRow,
-    NewPublicationPromotionRow, NewPublicationSubmissionRow, NewPublisherAuditEventRow,
-    NewPublisherKeyRow, NewPublisherMembershipRow, NewPublisherProfileRow, PackRow, PackVersionRow,
-    PlatformRoleRow, PublicationAppealResolutionRow, PublicationAppealRow, PublicationIntentRow,
+    NewAccountPasswordRecoveryTokenRow, NewAccountRow, NewAccountSessionRefreshTokenRow,
+    NewAccountSessionRow, NewAuthorRow, NewHandleRow, NewNativeAuthorizationCodeRow,
+    NewPackDownloadRow, NewPackRow, NewPackVersionRow, NewPublicationAppealResolutionRow,
+    NewPublicationAppealRow, NewPublicationIntentRow, NewPublicationLifecycleDecisionRow,
+    NewPublicationModerationDecisionRow, NewPublicationPromotionRow, NewPublicationSubmissionRow,
+    NewPublisherAuditEventRow, NewPublisherKeyRow, NewPublisherMembershipRow,
+    NewPublisherProfileRow, PackRow, PackVersionRow, PlatformRoleRow,
+    PublicationAppealResolutionRow, PublicationAppealRow, PublicationIntentRow,
     PublicationLifecycleDecisionRow, PublicationModerationDecisionRow, PublicationPromotionRow,
     PublicationSubmissionRow, PublisherKeyRow, PublisherMembershipRow, PublisherProfileRow,
 };
 use crate::pool::{build_pool, PgPool};
 use crate::schema::{
-    account_invite_requests, account_invites, account_password_credentials,
+    account_auth_audit_events, account_invite_requests, account_invites,
+    account_mfa_authenticators, account_mfa_login_challenges, account_mfa_recovery_codes,
+    account_native_authorization_codes, account_password_credentials,
     account_password_recovery_outbox, account_password_recovery_tokens, account_platform_roles,
-    account_sessions, accounts, authors, handles, pack_downloads, pack_versions, packs,
-    publication_appeal_resolutions, publication_appeals, publication_intents,
+    account_session_refresh_tokens, account_sessions, accounts, authors, handles, pack_downloads,
+    pack_versions, packs, publication_appeal_resolutions, publication_appeals, publication_intents,
     publication_lifecycle_decisions, publication_moderation_decisions, publication_promotions,
     publication_submissions, publisher_audit_events, publisher_keys, publisher_memberships,
     publisher_profiles, signed_request_nonces,
@@ -133,6 +147,32 @@ enum CatalogTransactionError {
     Catalog(CatalogError),
     /// A raw Diesel failure that must be mapped after the transaction ends.
     Diesel(diesel::result::Error),
+}
+
+/// Internal row-preserving result of a committed refresh-token transaction.
+enum SessionRefreshTransactionResult {
+    /// Rotation committed and returned the updated session row.
+    Rotated(AccountSessionRow),
+    /// A consumed generation was replayed and family revocation committed.
+    ReplayRevoked,
+    /// The presented generation or session was unusable without a state change.
+    Rejected,
+}
+
+/// Internal row-preserving result of an MFA challenge transaction.
+enum MfaCompletionTransactionResult {
+    /// Challenge and proof consumption committed with this session row.
+    Completed(AccountSessionRow),
+    /// The challenge or proof was unusable and no state changed.
+    Rejected,
+}
+
+/// Internal row-preserving result of a native authorization-code transaction.
+enum NativeCodeExchangeTransactionResult {
+    /// Exact code and PKCE consumption committed with this session row.
+    Exchanged(AccountSessionRow),
+    /// The code or one of its exact bindings was unusable.
+    Rejected,
 }
 
 /// Convert raw Diesel failures into the shared transaction error wrapper.
@@ -243,6 +283,171 @@ fn new_password_recovery_delivery_row(
         last_error_code: None,
         created_at,
     })
+}
+
+/// Validate one fixed-length cryptographic digest without exposing its bytes.
+fn validate_auth_digest(digest: &[u8], kind: &str) -> Result<(), CatalogError> {
+    if digest.len() != 32 {
+        return Err(CatalogError::Validation(format!(
+            "{kind} digest must be 32 bytes"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate one bounded static account-auth audit reason code.
+fn validate_auth_reason_code(reason_code: &str) -> Result<(), CatalogError> {
+    let bytes = reason_code.as_bytes();
+    let valid_head = !bytes.is_empty()
+        && bytes.len() <= 64
+        && bytes
+            .first()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit());
+    let valid_tail = bytes.iter().skip(1).all(|byte| {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'.' | b'-')
+    });
+    if !valid_head || !valid_tail {
+        return Err(CatalogError::Validation(
+            "authentication audit reason code is invalid".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate that an audit event contains only the schema's bounded fields.
+fn validate_auth_audit_event(event: &AccountAuthAuditEventRecord) -> Result<(), CatalogError> {
+    if event.id.is_nil()
+        || event
+            .identifier_tag
+            .as_ref()
+            .is_some_and(|tag| tag.len() != 32)
+        || event
+            .network_tag
+            .as_ref()
+            .is_some_and(|tag| tag.len() != 32)
+    {
+        return Err(CatalogError::Validation(
+            "authentication audit event metadata is invalid".to_string(),
+        ));
+    }
+    if let Some(reason_code) = event.reason_code.as_deref() {
+        validate_auth_reason_code(reason_code)?;
+    }
+    Ok(())
+}
+
+/// Require the exact success-event binding for one atomic security mutation.
+fn validate_atomic_auth_audit_event(
+    event: &AccountAuthAuditEventRecord,
+    event_kind: AccountAuthAuditEventKind,
+    account_id: Uuid,
+    session_id: Option<Uuid>,
+    client_kind: Option<frameshift_catalog::AccountSessionClientKind>,
+    created_at: DateTime<Utc>,
+) -> Result<(), CatalogError> {
+    validate_auth_audit_event(event)?;
+    if event.event_kind != event_kind
+        || event.outcome != AccountAuthAuditOutcome::Success
+        || event.account_id != Some(account_id)
+        || event.session_id != session_id
+        || event.client_kind != client_kind
+        || event.reason_code.is_some()
+        || event.created_at != created_at
+    {
+        return Err(CatalogError::Validation(
+            "authentication audit event does not match its state transition".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate one access-plus-refresh session issuance before a transaction.
+fn validate_session_issuance(issuance: &AccountSessionIssuance) -> Result<(), CatalogError> {
+    let session = &issuance.session;
+    validate_auth_digest(&session.token_digest, "access token")?;
+    validate_auth_digest(&issuance.refresh_token_digest, "refresh token")?;
+    if session.id.is_nil()
+        || session.account_id.is_nil()
+        || issuance.refresh_token_id.is_nil()
+        || session.token_digest == issuance.refresh_token_digest
+        || session.revoked_at.is_some()
+        || session.last_seen_at < session.created_at
+        || session.access_expires_at <= session.created_at
+        || session.access_expires_at > session.idle_expires_at
+        || session.idle_expires_at > session.absolute_expires_at
+        || issuance.refresh_expires_at <= session.created_at
+        || issuance.refresh_expires_at > session.absolute_expires_at
+        || session
+            .mfa_verified_at
+            .is_some_and(|verified_at| verified_at > session.last_seen_at)
+    {
+        return Err(CatalogError::Validation(
+            "account session issuance is inconsistent".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Compare optional assurance timestamps at PostgreSQL's microsecond precision.
+fn auth_assurance_timestamp_matches(
+    left: Option<DateTime<Utc>>,
+    right: Option<DateTime<Utc>>,
+) -> bool {
+    left.map(|timestamp| timestamp.timestamp_micros())
+        == right.map(|timestamp| timestamp.timestamp_micros())
+}
+
+/// Insert one session family and refresh generation zero in the current transaction.
+async fn insert_session_issuance(
+    conn: &mut diesel_async::AsyncPgConnection,
+    issuance: AccountSessionIssuance,
+) -> Result<AccountSessionRow, CatalogTransactionError> {
+    let session = issuance.session;
+    let row = diesel::insert_into(account_sessions::table)
+        .values(NewAccountSessionRow {
+            id: session.id,
+            account_id: session.account_id,
+            token_digest: session.token_digest,
+            client_kind: encode_text_enum(session.client_kind)
+                .map_err(CatalogTransactionError::Catalog)?,
+            created_at: session.created_at,
+            last_seen_at: session.last_seen_at,
+            access_expires_at: session.access_expires_at,
+            idle_expires_at: session.idle_expires_at,
+            absolute_expires_at: session.absolute_expires_at,
+            mfa_verified_at: session.mfa_verified_at,
+            revoked_at: session.revoked_at,
+        })
+        .returning(AccountSessionRow::as_returning())
+        .get_result(conn)
+        .await?;
+    diesel::insert_into(account_session_refresh_tokens::table)
+        .values(NewAccountSessionRefreshTokenRow {
+            id: issuance.refresh_token_id,
+            session_id: row.id,
+            generation: 0,
+            token_digest: issuance.refresh_token_digest,
+            created_at: row.created_at,
+            expires_at: issuance.refresh_expires_at,
+            consumed_at: None,
+        })
+        .execute(conn)
+        .await?;
+    Ok(row)
+}
+
+/// Insert one validated sanitized account-auth audit event in a transaction.
+async fn insert_auth_audit_event(
+    conn: &mut diesel_async::AsyncPgConnection,
+    event: AccountAuthAuditEventRecord,
+) -> Result<(), CatalogTransactionError> {
+    let row = NewAccountAuthAuditEventRow::from_record(event)
+        .map_err(CatalogTransactionError::Catalog)?;
+    diesel::insert_into(account_auth_audit_events::table)
+        .values(row)
+        .execute(conn)
+        .await?;
+    Ok(())
 }
 
 /// Validate and convert a catalog audit record into its insertable row.
@@ -918,16 +1123,18 @@ async fn require_active_administrator(
     Ok(())
 }
 
-/// Reject a role grant for an account that does not exist.
+/// Lock the target account and reject a role grant when it does not exist.
 ///
 /// The foreign key would also reject it, but an explicit check keeps the error
-/// specific instead of surfacing a constraint violation.
+/// specific instead of surfacing a constraint violation. The row lock also
+/// serializes the MFA prerequisite with concurrent MFA disable operations.
 async fn require_existing_account(
     conn: &mut diesel_async::AsyncPgConnection,
     account_id: uuid::Uuid,
 ) -> Result<(), CatalogTransactionError> {
     let exists = accounts::table
         .find(account_id)
+        .for_update()
         .select(accounts::id)
         .first::<uuid::Uuid>(conn)
         .await
@@ -1597,10 +1804,11 @@ impl CatalogBackend for PostgresCatalog {
         &self,
         request: LocalAccountRegistrationRequest,
     ) -> Result<LocalAccountRegistrationResult, CatalogError> {
+        validate_session_issuance(&request.session)?;
         if request.invite_token_digest.len() != 32
-            || request.session.token_digest.len() != 32
+            || request.account.status != AccountStatus::Active
             || request.credential.account_id != request.account.id
-            || request.session.account_id != request.account.id
+            || request.session.session.account_id != request.account.id
             || request.account.email.as_deref()
                 != Some(request.credential.normalized_email.as_str())
             || request.credential.email_verified_at.is_none()
@@ -1609,14 +1817,21 @@ impl CatalogBackend for PostgresCatalog {
                 "local registration records are inconsistent".to_string(),
             ));
         }
+        validate_atomic_auth_audit_event(
+            &request.audit_event,
+            AccountAuthAuditEventKind::SessionCreated,
+            request.account.id,
+            Some(request.session.session.id),
+            Some(request.session.session.client_kind),
+            request.session.session.created_at,
+        )?;
         let account_result = request.account.clone();
-        let session_result = request.session.clone();
         let account_key = request.account.id;
         let now = request.account.created_at;
         let mut conn = self.pool.get().await.map_err(map_pool_error)?;
         use diesel_async::AsyncConnection as _;
         let result = conn
-            .transaction::<(), CatalogTransactionError, _>(async move |conn| {
+            .transaction::<AccountSessionRow, CatalogTransactionError, _>(async move |conn| {
                 let invitation = account_invites::table
                     .filter(account_invites::token_digest.eq(&request.invite_token_digest))
                     .filter(account_invites::consumed_at.is_null())
@@ -1679,28 +1894,15 @@ impl CatalogBackend for PostgresCatalog {
                     })
                     .execute(conn)
                     .await?;
-                diesel::insert_into(account_sessions::table)
-                    .values(NewAccountSessionRow {
-                        id: request.session.id,
-                        account_id: request.session.account_id,
-                        token_digest: request.session.token_digest,
-                        client_kind: encode_text_enum(request.session.client_kind)
-                            .map_err(CatalogTransactionError::Catalog)?,
-                        created_at: request.session.created_at,
-                        last_seen_at: request.session.last_seen_at,
-                        idle_expires_at: request.session.idle_expires_at,
-                        absolute_expires_at: request.session.absolute_expires_at,
-                        revoked_at: request.session.revoked_at,
-                    })
-                    .execute(conn)
-                    .await?;
-                Ok(())
+                let session = insert_session_issuance(conn, request.session).await?;
+                insert_auth_audit_event(conn, request.audit_event).await?;
+                Ok(session)
             })
             .await;
         match result {
-            Ok(()) => Ok(LocalAccountRegistrationResult {
+            Ok(session) => Ok(LocalAccountRegistrationResult {
                 account: account_result,
-                session: session_result,
+                session: session.into_record()?,
             }),
             Err(CatalogTransactionError::Catalog(error)) => Err(error),
             Err(CatalogTransactionError::Diesel(error)) => Err(map_diesel_error(
@@ -2276,35 +2478,55 @@ impl CatalogBackend for PostgresCatalog {
         Ok(rows == 1)
     }
 
-    /// Create one revocable first-party session after successful authentication.
+    /// Create one access-token session, refresh generation, and success audit atomically.
     async fn create_account_session(
         &self,
-        record: AccountSessionRecord,
-    ) -> Result<(), CatalogError> {
-        if record.token_digest.len() != 32 {
-            return Err(CatalogError::Validation(
-                "session token digest must be 32 bytes".to_string(),
-            ));
-        }
-        let key = record.id.to_string();
-        let client_kind = encode_text_enum(record.client_kind)?;
+        request: AccountSessionCreationRequest,
+    ) -> Result<AccountSessionRecord, CatalogError> {
+        validate_session_issuance(&request.issuance)?;
+        validate_atomic_auth_audit_event(
+            &request.audit_event,
+            AccountAuthAuditEventKind::SessionCreated,
+            request.issuance.session.account_id,
+            Some(request.issuance.session.id),
+            Some(request.issuance.session.client_kind),
+            request.issuance.session.created_at,
+        )?;
+        let session_id = request.issuance.session.id;
         let mut conn = self.pool.get().await.map_err(map_pool_error)?;
-        diesel::insert_into(account_sessions::table)
-            .values(NewAccountSessionRow {
-                id: record.id,
-                account_id: record.account_id,
-                token_digest: record.token_digest,
-                client_kind,
-                created_at: record.created_at,
-                last_seen_at: record.last_seen_at,
-                idle_expires_at: record.idle_expires_at,
-                absolute_expires_at: record.absolute_expires_at,
-                revoked_at: record.revoked_at,
+        use diesel_async::AsyncConnection as _;
+        let result = conn
+            .transaction::<AccountSessionRow, CatalogTransactionError, _>(async move |conn| {
+                let active_account = accounts::table
+                    .find(request.issuance.session.account_id)
+                    .filter(accounts::status.eq("active"))
+                    .for_update()
+                    .select(accounts::id)
+                    .first::<Uuid>(conn)
+                    .await
+                    .optional()?;
+                if active_account.is_none() {
+                    return Err(CatalogTransactionError::Catalog(
+                        CatalogError::Unauthorized {
+                            kind: "account_session",
+                            key: "inactive-account".to_string(),
+                        },
+                    ));
+                }
+                let session = insert_session_issuance(conn, request.issuance).await?;
+                insert_auth_audit_event(conn, request.audit_event).await?;
+                Ok(session)
             })
-            .execute(&mut conn)
-            .await
-            .map_err(|error| map_diesel_error(error, "account_session", key))?;
-        Ok(())
+            .await;
+        match result {
+            Ok(row) => row.into_record(),
+            Err(CatalogTransactionError::Catalog(error)) => Err(error),
+            Err(CatalogTransactionError::Diesel(error)) => Err(map_diesel_error(
+                error,
+                "account_session",
+                session_id.to_string(),
+            )),
+        }
     }
 
     /// Resolve one active first-party session by its opaque token digest.
@@ -2321,8 +2543,11 @@ impl CatalogBackend for PostgresCatalog {
         }
         let mut conn = self.pool.get().await.map_err(map_pool_error)?;
         account_sessions::table
+            .inner_join(accounts::table)
             .filter(account_sessions::token_digest.eq(token_digest))
+            .filter(accounts::status.eq("active"))
             .filter(account_sessions::revoked_at.is_null())
+            .filter(account_sessions::access_expires_at.gt(now))
             .filter(account_sessions::idle_expires_at.gt(now))
             .filter(account_sessions::absolute_expires_at.gt(now))
             .select(AccountSessionRow::as_select())
@@ -2389,6 +2614,944 @@ impl CatalogBackend for PostgresCatalog {
                 key: session_id.to_string(),
             });
         }
+        Ok(())
+    }
+
+    /// Rotate one refresh generation or commit family revocation after replay.
+    async fn refresh_account_session(
+        &self,
+        request: AccountSessionRefreshRequest,
+    ) -> Result<AccountSessionRefreshResult, CatalogError> {
+        validate_auth_digest(
+            &request.presented_refresh_token_digest,
+            "presented refresh token",
+        )?;
+        validate_auth_digest(
+            &request.replacement_access_token_digest,
+            "replacement access token",
+        )?;
+        validate_auth_digest(
+            &request.replacement_refresh_token_digest,
+            "replacement refresh token",
+        )?;
+        validate_auth_audit_event(&request.success_audit_event)?;
+        validate_auth_audit_event(&request.replay_audit_event)?;
+        if request.replacement_refresh_token_id.is_nil()
+            || request.presented_refresh_token_digest == request.replacement_refresh_token_digest
+            || request.presented_refresh_token_digest == request.replacement_access_token_digest
+            || request.replacement_refresh_token_digest == request.replacement_access_token_digest
+            || request.replacement_access_expires_at <= request.rotated_at
+            || request.replacement_idle_expires_at < request.replacement_access_expires_at
+            || request.replacement_refresh_expires_at <= request.rotated_at
+        {
+            return Err(CatalogError::Validation(
+                "refresh rotation request is inconsistent".to_string(),
+            ));
+        }
+
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        use diesel_async::AsyncConnection as _;
+        let result = conn
+            .transaction::<SessionRefreshTransactionResult, CatalogTransactionError, _>(
+                async move |conn| {
+                    let refresh = account_session_refresh_tokens::table
+                        .filter(
+                            account_session_refresh_tokens::token_digest
+                                .eq(&request.presented_refresh_token_digest),
+                        )
+                        .for_update()
+                        .select(AccountSessionRefreshTokenRow::as_select())
+                        .first(conn)
+                        .await
+                        .optional()?;
+                    let Some(refresh) = refresh else {
+                        return Ok(SessionRefreshTransactionResult::Rejected);
+                    };
+                    let session = account_sessions::table
+                        .find(refresh.session_id)
+                        .for_update()
+                        .select(AccountSessionRow::as_select())
+                        .first(conn)
+                        .await?;
+                    let account_is_active = accounts::table
+                        .find(session.account_id)
+                        .filter(accounts::status.eq("active"))
+                        .select(accounts::id)
+                        .first::<Uuid>(conn)
+                        .await
+                        .optional()?
+                        .is_some();
+
+                    if refresh.consumed_at.is_some() {
+                        validate_atomic_auth_audit_event(
+                            &request.replay_audit_event,
+                            AccountAuthAuditEventKind::SessionReplayRevoked,
+                            session.account_id,
+                            Some(session.id),
+                            Some(
+                                serde_json::from_value(serde_json::Value::String(
+                                    session.client_kind.clone(),
+                                ))
+                                .map_err(|error| {
+                                    CatalogTransactionError::Catalog(CatalogError::BackendError(
+                                        Box::new(std::io::Error::other(error.to_string())),
+                                    ))
+                                })?,
+                            ),
+                            request.rotated_at,
+                        )
+                        .map_err(CatalogTransactionError::Catalog)?;
+                        if session.revoked_at.is_none() {
+                            diesel::update(account_sessions::table.find(session.id))
+                                .set(account_sessions::revoked_at.eq(request.rotated_at))
+                                .execute(conn)
+                                .await?;
+                        }
+                        insert_auth_audit_event(conn, request.replay_audit_event).await?;
+                        return Ok(SessionRefreshTransactionResult::ReplayRevoked);
+                    }
+
+                    if refresh.expires_at <= request.rotated_at
+                        || !account_is_active
+                        || session.revoked_at.is_some()
+                        || session.idle_expires_at <= request.rotated_at
+                        || session.absolute_expires_at <= request.rotated_at
+                        || request.replacement_access_expires_at > session.absolute_expires_at
+                        || request.replacement_idle_expires_at > session.absolute_expires_at
+                        || request.replacement_refresh_expires_at > session.absolute_expires_at
+                    {
+                        return Ok(SessionRefreshTransactionResult::Rejected);
+                    }
+
+                    let client_kind = serde_json::from_value(serde_json::Value::String(
+                        session.client_kind.clone(),
+                    ))
+                    .map_err(|error| {
+                        CatalogTransactionError::Catalog(CatalogError::BackendError(Box::new(
+                            std::io::Error::other(error.to_string()),
+                        )))
+                    })?;
+                    validate_atomic_auth_audit_event(
+                        &request.success_audit_event,
+                        AccountAuthAuditEventKind::SessionRefreshed,
+                        session.account_id,
+                        Some(session.id),
+                        Some(client_kind),
+                        request.rotated_at,
+                    )
+                    .map_err(CatalogTransactionError::Catalog)?;
+
+                    diesel::update(account_session_refresh_tokens::table.find(refresh.id))
+                        .set(account_session_refresh_tokens::consumed_at.eq(request.rotated_at))
+                        .execute(conn)
+                        .await?;
+                    diesel::insert_into(account_session_refresh_tokens::table)
+                        .values(NewAccountSessionRefreshTokenRow {
+                            id: request.replacement_refresh_token_id,
+                            session_id: session.id,
+                            generation: refresh.generation + 1,
+                            token_digest: request.replacement_refresh_token_digest,
+                            created_at: request.rotated_at,
+                            expires_at: request.replacement_refresh_expires_at,
+                            consumed_at: None,
+                        })
+                        .execute(conn)
+                        .await?;
+                    let updated = diesel::update(account_sessions::table.find(session.id))
+                        .set((
+                            account_sessions::token_digest
+                                .eq(request.replacement_access_token_digest),
+                            account_sessions::last_seen_at.eq(request.rotated_at),
+                            account_sessions::access_expires_at
+                                .eq(request.replacement_access_expires_at),
+                            account_sessions::idle_expires_at
+                                .eq(request.replacement_idle_expires_at),
+                        ))
+                        .returning(AccountSessionRow::as_returning())
+                        .get_result(conn)
+                        .await?;
+                    insert_auth_audit_event(conn, request.success_audit_event).await?;
+                    Ok(SessionRefreshTransactionResult::Rotated(updated))
+                },
+            )
+            .await;
+        match result {
+            Ok(SessionRefreshTransactionResult::Rotated(row)) => {
+                row.into_record().map(AccountSessionRefreshResult::Rotated)
+            }
+            Ok(SessionRefreshTransactionResult::ReplayRevoked) => {
+                Ok(AccountSessionRefreshResult::ReplayRevoked)
+            }
+            Ok(SessionRefreshTransactionResult::Rejected) => {
+                Ok(AccountSessionRefreshResult::Rejected)
+            }
+            Err(CatalogTransactionError::Catalog(error)) => Err(error),
+            Err(CatalogTransactionError::Diesel(error)) => Err(map_diesel_error(
+                error,
+                "account_session_refresh",
+                "opaque-token".to_string(),
+            )),
+        }
+    }
+
+    /// Retrieve the single active encrypted TOTP authenticator for an account.
+    async fn get_active_account_mfa_authenticator(
+        &self,
+        account_id: uuid::Uuid,
+    ) -> Result<AccountMfaAuthenticatorRecord, CatalogError> {
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        account_mfa_authenticators::table
+            .filter(account_mfa_authenticators::account_id.eq(account_id))
+            .filter(account_mfa_authenticators::state.eq("active"))
+            .select(AccountMfaAuthenticatorRow::as_select())
+            .first(&mut conn)
+            .await
+            .map_err(|error| {
+                map_diesel_error(error, "account_mfa_authenticator", account_id.to_string())
+            })?
+            .into_record()
+    }
+
+    /// Retrieve one unexpired pending encrypted TOTP authenticator by exact owner and identifier.
+    async fn get_pending_account_mfa_authenticator(
+        &self,
+        account_id: uuid::Uuid,
+        authenticator_id: uuid::Uuid,
+        now: DateTime<Utc>,
+    ) -> Result<AccountMfaAuthenticatorRecord, CatalogError> {
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        account_mfa_authenticators::table
+            .find(authenticator_id)
+            .filter(account_mfa_authenticators::account_id.eq(account_id))
+            .filter(account_mfa_authenticators::state.eq("pending"))
+            .filter(account_mfa_authenticators::pending_expires_at.gt(now))
+            .select(AccountMfaAuthenticatorRow::as_select())
+            .first(&mut conn)
+            .await
+            .map_err(|error| {
+                map_diesel_error(
+                    error,
+                    "account_mfa_authenticator",
+                    authenticator_id.to_string(),
+                )
+            })?
+            .into_record()
+    }
+
+    /// Replace a pending TOTP enrollment and append its success audit atomically.
+    async fn begin_account_mfa_enrollment(
+        &self,
+        request: AccountMfaEnrollmentRequest,
+    ) -> Result<AccountMfaAuthenticatorRecord, CatalogError> {
+        let authenticator = &request.authenticator;
+        if authenticator.id.is_nil()
+            || authenticator.account_id.is_nil()
+            || authenticator.state != AccountMfaAuthenticatorState::Pending
+            || !(16..=4096).contains(&authenticator.secret.ciphertext.len())
+            || authenticator.secret.key_version <= 0
+            || authenticator
+                .pending_expires_at
+                .is_none_or(|expires_at| expires_at <= authenticator.created_at)
+            || authenticator.last_used_timestep.is_some()
+            || authenticator.activated_at.is_some()
+            || authenticator.disabled_at.is_some()
+        {
+            return Err(CatalogError::Validation(
+                "pending MFA authenticator is inconsistent".to_string(),
+            ));
+        }
+        validate_atomic_auth_audit_event(
+            &request.audit_event,
+            AccountAuthAuditEventKind::MfaEnrollmentStarted,
+            authenticator.account_id,
+            None,
+            None,
+            authenticator.created_at,
+        )?;
+        let account_id = authenticator.account_id;
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        use diesel_async::AsyncConnection as _;
+        let result = conn
+            .transaction::<AccountMfaAuthenticatorRow, CatalogTransactionError, _>(
+                async move |conn| {
+                    accounts::table
+                        .find(request.authenticator.account_id)
+                        .filter(accounts::status.eq("active"))
+                        .for_update()
+                        .select(accounts::id)
+                        .first::<Uuid>(conn)
+                        .await?;
+                    diesel::update(
+                        account_mfa_authenticators::table
+                            .filter(
+                                account_mfa_authenticators::account_id
+                                    .eq(request.authenticator.account_id),
+                            )
+                            .filter(account_mfa_authenticators::state.eq("pending")),
+                    )
+                    .set((
+                        account_mfa_authenticators::state.eq("disabled"),
+                        account_mfa_authenticators::pending_expires_at.eq(None::<DateTime<Utc>>),
+                        account_mfa_authenticators::disabled_at
+                            .eq(Some(request.authenticator.created_at)),
+                    ))
+                    .execute(conn)
+                    .await?;
+                    let row = diesel::insert_into(account_mfa_authenticators::table)
+                        .values(NewAccountMfaAuthenticatorRow {
+                            id: request.authenticator.id,
+                            account_id: request.authenticator.account_id,
+                            state: "pending".to_string(),
+                            secret_ciphertext: request.authenticator.secret.ciphertext,
+                            secret_nonce: request.authenticator.secret.nonce.to_vec(),
+                            secret_key_version: request.authenticator.secret.key_version,
+                            pending_expires_at: request.authenticator.pending_expires_at,
+                            last_used_timestep: None,
+                            created_at: request.authenticator.created_at,
+                            activated_at: None,
+                            disabled_at: None,
+                        })
+                        .returning(AccountMfaAuthenticatorRow::as_returning())
+                        .get_result(conn)
+                        .await?;
+                    insert_auth_audit_event(conn, request.audit_event).await?;
+                    Ok(row)
+                },
+            )
+            .await;
+        match result {
+            Ok(row) => row.into_record(),
+            Err(CatalogTransactionError::Catalog(error)) => Err(error),
+            Err(CatalogTransactionError::Diesel(error)) => Err(map_diesel_error(
+                error,
+                "account_mfa_authenticator",
+                account_id.to_string(),
+            )),
+        }
+    }
+
+    /// Activate a pending TOTP authenticator, recovery codes, and audit atomically.
+    async fn activate_account_mfa(
+        &self,
+        request: AccountMfaActivationRequest,
+    ) -> Result<AccountMfaAuthenticatorRecord, CatalogError> {
+        let distinct_ids = request
+            .recovery_codes
+            .iter()
+            .map(|code| code.id)
+            .collect::<HashSet<_>>();
+        let distinct_digests = request
+            .recovery_codes
+            .iter()
+            .map(|code| code.code_digest.clone())
+            .collect::<HashSet<_>>();
+        if request.account_id.is_nil()
+            || request.authenticator_id.is_nil()
+            || request.verified_timestep < 0
+            || !(8..=16).contains(&request.recovery_codes.len())
+            || distinct_ids.len() != request.recovery_codes.len()
+            || distinct_digests.len() != request.recovery_codes.len()
+            || request
+                .recovery_codes
+                .iter()
+                .any(|code| code.id.is_nil() || code.code_digest.len() != 32)
+        {
+            return Err(CatalogError::Validation(
+                "MFA activation request is inconsistent".to_string(),
+            ));
+        }
+        validate_atomic_auth_audit_event(
+            &request.audit_event,
+            AccountAuthAuditEventKind::MfaEnrollmentActivated,
+            request.account_id,
+            None,
+            None,
+            request.activated_at,
+        )?;
+        let account_id = request.account_id;
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        use diesel_async::AsyncConnection as _;
+        let result = conn
+            .transaction::<AccountMfaAuthenticatorRow, CatalogTransactionError, _>(
+                async move |conn| {
+                    accounts::table
+                        .find(request.account_id)
+                        .filter(accounts::status.eq("active"))
+                        .for_update()
+                        .select(accounts::id)
+                        .first::<Uuid>(conn)
+                        .await?;
+                    let pending = account_mfa_authenticators::table
+                        .find(request.authenticator_id)
+                        .filter(account_mfa_authenticators::account_id.eq(request.account_id))
+                        .filter(account_mfa_authenticators::state.eq("pending"))
+                        .filter(
+                            account_mfa_authenticators::pending_expires_at.gt(request.activated_at),
+                        )
+                        .for_update()
+                        .select(AccountMfaAuthenticatorRow::as_select())
+                        .first(conn)
+                        .await
+                        .optional()?;
+                    let Some(pending) = pending else {
+                        return Err(CatalogTransactionError::Catalog(
+                            CatalogError::Unauthorized {
+                                kind: "account_mfa_authenticator",
+                                key: "invalid-or-expired".to_string(),
+                            },
+                        ));
+                    };
+                    diesel::update(
+                        account_mfa_authenticators::table
+                            .filter(account_mfa_authenticators::account_id.eq(request.account_id))
+                            .filter(account_mfa_authenticators::state.eq("active")),
+                    )
+                    .set((
+                        account_mfa_authenticators::state.eq("disabled"),
+                        account_mfa_authenticators::disabled_at.eq(Some(request.activated_at)),
+                    ))
+                    .execute(conn)
+                    .await?;
+                    let activated =
+                        diesel::update(account_mfa_authenticators::table.find(pending.id))
+                            .set((
+                                account_mfa_authenticators::state.eq("active"),
+                                account_mfa_authenticators::pending_expires_at
+                                    .eq(None::<DateTime<Utc>>),
+                                account_mfa_authenticators::last_used_timestep
+                                    .eq(Some(request.verified_timestep)),
+                                account_mfa_authenticators::activated_at
+                                    .eq(Some(request.activated_at)),
+                            ))
+                            .returning(AccountMfaAuthenticatorRow::as_returning())
+                            .get_result(conn)
+                            .await?;
+                    let recovery_rows = request
+                        .recovery_codes
+                        .into_iter()
+                        .map(|code| NewAccountMfaRecoveryCodeRow {
+                            id: code.id,
+                            authenticator_id: pending.id,
+                            code_digest: code.code_digest,
+                            created_at: request.activated_at,
+                            consumed_at: None,
+                        })
+                        .collect::<Vec<_>>();
+                    diesel::insert_into(account_mfa_recovery_codes::table)
+                        .values(recovery_rows)
+                        .execute(conn)
+                        .await?;
+                    insert_auth_audit_event(conn, request.audit_event).await?;
+                    Ok(activated)
+                },
+            )
+            .await;
+        match result {
+            Ok(row) => row.into_record(),
+            Err(CatalogTransactionError::Catalog(error)) => Err(error),
+            Err(CatalogTransactionError::Diesel(error)) => Err(map_diesel_error(
+                error,
+                "account_mfa_authenticator",
+                account_id.to_string(),
+            )),
+        }
+    }
+
+    /// Disable active MFA only when no active privileged role would lose assurance.
+    async fn disable_account_mfa(
+        &self,
+        request: AccountMfaDisableRequest,
+    ) -> Result<bool, CatalogError> {
+        validate_atomic_auth_audit_event(
+            &request.audit_event,
+            AccountAuthAuditEventKind::MfaDisabled,
+            request.account_id,
+            None,
+            None,
+            request.disabled_at,
+        )?;
+        let account_id = request.account_id;
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        use diesel_async::AsyncConnection as _;
+        let result = conn
+            .transaction::<bool, CatalogTransactionError, _>(async move |conn| {
+                accounts::table
+                    .find(request.account_id)
+                    .for_update()
+                    .select(accounts::id)
+                    .first::<Uuid>(conn)
+                    .await?;
+                let privileged_roles = account_platform_roles::table
+                    .filter(account_platform_roles::account_id.eq(request.account_id))
+                    .filter(account_platform_roles::state.eq("active"))
+                    .count()
+                    .get_result::<i64>(conn)
+                    .await?;
+                if privileged_roles > 0 {
+                    return Err(CatalogTransactionError::Catalog(CatalogError::Validation(
+                        "active privileged roles require MFA".to_string(),
+                    )));
+                }
+                let rows = diesel::update(
+                    account_mfa_authenticators::table
+                        .filter(account_mfa_authenticators::account_id.eq(request.account_id))
+                        .filter(account_mfa_authenticators::state.eq("active")),
+                )
+                .set((
+                    account_mfa_authenticators::state.eq("disabled"),
+                    account_mfa_authenticators::disabled_at.eq(Some(request.disabled_at)),
+                ))
+                .execute(conn)
+                .await?;
+                if rows == 0 {
+                    return Ok(false);
+                }
+                insert_auth_audit_event(conn, request.audit_event).await?;
+                Ok(true)
+            })
+            .await;
+        match result {
+            Ok(disabled) => Ok(disabled),
+            Err(CatalogTransactionError::Catalog(error)) => Err(error),
+            Err(CatalogTransactionError::Diesel(error)) => Err(map_diesel_error(
+                error,
+                "account_mfa_authenticator",
+                account_id.to_string(),
+            )),
+        }
+    }
+
+    /// Create a digest-only MFA challenge and its success audit atomically.
+    async fn create_account_mfa_challenge(
+        &self,
+        request: AccountMfaChallengeCreationRequest,
+    ) -> Result<(), CatalogError> {
+        validate_auth_digest(&request.challenge.token_digest, "MFA challenge")?;
+        if request.challenge.id.is_nil()
+            || request.challenge.account_id.is_nil()
+            || request.challenge.expires_at <= request.challenge.created_at
+            || request.challenge.consumed_at.is_some()
+        {
+            return Err(CatalogError::Validation(
+                "MFA challenge is inconsistent".to_string(),
+            ));
+        }
+        validate_atomic_auth_audit_event(
+            &request.audit_event,
+            AccountAuthAuditEventKind::MfaChallengeCreated,
+            request.challenge.account_id,
+            None,
+            Some(request.challenge.client_kind),
+            request.challenge.created_at,
+        )?;
+        let account_id = request.challenge.account_id;
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        use diesel_async::AsyncConnection as _;
+        let result = conn
+            .transaction::<(), CatalogTransactionError, _>(async move |conn| {
+                accounts::table
+                    .find(request.challenge.account_id)
+                    .filter(accounts::status.eq("active"))
+                    .for_update()
+                    .select(accounts::id)
+                    .first::<Uuid>(conn)
+                    .await?;
+                let active_authenticators = account_mfa_authenticators::table
+                    .filter(account_mfa_authenticators::account_id.eq(request.challenge.account_id))
+                    .filter(account_mfa_authenticators::state.eq("active"))
+                    .count()
+                    .get_result::<i64>(conn)
+                    .await?;
+                if active_authenticators != 1 {
+                    return Err(CatalogTransactionError::Catalog(
+                        CatalogError::Unauthorized {
+                            kind: "account_mfa_authenticator",
+                            key: account_id.to_string(),
+                        },
+                    ));
+                }
+                diesel::insert_into(account_mfa_login_challenges::table)
+                    .values(NewAccountMfaLoginChallengeRow {
+                        id: request.challenge.id,
+                        account_id: request.challenge.account_id,
+                        token_digest: request.challenge.token_digest,
+                        client_kind: encode_text_enum(request.challenge.client_kind)
+                            .map_err(CatalogTransactionError::Catalog)?,
+                        created_at: request.challenge.created_at,
+                        expires_at: request.challenge.expires_at,
+                        consumed_at: None,
+                    })
+                    .execute(conn)
+                    .await?;
+                insert_auth_audit_event(conn, request.audit_event).await?;
+                Ok(())
+            })
+            .await;
+        match result {
+            Ok(()) => Ok(()),
+            Err(CatalogTransactionError::Catalog(error)) => Err(error),
+            Err(CatalogTransactionError::Diesel(error)) => Err(map_diesel_error(
+                error,
+                "account_mfa_challenge",
+                account_id.to_string(),
+            )),
+        }
+    }
+
+    /// Consume one MFA challenge and proof while issuing a verified session family.
+    async fn complete_account_mfa_challenge(
+        &self,
+        request: AccountMfaChallengeCompletionRequest,
+    ) -> Result<AccountMfaChallengeCompletionResult, CatalogError> {
+        validate_auth_digest(&request.challenge_token_digest, "MFA challenge")?;
+        if let AccountMfaChallengeProof::RecoveryCodeDigest(digest) = &request.proof {
+            validate_auth_digest(digest, "MFA recovery code")?;
+        }
+        validate_session_issuance(&request.issuance)?;
+        if request.authenticator_id.is_nil()
+            || request.issuance.session.mfa_verified_at != Some(request.completed_at)
+            || request.issuance.session.created_at != request.completed_at
+        {
+            return Err(CatalogError::Validation(
+                "MFA session assurance is inconsistent".to_string(),
+            ));
+        }
+        validate_auth_audit_event(&request.audit_event)?;
+        let session_id = request.issuance.session.id;
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        use diesel_async::AsyncConnection as _;
+        let result = conn
+            .transaction::<MfaCompletionTransactionResult, CatalogTransactionError, _>(
+                async move |conn| {
+                    let challenge = account_mfa_login_challenges::table
+                        .filter(
+                            account_mfa_login_challenges::token_digest
+                                .eq(&request.challenge_token_digest),
+                        )
+                        .for_update()
+                        .select(AccountMfaLoginChallengeRow::as_select())
+                        .first(conn)
+                        .await
+                        .optional()?;
+                    let Some(challenge) = challenge else {
+                        return Ok(MfaCompletionTransactionResult::Rejected);
+                    };
+                    let challenge = challenge
+                        .into_record()
+                        .map_err(CatalogTransactionError::Catalog)?;
+                    if challenge.consumed_at.is_some()
+                        || challenge.expires_at <= request.completed_at
+                        || challenge.account_id != request.issuance.session.account_id
+                        || challenge.client_kind != request.issuance.session.client_kind
+                    {
+                        return Ok(MfaCompletionTransactionResult::Rejected);
+                    }
+                    let account_is_active = accounts::table
+                        .find(challenge.account_id)
+                        .filter(accounts::status.eq("active"))
+                        .for_update()
+                        .select(accounts::id)
+                        .first::<Uuid>(conn)
+                        .await
+                        .optional()?
+                        .is_some();
+                    if !account_is_active {
+                        return Ok(MfaCompletionTransactionResult::Rejected);
+                    }
+                    let authenticator = account_mfa_authenticators::table
+                        .find(request.authenticator_id)
+                        .filter(account_mfa_authenticators::account_id.eq(challenge.account_id))
+                        .filter(account_mfa_authenticators::state.eq("active"))
+                        .for_update()
+                        .select(AccountMfaAuthenticatorRow::as_select())
+                        .first(conn)
+                        .await
+                        .optional()?;
+                    let Some(authenticator) = authenticator else {
+                        return Ok(MfaCompletionTransactionResult::Rejected);
+                    };
+
+                    validate_atomic_auth_audit_event(
+                        &request.audit_event,
+                        AccountAuthAuditEventKind::MfaChallengeCompleted,
+                        challenge.account_id,
+                        Some(request.issuance.session.id),
+                        Some(challenge.client_kind),
+                        request.completed_at,
+                    )
+                    .map_err(CatalogTransactionError::Catalog)?;
+
+                    match request.proof {
+                        AccountMfaChallengeProof::TotpTimestep(timestep) => {
+                            if timestep < 0
+                                || authenticator
+                                    .last_used_timestep
+                                    .is_some_and(|last_used| timestep <= last_used)
+                            {
+                                return Ok(MfaCompletionTransactionResult::Rejected);
+                            }
+                            diesel::update(
+                                account_mfa_authenticators::table.find(authenticator.id),
+                            )
+                            .set(account_mfa_authenticators::last_used_timestep.eq(Some(timestep)))
+                            .execute(conn)
+                            .await?;
+                        }
+                        AccountMfaChallengeProof::RecoveryCodeDigest(digest) => {
+                            let rows = diesel::update(
+                                account_mfa_recovery_codes::table
+                                    .filter(
+                                        account_mfa_recovery_codes::authenticator_id
+                                            .eq(authenticator.id),
+                                    )
+                                    .filter(account_mfa_recovery_codes::code_digest.eq(digest))
+                                    .filter(account_mfa_recovery_codes::consumed_at.is_null()),
+                            )
+                            .set(
+                                account_mfa_recovery_codes::consumed_at
+                                    .eq(Some(request.completed_at)),
+                            )
+                            .execute(conn)
+                            .await?;
+                            if rows != 1 {
+                                return Ok(MfaCompletionTransactionResult::Rejected);
+                            }
+                        }
+                    }
+                    diesel::update(account_mfa_login_challenges::table.find(challenge.id))
+                        .set(
+                            account_mfa_login_challenges::consumed_at
+                                .eq(Some(request.completed_at)),
+                        )
+                        .execute(conn)
+                        .await?;
+                    let session = insert_session_issuance(conn, request.issuance).await?;
+                    insert_auth_audit_event(conn, request.audit_event).await?;
+                    Ok(MfaCompletionTransactionResult::Completed(session))
+                },
+            )
+            .await;
+        match result {
+            Ok(MfaCompletionTransactionResult::Completed(row)) => row
+                .into_record()
+                .map(AccountMfaChallengeCompletionResult::Completed),
+            Ok(MfaCompletionTransactionResult::Rejected) => {
+                Ok(AccountMfaChallengeCompletionResult::Rejected)
+            }
+            Err(CatalogTransactionError::Catalog(error)) => Err(error),
+            Err(CatalogTransactionError::Diesel(error)) => Err(map_diesel_error(
+                error,
+                "account_mfa_challenge",
+                session_id.to_string(),
+            )),
+        }
+    }
+
+    /// Issue one digest-only native authorization code with an atomic success audit.
+    async fn create_native_authorization_code(
+        &self,
+        request: NativeAuthorizationCodeCreationRequest,
+    ) -> Result<(), CatalogError> {
+        validate_auth_digest(&request.code.token_digest, "native authorization code")?;
+        validate_auth_digest(&request.code.pkce_challenge, "S256 PKCE challenge")?;
+        if request.code.id.is_nil()
+            || request.code.account_id.is_nil()
+            || request.code.client_kind == frameshift_catalog::AccountSessionClientKind::Browser
+            || request.code.redirect_uri.is_empty()
+            || request.code.redirect_uri.len() > 2048
+            || request.code.redirect_uri.trim() != request.code.redirect_uri
+            || request.code.expires_at <= request.code.created_at
+            || request.code.consumed_at.is_some()
+            || request
+                .code
+                .mfa_verified_at
+                .is_some_and(|verified_at| verified_at > request.code.created_at)
+        {
+            return Err(CatalogError::Validation(
+                "native authorization code is inconsistent".to_string(),
+            ));
+        }
+        validate_atomic_auth_audit_event(
+            &request.audit_event,
+            AccountAuthAuditEventKind::NativeAuthorizationCodeCreated,
+            request.code.account_id,
+            None,
+            Some(request.code.client_kind),
+            request.code.created_at,
+        )?;
+        let account_id = request.code.account_id;
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        use diesel_async::AsyncConnection as _;
+        let result = conn
+            .transaction::<(), CatalogTransactionError, _>(async move |conn| {
+                accounts::table
+                    .find(request.code.account_id)
+                    .filter(accounts::status.eq("active"))
+                    .for_update()
+                    .select(accounts::id)
+                    .first::<Uuid>(conn)
+                    .await?;
+                diesel::insert_into(account_native_authorization_codes::table)
+                    .values(NewNativeAuthorizationCodeRow {
+                        id: request.code.id,
+                        account_id: request.code.account_id,
+                        token_digest: request.code.token_digest,
+                        client_kind: encode_text_enum(request.code.client_kind)
+                            .map_err(CatalogTransactionError::Catalog)?,
+                        redirect_uri: request.code.redirect_uri,
+                        pkce_challenge: request.code.pkce_challenge,
+                        mfa_verified_at: request.code.mfa_verified_at,
+                        created_at: request.code.created_at,
+                        expires_at: request.code.expires_at,
+                        consumed_at: None,
+                    })
+                    .execute(conn)
+                    .await?;
+                insert_auth_audit_event(conn, request.audit_event).await?;
+                Ok(())
+            })
+            .await;
+        match result {
+            Ok(()) => Ok(()),
+            Err(CatalogTransactionError::Catalog(error)) => Err(error),
+            Err(CatalogTransactionError::Diesel(error)) => Err(map_diesel_error(
+                error,
+                "native_authorization_code",
+                account_id.to_string(),
+            )),
+        }
+    }
+
+    /// Exchange one exact native code and S256 binding for a session family.
+    async fn exchange_native_authorization_code(
+        &self,
+        request: NativeAuthorizationCodeExchangeRequest,
+    ) -> Result<NativeAuthorizationCodeExchangeResult, CatalogError> {
+        validate_auth_digest(&request.code_token_digest, "native authorization code")?;
+        validate_auth_digest(&request.pkce_challenge, "S256 PKCE challenge")?;
+        validate_session_issuance(&request.issuance)?;
+        validate_auth_audit_event(&request.audit_event)?;
+        if request.client_kind == frameshift_catalog::AccountSessionClientKind::Browser
+            || request.redirect_uri.is_empty()
+            || request.redirect_uri.len() > 2048
+            || request.redirect_uri.trim() != request.redirect_uri
+            || request.issuance.session.client_kind != request.client_kind
+            || request.issuance.session.created_at != request.exchanged_at
+        {
+            return Err(CatalogError::Validation(
+                "native authorization-code exchange is inconsistent".to_string(),
+            ));
+        }
+        let session_id = request.issuance.session.id;
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        use diesel_async::AsyncConnection as _;
+        let result = conn
+            .transaction::<NativeCodeExchangeTransactionResult, CatalogTransactionError, _>(
+                async move |conn| {
+                    let code = account_native_authorization_codes::table
+                        .filter(
+                            account_native_authorization_codes::token_digest
+                                .eq(&request.code_token_digest),
+                        )
+                        .for_update()
+                        .select(NativeAuthorizationCodeRow::as_select())
+                        .first(conn)
+                        .await
+                        .optional()?;
+                    let Some(code) = code else {
+                        return Ok(NativeCodeExchangeTransactionResult::Rejected);
+                    };
+                    let code = code
+                        .into_record()
+                        .map_err(CatalogTransactionError::Catalog)?;
+                    if code.consumed_at.is_some()
+                        || code.expires_at <= request.exchanged_at
+                        || code.client_kind != request.client_kind
+                        || code.redirect_uri != request.redirect_uri
+                        || code.pkce_challenge != request.pkce_challenge
+                        || code.account_id != request.issuance.session.account_id
+                        || !auth_assurance_timestamp_matches(
+                            code.mfa_verified_at,
+                            request.issuance.session.mfa_verified_at,
+                        )
+                    {
+                        return Ok(NativeCodeExchangeTransactionResult::Rejected);
+                    }
+                    let account_is_active = accounts::table
+                        .find(code.account_id)
+                        .filter(accounts::status.eq("active"))
+                        .for_update()
+                        .select(accounts::id)
+                        .first::<Uuid>(conn)
+                        .await
+                        .optional()?
+                        .is_some();
+                    if !account_is_active {
+                        return Ok(NativeCodeExchangeTransactionResult::Rejected);
+                    }
+                    validate_atomic_auth_audit_event(
+                        &request.audit_event,
+                        AccountAuthAuditEventKind::NativeAuthorizationCodeConsumed,
+                        code.account_id,
+                        Some(request.issuance.session.id),
+                        Some(request.client_kind),
+                        request.exchanged_at,
+                    )
+                    .map_err(CatalogTransactionError::Catalog)?;
+                    diesel::update(account_native_authorization_codes::table.find(code.id))
+                        .set(
+                            account_native_authorization_codes::consumed_at
+                                .eq(Some(request.exchanged_at)),
+                        )
+                        .execute(conn)
+                        .await?;
+                    let session = insert_session_issuance(conn, request.issuance).await?;
+                    insert_auth_audit_event(conn, request.audit_event).await?;
+                    Ok(NativeCodeExchangeTransactionResult::Exchanged(session))
+                },
+            )
+            .await;
+        match result {
+            Ok(NativeCodeExchangeTransactionResult::Exchanged(row)) => row
+                .into_record()
+                .map(NativeAuthorizationCodeExchangeResult::Exchanged),
+            Ok(NativeCodeExchangeTransactionResult::Rejected) => {
+                Ok(NativeAuthorizationCodeExchangeResult::Rejected)
+            }
+            Err(CatalogTransactionError::Catalog(error)) => Err(error),
+            Err(CatalogTransactionError::Diesel(error)) => Err(map_diesel_error(
+                error,
+                "native_authorization_code",
+                session_id.to_string(),
+            )),
+        }
+    }
+
+    /// Append a sanitized rejection audit outside a successful state mutation.
+    async fn append_account_auth_audit_event(
+        &self,
+        event: AccountAuthAuditEventRecord,
+    ) -> Result<(), CatalogError> {
+        validate_auth_audit_event(&event)?;
+        if event.event_kind != AccountAuthAuditEventKind::AuthenticationRejected
+            || event.outcome != AccountAuthAuditOutcome::Rejected
+            || event.session_id.is_some()
+            || event.reason_code.is_none()
+        {
+            return Err(CatalogError::Validation(
+                "standalone authentication audit event must be a sanitized rejection".to_string(),
+            ));
+        }
+        let event_id = event.id;
+        let row = NewAccountAuthAuditEventRow::from_record(event)?;
+        let mut conn = self.pool.get().await.map_err(map_pool_error)?;
+        diesel::insert_into(account_auth_audit_events::table)
+            .values(row)
+            .execute(&mut conn)
+            .await
+            .map_err(|error| {
+                map_diesel_error(error, "account_auth_audit_event", event_id.to_string())
+            })?;
         Ok(())
     }
 
@@ -3310,6 +4473,17 @@ impl CatalogBackend for PostgresCatalog {
                 require_active_administrator(conn, request.actor_account_id, "platform_role")
                     .await?;
                 require_existing_account(conn, request.account_id).await?;
+                let active_authenticators = account_mfa_authenticators::table
+                    .filter(account_mfa_authenticators::account_id.eq(request.account_id))
+                    .filter(account_mfa_authenticators::state.eq("active"))
+                    .count()
+                    .get_result::<i64>(conn)
+                    .await?;
+                if active_authenticators != 1 {
+                    return Err(CatalogTransactionError::Catalog(CatalogError::Validation(
+                        "moderator and administrator roles require active MFA".to_string(),
+                    )));
+                }
                 let existing = active_or_revoked_role(conn, request.account_id, &role_text).await?;
                 let now = Utc::now();
                 if let Some(existing) = existing {
@@ -3454,14 +4628,11 @@ impl CatalogBackend for PostgresCatalog {
                             key: request.account_id.to_string(),
                         })
                     })?;
-                // Setting the status an account already holds is a no-op.
-                if target.status == status_text {
-                    return Ok(target);
-                }
                 // A non-active account grants no authority, so suspending the
                 // sole administrator would strand the platform exactly as
                 // revoking their role would.
-                if status_text != "active"
+                if target.status != status_text
+                    && status_text != "active"
                     && administrator_coverage(conn).await? <= 1
                     && account_holds_active_administrator(conn, request.account_id).await?
                 {
@@ -3469,15 +4640,33 @@ impl CatalogBackend for PostgresCatalog {
                         "cannot suspend or disable the last active administrator".to_string(),
                     )));
                 }
-                diesel::update(accounts::table.find(request.account_id))
-                    .set((
-                        accounts::status.eq(&status_text),
-                        accounts::updated_at.eq(Utc::now()),
-                    ))
-                    .returning(AccountRow::as_returning())
-                    .get_result(conn)
-                    .await
-                    .map_err(CatalogTransactionError::from)
+                let updated = if target.status == status_text {
+                    target
+                } else {
+                    diesel::update(accounts::table.find(request.account_id))
+                        .set((
+                            accounts::status.eq(&status_text),
+                            accounts::updated_at.eq(Utc::now()),
+                        ))
+                        .returning(AccountRow::as_returning())
+                        .get_result(conn)
+                        .await?
+                };
+                if status_text != "active" {
+                    diesel::update(
+                        account_sessions::table
+                            .filter(account_sessions::account_id.eq(request.account_id))
+                            .filter(account_sessions::revoked_at.is_null()),
+                    )
+                    .set(account_sessions::revoked_at.eq(diesel::dsl::sql::<
+                        diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>,
+                    >(
+                        "GREATEST(account_sessions.created_at, CURRENT_TIMESTAMP)",
+                    )))
+                    .execute(conn)
+                    .await?;
+                }
+                Ok(updated)
             })
             .await;
         match result {

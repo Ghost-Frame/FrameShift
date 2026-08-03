@@ -16,11 +16,12 @@ use base64::Engine as _;
 use chrono::Utc;
 use ed25519_dalek::{Signer as _, SigningKey};
 use frameshift_catalog::{
-    AccountInviteIntent, AccountInviteRecord, AccountInviteRequestRecord, AccountInviteStatus,
-    AccountStatus, Ed25519PublicKey, MembershipState, PasswordRecoveryDeliveryKind,
-    PasswordRecoveryDeliveryRecord, PlatformRole, PlatformRoleRecord, PlatformRoleState,
-    PublisherKeyRecord, PublisherKeyState, PublisherMembershipRecord, PublisherModerationStatus,
-    PublisherProfileRecord, PublisherRole,
+    AccountAuthAuditEventKind, AccountInviteIntent, AccountInviteRecord,
+    AccountInviteRequestRecord, AccountInviteStatus, AccountMfaAuthenticatorRecord,
+    AccountMfaAuthenticatorState, AccountStatus, Ed25519PublicKey, EncryptedTotpSecret,
+    MembershipState, PasswordRecoveryDeliveryKind, PasswordRecoveryDeliveryRecord, PlatformRole,
+    PlatformRoleRecord, PlatformRoleState, PublisherKeyRecord, PublisherKeyState,
+    PublisherMembershipRecord, PublisherModerationStatus, PublisherProfileRecord, PublisherRole,
 };
 use frameshift_server::account_auth::{BearerTokenVerifier, OidcAuthError, VerifiedOidcIdentity};
 use frameshift_server::metrics::Metrics;
@@ -235,6 +236,8 @@ fn first_party_test_config() -> Arc<ServerConfig> {
     config.cors_allowed_origins = "https://frameshift.test".to_string();
     config.first_party_auth = FirstPartyAuthConfig {
         password_pepper: SecretString::new("integration-test-password-pepper".to_string()),
+        mfa_encryption_key: SecretString::new(URL_SAFE_NO_PAD.encode([23_u8; 32])),
+        native_authorization_url: "https://frameshift.test/account/".to_string(),
         ..FirstPartyAuthConfig::disabled()
     };
     Arc::new(config)
@@ -359,17 +362,19 @@ async fn send_browser(
         .unwrap()
 }
 
-/// Retry a password-login request only while parallel tests occupy every Argon slot.
-async fn send_password_login_when_capacity_is_available(
+/// Retry a valid browser password operation for at most thirty seconds of Argon contention.
+async fn send_browser_password_operation_when_capacity_is_available(
     state: AppState,
+    path: &str,
     body: Value,
 ) -> axum::http::Response<axum::body::Body> {
     let mut last_response = None;
-    for _ in 0..100 {
-        let response = send(
+    for _ in 0..600 {
+        let response = send_browser(
             state.clone(),
             Method::POST,
-            "/v1/auth/login",
+            path,
+            Some("https://frameshift.test"),
             None,
             Some(body.clone()),
         )
@@ -383,10 +388,34 @@ async fn send_password_login_when_capacity_is_available(
     last_response.expect("the bounded capacity retry loop always sends at least one request")
 }
 
+/// Retry one browser password login under the shared Argon2 work bound.
+async fn send_password_login_when_capacity_is_available(
+    state: AppState,
+    body: Value,
+) -> axum::http::Response<axum::body::Body> {
+    send_browser_password_operation_when_capacity_is_available(state, "/v1/auth/login", body).await
+}
+
 /// Decode one JSON response body after its status has been asserted.
 async fn response_json(response: axum::http::Response<axum::body::Body>) -> Value {
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     serde_json::from_slice(&bytes).unwrap()
+}
+
+/// Extract one named cookie pair from a response carrying multiple Set-Cookie headers.
+fn response_cookie(response: &axum::http::Response<axum::body::Body>, name: &str) -> String {
+    let prefix = format!("{name}=");
+    response
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find(|value| value.starts_with(&prefix))
+        .expect("the response carries the requested cookie")
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string()
 }
 
 /// Provision one test account and return its generated stable identifier.
@@ -859,13 +888,10 @@ async fn invite_redemption_creates_one_browser_account_and_logout_revokes_it() {
     assert_eq!(blocklisted.status(), StatusCode::BAD_REQUEST);
     assert!(catalog.state.read().unwrap().accounts.is_empty());
 
-    let registered = send_browser(
+    let registered = send_browser_password_operation_when_capacity_is_available(
         state.clone(),
-        Method::POST,
         "/v1/auth/register",
-        Some("https://frameshift.test"),
-        None,
-        Some(registration.clone()),
+        registration.clone(),
     )
     .await;
     assert_eq!(registered.status(), StatusCode::OK);
@@ -923,6 +949,17 @@ async fn invite_redemption_creates_one_browser_account_and_logout_revokes_it() {
     .await;
     assert_eq!(authenticated.status(), StatusCode::OK);
 
+    let browser_access_token = cookie.split_once('=').unwrap().1;
+    let wrong_transport = send(
+        state.clone(),
+        Method::GET,
+        "/v1/account",
+        Some(browser_access_token),
+        None,
+    )
+    .await;
+    assert_eq!(wrong_transport.status(), StatusCode::UNAUTHORIZED);
+
     let logged_out = send_browser(
         state.clone(),
         Method::POST,
@@ -950,6 +987,390 @@ async fn invite_redemption_creates_one_browser_account_and_logout_revokes_it() {
 
     let revoked = send_browser(state, Method::GET, "/v1/account", None, Some(&cookie), None).await;
     assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// Replaying a consumed browser refresh token revokes the full rotated session family.
+#[tokio::test]
+async fn browser_refresh_rotation_detects_replay_and_revokes_the_family() {
+    let catalog = MockCatalog::new();
+    let invite_token = fixture_bootstrap_invite(&catalog, "refresh-owner@example.test");
+    let state = test_state_with_config(catalog.clone(), None, first_party_test_config());
+    let registered = send_browser_password_operation_when_capacity_is_available(
+        state.clone(),
+        "/v1/auth/register",
+        json!({
+            "invite_token": invite_token,
+            "email": "refresh-owner@example.test",
+            "password": "correct horse battery staple",
+            "client_kind": "browser"
+        }),
+    )
+    .await;
+    assert_eq!(registered.status(), StatusCode::OK);
+    let original_access_cookie = response_cookie(&registered, "__Host-frameshift_session");
+    let original_refresh_cookie = response_cookie(&registered, "__Host-frameshift_refresh");
+
+    let refreshed = send_browser(
+        state.clone(),
+        Method::POST,
+        "/v1/auth/refresh",
+        Some("https://frameshift.test"),
+        Some(&original_refresh_cookie),
+        Some(json!({"client_kind": "browser"})),
+    )
+    .await;
+    assert_eq!(refreshed.status(), StatusCode::OK);
+    let replacement_access_cookie = response_cookie(&refreshed, "__Host-frameshift_session");
+    let replacement_refresh_cookie = response_cookie(&refreshed, "__Host-frameshift_refresh");
+    assert_ne!(replacement_access_cookie, original_access_cookie);
+    assert_ne!(replacement_refresh_cookie, original_refresh_cookie);
+    let refreshed_body = response_json(refreshed).await;
+    assert!(refreshed_body["access_token"].is_null());
+    assert!(refreshed_body["refresh_token"].is_null());
+
+    let superseded_access = send_browser(
+        state.clone(),
+        Method::GET,
+        "/v1/account",
+        None,
+        Some(&original_access_cookie),
+        None,
+    )
+    .await;
+    assert_eq!(superseded_access.status(), StatusCode::UNAUTHORIZED);
+    let replacement_access = send_browser(
+        state.clone(),
+        Method::GET,
+        "/v1/account",
+        None,
+        Some(&replacement_access_cookie),
+        None,
+    )
+    .await;
+    assert_eq!(replacement_access.status(), StatusCode::OK);
+
+    let replayed = send_browser(
+        state.clone(),
+        Method::POST,
+        "/v1/auth/refresh",
+        Some("https://frameshift.test"),
+        Some(&original_refresh_cookie),
+        Some(json!({"client_kind": "browser"})),
+    )
+    .await;
+    assert_eq!(replayed.status(), StatusCode::UNAUTHORIZED);
+    let revoked_replacement = send_browser(
+        state,
+        Method::GET,
+        "/v1/account",
+        None,
+        Some(&replacement_access_cookie),
+        None,
+    )
+    .await;
+    assert_eq!(revoked_replacement.status(), StatusCode::UNAUTHORIZED);
+
+    let stored = catalog.state.read().unwrap();
+    assert!(stored
+        .account_sessions
+        .values()
+        .all(|session| session.revoked_at.is_some()));
+    assert_eq!(
+        stored
+            .account_auth_audit_events
+            .iter()
+            .filter(|event| event.event_kind == AccountAuthAuditEventKind::SessionRefreshed)
+            .count(),
+        1
+    );
+    assert_eq!(
+        stored
+            .account_auth_audit_events
+            .iter()
+            .filter(|event| event.event_kind == AccountAuthAuditEventKind::SessionReplayRevoked)
+            .count(),
+        1
+    );
+}
+
+/// A native code preserves state, enforces S256, and succeeds only once.
+#[tokio::test]
+async fn native_authorization_code_is_exactly_bound_and_single_use() {
+    let catalog = MockCatalog::new();
+    let invite_token = fixture_bootstrap_invite(&catalog, "native-owner@example.test");
+    let state = test_state_with_config(catalog.clone(), None, first_party_test_config());
+    let registered = send_browser_password_operation_when_capacity_is_available(
+        state.clone(),
+        "/v1/auth/register",
+        json!({
+            "invite_token": invite_token,
+            "email": "native-owner@example.test",
+            "password": "correct horse battery staple",
+            "client_kind": "browser"
+        }),
+    )
+    .await;
+    assert_eq!(registered.status(), StatusCode::OK);
+    let browser_cookie = response_cookie(&registered, "__Host-frameshift_session");
+    {
+        let mut stored = catalog.state.write().unwrap();
+        stored
+            .account_sessions
+            .values_mut()
+            .next()
+            .unwrap()
+            .mfa_verified_at = Some(Utc::now());
+    }
+
+    let verifier = "a".repeat(43);
+    let wrong_verifier = "b".repeat(43);
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    let state_value = URL_SAFE_NO_PAD.encode([37_u8; 32]);
+    let callback = "http://127.0.0.1:45678/callback";
+    let authorized = send_browser(
+        state.clone(),
+        Method::POST,
+        "/v1/auth/native/authorize",
+        Some("https://frameshift.test"),
+        Some(&browser_cookie),
+        Some(json!({
+            "client_kind": "desktop",
+            "redirect_uri": callback,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "state": state_value
+        })),
+    )
+    .await;
+    assert_eq!(authorized.status(), StatusCode::OK);
+    let redirect = url::Url::parse(
+        response_json(authorized).await["redirect_uri"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(redirect.scheme(), "http");
+    assert_eq!(redirect.host_str(), Some("127.0.0.1"));
+    assert_eq!(redirect.port(), Some(45678));
+    assert_eq!(redirect.path(), "/callback");
+    let redirect_query: HashMap<_, _> = redirect.query_pairs().into_owned().collect();
+    assert_eq!(redirect_query.get("state"), Some(&state_value));
+    let code = redirect_query.get("code").unwrap().clone();
+
+    let wrong_exchange = send(
+        state.clone(),
+        Method::POST,
+        "/v1/auth/native/token",
+        None,
+        Some(json!({
+            "grant_type": "authorization_code",
+            "code": code.clone(),
+            "code_verifier": wrong_verifier,
+            "redirect_uri": callback,
+            "client_kind": "desktop"
+        })),
+    )
+    .await;
+    assert_eq!(wrong_exchange.status(), StatusCode::UNAUTHORIZED);
+
+    let exchange_body = json!({
+        "grant_type": "authorization_code",
+        "code": code,
+        "code_verifier": verifier,
+        "redirect_uri": callback,
+        "client_kind": "desktop"
+    });
+    let exchanged = send(
+        state.clone(),
+        Method::POST,
+        "/v1/auth/native/token",
+        None,
+        Some(exchange_body.clone()),
+    )
+    .await;
+    assert_eq!(exchanged.status(), StatusCode::OK);
+    let exchanged_body = response_json(exchanged).await;
+    let access_token = exchanged_body["access_token"].as_str().unwrap();
+    assert!(exchanged_body["refresh_token"].as_str().is_some());
+    assert_eq!(exchanged_body["token_type"], "Bearer");
+    let authenticated = send(
+        state.clone(),
+        Method::GET,
+        "/v1/account",
+        Some(access_token),
+        None,
+    )
+    .await;
+    assert_eq!(authenticated.status(), StatusCode::OK);
+
+    let native_cookie = format!("__Host-frameshift_session={access_token}");
+    let wrong_transport = send_browser(
+        state.clone(),
+        Method::GET,
+        "/v1/account",
+        None,
+        Some(&native_cookie),
+        None,
+    )
+    .await;
+    assert_eq!(wrong_transport.status(), StatusCode::UNAUTHORIZED);
+
+    let replayed = send(
+        state,
+        Method::POST,
+        "/v1/auth/native/token",
+        None,
+        Some(exchange_body),
+    )
+    .await;
+    assert_eq!(replayed.status(), StatusCode::UNAUTHORIZED);
+
+    let stored = catalog.state.read().unwrap();
+    assert!(stored
+        .native_authorization_codes
+        .values()
+        .all(|stored_code| stored_code.consumed_at.is_some()));
+    assert_eq!(
+        stored
+            .account_auth_audit_events
+            .iter()
+            .filter(|event| {
+                event.event_kind == AccountAuthAuditEventKind::NativeAuthorizationCodeCreated
+            })
+            .count(),
+        1
+    );
+    assert_eq!(
+        stored
+            .account_auth_audit_events
+            .iter()
+            .filter(|event| {
+                event.event_kind == AccountAuthAuditEventKind::NativeAuthorizationCodeConsumed
+            })
+            .count(),
+        1
+    );
+}
+
+/// Initial MFA enrollment remains available while stale sessions cannot replace active MFA.
+#[tokio::test]
+async fn stale_browser_session_cannot_start_or_activate_mfa_replacement() {
+    let catalog = MockCatalog::new();
+    let invite_token = fixture_bootstrap_invite(&catalog, "mfa-owner@example.test");
+    let state = test_state_with_config(catalog.clone(), None, first_party_test_config());
+    let registered = send_browser_password_operation_when_capacity_is_available(
+        state.clone(),
+        "/v1/auth/register",
+        json!({
+            "invite_token": invite_token.clone(),
+            "email": "mfa-owner@example.test",
+            "password": "correct horse battery staple",
+            "client_kind": "browser"
+        }),
+    )
+    .await;
+    assert_eq!(registered.status(), StatusCode::OK);
+    let cookie = registered
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find(|value| value.starts_with("__Host-frameshift_session="))
+        .expect("browser login returns the access-token cookie")
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    let initial = send_browser(
+        state.clone(),
+        Method::POST,
+        "/v1/auth/mfa/enroll",
+        Some("https://frameshift.test"),
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(initial.status(), StatusCode::CREATED);
+    let initial_authenticator_id = response_json(initial).await["authenticator_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let active_authenticator_id = Uuid::new_v4();
+    {
+        let now = Utc::now();
+        let mut stored = catalog.state.write().unwrap();
+        let account_id = *stored.accounts.keys().next().unwrap();
+        stored
+            .account_sessions
+            .values_mut()
+            .next()
+            .unwrap()
+            .mfa_verified_at = Some(now - chrono::Duration::minutes(10));
+        stored.account_mfa_authenticators.insert(
+            active_authenticator_id,
+            AccountMfaAuthenticatorRecord {
+                id: active_authenticator_id,
+                account_id,
+                state: AccountMfaAuthenticatorState::Active,
+                secret: EncryptedTotpSecret {
+                    ciphertext: vec![7_u8; 48],
+                    nonce: [11_u8; 24],
+                    key_version: 1,
+                },
+                pending_expires_at: None,
+                last_used_timestep: Some(1),
+                created_at: now - chrono::Duration::days(1),
+                activated_at: Some(now - chrono::Duration::days(1)),
+                disabled_at: None,
+            },
+        );
+    }
+
+    let replacement = send_browser(
+        state.clone(),
+        Method::POST,
+        "/v1/auth/mfa/enroll",
+        Some("https://frameshift.test"),
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(replacement.status(), StatusCode::FORBIDDEN);
+    let activation = send_browser(
+        state,
+        Method::POST,
+        "/v1/auth/mfa/activate",
+        Some("https://frameshift.test"),
+        Some(&cookie),
+        Some(json!({
+            "authenticator_id": initial_authenticator_id,
+            "totp_code": "000000"
+        })),
+    )
+    .await;
+    assert_eq!(activation.status(), StatusCode::FORBIDDEN);
+
+    let stored = catalog.state.read().unwrap();
+    assert_eq!(
+        stored
+            .account_mfa_authenticators
+            .values()
+            .filter(|authenticator| {
+                authenticator.state == AccountMfaAuthenticatorState::Pending
+            })
+            .count(),
+        1
+    );
+    assert_eq!(
+        stored
+            .account_mfa_authenticators
+            .get(&active_authenticator_id)
+            .unwrap()
+            .state,
+        AccountMfaAuthenticatorState::Active
+    );
 }
 
 /// Recovery stays unavailable without complete configuration and always requires exact Origin.
@@ -993,17 +1414,15 @@ async fn password_recovery_request_is_indistinguishable_and_encrypted() {
     let invite_token = fixture_bootstrap_invite(&catalog, "recover@example.test");
     let config = password_recovery_test_config();
     let state = test_state_with_config(catalog.clone(), None, Arc::clone(&config));
-    let registered = send(
+    let registered = send_browser_password_operation_when_capacity_is_available(
         state.clone(),
-        Method::POST,
         "/v1/auth/register",
-        None,
-        Some(json!({
+        json!({
             "invite_token": invite_token,
             "email": "recover@example.test",
             "password": "correct horse battery staple",
-            "client_kind": "desktop"
-        })),
+            "client_kind": "browser"
+        }),
     )
     .await;
     assert_eq!(registered.status(), StatusCode::OK);
@@ -1064,17 +1483,15 @@ async fn password_recovery_completion_is_atomic_and_generic_on_replay() {
     let invite_token = fixture_bootstrap_invite(&catalog, "complete@example.test");
     let config = password_recovery_test_config();
     let state = test_state_with_config(catalog.clone(), None, Arc::clone(&config));
-    let registered = send(
+    let registered = send_browser_password_operation_when_capacity_is_available(
         state.clone(),
-        Method::POST,
         "/v1/auth/register",
-        None,
-        Some(json!({
+        json!({
             "invite_token": invite_token,
             "email": "complete@example.test",
             "password": "correct horse battery staple",
-            "client_kind": "desktop"
-        })),
+            "client_kind": "browser"
+        }),
     )
     .await;
     assert_eq!(registered.status(), StatusCode::OK);
@@ -1096,13 +1513,10 @@ async fn password_recovery_completion_is_atomic_and_generic_on_replay() {
     wait_for_recovery_enqueue(&catalog).await;
     let token = fixture_recovery_token(&catalog, &config);
     let replacement = "violet moons remember every careful promise";
-    let completed = send_browser(
+    let completed = send_browser_password_operation_when_capacity_is_available(
         state.clone(),
-        Method::POST,
         "/v1/auth/password-recovery/complete",
-        Some("https://frameshift.test"),
-        None,
-        Some(json!({"token": token.clone(), "password": replacement})),
+        json!({"token": token.clone(), "password": replacement}),
     )
     .await;
     assert_eq!(completed.status(), StatusCode::NO_CONTENT);
@@ -1145,27 +1559,21 @@ async fn password_recovery_completion_is_atomic_and_generic_on_replay() {
         ));
     }
 
-    let replay = send_browser(
+    let replay = send_browser_password_operation_when_capacity_is_available(
         state.clone(),
-        Method::POST,
         "/v1/auth/password-recovery/complete",
-        Some("https://frameshift.test"),
-        None,
-        Some(json!({"token": token, "password": replacement})),
+        json!({"token": token, "password": replacement}),
     )
     .await;
     assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
     let replay_body = response_json(replay).await;
-    let invalid = send_browser(
+    let invalid = send_browser_password_operation_when_capacity_is_available(
         state,
-        Method::POST,
         "/v1/auth/password-recovery/complete",
-        Some("https://frameshift.test"),
-        None,
-        Some(json!({
+        json!({
             "token": URL_SAFE_NO_PAD.encode([99_u8; 32]),
             "password": replacement
-        })),
+        }),
     )
     .await;
     assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
@@ -1221,37 +1629,47 @@ async fn password_recovery_worker_fails_permanent_and_tampered_deliveries() {
     assert!(observed_ids.lock().unwrap().is_empty());
 }
 
-/// Desktop login returns an explicit bearer and rejects a short wrong password generically.
+/// Password credentials stay in the trusted browser portal instead of native clients.
 #[tokio::test]
-async fn desktop_password_login_uses_explicit_revocable_bearer_sessions() {
+async fn password_login_is_confined_to_the_trusted_browser_portal() {
     let catalog = MockCatalog::new();
     let invite_token = fixture_bootstrap_invite(&catalog, "desktop@example.test");
     let state = test_state_with_config(catalog, None, first_party_test_config());
-    let registered = send(
+    let native_registration = send(
         state.clone(),
         Method::POST,
         "/v1/auth/register",
         None,
         Some(json!({
-            "invite_token": invite_token,
+            "invite_token": invite_token.clone(),
             "email": "desktop@example.test",
             "password": "correct horse battery staple",
             "client_kind": "desktop"
         })),
     )
     .await;
+    assert_eq!(native_registration.status(), StatusCode::BAD_REQUEST);
+
+    let registered = send_browser_password_operation_when_capacity_is_available(
+        state.clone(),
+        "/v1/auth/register",
+        json!({
+            "invite_token": invite_token,
+            "email": "desktop@example.test",
+            "password": "correct horse battery staple",
+            "client_kind": "browser"
+        }),
+    )
+    .await;
     assert_eq!(registered.status(), StatusCode::OK);
-    let initial_token = response_json(registered).await["token"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    assert!(response_json(registered).await["access_token"].is_null());
 
     let wrong_password = send_password_login_when_capacity_is_available(
         state.clone(),
         json!({
             "email": "desktop@example.test",
             "password": "wrong",
-            "client_kind": "desktop"
+            "client_kind": "browser"
         }),
     )
     .await;
@@ -1262,19 +1680,25 @@ async fn desktop_password_login_uses_explicit_revocable_bearer_sessions() {
         json!({
             "email": " DESKTOP@example.test ",
             "password": "correct horse battery staple",
-            "client_kind": "desktop"
+            "client_kind": "browser"
         }),
     )
     .await;
     assert_eq!(logged_in.status(), StatusCode::OK);
-    let token = response_json(logged_in).await["token"]
-        .as_str()
+    let cookie = logged_in
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find(|value| value.starts_with("__Host-frameshift_session="))
+        .expect("browser login returns the access-token cookie")
+        .split(';')
+        .next()
         .unwrap()
         .to_string();
-    assert_ne!(token, initial_token);
-    assert_eq!(URL_SAFE_NO_PAD.decode(&token).unwrap().len(), 32);
 
-    let authenticated = send(state, Method::GET, "/v1/account", Some(&token), None).await;
+    let authenticated =
+        send_browser(state, Method::GET, "/v1/account", None, Some(&cookie), None).await;
     assert_eq!(authenticated.status(), StatusCode::OK);
 }
 

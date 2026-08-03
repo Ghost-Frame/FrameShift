@@ -871,6 +871,10 @@ mod tests {
         config.cors_allowed_origins = "https://frameshift.test".to_string();
         config.first_party_auth.password_pepper =
             SecretString::new("test-password-pepper".to_string());
+        config.first_party_auth.mfa_encryption_key =
+            SecretString::new(URL_SAFE_NO_PAD.encode([17_u8; 32]));
+        config.first_party_auth.native_authorization_url =
+            "https://frameshift.test/account/".to_string();
         config.first_party_auth.recovery.enabled = true;
         config.first_party_auth.recovery.provider_api_key =
             SecretString::new("re_test_key".to_string());

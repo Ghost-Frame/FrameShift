@@ -17,24 +17,29 @@ use diesel::prelude::*;
 use serde_json::Value as JsonValue;
 
 use frameshift_catalog::{
-    AccountInviteIntent, AccountInviteRecord, AccountInviteRequestRecord, AccountInviteStatus,
-    AccountPasswordCredentialRecord, AccountRecord, AccountSessionClientKind, AccountSessionRecord,
-    AccountStatus, AuthorRecord, CatalogError, Ed25519PublicKey, MembershipState, OauthLink,
-    ObjectHash, PackRecord, PackStatus, PackVersionRecord, PasswordRecoveryDeliveryKind,
-    PasswordRecoveryDeliveryRecord, PlatformRole, PlatformRoleRecord, PlatformRoleState,
-    PublicationAppealDisposition, PublicationAppealRecord, PublicationAppealResolutionRecord,
-    PublicationIntentRecord, PublicationLifecycleAction, PublicationLifecycleDecisionRecord,
-    PublicationModerationAction, PublicationModerationDecisionRecord, PublicationPromotionRecord,
-    PublicationSubmissionRecord, PublicationSubmissionState, PublisherKeyRecord, PublisherKeyState,
-    PublisherMembershipRecord, PublisherModerationStatus, PublisherProfileRecord, PublisherRole,
+    AccountAuthAuditEventRecord, AccountInviteIntent, AccountInviteRecord,
+    AccountInviteRequestRecord, AccountInviteStatus, AccountMfaAuthenticatorRecord,
+    AccountMfaAuthenticatorState, AccountMfaLoginChallengeRecord, AccountPasswordCredentialRecord,
+    AccountRecord, AccountSessionClientKind, AccountSessionRecord, AccountStatus, AuthorRecord,
+    CatalogError, Ed25519PublicKey, EncryptedTotpSecret, MembershipState,
+    NativeAuthorizationCodeRecord, OauthLink, ObjectHash, PackRecord, PackStatus,
+    PackVersionRecord, PasswordRecoveryDeliveryKind, PasswordRecoveryDeliveryRecord, PlatformRole,
+    PlatformRoleRecord, PlatformRoleState, PublicationAppealDisposition, PublicationAppealRecord,
+    PublicationAppealResolutionRecord, PublicationIntentRecord, PublicationLifecycleAction,
+    PublicationLifecycleDecisionRecord, PublicationModerationAction,
+    PublicationModerationDecisionRecord, PublicationPromotionRecord, PublicationSubmissionRecord,
+    PublicationSubmissionState, PublisherKeyRecord, PublisherKeyState, PublisherMembershipRecord,
+    PublisherModerationStatus, PublisherProfileRecord, PublisherRole,
 };
 use uuid::Uuid;
 
 use crate::schema::{
-    account_invite_requests, account_invites, account_password_credentials,
+    account_auth_audit_events, account_invite_requests, account_invites,
+    account_mfa_authenticators, account_mfa_login_challenges, account_mfa_recovery_codes,
+    account_native_authorization_codes, account_password_credentials,
     account_password_recovery_outbox, account_password_recovery_tokens, account_platform_roles,
-    account_sessions, accounts, authors, handles, pack_downloads, pack_versions, packs,
-    publication_appeal_resolutions, publication_appeals, publication_intents,
+    account_session_refresh_tokens, account_sessions, accounts, authors, handles, pack_downloads,
+    pack_versions, packs, publication_appeal_resolutions, publication_appeals, publication_intents,
     publication_lifecycle_decisions, publication_moderation_decisions, publication_promotions,
     publication_submissions, publisher_audit_events, publisher_keys, publisher_memberships,
     publisher_profiles,
@@ -272,10 +277,14 @@ pub(crate) struct AccountSessionRow {
     pub created_at: DateTime<Utc>,
     /// Most recent authenticated-use timestamp.
     pub last_seen_at: DateTime<Utc>,
+    /// Exclusive expiry of the current access token.
+    pub access_expires_at: DateTime<Utc>,
     /// Sliding inactivity expiry timestamp.
     pub idle_expires_at: DateTime<Utc>,
     /// Non-extendable absolute expiry timestamp.
     pub absolute_expires_at: DateTime<Utc>,
+    /// Most recent second-factor verification inherited by this session.
+    pub mfa_verified_at: Option<DateTime<Utc>>,
     /// Explicit revocation timestamp.
     pub revoked_at: Option<DateTime<Utc>>,
 }
@@ -296,12 +305,246 @@ pub(crate) struct NewAccountSessionRow {
     pub created_at: DateTime<Utc>,
     /// Most recent authenticated-use timestamp.
     pub last_seen_at: DateTime<Utc>,
+    /// Exclusive expiry of the current access token.
+    pub access_expires_at: DateTime<Utc>,
     /// Sliding inactivity expiry timestamp.
     pub idle_expires_at: DateTime<Utc>,
     /// Non-extendable absolute expiry timestamp.
     pub absolute_expires_at: DateTime<Utc>,
+    /// Most recent second-factor verification inherited by this session.
+    pub mfa_verified_at: Option<DateTime<Utc>>,
     /// Explicit revocation timestamp.
     pub revoked_at: Option<DateTime<Utc>>,
+}
+
+/// Queryable append-only refresh-token generation row.
+#[derive(Queryable, Selectable)]
+#[diesel(table_name = account_session_refresh_tokens)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub(crate) struct AccountSessionRefreshTokenRow {
+    /// Stable refresh-generation identifier.
+    pub id: Uuid,
+    /// Session family owning this generation.
+    pub session_id: Uuid,
+    /// Monotonically increasing family generation.
+    pub generation: i64,
+    /// Exclusive refresh-token expiry timestamp.
+    pub expires_at: DateTime<Utc>,
+    /// Successful consumption or replay-observation timestamp.
+    pub consumed_at: Option<DateTime<Utc>>,
+}
+
+/// Insertable append-only refresh-token generation row.
+#[derive(Insertable)]
+#[diesel(table_name = account_session_refresh_tokens)]
+pub(crate) struct NewAccountSessionRefreshTokenRow {
+    /// Stable refresh-generation identifier.
+    pub id: Uuid,
+    /// Session family owning this generation.
+    pub session_id: Uuid,
+    /// Monotonically increasing family generation.
+    pub generation: i64,
+    /// SHA-256 digest of the random refresh token.
+    pub token_digest: Vec<u8>,
+    /// Refresh-token creation timestamp.
+    pub created_at: DateTime<Utc>,
+    /// Exclusive refresh-token expiry timestamp.
+    pub expires_at: DateTime<Utc>,
+    /// Successful consumption timestamp, absent for a newly issued token.
+    pub consumed_at: Option<DateTime<Utc>>,
+}
+
+/// Queryable encrypted TOTP authenticator row.
+#[derive(Queryable, Selectable)]
+#[diesel(table_name = account_mfa_authenticators)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub(crate) struct AccountMfaAuthenticatorRow {
+    /// Stable authenticator identifier.
+    pub id: Uuid,
+    /// Account owning this authenticator.
+    pub account_id: Uuid,
+    /// Pending, active, or disabled lifecycle state.
+    pub state: String,
+    /// Opaque authenticated ciphertext containing the TOTP seed.
+    pub secret_ciphertext: Vec<u8>,
+    /// Random 192-bit XChaCha20-Poly1305 nonce.
+    pub secret_nonce: Vec<u8>,
+    /// Deployment-managed encryption-key version.
+    pub secret_key_version: i16,
+    /// Exclusive deadline for confirming a pending enrollment.
+    pub pending_expires_at: Option<DateTime<Utc>>,
+    /// Greatest successfully consumed TOTP timestep.
+    pub last_used_timestep: Option<i64>,
+    /// Authenticator metadata creation timestamp.
+    pub created_at: DateTime<Utc>,
+    /// Successful enrollment activation timestamp.
+    pub activated_at: Option<DateTime<Utc>>,
+    /// Authenticator disable timestamp.
+    pub disabled_at: Option<DateTime<Utc>>,
+}
+
+/// Insertable encrypted TOTP authenticator row.
+#[derive(Insertable)]
+#[diesel(table_name = account_mfa_authenticators)]
+pub(crate) struct NewAccountMfaAuthenticatorRow {
+    /// Stable authenticator identifier.
+    pub id: Uuid,
+    /// Account owning this authenticator.
+    pub account_id: Uuid,
+    /// Pending, active, or disabled lifecycle state.
+    pub state: String,
+    /// Opaque authenticated ciphertext containing the TOTP seed.
+    pub secret_ciphertext: Vec<u8>,
+    /// Random 192-bit XChaCha20-Poly1305 nonce.
+    pub secret_nonce: Vec<u8>,
+    /// Deployment-managed encryption-key version.
+    pub secret_key_version: i16,
+    /// Exclusive deadline for confirming a pending enrollment.
+    pub pending_expires_at: Option<DateTime<Utc>>,
+    /// Greatest successfully consumed TOTP timestep.
+    pub last_used_timestep: Option<i64>,
+    /// Authenticator metadata creation timestamp.
+    pub created_at: DateTime<Utc>,
+    /// Successful enrollment activation timestamp.
+    pub activated_at: Option<DateTime<Utc>>,
+    /// Authenticator disable timestamp.
+    pub disabled_at: Option<DateTime<Utc>>,
+}
+
+/// Insertable digest-only MFA recovery-code row.
+#[derive(Insertable)]
+#[diesel(table_name = account_mfa_recovery_codes)]
+pub(crate) struct NewAccountMfaRecoveryCodeRow {
+    /// Stable recovery-code identifier.
+    pub id: Uuid,
+    /// Authenticator that issued this recovery code.
+    pub authenticator_id: Uuid,
+    /// SHA-256 digest of the random recovery code.
+    pub code_digest: Vec<u8>,
+    /// Recovery-code creation timestamp.
+    pub created_at: DateTime<Utc>,
+    /// Successful one-time consumption timestamp.
+    pub consumed_at: Option<DateTime<Utc>>,
+}
+
+/// Queryable digest-only MFA login challenge row.
+#[derive(Queryable, Selectable)]
+#[diesel(table_name = account_mfa_login_challenges)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub(crate) struct AccountMfaLoginChallengeRow {
+    /// Stable challenge identifier.
+    pub id: Uuid,
+    /// Account that passed the first factor.
+    pub account_id: Uuid,
+    /// SHA-256 digest of the random challenge token.
+    pub token_digest: Vec<u8>,
+    /// Browser, desktop, or CLI client binding.
+    pub client_kind: String,
+    /// Challenge creation timestamp.
+    pub created_at: DateTime<Utc>,
+    /// Exclusive challenge-completion deadline.
+    pub expires_at: DateTime<Utc>,
+    /// Successful one-time completion timestamp.
+    pub consumed_at: Option<DateTime<Utc>>,
+}
+
+/// Insertable digest-only MFA login challenge row.
+#[derive(Insertable)]
+#[diesel(table_name = account_mfa_login_challenges)]
+pub(crate) struct NewAccountMfaLoginChallengeRow {
+    /// Stable challenge identifier.
+    pub id: Uuid,
+    /// Account that passed the first factor.
+    pub account_id: Uuid,
+    /// SHA-256 digest of the random challenge token.
+    pub token_digest: Vec<u8>,
+    /// Browser, desktop, or CLI client binding.
+    pub client_kind: String,
+    /// Challenge creation timestamp.
+    pub created_at: DateTime<Utc>,
+    /// Exclusive challenge-completion deadline.
+    pub expires_at: DateTime<Utc>,
+    /// Successful one-time completion timestamp.
+    pub consumed_at: Option<DateTime<Utc>>,
+}
+
+/// Queryable digest-only native authorization-code row.
+#[derive(Queryable, Selectable)]
+#[diesel(table_name = account_native_authorization_codes)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub(crate) struct NativeAuthorizationCodeRow {
+    /// Stable authorization-code identifier.
+    pub id: Uuid,
+    /// Browser-authenticated account authorizing the native client.
+    pub account_id: Uuid,
+    /// SHA-256 digest of the random authorization code.
+    pub token_digest: Vec<u8>,
+    /// Desktop or CLI client binding.
+    pub client_kind: String,
+    /// Exact IP-literal loopback redirect URI string.
+    pub redirect_uri: String,
+    /// Decoded 32-byte S256 PKCE challenge.
+    pub pkce_challenge: Vec<u8>,
+    /// MFA assurance inherited from the browser session.
+    pub mfa_verified_at: Option<DateTime<Utc>>,
+    /// Authorization-code creation timestamp.
+    pub created_at: DateTime<Utc>,
+    /// Exclusive authorization-code exchange deadline.
+    pub expires_at: DateTime<Utc>,
+    /// Successful one-time exchange timestamp.
+    pub consumed_at: Option<DateTime<Utc>>,
+}
+
+/// Insertable digest-only native authorization-code row.
+#[derive(Insertable)]
+#[diesel(table_name = account_native_authorization_codes)]
+pub(crate) struct NewNativeAuthorizationCodeRow {
+    /// Stable authorization-code identifier.
+    pub id: Uuid,
+    /// Browser-authenticated account authorizing the native client.
+    pub account_id: Uuid,
+    /// SHA-256 digest of the random authorization code.
+    pub token_digest: Vec<u8>,
+    /// Desktop or CLI client binding.
+    pub client_kind: String,
+    /// Exact IP-literal loopback redirect URI string.
+    pub redirect_uri: String,
+    /// Decoded 32-byte S256 PKCE challenge.
+    pub pkce_challenge: Vec<u8>,
+    /// MFA assurance inherited from the browser session.
+    pub mfa_verified_at: Option<DateTime<Utc>>,
+    /// Authorization-code creation timestamp.
+    pub created_at: DateTime<Utc>,
+    /// Exclusive authorization-code exchange deadline.
+    pub expires_at: DateTime<Utc>,
+    /// Successful one-time exchange timestamp.
+    pub consumed_at: Option<DateTime<Utc>>,
+}
+
+/// Insertable append-only sanitized authentication audit row.
+#[derive(Insertable)]
+#[diesel(table_name = account_auth_audit_events)]
+pub(crate) struct NewAccountAuthAuditEventRow {
+    /// Stable event identifier.
+    pub id: Uuid,
+    /// Stable authentication event class.
+    pub event_kind: String,
+    /// Stable success or rejection outcome.
+    pub outcome: String,
+    /// Optional affected account identifier.
+    pub account_id: Option<Uuid>,
+    /// Optional affected session-family identifier.
+    pub session_id: Option<Uuid>,
+    /// Optional browser, desktop, or CLI client class.
+    pub client_kind: Option<String>,
+    /// Optional keyed canonical-identifier digest.
+    pub identifier_tag: Option<Vec<u8>>,
+    /// Optional keyed canonical-network digest.
+    pub network_tag: Option<Vec<u8>>,
+    /// Optional bounded static reason code.
+    pub reason_code: Option<String>,
+    /// Event creation timestamp.
+    pub created_at: DateTime<Utc>,
 }
 
 /// Insertable digest-only password-recovery token row.
@@ -1170,6 +1413,16 @@ pub(crate) fn vec_to_recovery_nonce(bytes: Vec<u8>) -> Result<[u8; 24], CatalogE
     })
 }
 
+/// Convert encrypted TOTP nonce bytes into the fixed XChaCha20 nonce size.
+pub(crate) fn vec_to_totp_nonce(bytes: Vec<u8>) -> Result<[u8; 24], CatalogError> {
+    bytes.try_into().map_err(|value: Vec<u8>| {
+        CatalogError::BackendError(Box::new(std::io::Error::other(format!(
+            "TOTP secret nonce in DB has wrong length: {} bytes",
+            value.len()
+        ))))
+    })
+}
+
 /// Decode a serde string enum stored in a PostgreSQL TEXT column.
 fn parse_text_enum<T>(value: String, kind: &str) -> Result<T, CatalogError>
 where
@@ -1283,9 +1536,96 @@ impl AccountSessionRow {
             )?,
             created_at: self.created_at,
             last_seen_at: self.last_seen_at,
+            access_expires_at: self.access_expires_at,
             idle_expires_at: self.idle_expires_at,
             absolute_expires_at: self.absolute_expires_at,
+            mfa_verified_at: self.mfa_verified_at,
             revoked_at: self.revoked_at,
+        })
+    }
+}
+
+/// Conversion helpers for encrypted TOTP authenticator rows.
+impl AccountMfaAuthenticatorRow {
+    /// Convert database metadata into a typed encrypted authenticator record.
+    pub(crate) fn into_record(self) -> Result<AccountMfaAuthenticatorRecord, CatalogError> {
+        Ok(AccountMfaAuthenticatorRecord {
+            id: self.id,
+            account_id: self.account_id,
+            state: parse_text_enum::<AccountMfaAuthenticatorState>(
+                self.state,
+                "account MFA authenticator state",
+            )?,
+            secret: EncryptedTotpSecret {
+                ciphertext: self.secret_ciphertext,
+                nonce: vec_to_totp_nonce(self.secret_nonce)?,
+                key_version: self.secret_key_version,
+            },
+            pending_expires_at: self.pending_expires_at,
+            last_used_timestep: self.last_used_timestep,
+            created_at: self.created_at,
+            activated_at: self.activated_at,
+            disabled_at: self.disabled_at,
+        })
+    }
+}
+
+/// Conversion helpers for digest-only MFA login challenge rows.
+impl AccountMfaLoginChallengeRow {
+    /// Convert a database row into a typed MFA challenge record.
+    pub(crate) fn into_record(self) -> Result<AccountMfaLoginChallengeRecord, CatalogError> {
+        Ok(AccountMfaLoginChallengeRecord {
+            id: self.id,
+            account_id: self.account_id,
+            token_digest: self.token_digest,
+            client_kind: parse_text_enum::<AccountSessionClientKind>(
+                self.client_kind,
+                "MFA challenge client kind",
+            )?,
+            created_at: self.created_at,
+            expires_at: self.expires_at,
+            consumed_at: self.consumed_at,
+        })
+    }
+}
+
+/// Conversion helpers for digest-only native authorization-code rows.
+impl NativeAuthorizationCodeRow {
+    /// Convert a database row into an exactly bound authorization-code record.
+    pub(crate) fn into_record(self) -> Result<NativeAuthorizationCodeRecord, CatalogError> {
+        Ok(NativeAuthorizationCodeRecord {
+            id: self.id,
+            account_id: self.account_id,
+            token_digest: self.token_digest,
+            client_kind: parse_text_enum::<AccountSessionClientKind>(
+                self.client_kind,
+                "native authorization-code client kind",
+            )?,
+            redirect_uri: self.redirect_uri,
+            pkce_challenge: self.pkce_challenge,
+            mfa_verified_at: self.mfa_verified_at,
+            created_at: self.created_at,
+            expires_at: self.expires_at,
+            consumed_at: self.consumed_at,
+        })
+    }
+}
+
+/// Conversion helpers for sanitized account-auth audit records.
+impl NewAccountAuthAuditEventRow {
+    /// Encode one typed audit record for insertion without accepting raw inputs.
+    pub(crate) fn from_record(record: AccountAuthAuditEventRecord) -> Result<Self, CatalogError> {
+        Ok(Self {
+            id: record.id,
+            event_kind: encode_text_enum(record.event_kind)?,
+            outcome: encode_text_enum(record.outcome)?,
+            account_id: record.account_id,
+            session_id: record.session_id,
+            client_kind: record.client_kind.map(encode_text_enum).transpose()?,
+            identifier_tag: record.identifier_tag,
+            network_tag: record.network_tag,
+            reason_code: record.reason_code,
+            created_at: record.created_at,
         })
     }
 }

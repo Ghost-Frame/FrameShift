@@ -490,10 +490,10 @@ fn validate_session_authentication(
 ) -> Result<(), SessionStoreError> {
     let summary = session.summary();
     if matches!(authentication, SessionAuthentication::FirstParty)
-        && (summary.refreshable || summary.scope.is_some() || summary.expires_in.is_none())
+        && (summary.scope.is_some() || summary.expires_in.is_none())
     {
         return Err(SessionStoreError::Invalid(
-            "first-party sessions must have an expiry and no OIDC refresh metadata".to_string(),
+            "first-party sessions must have an expiry and no OIDC scope metadata".to_string(),
         ));
     }
     Ok(())
@@ -945,7 +945,7 @@ mod tests {
         assert!(!store.metadata_path().exists());
     }
 
-    /// First-party sessions use explicit metadata and remain non-refreshable.
+    /// First-party sessions keep rotating refresh credentials only in secret storage.
     #[test]
     fn saves_and_loads_first_party_session() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -957,7 +957,7 @@ mod tests {
         };
         let session = AuthenticatedSession::from_stored_parts(
             SecretString::new("local-access".to_string()),
-            None,
+            Some(SecretString::new("local-refresh".to_string())),
             Some(600),
             None,
             42,
@@ -970,19 +970,26 @@ mod tests {
             fs::read_to_string(store.metadata_path()).expect("read first-party metadata");
         assert!(metadata_text.contains("\"kind\": \"first_party\""));
         assert!(!metadata_text.contains("local-access"));
+        assert!(!metadata_text.contains("local-refresh"));
         let loaded = store.load_with_store(&credentials).expect("load session");
         assert_eq!(
             loaded.metadata.authentication,
             SessionAuthentication::FirstParty
         );
-        assert!(loaded.session.refresh_token().is_none());
+        assert_eq!(
+            loaded
+                .session
+                .refresh_token()
+                .map(|token| token.expose_secret().as_str()),
+            Some("local-refresh")
+        );
         assert_eq!(
             loaded.session.access_token().expose_secret(),
             "local-access"
         );
     }
 
-    /// Provider metadata cannot relabel an OIDC refreshable session as first-party.
+    /// Provider metadata cannot relabel an OIDC-scoped session as first-party.
     #[test]
     fn rejects_first_party_metadata_for_oidc_session_shape() {
         let temp = tempfile::tempdir().expect("tempdir");

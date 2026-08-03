@@ -80,6 +80,13 @@ async fn build_state(config: Arc<ServerConfig>) -> Result<InitializedState, Serv
     {
         delivery_key.zeroize();
     }
+    if let Some(mut mfa_key) = config
+        .first_party_auth
+        .decoded_mfa_encryption_key()
+        .map_err(ServerError::Startup)?
+    {
+        mfa_key.zeroize();
+    }
 
     let catalog_config = PostgresCatalogConfig {
         url: secrecy::SecretString::new(config.postgres_url.expose_secret().to_string()),

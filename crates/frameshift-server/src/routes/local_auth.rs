@@ -7,24 +7,27 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Extension, Json, Router};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine as _;
 use chrono::{DateTime, Duration, Utc};
 use frameshift_catalog::{
-    AccountPasswordCredentialRecord, AccountPasswordRehashRequest, AccountRecord,
-    AccountSessionClientKind, AccountSessionRecord, AccountStatus, CatalogError,
+    AccountAuthAuditEventKind, AccountAuthAuditOutcome, AccountMfaChallengeCreationRequest,
+    AccountMfaLoginChallengeRecord, AccountPasswordCredentialRecord, AccountPasswordRehashRequest,
+    AccountRecord, AccountSessionClientKind, AccountSessionCreationRequest, AccountSessionRecord,
+    AccountSessionRefreshRequest, AccountSessionRefreshResult, AccountStatus, CatalogError,
     EncryptedPasswordRecoveryDelivery, LocalAccountRegistrationRequest,
     PasswordRecoveryCompletionRequest, PasswordRecoveryEnqueueRequest,
 };
-use rand_core::{OsRng, RngCore as _};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 use tokio::sync::{Semaphore, SemaphorePermit};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::error::AppError;
+use crate::first_party_auth::{
+    add_std_duration, auth_audit_event, decode_access_token, decode_refresh_token,
+    generate_access_token, generate_bound_token, generate_refresh_token, identifier_tag,
+    issue_session, AuthAuditContext,
+};
 use crate::middleware::account::AuthenticatedAccount;
 use crate::password_auth::{PasswordAuthError, PasswordService};
 use crate::password_blocklist;
@@ -47,17 +50,8 @@ const MIN_RECOVERY_REQUEST_DURATION: std::time::Duration = std::time::Duration::
 /// Maximum time allowed for delivery of the post-change notification.
 const PASSWORD_CHANGED_DELIVERY_TTL: Duration = Duration::hours(24);
 
-/// Browser or explicit bearer presentation selected by the client.
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LocalAuthClientKind {
-    /// Browser receives a secure HTTP-only cookie.
-    Browser,
-    /// Desktop application receives an explicit bearer token.
-    Desktop,
-    /// Command-line client receives an explicit bearer token.
-    Cli,
-}
+/// Backward-compatible name for the catalog-owned session client class.
+pub type LocalAuthClientKind = AccountSessionClientKind;
 
 /// Browser-submitted fields for invite redemption and account creation.
 #[derive(Deserialize)]
@@ -105,6 +99,16 @@ pub struct CompletePasswordRecoveryRequest {
     pub password: String,
 }
 
+/// Refresh-token input selected by transport class.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RefreshLocalSessionRequest {
+    /// Browser, desktop, or CLI presentation required by the caller.
+    pub client_kind: LocalAuthClientKind,
+    /// Rotating raw refresh token accepted only from desktop and CLI clients.
+    pub refresh_token: Option<String>,
+}
+
 /// Generic recovery-request acknowledgement shared by known and unknown emails.
 #[derive(Debug, Serialize)]
 pub struct PasswordRecoveryAcceptedResponse {
@@ -112,14 +116,33 @@ pub struct PasswordRecoveryAcceptedResponse {
     pub accepted: bool,
 }
 
-/// Successful local registration or login response.
+/// Successful first-party session issuance or refresh response.
 #[derive(Debug, Serialize)]
 pub struct LocalAuthResponse {
     /// Durable authenticated account.
     pub account: AccountRecord,
-    /// Raw bearer token returned only to desktop and CLI clients.
-    pub token: Option<String>,
-    /// Non-extendable session expiry.
+    /// Raw access token returned only to desktop and CLI clients.
+    pub access_token: Option<String>,
+    /// Raw refresh token returned only to desktop and CLI clients.
+    pub refresh_token: Option<String>,
+    /// Stable OAuth bearer-token presentation type.
+    pub token_type: &'static str,
+    /// Short-lived access-token expiry.
+    pub expires_at: DateTime<Utc>,
+    /// Current refresh-token generation expiry.
+    pub refresh_expires_at: DateTime<Utc>,
+    /// Non-extendable session-family expiry.
+    pub session_expires_at: DateTime<Utc>,
+}
+
+/// Password-login response requiring browser-side second-factor completion.
+#[derive(Debug, Serialize)]
+pub struct MfaChallengeRequiredResponse {
+    /// Stable signal that no session was issued yet.
+    pub mfa_required: bool,
+    /// Opaque one-time challenge bearer.
+    pub challenge_token: String,
+    /// Exclusive challenge completion deadline.
     pub expires_at: DateTime<Utc>,
 }
 
@@ -135,6 +158,7 @@ pub fn local_auth_public_router() -> Router<AppState> {
     Router::new()
         .route("/register", post(register_local_account))
         .route("/login", post(login_local_account))
+        .route("/refresh", post(refresh_local_session))
         .route(
             "/password-recovery/request",
             post(request_password_recovery),
@@ -160,18 +184,28 @@ async fn register_local_account(
     Json(request): Json<RegisterLocalAccountRequest>,
 ) -> Result<Response, AppError> {
     require_local_auth_enabled(&state)?;
-    if matches!(request.client_kind, LocalAuthClientKind::Browser) {
-        require_trusted_browser_origin(&state, &headers)?;
+    if request.client_kind != LocalAuthClientKind::Browser {
+        return Err(AppError::BadRequest(
+            "password registration is available only in the trusted browser portal".into(),
+        ));
     }
+    require_trusted_browser_origin(&state, &headers)?;
     let invite_digest = decode_and_digest_token(&request.invite_token)?;
     let normalized_email = normalize_email(&request.email)?;
+    let registration_identifier_tag =
+        identifier_tag(&state.config.first_party_auth, &normalized_email);
     let display_name = normalize_optional_display_name(request.display_name)?;
     let password = protected_new_password(request.password)?;
     let password_hash = hash_password(&state, password).await?;
-    let (session_token, session_digest) = generate_token();
     let now = Utc::now();
     let account_id = Uuid::new_v4();
-    let session = build_session(&state, account_id, session_digest, request.client_kind, now)?;
+    let issued = issue_session(
+        &state.config.first_party_auth,
+        account_id,
+        request.client_kind,
+        now,
+        None,
+    )?;
     let account = AccountRecord {
         id: account_id,
         issuer: state.config.first_party_auth.issuer.clone(),
@@ -198,7 +232,19 @@ async fn register_local_account(
                 password_changed_at: now,
                 updated_at: now,
             },
-            session: session.clone(),
+            session: issued.issuance.clone(),
+            audit_event: auth_audit_event(
+                AccountAuthAuditEventKind::SessionCreated,
+                AccountAuthAuditOutcome::Success,
+                AuthAuditContext {
+                    account_id: Some(account_id),
+                    session_id: Some(issued.issuance.session.id),
+                    client_kind: Some(request.client_kind),
+                    identifier_tag: Some(registration_identifier_tag),
+                    reason_code: None,
+                },
+                now,
+            ),
         })
         .await
         .map_err(map_registration_error)?;
@@ -207,7 +253,9 @@ async fn register_local_account(
         result.account,
         result.session,
         request.client_kind,
-        session_token,
+        issued.access_token,
+        issued.refresh_token,
+        issued.issuance.refresh_expires_at,
     )
 }
 
@@ -218,10 +266,14 @@ async fn login_local_account(
     Json(request): Json<LoginLocalAccountRequest>,
 ) -> Result<Response, AppError> {
     require_local_auth_enabled(&state)?;
-    if matches!(request.client_kind, LocalAuthClientKind::Browser) {
-        require_trusted_browser_origin(&state, &headers)?;
+    if request.client_kind != LocalAuthClientKind::Browser {
+        return Err(AppError::BadRequest(
+            "password login is available only in the trusted browser portal".into(),
+        ));
     }
+    require_trusted_browser_origin(&state, &headers)?;
     let normalized_email = normalize_email(&request.email)?;
+    let login_identifier_tag = identifier_tag(&state.config.first_party_auth, &normalized_email);
     let password = protected_login_password(request.password)?;
     let credential = match state
         .catalog
@@ -234,29 +286,296 @@ async fn login_local_account(
     };
     let password_matches =
         verify_or_absorb_password_work(&state, password.clone(), credential.as_ref()).await?;
-    let credential = credential
-        .filter(|_| password_matches)
-        .ok_or_else(|| AppError::Unauthorized("email or password is incorrect".to_string()))?;
+    let Some(credential) = credential.filter(|_| password_matches) else {
+        append_rejection_audit(
+            &state,
+            None,
+            None,
+            Some(request.client_kind),
+            Some(login_identifier_tag),
+            "invalid_password",
+        )
+        .await;
+        return Err(AppError::Unauthorized(
+            "email or password is incorrect".to_string(),
+        ));
+    };
     let account = state
         .catalog
         .get_account(credential.account_id)
         .await
         .map_err(|error| AppError::from_catalog(error, "account"))?;
     if account.status != AccountStatus::Active {
+        append_rejection_audit(
+            &state,
+            Some(account.id),
+            None,
+            Some(request.client_kind),
+            Some(login_identifier_tag),
+            "inactive_account",
+        )
+        .await;
         return Err(AppError::Unauthorized(
             "email or password is incorrect".to_string(),
         ));
     }
     rehash_password_if_rotated(&state, &password, &credential).await?;
-    let (session_token, session_digest) = generate_token();
     let now = Utc::now();
-    let session = build_session(&state, account.id, session_digest, request.client_kind, now)?;
-    state
+    match state
         .catalog
-        .create_account_session(session.clone())
+        .get_active_account_mfa_authenticator(account.id)
         .await
-        .map_err(|error| AppError::from_catalog(error, "account session"))?;
-    local_auth_response(&state, account, session, request.client_kind, session_token)
+    {
+        Ok(_) => {
+            let (challenge_token, challenge_digest) =
+                generate_bound_token(account.id, request.client_kind);
+            let expires_at = add_std_duration(
+                now,
+                state.config.first_party_auth.mfa_challenge_ttl,
+                "MFA challenge TTL",
+            )?;
+            state
+                .catalog
+                .create_account_mfa_challenge(AccountMfaChallengeCreationRequest {
+                    challenge: AccountMfaLoginChallengeRecord {
+                        id: Uuid::new_v4(),
+                        account_id: account.id,
+                        token_digest: challenge_digest,
+                        client_kind: request.client_kind,
+                        created_at: now,
+                        expires_at,
+                        consumed_at: None,
+                    },
+                    audit_event: auth_audit_event(
+                        AccountAuthAuditEventKind::MfaChallengeCreated,
+                        AccountAuthAuditOutcome::Success,
+                        AuthAuditContext {
+                            account_id: Some(account.id),
+                            client_kind: Some(request.client_kind),
+                            identifier_tag: Some(login_identifier_tag),
+                            ..AuthAuditContext::default()
+                        },
+                        now,
+                    ),
+                })
+                .await
+                .map_err(|error| AppError::from_catalog(error, "MFA challenge"))?;
+            Ok((
+                StatusCode::ACCEPTED,
+                Json(MfaChallengeRequiredResponse {
+                    mfa_required: true,
+                    challenge_token,
+                    expires_at,
+                }),
+            )
+                .into_response())
+        }
+        Err(CatalogError::NotFound { .. }) => {
+            let issued = issue_session(
+                &state.config.first_party_auth,
+                account.id,
+                request.client_kind,
+                now,
+                None,
+            )?;
+            let session = state
+                .catalog
+                .create_account_session(AccountSessionCreationRequest {
+                    issuance: issued.issuance.clone(),
+                    audit_event: auth_audit_event(
+                        AccountAuthAuditEventKind::SessionCreated,
+                        AccountAuthAuditOutcome::Success,
+                        AuthAuditContext {
+                            account_id: Some(account.id),
+                            session_id: Some(issued.issuance.session.id),
+                            client_kind: Some(request.client_kind),
+                            identifier_tag: Some(login_identifier_tag),
+                            reason_code: None,
+                        },
+                        now,
+                    ),
+                })
+                .await
+                .map_err(|error| AppError::from_catalog(error, "account session"))?;
+            local_auth_response(
+                &state,
+                account,
+                session,
+                request.client_kind,
+                issued.access_token,
+                issued.refresh_token,
+                issued.issuance.refresh_expires_at,
+            )
+        }
+        Err(error) => Err(AppError::from_catalog(error, "MFA authenticator")),
+    }
+}
+
+/// Rotate one refresh generation and replace the short-lived access token.
+async fn refresh_local_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<RefreshLocalSessionRequest>,
+) -> Result<Response, AppError> {
+    require_local_auth_enabled(&state)?;
+    let raw_refresh = match request.client_kind {
+        LocalAuthClientKind::Browser => {
+            require_trusted_browser_origin(&state, &headers)?;
+            if request.refresh_token.is_some() {
+                return Err(AppError::BadRequest(
+                    "browser refresh tokens are accepted only from the secure cookie".into(),
+                ));
+            }
+            extract_named_cookie(&headers, &state.config.first_party_auth.refresh_cookie_name)
+                .ok_or_else(|| {
+                    AppError::Unauthorized("refresh token is invalid or expired".into())
+                })?
+                .to_string()
+        }
+        LocalAuthClientKind::Desktop | LocalAuthClientKind::Cli => request
+            .refresh_token
+            .ok_or_else(|| AppError::Unauthorized("refresh token is invalid or expired".into()))?,
+    };
+    let raw_refresh = Zeroizing::new(raw_refresh);
+    let decoded = decode_refresh_token(raw_refresh.as_str())?;
+    if decoded.client_kind != request.client_kind {
+        append_rejection_audit(
+            &state,
+            Some(decoded.account_id),
+            Some(decoded.session_id),
+            Some(request.client_kind),
+            None,
+            "refresh_client_mismatch",
+        )
+        .await;
+        return Err(AppError::Unauthorized(
+            "refresh token is invalid or expired".into(),
+        ));
+    }
+    let now = Utc::now();
+    if decoded.absolute_expires_at <= now {
+        append_rejection_audit(
+            &state,
+            Some(decoded.account_id),
+            Some(decoded.session_id),
+            Some(decoded.client_kind),
+            None,
+            "refresh_expired",
+        )
+        .await;
+        return Err(AppError::Unauthorized(
+            "refresh token is invalid or expired".into(),
+        ));
+    }
+    let (replacement_access_token, replacement_access_digest) = generate_access_token();
+    let (replacement_refresh_token, replacement_refresh_digest) = generate_refresh_token(
+        decoded.account_id,
+        decoded.session_id,
+        decoded.absolute_expires_at,
+        decoded.client_kind,
+    );
+    let idle_ttl = match decoded.client_kind {
+        AccountSessionClientKind::Browser => state.config.first_party_auth.browser_idle_ttl,
+        AccountSessionClientKind::Desktop | AccountSessionClientKind::Cli => {
+            state.config.first_party_auth.bearer_idle_ttl
+        }
+    };
+    let replacement_access_expires_at = std::cmp::min(
+        add_std_duration(
+            now,
+            state.config.first_party_auth.access_ttl,
+            "access-token TTL",
+        )?,
+        decoded.absolute_expires_at,
+    );
+    let replacement_idle_expires_at = std::cmp::min(
+        add_std_duration(now, idle_ttl, "session idle TTL")?,
+        decoded.absolute_expires_at,
+    );
+    let replacement_refresh_expires_at = std::cmp::min(
+        add_std_duration(
+            now,
+            state.config.first_party_auth.refresh_ttl,
+            "refresh-token TTL",
+        )?,
+        replacement_idle_expires_at,
+    );
+    let result = state
+        .catalog
+        .refresh_account_session(AccountSessionRefreshRequest {
+            presented_refresh_token_digest: decoded.digest,
+            replacement_access_token_digest: replacement_access_digest,
+            replacement_access_expires_at,
+            replacement_idle_expires_at,
+            replacement_refresh_token_id: Uuid::new_v4(),
+            replacement_refresh_token_digest: replacement_refresh_digest,
+            replacement_refresh_expires_at,
+            rotated_at: now,
+            success_audit_event: auth_audit_event(
+                AccountAuthAuditEventKind::SessionRefreshed,
+                AccountAuthAuditOutcome::Success,
+                AuthAuditContext {
+                    account_id: Some(decoded.account_id),
+                    session_id: Some(decoded.session_id),
+                    client_kind: Some(decoded.client_kind),
+                    ..AuthAuditContext::default()
+                },
+                now,
+            ),
+            replay_audit_event: auth_audit_event(
+                AccountAuthAuditEventKind::SessionReplayRevoked,
+                AccountAuthAuditOutcome::Success,
+                AuthAuditContext {
+                    account_id: Some(decoded.account_id),
+                    session_id: Some(decoded.session_id),
+                    client_kind: Some(decoded.client_kind),
+                    ..AuthAuditContext::default()
+                },
+                now,
+            ),
+        })
+        .await
+        .map_err(|error| AppError::from_catalog(error, "account session refresh"))?;
+    match result {
+        AccountSessionRefreshResult::Rotated(session) => {
+            let account = state
+                .catalog
+                .get_account(session.account_id)
+                .await
+                .map_err(|error| AppError::from_catalog(error, "account"))?;
+            if account.status != AccountStatus::Active {
+                return Err(AppError::Unauthorized(
+                    "refresh token is invalid or expired".into(),
+                ));
+            }
+            local_auth_response(
+                &state,
+                account,
+                session,
+                request.client_kind,
+                replacement_access_token,
+                replacement_refresh_token,
+                replacement_refresh_expires_at,
+            )
+        }
+        AccountSessionRefreshResult::ReplayRevoked => Err(AppError::Unauthorized(
+            "refresh token is invalid or expired".into(),
+        )),
+        AccountSessionRefreshResult::Rejected => {
+            append_rejection_audit(
+                &state,
+                Some(decoded.account_id),
+                Some(decoded.session_id),
+                Some(decoded.client_kind),
+                None,
+                "refresh_rejected",
+            )
+            .await;
+            Err(AppError::Unauthorized(
+                "refresh token is invalid or expired".into(),
+            ))
+        }
+    }
 }
 
 /// Enqueue one encrypted reset delivery without disclosing account existence.
@@ -381,15 +700,11 @@ async fn logout_local_account(
     )
         .into_response();
     if auth.via_cookie {
-        let cleared = format!(
-            "{}=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0",
-            state.config.first_party_auth.cookie_name
-        );
-        response.headers_mut().insert(
-            header::SET_COOKIE,
-            HeaderValue::from_str(&cleared)
-                .map_err(|_| AppError::Internal("invalid session cookie configuration".into()))?,
-        );
+        append_cleared_cookie(&mut response, &state.config.first_party_auth.cookie_name)?;
+        append_cleared_cookie(
+            &mut response,
+            &state.config.first_party_auth.refresh_cookie_name,
+        )?;
     }
     Ok(response)
 }
@@ -415,8 +730,11 @@ fn require_password_recovery_enabled(state: &AppState) -> Result<RecoveryDeliver
         })
 }
 
-/// Require an exact configured browser origin before cookie creation.
-fn require_trusted_browser_origin(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
+/// Require an exact configured browser origin before cookie creation or mutation.
+pub(crate) fn require_trusted_browser_origin(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(), AppError> {
     let origin = headers
         .get(header::ORIGIN)
         .and_then(|value| value.to_str().ok())
@@ -620,105 +938,127 @@ fn invalid_recovery_token_error() -> AppError {
 
 /// Generate one random 256-bit token and its SHA-256 digest.
 pub(crate) fn generate_token() -> (String, Vec<u8>) {
-    let mut raw = Zeroizing::new([0_u8; 32]);
-    OsRng.fill_bytes(raw.as_mut_slice());
-    (
-        URL_SAFE_NO_PAD.encode(raw.as_slice()),
-        Sha256::digest(raw.as_slice()).to_vec(),
-    )
+    generate_access_token()
 }
 
 /// Decode one canonical 256-bit token and return its SHA-256 digest.
 pub(crate) fn decode_and_digest_token(token: &str) -> Result<Vec<u8>, AppError> {
-    if token.len() > 128 || token.chars().any(char::is_whitespace) {
-        return Err(AppError::Unauthorized(
-            "token is invalid or expired".to_string(),
-        ));
-    }
-    let raw = Zeroizing::new(
-        URL_SAFE_NO_PAD
-            .decode(token)
-            .map_err(|_| AppError::Unauthorized("token is invalid or expired".to_string()))?,
-    );
-    if raw.len() != 32 || URL_SAFE_NO_PAD.encode(raw.as_slice()) != token {
-        return Err(AppError::Unauthorized(
-            "token is invalid or expired".to_string(),
-        ));
-    }
-    Ok(Sha256::digest(raw.as_slice()).to_vec())
+    decode_access_token(token)
 }
 
-/// Build one session with transport-specific idle duration and a shared absolute cap.
-fn build_session(
+/// Append one standalone sanitized rejection audit without changing its public response.
+pub(crate) async fn append_rejection_audit(
     state: &AppState,
-    account_id: Uuid,
-    token_digest: Vec<u8>,
-    client_kind: LocalAuthClientKind,
-    now: DateTime<Utc>,
-) -> Result<AccountSessionRecord, AppError> {
-    let (client_kind, idle_ttl) = match client_kind {
-        LocalAuthClientKind::Browser => (
-            AccountSessionClientKind::Browser,
-            state.config.first_party_auth.browser_idle_ttl,
-        ),
-        LocalAuthClientKind::Desktop => (
-            AccountSessionClientKind::Desktop,
-            state.config.first_party_auth.bearer_idle_ttl,
-        ),
-        LocalAuthClientKind::Cli => (
-            AccountSessionClientKind::Cli,
-            state.config.first_party_auth.bearer_idle_ttl,
-        ),
-    };
-    let idle_ttl = Duration::from_std(idle_ttl)
-        .map_err(|_| AppError::Internal("session idle duration is invalid".to_string()))?;
-    let absolute_ttl = Duration::from_std(state.config.first_party_auth.absolute_ttl)
-        .map_err(|_| AppError::Internal("session absolute duration is invalid".to_string()))?;
-    Ok(AccountSessionRecord {
-        id: Uuid::new_v4(),
-        account_id,
-        token_digest,
-        client_kind,
-        created_at: now,
-        last_seen_at: now,
-        idle_expires_at: now + idle_ttl,
-        absolute_expires_at: now + absolute_ttl,
-        revoked_at: None,
-    })
+    account_id: Option<Uuid>,
+    session_id: Option<Uuid>,
+    client_kind: Option<AccountSessionClientKind>,
+    identifier_tag: Option<Vec<u8>>,
+    reason_code: &'static str,
+) {
+    let event = auth_audit_event(
+        AccountAuthAuditEventKind::AuthenticationRejected,
+        AccountAuthAuditOutcome::Rejected,
+        AuthAuditContext {
+            account_id,
+            session_id,
+            client_kind,
+            identifier_tag,
+            reason_code: Some(reason_code),
+        },
+        Utc::now(),
+    );
+    if state
+        .catalog
+        .append_account_auth_audit_event(event)
+        .await
+        .is_err()
+    {
+        tracing::warn!(reason_code, "authentication rejection audit failed");
+    }
 }
 
 /// Build the transport-specific successful authentication response.
-fn local_auth_response(
+pub(crate) fn local_auth_response(
     state: &AppState,
     account: AccountRecord,
     session: AccountSessionRecord,
     client_kind: LocalAuthClientKind,
-    raw_token: String,
+    access_token: String,
+    refresh_token: String,
+    refresh_expires_at: DateTime<Utc>,
 ) -> Result<Response, AppError> {
-    let explicit_token =
-        (!matches!(client_kind, LocalAuthClientKind::Browser)).then(|| raw_token.clone());
+    let explicit_access_token =
+        (client_kind != LocalAuthClientKind::Browser).then(|| access_token.clone());
+    let explicit_refresh_token =
+        (client_kind != LocalAuthClientKind::Browser).then(|| refresh_token.clone());
     let mut response = (
         StatusCode::OK,
         Json(LocalAuthResponse {
             account,
-            token: explicit_token,
-            expires_at: session.absolute_expires_at,
+            access_token: explicit_access_token,
+            refresh_token: explicit_refresh_token,
+            token_type: "Bearer",
+            expires_at: session.access_expires_at,
+            refresh_expires_at,
+            session_expires_at: session.absolute_expires_at,
         }),
     )
         .into_response();
-    if matches!(client_kind, LocalAuthClientKind::Browser) {
-        let max_age = state.config.first_party_auth.absolute_ttl.as_secs();
-        let cookie = format!(
-            "{}={raw_token}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age={max_age}",
-            state.config.first_party_auth.cookie_name
-        );
-        response.headers_mut().insert(
-            header::SET_COOKIE,
-            HeaderValue::from_str(&cookie)
-                .map_err(|_| AppError::Internal("invalid session cookie configuration".into()))?,
-        );
+    if client_kind == LocalAuthClientKind::Browser {
+        let now = Utc::now();
+        append_session_cookie(
+            &mut response,
+            &state.config.first_party_auth.cookie_name,
+            &access_token,
+            (session.access_expires_at - now).num_seconds().max(0),
+        )?;
+        append_session_cookie(
+            &mut response,
+            &state.config.first_party_auth.refresh_cookie_name,
+            &refresh_token,
+            (refresh_expires_at - now).num_seconds().max(0),
+        )?;
     }
     Ok(response)
+}
+
+/// Extract exactly one non-empty named cookie and reject duplicate-name ambiguity.
+pub(crate) fn extract_named_cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    let raw = headers.get(header::COOKIE)?.to_str().ok()?;
+    let mut matches = raw.split(';').filter_map(|part| {
+        let (candidate, value) = part.trim().split_once('=')?;
+        (candidate == name && !value.is_empty()).then_some(value)
+    });
+    let token = matches.next()?;
+    matches.next().is_none().then_some(token)
+}
+
+/// Append one Secure, HTTP-only, Strict browser session cookie.
+fn append_session_cookie(
+    response: &mut Response,
+    name: &str,
+    value: &str,
+    max_age: i64,
+) -> Result<(), AppError> {
+    let cookie =
+        format!("{name}={value}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age={max_age}");
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&cookie)
+            .map_err(|_| AppError::Internal("invalid session cookie configuration".into()))?,
+    );
+    Ok(())
+}
+
+/// Append one expired Secure, HTTP-only, Strict browser cookie.
+fn append_cleared_cookie(response: &mut Response, name: &str) -> Result<(), AppError> {
+    let cookie = format!("{name}=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0");
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&cookie)
+            .map_err(|_| AppError::Internal("invalid session cookie configuration".into()))?,
+    );
+    Ok(())
 }
 
 #[cfg(test)]

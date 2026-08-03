@@ -65,6 +65,8 @@ pub struct AuthConfigResponse {
     pub first_party_enabled: bool,
     /// Stable first-party registration policy.
     pub registration: &'static str,
+    /// Credential-free HTTPS portal used for native first-party authorization.
+    pub native_authorization_url: Option<String>,
     /// Configured OIDC issuer when enabled.
     pub issuer: Option<String>,
     /// Configured resource audience when enabled.
@@ -76,6 +78,8 @@ pub struct AuthConfigResponse {
 pub struct AccountResponse {
     /// Durable account record.
     pub account: AccountRecord,
+    /// Whether this account currently has an active MFA authenticator.
+    pub mfa_enabled: bool,
     /// Publisher memberships held by the account.
     pub memberships: Vec<PublisherMembershipRecord>,
     /// Publisher profiles aligned with memberships in the same stable order.
@@ -307,6 +311,7 @@ async fn get_auth_config(State(state): State<AppState>) -> Json<AuthConfigRespon
         enabled: oidc_enabled || first_party_enabled,
         first_party_enabled,
         registration: "invite_only",
+        native_authorization_url: state.config.first_party_auth.native_authorization_url(),
         issuer: oidc_enabled.then(|| state.config.oidc.issuer.clone()),
         audience: oidc_enabled.then(|| state.config.oidc.audience.clone()),
     })
@@ -317,6 +322,15 @@ async fn get_account(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthenticatedAccount>,
 ) -> Result<Json<AccountResponse>, AppError> {
+    let mfa_enabled = match state
+        .catalog
+        .get_active_account_mfa_authenticator(auth.account.id)
+        .await
+    {
+        Ok(_) => true,
+        Err(CatalogError::NotFound { .. }) => false,
+        Err(error) => return Err(AppError::from_catalog(error, "MFA authenticator")),
+    };
     let memberships = state
         .catalog
         .list_account_memberships(auth.account.id)
@@ -334,6 +348,7 @@ async fn get_account(
     }
     Ok(Json(AccountResponse {
         account: auth.account,
+        mfa_enabled,
         memberships,
         publishers,
     }))

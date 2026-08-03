@@ -13,11 +13,18 @@ use crate::error::{CatalogError, HealthStatus};
 use crate::filters::{PackSearchFilters, PackSearchResult};
 use crate::identity::Ed25519PublicKey;
 use crate::records::{
-    AccountInviteIssueRequest, AccountInviteRecord, AccountInviteRequestRecord,
-    AccountInviteReviewRequest, AccountInviteStatus, AccountPasswordCredentialRecord,
-    AccountPasswordRehashRequest, AccountRecord, AccountSessionRecord, AccountStatusChangeRequest,
-    AuthorRecord, LocalAccountRegistrationRequest, LocalAccountRegistrationResult, PackRecord,
-    PackVersionRecord, PasswordRecoveryCompletionRequest, PasswordRecoveryDeliveryClaimRequest,
+    AccountAuthAuditEventRecord, AccountInviteIssueRequest, AccountInviteRecord,
+    AccountInviteRequestRecord, AccountInviteReviewRequest, AccountInviteStatus,
+    AccountMfaActivationRequest, AccountMfaAuthenticatorRecord,
+    AccountMfaChallengeCompletionRequest, AccountMfaChallengeCompletionResult,
+    AccountMfaChallengeCreationRequest, AccountMfaDisableRequest, AccountMfaEnrollmentRequest,
+    AccountPasswordCredentialRecord, AccountPasswordRehashRequest, AccountRecord,
+    AccountSessionCreationRequest, AccountSessionRecord, AccountSessionRefreshRequest,
+    AccountSessionRefreshResult, AccountStatusChangeRequest, AuthorRecord,
+    LocalAccountRegistrationRequest, LocalAccountRegistrationResult,
+    NativeAuthorizationCodeCreationRequest, NativeAuthorizationCodeExchangeRequest,
+    NativeAuthorizationCodeExchangeResult, PackRecord, PackVersionRecord,
+    PasswordRecoveryCompletionRequest, PasswordRecoveryDeliveryClaimRequest,
     PasswordRecoveryDeliveryRecord, PasswordRecoveryEnqueueRequest, PlatformRoleAssignmentRequest,
     PlatformRoleRecord, PlatformRoleRevocationRequest, PublicationAppealCaseRecord,
     PublicationAppealCursor, PublicationAppealRecord, PublicationAppealRequest,
@@ -263,14 +270,14 @@ pub trait CatalogBackend: Send + Sync {
         ))
     }
 
-    /// Create a revocable session after successful first-party authentication.
+    /// Create an access-token session and refresh generation atomically.
     async fn create_account_session(
         &self,
-        record: AccountSessionRecord,
-    ) -> Result<(), CatalogError> {
+        request: AccountSessionCreationRequest,
+    ) -> Result<AccountSessionRecord, CatalogError> {
         Err(CatalogError::Unauthorized {
             kind: "account_session",
-            key: record.id.to_string(),
+            key: request.issuance.session.id.to_string(),
         })
     }
 
@@ -313,6 +320,136 @@ pub trait CatalogBackend: Send + Sync {
             kind: "account_session",
             key: session_id.to_string(),
         })
+    }
+
+    /// Atomically rotate one refresh generation or revoke its family on replay.
+    async fn refresh_account_session(
+        &self,
+        request: AccountSessionRefreshRequest,
+    ) -> Result<AccountSessionRefreshResult, CatalogError> {
+        let _ = request;
+        Err(CatalogError::Validation(
+            "refresh-token sessions are not supported by this backend".to_string(),
+        ))
+    }
+
+    /// Retrieve the active encrypted TOTP metadata for one account.
+    async fn get_active_account_mfa_authenticator(
+        &self,
+        account_id: uuid::Uuid,
+    ) -> Result<AccountMfaAuthenticatorRecord, CatalogError> {
+        Err(CatalogError::NotFound {
+            kind: "account_mfa_authenticator",
+            key: account_id.to_string(),
+        })
+    }
+
+    /// Retrieve one unexpired pending authenticator owned by the account.
+    async fn get_pending_account_mfa_authenticator(
+        &self,
+        account_id: uuid::Uuid,
+        authenticator_id: uuid::Uuid,
+        now: DateTime<Utc>,
+    ) -> Result<AccountMfaAuthenticatorRecord, CatalogError> {
+        let _ = (account_id, now);
+        Err(CatalogError::NotFound {
+            kind: "account_mfa_authenticator",
+            key: authenticator_id.to_string(),
+        })
+    }
+
+    /// Atomically replace any pending enrollment with encrypted TOTP metadata.
+    async fn begin_account_mfa_enrollment(
+        &self,
+        request: AccountMfaEnrollmentRequest,
+    ) -> Result<AccountMfaAuthenticatorRecord, CatalogError> {
+        let account_id = request.authenticator.account_id;
+        let _ = request;
+        Err(CatalogError::Unauthorized {
+            kind: "account_mfa_authenticator",
+            key: account_id.to_string(),
+        })
+    }
+
+    /// Atomically activate a pending authenticator and replace recovery codes.
+    async fn activate_account_mfa(
+        &self,
+        request: AccountMfaActivationRequest,
+    ) -> Result<AccountMfaAuthenticatorRecord, CatalogError> {
+        let account_id = request.account_id;
+        let _ = request;
+        Err(CatalogError::Unauthorized {
+            kind: "account_mfa_authenticator",
+            key: account_id.to_string(),
+        })
+    }
+
+    /// Disable active MFA only when the account has no privileged role.
+    async fn disable_account_mfa(
+        &self,
+        request: AccountMfaDisableRequest,
+    ) -> Result<bool, CatalogError> {
+        let account_id = request.account_id;
+        let _ = request;
+        Err(CatalogError::Unauthorized {
+            kind: "account_mfa_authenticator",
+            key: account_id.to_string(),
+        })
+    }
+
+    /// Atomically create one digest-only expiring MFA login challenge.
+    async fn create_account_mfa_challenge(
+        &self,
+        request: AccountMfaChallengeCreationRequest,
+    ) -> Result<(), CatalogError> {
+        let _ = request;
+        Err(CatalogError::Validation(
+            "MFA login challenges are not supported by this backend".to_string(),
+        ))
+    }
+
+    /// Consume an MFA challenge and proof while issuing a verified session.
+    async fn complete_account_mfa_challenge(
+        &self,
+        request: AccountMfaChallengeCompletionRequest,
+    ) -> Result<AccountMfaChallengeCompletionResult, CatalogError> {
+        let _ = request;
+        Err(CatalogError::Validation(
+            "MFA login challenges are not supported by this backend".to_string(),
+        ))
+    }
+
+    /// Atomically create one digest-only native authorization code.
+    async fn create_native_authorization_code(
+        &self,
+        request: NativeAuthorizationCodeCreationRequest,
+    ) -> Result<(), CatalogError> {
+        let _ = request;
+        Err(CatalogError::Validation(
+            "native authorization codes are not supported by this backend".to_string(),
+        ))
+    }
+
+    /// Consume one exactly bound native authorization code and issue a session.
+    async fn exchange_native_authorization_code(
+        &self,
+        request: NativeAuthorizationCodeExchangeRequest,
+    ) -> Result<NativeAuthorizationCodeExchangeResult, CatalogError> {
+        let _ = request;
+        Err(CatalogError::Validation(
+            "native authorization codes are not supported by this backend".to_string(),
+        ))
+    }
+
+    /// Append one sanitized authentication event outside a success transaction.
+    async fn append_account_auth_audit_event(
+        &self,
+        event: AccountAuthAuditEventRecord,
+    ) -> Result<(), CatalogError> {
+        let _ = event;
+        Err(CatalogError::Validation(
+            "authentication audit events are not supported by this backend".to_string(),
+        ))
     }
 
     /// Create an OIDC-backed account with a unique `(issuer, subject)` identity.

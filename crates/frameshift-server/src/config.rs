@@ -67,10 +67,20 @@
 //! | `LOCAL_AUTH_PREVIOUS_PEPPERS` | `""` | Comma-separated `version:secret` entries for peppers rotated out of `LOCAL_AUTH_PASSWORD_PEPPER`; lets credentials hashed under an older pepper version keep verifying instead of being permanently locked out by rotation |
 //! | `LOCAL_AUTH_ISSUER` | FrameShift first-party URL | Stable issuer written to local account rows |
 //! | `LOCAL_AUTH_COOKIE_NAME` | `__Host-frameshift_session` | Secure browser session cookie name |
+//! | `LOCAL_AUTH_REFRESH_COOKIE_NAME` | `__Host-frameshift_refresh` | Secure browser refresh cookie name |
+//! | `LOCAL_AUTH_ACCESS_TTL_SECS` | `900` | Short-lived access-token lifetime |
+//! | `LOCAL_AUTH_REFRESH_TTL_SECS` | `2592000` | Rotating refresh-token generation lifetime |
 //! | `LOCAL_AUTH_INVITE_TTL_SECS` | `604800` | Lifetime of reviewer-issued invitations |
 //! | `LOCAL_AUTH_BROWSER_IDLE_SECS` | `604800` | Browser session inactivity lifetime |
 //! | `LOCAL_AUTH_BEARER_IDLE_SECS` | `2592000` | Desktop and CLI session inactivity lifetime |
 //! | `LOCAL_AUTH_ABSOLUTE_SECS` | `7776000` | Non-extendable lifetime for every local session |
+//! | `LOCAL_AUTH_MFA_ENCRYPTION_KEY` | `""` | Canonical base64url-no-padding 256-bit TOTP encryption key |
+//! | `LOCAL_AUTH_MFA_KEY_VERSION` | `1` | Positive TOTP encryption-key version |
+//! | `LOCAL_AUTH_MFA_ENROLLMENT_TTL_SECS` | `600` | Pending TOTP enrollment lifetime |
+//! | `LOCAL_AUTH_MFA_CHALLENGE_TTL_SECS` | `300` | Password-bound MFA challenge lifetime |
+//! | `LOCAL_AUTH_MFA_FRESHNESS_SECS` | `300` | Maximum MFA assurance age on privileged routes |
+//! | `LOCAL_AUTH_NATIVE_CODE_TTL_SECS` | `300` | One-time native authorization-code lifetime |
+//! | `LOCAL_AUTH_NATIVE_AUTHORIZATION_URL` | `""` | Credential-free HTTPS portal URL ending in `/account/` |
 //! | `LOCAL_AUTH_RECOVERY_ENABLED` | `false` | Enable fail-closed first-party password recovery when every remaining recovery setting is valid |
 //! | `LOCAL_AUTH_RECOVERY_API_KEY` | `""` | Dedicated Resend sending key supplied by the credential broker |
 //! | `LOCAL_AUTH_RECOVERY_FROM` | `""` | Verified FrameShift sender identity used for recovery mail |
@@ -353,6 +363,12 @@ pub struct FirstPartyAuthConfig {
     pub issuer: String,
     /// Secure browser session cookie name.
     pub cookie_name: String,
+    /// Secure browser refresh cookie name.
+    pub refresh_cookie_name: String,
+    /// Short lifetime of each access token.
+    pub access_ttl: Duration,
+    /// Lifetime of each rotating refresh-token generation.
+    pub refresh_ttl: Duration,
     /// Lifetime of reviewer-issued invitation tokens.
     pub invite_ttl: Duration,
     /// Sliding inactivity lifetime for browser sessions.
@@ -361,6 +377,20 @@ pub struct FirstPartyAuthConfig {
     pub bearer_idle_ttl: Duration,
     /// Non-extendable maximum session lifetime.
     pub absolute_ttl: Duration,
+    /// Base64url-no-padding encoded 256-bit TOTP encryption key.
+    pub mfa_encryption_key: SecretString,
+    /// Positive encryption-key version persisted beside TOTP ciphertext.
+    pub mfa_key_version: i16,
+    /// Exclusive lifetime of a pending TOTP enrollment.
+    pub mfa_enrollment_ttl: Duration,
+    /// Exclusive lifetime of a password-bound MFA challenge.
+    pub mfa_challenge_ttl: Duration,
+    /// Maximum age of MFA assurance on privileged account surfaces.
+    pub mfa_freshness_ttl: Duration,
+    /// Exclusive lifetime of a native authorization code.
+    pub native_code_ttl: Duration,
+    /// Credential-free HTTPS account portal used by native clients.
+    pub native_authorization_url: String,
     /// Optional password-recovery and mail-delivery settings.
     pub recovery: PasswordRecoveryConfig,
 }
@@ -375,28 +405,100 @@ impl FirstPartyAuthConfig {
             previous_peppers: HashMap::new(),
             issuer: "https://frameshift.syntheos.dev/first-party".to_string(),
             cookie_name: "__Host-frameshift_session".to_string(),
+            refresh_cookie_name: "__Host-frameshift_refresh".to_string(),
+            access_ttl: Duration::from_secs(15 * 60),
+            refresh_ttl: Duration::from_secs(30 * 24 * 60 * 60),
             invite_ttl: Duration::from_secs(7 * 24 * 60 * 60),
             browser_idle_ttl: Duration::from_secs(7 * 24 * 60 * 60),
             bearer_idle_ttl: Duration::from_secs(30 * 24 * 60 * 60),
             absolute_ttl: Duration::from_secs(90 * 24 * 60 * 60),
+            mfa_encryption_key: SecretString::new(String::new()),
+            mfa_key_version: 1,
+            mfa_enrollment_ttl: Duration::from_secs(10 * 60),
+            mfa_challenge_ttl: Duration::from_secs(5 * 60),
+            mfa_freshness_ttl: Duration::from_secs(5 * 60),
+            native_code_ttl: Duration::from_secs(5 * 60),
+            native_authorization_url: String::new(),
             recovery: PasswordRecoveryConfig::disabled(),
         }
     }
 
-    /// Return whether the password pepper and all bounded settings are valid.
-    pub fn enabled(&self) -> bool {
+    /// Decode and strictly validate the enabled first-party authentication settings.
+    pub fn decoded_mfa_encryption_key(&self) -> Result<Option<[u8; 32]>, String> {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine as _;
         use secrecy::ExposeSecret as _;
 
-        !self.password_pepper.expose_secret().is_empty()
-            && self.pepper_version > 0
-            && !self.issuer.trim().is_empty()
-            && self.cookie_name.starts_with("__Host-")
-            && !self.cookie_name.contains([';', ' ', '\t', '\r', '\n'])
-            && !self.invite_ttl.is_zero()
-            && !self.browser_idle_ttl.is_zero()
-            && !self.bearer_idle_ttl.is_zero()
-            && self.absolute_ttl >= self.browser_idle_ttl
-            && self.absolute_ttl >= self.bearer_idle_ttl
+        if self.password_pepper.expose_secret().is_empty() {
+            return Ok(None);
+        }
+        let valid_cookie_name = |name: &str| {
+            name.starts_with("__Host-")
+                && !name.contains([';', ' ', '\t', '\r', '\n'])
+                && name.len() <= 128
+        };
+        if self.pepper_version <= 0
+            || self.issuer.trim().is_empty()
+            || !valid_cookie_name(&self.cookie_name)
+            || !valid_cookie_name(&self.refresh_cookie_name)
+            || self.cookie_name == self.refresh_cookie_name
+            || self.access_ttl.is_zero()
+            || self.refresh_ttl.is_zero()
+            || self.invite_ttl.is_zero()
+            || self.browser_idle_ttl.is_zero()
+            || self.bearer_idle_ttl.is_zero()
+            || self.absolute_ttl < self.browser_idle_ttl
+            || self.absolute_ttl < self.bearer_idle_ttl
+            || self.absolute_ttl < self.access_ttl
+            || self.absolute_ttl < self.refresh_ttl
+            || self.mfa_enrollment_ttl.is_zero()
+            || self.mfa_challenge_ttl.is_zero()
+            || self.mfa_freshness_ttl.is_zero()
+            || self.native_code_ttl.is_zero()
+            || self.mfa_key_version <= 0
+        {
+            return Err(
+                "first-party authentication durations, versions, or cookie names are invalid"
+                    .into(),
+            );
+        }
+        let portal = url::Url::parse(&self.native_authorization_url)
+            .map_err(|error| format!("LOCAL_AUTH_NATIVE_AUTHORIZATION_URL is invalid: {error}"))?;
+        if portal.scheme() != "https"
+            || portal.host_str().is_none()
+            || !portal.username().is_empty()
+            || portal.password().is_some()
+            || portal.path() != "/account/"
+            || portal.query().is_some()
+            || portal.fragment().is_some()
+        {
+            return Err("LOCAL_AUTH_NATIVE_AUTHORIZATION_URL must be a credential-free HTTPS URL whose path is exactly /account/".into());
+        }
+        let encoded_key = self.mfa_encryption_key.expose_secret();
+        let decoded = Zeroizing::new(URL_SAFE_NO_PAD.decode(encoded_key).map_err(|error| {
+            format!("LOCAL_AUTH_MFA_ENCRYPTION_KEY base64url decode failed: {error}")
+        })?);
+        if decoded.len() != 32 || URL_SAFE_NO_PAD.encode(decoded.as_slice()) != encoded_key.as_str()
+        {
+            return Err(
+                "LOCAL_AUTH_MFA_ENCRYPTION_KEY must be canonical base64url for exactly 32 bytes"
+                    .into(),
+            );
+        }
+        let mut key = [0_u8; 32];
+        key.copy_from_slice(decoded.as_slice());
+        Ok(Some(key))
+    }
+
+    /// Return the trusted native account portal when first-party auth is valid.
+    pub fn native_authorization_url(&self) -> Option<String> {
+        self.enabled()
+            .then(|| self.native_authorization_url.clone())
+    }
+
+    /// Return whether the password pepper and all bounded settings are valid.
+    pub fn enabled(&self) -> bool {
+        matches!(self.decoded_mfa_encryption_key(), Ok(Some(_)))
     }
 }
 
@@ -413,10 +515,20 @@ impl std::fmt::Debug for FirstPartyAuthConfig {
             )
             .field("issuer", &self.issuer)
             .field("cookie_name", &self.cookie_name)
+            .field("refresh_cookie_name", &self.refresh_cookie_name)
+            .field("access_ttl", &self.access_ttl)
+            .field("refresh_ttl", &self.refresh_ttl)
             .field("invite_ttl", &self.invite_ttl)
             .field("browser_idle_ttl", &self.browser_idle_ttl)
             .field("bearer_idle_ttl", &self.bearer_idle_ttl)
             .field("absolute_ttl", &self.absolute_ttl)
+            .field("mfa_encryption_key", &"[REDACTED]")
+            .field("mfa_key_version", &self.mfa_key_version)
+            .field("mfa_enrollment_ttl", &self.mfa_enrollment_ttl)
+            .field("mfa_challenge_ttl", &self.mfa_challenge_ttl)
+            .field("mfa_freshness_ttl", &self.mfa_freshness_ttl)
+            .field("native_code_ttl", &self.native_code_ttl)
+            .field("native_authorization_url", &self.native_authorization_url)
             .field("recovery", &self.recovery)
             .finish()
     }
@@ -1008,6 +1120,12 @@ struct RawConfig {
     local_auth_issuer: String,
     /// Secure browser session cookie name.
     local_auth_cookie_name: String,
+    /// Secure browser refresh cookie name.
+    local_auth_refresh_cookie_name: String,
+    /// Access-token lifetime in seconds.
+    local_auth_access_ttl_secs: u64,
+    /// Refresh-token generation lifetime in seconds.
+    local_auth_refresh_ttl_secs: u64,
     /// Reviewer-issued invitation lifetime in seconds.
     local_auth_invite_ttl_secs: u64,
     /// Browser session inactivity lifetime in seconds.
@@ -1016,6 +1134,20 @@ struct RawConfig {
     local_auth_bearer_idle_secs: u64,
     /// Non-extendable session lifetime in seconds.
     local_auth_absolute_secs: u64,
+    /// Canonical base64url-no-padding TOTP encryption key.
+    local_auth_mfa_encryption_key: String,
+    /// Positive TOTP encryption-key version.
+    local_auth_mfa_key_version: i16,
+    /// Pending TOTP enrollment lifetime in seconds.
+    local_auth_mfa_enrollment_ttl_secs: u64,
+    /// Password-bound MFA challenge lifetime in seconds.
+    local_auth_mfa_challenge_ttl_secs: u64,
+    /// MFA assurance freshness lifetime in seconds.
+    local_auth_mfa_freshness_secs: u64,
+    /// Native authorization-code lifetime in seconds.
+    local_auth_native_code_ttl_secs: u64,
+    /// Credential-free HTTPS native account portal.
+    local_auth_native_authorization_url: String,
     /// Whether the complete password-recovery subsystem is enabled.
     local_auth_recovery_enabled: bool,
     /// Dedicated Resend API credential for recovery mail.
@@ -1172,10 +1304,20 @@ impl RawConfig {
                 previous_peppers: parse_previous_peppers(&self.local_auth_previous_peppers),
                 issuer: self.local_auth_issuer,
                 cookie_name: self.local_auth_cookie_name,
+                refresh_cookie_name: self.local_auth_refresh_cookie_name,
+                access_ttl: Duration::from_secs(self.local_auth_access_ttl_secs),
+                refresh_ttl: Duration::from_secs(self.local_auth_refresh_ttl_secs),
                 invite_ttl: Duration::from_secs(self.local_auth_invite_ttl_secs),
                 browser_idle_ttl: Duration::from_secs(self.local_auth_browser_idle_secs),
                 bearer_idle_ttl: Duration::from_secs(self.local_auth_bearer_idle_secs),
                 absolute_ttl: Duration::from_secs(self.local_auth_absolute_secs),
+                mfa_encryption_key: SecretString::new(self.local_auth_mfa_encryption_key),
+                mfa_key_version: self.local_auth_mfa_key_version,
+                mfa_enrollment_ttl: Duration::from_secs(self.local_auth_mfa_enrollment_ttl_secs),
+                mfa_challenge_ttl: Duration::from_secs(self.local_auth_mfa_challenge_ttl_secs),
+                mfa_freshness_ttl: Duration::from_secs(self.local_auth_mfa_freshness_secs),
+                native_code_ttl: Duration::from_secs(self.local_auth_native_code_ttl_secs),
+                native_authorization_url: self.local_auth_native_authorization_url,
                 recovery: PasswordRecoveryConfig {
                     enabled: self.local_auth_recovery_enabled,
                     provider_api_key: SecretString::new(self.local_auth_recovery_api_key),
@@ -1262,10 +1404,20 @@ fn default_raw_config() -> RawConfig {
         local_auth_previous_peppers: String::new(),
         local_auth_issuer: "https://frameshift.syntheos.dev/first-party".to_string(),
         local_auth_cookie_name: "__Host-frameshift_session".to_string(),
+        local_auth_refresh_cookie_name: "__Host-frameshift_refresh".to_string(),
+        local_auth_access_ttl_secs: 15 * 60,
+        local_auth_refresh_ttl_secs: 30 * 24 * 60 * 60,
         local_auth_invite_ttl_secs: 7 * 24 * 60 * 60,
         local_auth_browser_idle_secs: 7 * 24 * 60 * 60,
         local_auth_bearer_idle_secs: 30 * 24 * 60 * 60,
         local_auth_absolute_secs: 90 * 24 * 60 * 60,
+        local_auth_mfa_encryption_key: String::new(),
+        local_auth_mfa_key_version: 1,
+        local_auth_mfa_enrollment_ttl_secs: 10 * 60,
+        local_auth_mfa_challenge_ttl_secs: 5 * 60,
+        local_auth_mfa_freshness_secs: 5 * 60,
+        local_auth_native_code_ttl_secs: 5 * 60,
+        local_auth_native_authorization_url: String::new(),
         local_auth_recovery_enabled: false,
         local_auth_recovery_api_key: String::new(),
         local_auth_recovery_from: String::new(),
@@ -1583,6 +1735,8 @@ mod tests {
         let mut raw = default_raw_config();
         raw.cors_allowed_origins = "https://frameshift.test".to_string();
         raw.local_auth_password_pepper = "test-password-pepper".to_string();
+        raw.local_auth_mfa_encryption_key = URL_SAFE_NO_PAD.encode([11_u8; 32]);
+        raw.local_auth_native_authorization_url = "https://frameshift.test/account/".to_string();
         raw.local_auth_recovery_enabled = true;
         raw.local_auth_recovery_api_key = "re_test_provider_key".to_string();
         raw.local_auth_recovery_from = "FrameShift <recovery@frameshift.test>".to_string();
