@@ -477,7 +477,7 @@ mod tests {
 
     use chrono::{TimeZone as _, Utc};
     use frameshift_catalog::{PublicationAppealCursor, PublicationLifecycleCursor};
-    use frameshift_studio::Studio;
+    use frameshift_studio::{Studio, MIN_PUBLICATION_CONFORMANCE_THRESHOLD};
 
     use super::*;
 
@@ -487,7 +487,7 @@ mod tests {
     }
 
     /// Build a valid exact pre-review snapshot using the fixture key.
-    fn ready_snapshot(root: &std::path::Path) -> DraftSnapshot {
+    async fn ready_snapshot(root: &std::path::Path) -> DraftSnapshot {
         let source = root.join("source");
         fs::create_dir_all(&source).unwrap();
         fs::write(
@@ -503,6 +503,15 @@ mod tests {
         let studio = Studio::open(root.join("studio")).unwrap();
         let status = studio.import("fixture", "Fixture", &source).unwrap();
         let inventory_hash = status.publication.inventory_hash;
+        let report = studio
+            .validate_draft(
+                "fixture",
+                MIN_PUBLICATION_CONFORMANCE_THRESHOLD,
+                &frameshift_conformance::MockRunner::new("unused"),
+            )
+            .await
+            .unwrap();
+        assert!(report.valid);
         studio
             .snapshot_for_review("fixture", &inventory_hash)
             .unwrap()
@@ -578,10 +587,10 @@ mod tests {
     }
 
     /// Repeated preparation produces byte-identical archives and valid pack signatures.
-    #[test]
-    fn preparation_is_reproducible_and_signed() {
+    #[tokio::test]
+    async fn preparation_is_reproducible_and_signed() {
         let temporary = tempfile::tempdir().unwrap();
-        let snapshot = ready_snapshot(temporary.path());
+        let snapshot = ready_snapshot(temporary.path()).await;
         let first = prepare_publication(&snapshot, &signing_key()).unwrap();
         let second = prepare_publication(&snapshot, &signing_key()).unwrap();
         assert_eq!(first.binding, second.binding);
@@ -598,10 +607,10 @@ mod tests {
     }
 
     /// Preparation refuses a signer that differs from the manifest identity.
-    #[test]
-    fn preparation_rejects_manifest_signer_mismatch() {
+    #[tokio::test]
+    async fn preparation_rejects_manifest_signer_mismatch() {
         let temporary = tempfile::tempdir().unwrap();
-        let snapshot = ready_snapshot(temporary.path());
+        let snapshot = ready_snapshot(temporary.path()).await;
         let different_key = SigningKey::from_bytes(&[18_u8; 32]);
         let error = match prepare_publication(&snapshot, &different_key) {
             Ok(_) => panic!("mismatched signer must fail"),
@@ -611,10 +620,10 @@ mod tests {
     }
 
     /// Intent JSON carries every reviewed identity, exact hash, and idempotency identifier.
-    #[test]
-    fn intent_request_serializes_exact_binding() {
+    #[tokio::test]
+    async fn intent_request_serializes_exact_binding() {
         let temporary = tempfile::tempdir().unwrap();
-        let snapshot = ready_snapshot(temporary.path());
+        let snapshot = ready_snapshot(temporary.path()).await;
         let prepared = prepare_publication(&snapshot, &signing_key()).unwrap();
         let request = CreatePublicationIntentRequest {
             id: Uuid::from_u128(1),
@@ -648,10 +657,10 @@ mod tests {
     }
 
     /// Final review, intent confirmation, and submission snapshot share one exact binding.
-    #[test]
-    fn artifact_first_review_flow_preserves_one_binding() {
+    #[tokio::test]
+    async fn artifact_first_review_flow_preserves_one_binding() {
         let temporary = tempfile::tempdir().unwrap();
-        let snapshot = ready_snapshot(temporary.path());
+        let snapshot = ready_snapshot(temporary.path()).await;
         let prepared = prepare_publication(&snapshot, &signing_key()).unwrap();
         let studio = Studio::open(temporary.path().join("studio")).unwrap();
         let binding = PublicationReviewBinding {
@@ -674,10 +683,10 @@ mod tests {
     }
 
     /// Intent creation rejects a prepared archive substituted after final review.
-    #[test]
-    fn intent_creation_rejects_reviewed_artifact_substitution() {
+    #[tokio::test]
+    async fn intent_creation_rejects_reviewed_artifact_substitution() {
         let temporary = tempfile::tempdir().unwrap();
-        let snapshot = ready_snapshot(temporary.path());
+        let snapshot = ready_snapshot(temporary.path()).await;
         let prepared = prepare_publication(&snapshot, &signing_key()).unwrap();
         let mut binding = PublicationReviewBinding {
             artifact: prepared.binding(),
