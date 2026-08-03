@@ -340,14 +340,77 @@ pub enum AccountSessionClientKind {
     Cli,
 }
 
-/// Revocable first-party session storing only an opaque token digest.
+/// Stable kind for one sanitized first-party authentication audit event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountAuthAuditEventKind {
+    /// A password, registration, MFA, or authorization-code flow issued a session.
+    SessionCreated,
+    /// A valid refresh credential rotated an existing session family.
+    SessionRefreshed,
+    /// A consumed refresh credential was replayed and revoked its family.
+    SessionReplayRevoked,
+    /// An encrypted TOTP authenticator entered pending enrollment.
+    MfaEnrollmentStarted,
+    /// A verified pending authenticator replaced the prior active authenticator.
+    MfaEnrollmentActivated,
+    /// An unprivileged account disabled its active authenticator.
+    MfaDisabled,
+    /// Password verification created an expiring second-factor challenge.
+    MfaChallengeCreated,
+    /// A TOTP timestep or recovery code completed a second-factor challenge.
+    MfaChallengeCompleted,
+    /// An authenticated browser issued a one-time native authorization code.
+    NativeAuthorizationCodeCreated,
+    /// A native client exchanged a bound authorization code using S256 PKCE.
+    NativeAuthorizationCodeConsumed,
+    /// An authentication attempt was rejected without exposing sensitive input.
+    AuthenticationRejected,
+}
+
+/// Stable outcome for a sanitized authentication audit event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountAuthAuditOutcome {
+    /// The audited state transition committed successfully.
+    Success,
+    /// The audited authentication attempt was rejected.
+    Rejected,
+}
+
+/// Append-only authentication audit event containing only sanitized fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountAuthAuditEventRecord {
+    /// Stable event identifier used to make atomic writes externally traceable.
+    pub id: Uuid,
+    /// Stable event class that never contains caller-controlled text.
+    pub event_kind: AccountAuthAuditEventKind,
+    /// Stable success or rejection outcome.
+    pub outcome: AccountAuthAuditOutcome,
+    /// Affected account when it is safe and known.
+    pub account_id: Option<Uuid>,
+    /// Affected session family when one exists.
+    pub session_id: Option<Uuid>,
+    /// Client class involved in the authentication flow.
+    pub client_kind: Option<AccountSessionClientKind>,
+    /// Optional deployment-keyed digest of a canonical identifier.
+    pub identifier_tag: Option<Vec<u8>>,
+    /// Optional deployment-keyed digest of a canonical network prefix.
+    pub network_tag: Option<Vec<u8>>,
+    /// Optional bounded static reason code containing no user input.
+    pub reason_code: Option<String>,
+    /// UTC timestamp at which the event occurred.
+    pub created_at: DateTime<Utc>,
+}
+
+/// Revocable first-party session storing only a short-lived access-token digest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountSessionRecord {
     /// Stable internal session identifier.
     pub id: Uuid,
     /// Account authenticated by the session.
     pub account_id: Uuid,
-    /// SHA-256 digest of the random token returned once to the client.
+    /// SHA-256 digest of the current random access token returned once to the client.
     pub token_digest: Vec<u8>,
     /// Client class controlling token presentation.
     pub client_kind: AccountSessionClientKind,
@@ -355,12 +418,291 @@ pub struct AccountSessionRecord {
     pub created_at: DateTime<Utc>,
     /// UTC timestamp of the most recent authenticated use.
     pub last_seen_at: DateTime<Utc>,
+    /// Exclusive expiry of the current short-lived access token.
+    pub access_expires_at: DateTime<Utc>,
     /// Sliding inactivity expiry.
     pub idle_expires_at: DateTime<Utc>,
     /// Non-extendable absolute expiry.
     pub absolute_expires_at: DateTime<Utc>,
+    /// Most recent second-factor verification inherited by this session.
+    pub mfa_verified_at: Option<DateTime<Utc>>,
     /// Explicit revocation timestamp.
     pub revoked_at: Option<DateTime<Utc>>,
+}
+
+/// Digest-only initial credentials for creating one session family atomically.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountSessionIssuance {
+    /// Persisted session family carrying the current access-token digest.
+    pub session: AccountSessionRecord,
+    /// Stable identifier for refresh generation zero.
+    pub refresh_token_id: Uuid,
+    /// SHA-256 digest of the initial random refresh token.
+    pub refresh_token_digest: Vec<u8>,
+    /// Exclusive expiry of the initial refresh token.
+    pub refresh_expires_at: DateTime<Utc>,
+}
+
+/// Atomic session-family creation request with its sanitized success audit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountSessionCreationRequest {
+    /// Access and initial refresh credentials to persist together.
+    pub issuance: AccountSessionIssuance,
+    /// Session-created success event committed in the same transaction.
+    pub audit_event: AccountAuthAuditEventRecord,
+}
+
+/// Atomic request to rotate one presented refresh token and its access token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountSessionRefreshRequest {
+    /// SHA-256 digest of the refresh token presented by the client.
+    pub presented_refresh_token_digest: Vec<u8>,
+    /// SHA-256 digest of the replacement access token.
+    pub replacement_access_token_digest: Vec<u8>,
+    /// Exclusive expiry of the replacement access token.
+    pub replacement_access_expires_at: DateTime<Utc>,
+    /// Replacement sliding inactivity expiry for the refreshed family.
+    pub replacement_idle_expires_at: DateTime<Utc>,
+    /// Stable identifier for the replacement refresh generation.
+    pub replacement_refresh_token_id: Uuid,
+    /// SHA-256 digest of the replacement refresh token.
+    pub replacement_refresh_token_digest: Vec<u8>,
+    /// Exclusive expiry of the replacement refresh token.
+    pub replacement_refresh_expires_at: DateTime<Utc>,
+    /// UTC timestamp committed for consumption, rotation, or replay revocation.
+    pub rotated_at: DateTime<Utc>,
+    /// Success event committed only when rotation succeeds.
+    pub success_audit_event: AccountAuthAuditEventRecord,
+    /// Replay event committed only when a consumed generation is presented.
+    pub replay_audit_event: AccountAuthAuditEventRecord,
+}
+
+/// Security-preserving result of one refresh-token transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccountSessionRefreshResult {
+    /// The access token and refresh generation rotated successfully.
+    Rotated(AccountSessionRecord),
+    /// A consumed generation was replayed and the complete family was revoked.
+    ReplayRevoked,
+    /// The digest was unknown, expired, or belonged to an unusable family.
+    Rejected,
+}
+
+/// Lifecycle state for encrypted TOTP authenticator metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountMfaAuthenticatorState {
+    /// The authenticator awaits a proof-of-possession confirmation.
+    Pending,
+    /// The authenticator may satisfy second-factor challenges.
+    Active,
+    /// The authenticator is retained only as security history.
+    Disabled,
+}
+
+/// Caller-encrypted TOTP secret metadata containing no plaintext secret.
+#[derive(Clone, PartialEq, Eq)]
+pub struct EncryptedTotpSecret {
+    /// Opaque authenticated ciphertext containing the TOTP seed.
+    pub ciphertext: Vec<u8>,
+    /// Random 192-bit XChaCha20-Poly1305 nonce.
+    pub nonce: [u8; 24],
+    /// Deployment-managed encryption-key version required for decryption.
+    pub key_version: i16,
+}
+
+/// Durable encrypted TOTP authenticator state for one account.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AccountMfaAuthenticatorRecord {
+    /// Stable authenticator identifier.
+    pub id: Uuid,
+    /// Account that owns the authenticator.
+    pub account_id: Uuid,
+    /// Pending, active, or disabled lifecycle state.
+    pub state: AccountMfaAuthenticatorState,
+    /// Encrypted TOTP seed and deployment key metadata.
+    pub secret: EncryptedTotpSecret,
+    /// Exclusive deadline for confirming a pending enrollment.
+    pub pending_expires_at: Option<DateTime<Utc>>,
+    /// Greatest successfully consumed TOTP timestep.
+    pub last_used_timestep: Option<i64>,
+    /// UTC timestamp when the encrypted metadata was created.
+    pub created_at: DateTime<Utc>,
+    /// UTC timestamp when enrollment was confirmed.
+    pub activated_at: Option<DateTime<Utc>>,
+    /// UTC timestamp when the authenticator stopped being active.
+    pub disabled_at: Option<DateTime<Utc>>,
+}
+
+/// Digest-only seed for one high-entropy MFA recovery code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountMfaRecoveryCodeSeed {
+    /// Stable recovery-code row identifier.
+    pub id: Uuid,
+    /// SHA-256 digest of the random recovery code shown once to the account.
+    pub code_digest: Vec<u8>,
+}
+
+/// Atomic request to begin or replace a pending TOTP enrollment.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AccountMfaEnrollmentRequest {
+    /// Pending encrypted authenticator record to persist.
+    pub authenticator: AccountMfaAuthenticatorRecord,
+    /// Enrollment-started success event committed with the pending state.
+    pub audit_event: AccountAuthAuditEventRecord,
+}
+
+/// Atomic request to activate a verified pending TOTP authenticator.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AccountMfaActivationRequest {
+    /// Account whose pending authenticator is being activated.
+    pub account_id: Uuid,
+    /// Exact pending authenticator that passed proof of possession.
+    pub authenticator_id: Uuid,
+    /// TOTP timestep consumed by enrollment confirmation.
+    pub verified_timestep: i64,
+    /// Digest-only high-entropy recovery codes created with activation.
+    pub recovery_codes: Vec<AccountMfaRecoveryCodeSeed>,
+    /// UTC timestamp committed as the activation and old-authenticator disable time.
+    pub activated_at: DateTime<Utc>,
+    /// Enrollment-activated success event committed with the swap.
+    pub audit_event: AccountAuthAuditEventRecord,
+}
+
+/// Atomic request to disable active MFA for an unprivileged account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountMfaDisableRequest {
+    /// Account whose active authenticator is being disabled.
+    pub account_id: Uuid,
+    /// UTC timestamp committed as the disable time.
+    pub disabled_at: DateTime<Utc>,
+    /// MFA-disabled success event committed with the state change.
+    pub audit_event: AccountAuthAuditEventRecord,
+}
+
+/// Digest-only expiring challenge issued after password verification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountMfaLoginChallengeRecord {
+    /// Stable challenge identifier.
+    pub id: Uuid,
+    /// Account that passed the first authentication factor.
+    pub account_id: Uuid,
+    /// SHA-256 digest of the random challenge token.
+    pub token_digest: Vec<u8>,
+    /// Client class to which challenge completion is bound.
+    pub client_kind: AccountSessionClientKind,
+    /// UTC challenge creation timestamp.
+    pub created_at: DateTime<Utc>,
+    /// Exclusive challenge-completion deadline.
+    pub expires_at: DateTime<Utc>,
+    /// Successful one-time completion timestamp.
+    pub consumed_at: Option<DateTime<Utc>>,
+}
+
+/// Atomic request to create a password-bound MFA login challenge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountMfaChallengeCreationRequest {
+    /// Digest-only challenge record to persist.
+    pub challenge: AccountMfaLoginChallengeRecord,
+    /// Challenge-created success event committed in the same transaction.
+    pub audit_event: AccountAuthAuditEventRecord,
+}
+
+/// Database-fenced proof already verified against an encrypted authenticator.
+#[derive(Clone, PartialEq, Eq)]
+pub enum AccountMfaChallengeProof {
+    /// TOTP timestep whose code was verified by the caller.
+    TotpTimestep(i64),
+    /// SHA-256 digest of a presented high-entropy recovery code.
+    RecoveryCodeDigest(Vec<u8>),
+}
+
+/// Atomic request to consume an MFA challenge and issue a verified session.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AccountMfaChallengeCompletionRequest {
+    /// SHA-256 digest of the random challenge token.
+    pub challenge_token_digest: Vec<u8>,
+    /// Exact active authenticator whose secret or recovery code verified the proof.
+    pub authenticator_id: Uuid,
+    /// TOTP timestep or recovery-code digest to consume once.
+    pub proof: AccountMfaChallengeProof,
+    /// Access and initial refresh credentials to persist on success.
+    pub issuance: AccountSessionIssuance,
+    /// UTC timestamp used for expiry, consumption, and MFA assurance.
+    pub completed_at: DateTime<Utc>,
+    /// Challenge-completed success event committed with the session.
+    pub audit_event: AccountAuthAuditEventRecord,
+}
+
+/// Result of atomically completing one MFA login challenge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccountMfaChallengeCompletionResult {
+    /// The proof and challenge were consumed and a session family was issued.
+    Completed(AccountSessionRecord),
+    /// The challenge or proof was unusable without exposing which condition failed.
+    Rejected,
+}
+
+/// Digest-only native authorization code bound to an exact S256 request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeAuthorizationCodeRecord {
+    /// Stable authorization-code identifier.
+    pub id: Uuid,
+    /// Browser-authenticated account authorizing the native client.
+    pub account_id: Uuid,
+    /// SHA-256 digest of the random one-time authorization code.
+    pub token_digest: Vec<u8>,
+    /// Desktop or CLI client receiving the code.
+    pub client_kind: AccountSessionClientKind,
+    /// Exact IP-literal loopback redirect URI string.
+    pub redirect_uri: String,
+    /// Decoded 32-byte S256 PKCE challenge.
+    pub pkce_challenge: Vec<u8>,
+    /// MFA assurance inherited from the authorizing browser session.
+    pub mfa_verified_at: Option<DateTime<Utc>>,
+    /// UTC code creation timestamp.
+    pub created_at: DateTime<Utc>,
+    /// Exclusive code-exchange deadline.
+    pub expires_at: DateTime<Utc>,
+    /// Successful one-time exchange timestamp.
+    pub consumed_at: Option<DateTime<Utc>>,
+}
+
+/// Atomic request to issue one native authorization code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeAuthorizationCodeCreationRequest {
+    /// Exact digest-only authorization record to persist.
+    pub code: NativeAuthorizationCodeRecord,
+    /// Code-created success event committed in the same transaction.
+    pub audit_event: AccountAuthAuditEventRecord,
+}
+
+/// Atomic S256 exchange request for one native authorization code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeAuthorizationCodeExchangeRequest {
+    /// SHA-256 digest of the random authorization code.
+    pub code_token_digest: Vec<u8>,
+    /// Desktop or CLI client class expected by the code.
+    pub client_kind: AccountSessionClientKind,
+    /// Exact redirect URI string expected by the code.
+    pub redirect_uri: String,
+    /// SHA-256 digest of the presented PKCE verifier.
+    pub pkce_challenge: Vec<u8>,
+    /// Access and initial refresh credentials to persist on success.
+    pub issuance: AccountSessionIssuance,
+    /// UTC timestamp used for expiry and one-time consumption.
+    pub exchanged_at: DateTime<Utc>,
+    /// Code-consumed success event committed with the session.
+    pub audit_event: AccountAuthAuditEventRecord,
+}
+
+/// Result of atomically exchanging one native authorization code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeAuthorizationCodeExchangeResult {
+    /// The exact code, client, redirect, and S256 challenge issued a session.
+    Exchanged(AccountSessionRecord),
+    /// The exchange failed without revealing which binding was unusable.
+    Rejected,
 }
 
 /// Atomic first-party registration input consumed with one invitation.
@@ -372,8 +714,10 @@ pub struct LocalAccountRegistrationRequest {
     pub account: AccountRecord,
     /// Argon2id password credential to create.
     pub credential: AccountPasswordCredentialRecord,
-    /// Initial authenticated session to create.
-    pub session: AccountSessionRecord,
+    /// Initial authenticated access and refresh credentials to create.
+    pub session: AccountSessionIssuance,
+    /// Session-created success event committed with registration.
+    pub audit_event: AccountAuthAuditEventRecord,
 }
 
 /// Result of an atomic first-party invitation redemption.

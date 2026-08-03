@@ -37,11 +37,14 @@ fn test_config(pepper: &str, pepper_version: i16, previous: Vec<(i16, &str)>) ->
     let mut config = ServerConfig::from_env().unwrap();
     config.bind_addr = "127.0.0.1:0".parse().unwrap();
     config.log_level = "off".to_string();
+    config.cors_allowed_origins = "https://frameshift.test".to_string();
     config.abuse_rate_per_min = 0;
     config.download_rate_per_min = 0;
     config.first_party_auth = FirstPartyAuthConfig {
         password_pepper: SecretString::new(pepper.to_string()),
         pepper_version,
+        mfa_encryption_key: SecretString::new(URL_SAFE_NO_PAD.encode([23_u8; 32])),
+        native_authorization_url: "https://frameshift.test/account/".to_string(),
         previous_peppers: previous
             .into_iter()
             .map(|(version, secret)| (version, SecretString::new(secret.to_string())))
@@ -99,6 +102,7 @@ async fn send(
     body: Option<Value>,
 ) -> axum::http::Response<Body> {
     let mut builder = Request::builder().method(method).uri(path);
+    builder = builder.header("origin", "https://frameshift.test");
     let bytes = body.map_or_else(Vec::new, |value| serde_json::to_vec(&value).unwrap());
     if !bytes.is_empty() {
         builder = builder.header("content-type", "application/json");
@@ -130,7 +134,7 @@ async fn login_verifies_credential_hashed_under_a_rotated_out_pepper() {
             "invite_token": invite_token,
             "email": "rotated@example.test",
             "password": "correct horse battery staple",
-            "client_kind": "desktop"
+            "client_kind": "browser"
         })),
     )
     .await;
@@ -156,7 +160,7 @@ async fn login_verifies_credential_hashed_under_a_rotated_out_pepper() {
         Some(json!({
             "email": "rotated@example.test",
             "password": "correct horse battery staple",
-            "client_kind": "desktop"
+            "client_kind": "browser"
         })),
     )
     .await;
@@ -179,7 +183,7 @@ async fn login_verifies_credential_hashed_under_a_rotated_out_pepper() {
         Some(json!({
             "email": "rotated@example.test",
             "password": "correct horse battery staple",
-            "client_kind": "desktop"
+            "client_kind": "browser"
         })),
     )
     .await;
@@ -221,7 +225,7 @@ async fn login_verifies_credential_hashed_under_a_rotated_out_pepper() {
         Some(json!({
             "email": "rotated@example.test",
             "password": "correct horse battery staple",
-            "client_kind": "desktop"
+            "client_kind": "browser"
         })),
     )
     .await;

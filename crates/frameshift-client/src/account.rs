@@ -3,14 +3,22 @@
 //! Access tokens enter only through [`SecretString`] and are attached solely
 //! to the registry request's `Authorization` header.
 
+use std::fmt;
+use std::net::IpAddr;
+
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use frameshift_catalog::{
     AccountInviteRecord, AccountInviteRequestRecord, AccountInviteStatus, AccountRecord,
     AccountStatus, PlatformRole, PlatformRoleRecord, PublisherMembershipRecord,
     PublisherProfileRecord,
 };
+use rand_core::{OsRng, RngCore as _};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
+use url::Url;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -39,6 +47,9 @@ pub struct AccountAuthConfig {
     /// First-party registration policy advertised by the registry.
     #[serde(default)]
     pub registration: Option<String>,
+    /// Trusted browser portal used for first-party native authorization.
+    #[serde(default)]
+    pub native_authorization_url: Option<String>,
 }
 
 /// Native first-party client presentation requested from the registry.
@@ -49,6 +60,85 @@ pub enum NativeAuthClient {
     Desktop,
     /// Command-line session.
     Cli,
+}
+
+/// Stable wire spellings for native client presentations.
+impl NativeAuthClient {
+    /// Return the exact query and JSON value bound into the authorization flow.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Desktop => "desktop",
+            Self::Cli => "cli",
+        }
+    }
+}
+
+/// Browser experience requested by one native authorization flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeAuthorizationIntent {
+    /// Authenticate an existing account before authorizing the native client.
+    Login,
+    /// Redeem an invitation in the browser before authorizing the native client.
+    Register,
+}
+
+/// Stable browser intents understood by the first-party account portal.
+impl NativeAuthorizationIntent {
+    /// Return the exact portal query value for this browser experience.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Login => "native_authorize",
+            Self::Register => "native_register",
+        }
+    }
+}
+
+/// Pending first-party native browser authorization bound to S256 PKCE.
+pub struct NativeAuthorizationFlow {
+    /// Trusted HTTPS portal URL that the caller opens in the system browser.
+    pub authorization_url: Url,
+    /// Exact IP-literal loopback callback registered by the native client.
+    redirect_uri: Url,
+    /// Desktop or CLI presentation bound into the one-time code.
+    client_kind: NativeAuthClient,
+    /// Random callback state retained for exact constant-time comparison.
+    state: SecretString,
+    /// Random PKCE verifier retained only until one code exchange.
+    code_verifier: SecretString,
+}
+
+/// Redact every random flow binding from diagnostics.
+impl fmt::Debug for NativeAuthorizationFlow {
+    /// Render only query-free portal and loopback URLs.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut portal = self.authorization_url.clone();
+        portal.set_query(None);
+        formatter
+            .debug_struct("NativeAuthorizationFlow")
+            .field("authorization_url", &portal)
+            .field("redirect_uri", &self.redirect_uri)
+            .field("client_kind", &self.client_kind)
+            .field("state", &"[REDACTED]")
+            .field("code_verifier", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Native first-party authorization or token-lifecycle failure.
+#[derive(Debug, thiserror::Error)]
+pub enum NativeAuthError {
+    /// Registry discovery or a token endpoint failed.
+    #[error(transparent)]
+    Registry(#[from] ClientError),
+    /// Trusted portal or loopback callback configuration was unsafe.
+    #[error("invalid native authorization configuration: {0}")]
+    InvalidConfiguration(String),
+    /// The browser callback did not match the pending flow.
+    #[error("native authorization callback rejected: {0}")]
+    InvalidCallback(String),
+    /// A successful registry response violated the frozen token contract.
+    #[error("native authorization response rejected: {0}")]
+    InvalidResponse(String),
 }
 
 /// Successful first-party authentication with its secret-bearing session.
@@ -71,50 +161,59 @@ impl std::fmt::Debug for LocalAccountSession {
     }
 }
 
-/// Password login request serialized only at the HTTP boundary.
+/// Native authorization-code exchange fields serialized at the HTTP boundary.
 #[derive(Serialize)]
-struct LoginLocalAccountRequest<'a> {
-    /// Normalized sign-in email supplied by the caller.
-    email: &'a str,
-    /// Secret account password exposed only to the serializer.
-    password: &'a str,
-    /// Native session presentation.
+struct NativeAuthorizationCodeRequest<'a> {
+    /// Frozen grant identifier for one-time native codes.
+    grant_type: &'static str,
+    /// One-time random authorization code exposed only to the serializer.
+    code: &'a str,
+    /// Secret S256 verifier exposed only to the serializer.
+    code_verifier: &'a str,
+    /// Exact IP-literal loopback URI bound into the code.
+    redirect_uri: &'a str,
+    /// Desktop or CLI presentation bound into the code.
     client_kind: NativeAuthClient,
 }
 
-/// Invitation registration request serialized only at the HTTP boundary.
+/// Native refresh request serialized only at the HTTP boundary.
 #[derive(Serialize)]
-struct RegisterLocalAccountRequest<'a> {
-    /// Secret one-time invitation token exposed only to the serializer.
-    invite_token: &'a str,
-    /// Invitation-bound email address.
-    email: &'a str,
-    /// Optional account display name.
-    display_name: Option<&'a str>,
-    /// Secret account password exposed only to the serializer.
-    password: &'a str,
-    /// Native session presentation.
+struct NativeRefreshRequest<'a> {
+    /// Desktop or CLI presentation bound into the session family.
     client_kind: NativeAuthClient,
+    /// Current rotating refresh credential exposed only to the serializer.
+    refresh_token: &'a str,
 }
 
-/// Wire response containing a bearer token that is wiped after conversion.
+/// Wire response carrying rotating native credentials that are wiped after conversion.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct LocalAuthResponse {
+struct NativeTokenResponse {
     /// Durable authenticated account.
     account: AccountRecord,
-    /// Opaque token required for native clients.
-    token: Option<String>,
-    /// Non-extendable session expiry.
+    /// Current short-lived opaque access token.
+    access_token: Option<String>,
+    /// Current rotating opaque refresh token.
+    refresh_token: Option<String>,
+    /// Required HTTP authorization scheme.
+    token_type: String,
+    /// Exclusive access-token expiry.
     expires_at: DateTime<Utc>,
+    /// Exclusive refresh-generation expiry.
+    refresh_expires_at: DateTime<Utc>,
+    /// Non-extendable session-family expiry.
+    session_expires_at: DateTime<Utc>,
 }
 
-/// Wipe the raw response token when its temporary wire value leaves scope.
-impl Drop for LocalAuthResponse {
-    /// Zero the optional raw token string.
+/// Wipe temporary raw native credentials when their wire value leaves scope.
+impl Drop for NativeTokenResponse {
+    /// Zero both optional token strings.
     fn drop(&mut self) {
         use zeroize::Zeroize as _;
-        if let Some(token) = &mut self.token {
+        if let Some(token) = &mut self.access_token {
+            token.zeroize();
+        }
+        if let Some(token) = &mut self.refresh_token {
             token.zeroize();
         }
     }
@@ -280,48 +379,95 @@ pub fn get_auth_config(server_url: &str) -> Result<AccountAuthConfig, ClientErro
     }
 }
 
-/// Register an invitation-bound first-party account and create a native session.
+/// Begin a browser-owned first-party authorization bound to one loopback listener.
 ///
 /// # Errors
 ///
-/// Returns a registry URL, transport, status, size, JSON, token-validation, or
-/// expiry error without including the invitation, password, or bearer token.
-pub fn register_local_account(
-    server_url: &str,
-    invite_token: &SecretString,
-    email: &str,
-    display_name: Option<&str>,
-    password: &SecretString,
+/// Returns a configuration error when the registry does not advertise the exact
+/// HTTPS account portal or the callback is not an exact IP-literal loopback URL.
+pub fn begin_native_authorization(
+    config: &AccountAuthConfig,
     client_kind: NativeAuthClient,
-) -> Result<LocalAccountSession, ClientError> {
-    let request = RegisterLocalAccountRequest {
-        invite_token: invite_token.expose_secret(),
-        email,
-        display_name,
-        password: password.expose_secret(),
+    redirect_uri: Url,
+    intent: NativeAuthorizationIntent,
+) -> Result<NativeAuthorizationFlow, NativeAuthError> {
+    if !config.first_party_enabled {
+        return Err(NativeAuthError::InvalidConfiguration(
+            "registry does not advertise first-party authentication".to_string(),
+        ));
+    }
+    let portal = config.native_authorization_url.as_deref().ok_or_else(|| {
+        NativeAuthError::InvalidConfiguration(
+            "registry omitted its native authorization portal".to_string(),
+        )
+    })?;
+    let mut authorization_url = validate_native_portal(portal)?;
+    validate_native_redirect(&redirect_uri)?;
+
+    let state = random_native_binding();
+    let code_verifier = random_native_binding();
+    let challenge =
+        URL_SAFE_NO_PAD.encode(Sha256::digest(code_verifier.expose_secret().as_bytes()));
+    authorization_url
+        .query_pairs_mut()
+        .append_pair("intent", intent.as_str())
+        .append_pair("client_kind", client_kind.as_str())
+        .append_pair("redirect_uri", redirect_uri.as_str())
+        .append_pair("code_challenge", &challenge)
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("state", state.expose_secret());
+
+    Ok(NativeAuthorizationFlow {
+        authorization_url,
+        redirect_uri,
         client_kind,
-    };
-    post_local_auth(server_url, "register", request)
+        state,
+        code_verifier,
+    })
 }
 
-/// Verify first-party credentials and create a native bearer session.
+/// Exchange an exact native browser callback for rotating first-party credentials.
 ///
 /// # Errors
 ///
-/// Returns a registry URL, transport, status, size, JSON, token-validation, or
-/// expiry error without including the password or bearer token.
-pub fn login_local_account(
+/// Returns a callback error before transport when the loopback URL or state does
+/// not exactly match the pending flow. Registry and response failures never
+/// include the code, verifier, state, access token, or refresh token.
+pub fn complete_native_authorization(
     server_url: &str,
-    email: &str,
-    password: &SecretString,
-    client_kind: NativeAuthClient,
-) -> Result<LocalAccountSession, ClientError> {
-    let request = LoginLocalAccountRequest {
-        email,
-        password: password.expose_secret(),
-        client_kind,
+    flow: NativeAuthorizationFlow,
+    callback_url: &Url,
+) -> Result<LocalAccountSession, NativeAuthError> {
+    let (code, _returned_state) = validate_native_callback(&flow, callback_url)?;
+    let redirect_uri = flow.redirect_uri.as_str();
+    let request = NativeAuthorizationCodeRequest {
+        grant_type: "authorization_code",
+        code: &code,
+        code_verifier: flow.code_verifier.expose_secret(),
+        redirect_uri,
+        client_kind: flow.client_kind,
     };
-    post_local_auth(server_url, "login", request)
+    let response = post_native_token_json(server_url, &["native", "token"], &request)?;
+    native_session_from_response(response)
+}
+
+/// Rotate a first-party native refresh credential and access token.
+///
+/// # Errors
+///
+/// Returns registry, JSON, response-contract, token-validation, or expiry errors
+/// without including either rotating credential.
+pub fn refresh_local_account(
+    server_url: &str,
+    refresh_token: &SecretString,
+    client_kind: NativeAuthClient,
+) -> Result<LocalAccountSession, NativeAuthError> {
+    let request = NativeRefreshRequest {
+        client_kind,
+        refresh_token: refresh_token.expose_secret(),
+    };
+    let response = post_native_token_json(server_url, &["refresh"], &request)?;
+    native_session_from_response(response)
 }
 
 /// Revoke one first-party bearer session at the registry.
@@ -367,14 +513,16 @@ pub fn logout_local_account(
 }
 
 /// Submit one first-party credential request and validate its native session.
-fn post_local_auth(
+fn post_native_token_json(
     server_url: &str,
-    operation: &str,
-    request: impl Serialize,
-) -> Result<LocalAccountSession, ClientError> {
-    let url = crate::publisher::registry_endpoint_url(server_url, &["v1", "auth", operation])?;
+    operation: &[&str],
+    request: &impl Serialize,
+) -> Result<NativeTokenResponse, NativeAuthError> {
+    let mut segments = vec!["v1", "auth"];
+    segments.extend_from_slice(operation);
+    let url = crate::publisher::registry_endpoint_url(server_url, &segments)?;
     let body = Zeroizing::new(
-        serde_json::to_vec(&request)
+        serde_json::to_vec(request)
             .map_err(|error| ClientError::JsonSerialize(error.to_string()))?,
     );
     let response = ureq::AgentBuilder::new()
@@ -384,48 +532,178 @@ fn post_local_auth(
         .post(url.as_str())
         .set("Content-Type", "application/json")
         .send_bytes(body.as_slice());
-    let mut response: LocalAuthResponse = match response {
-        Ok(response) => crate::registry::response_json_bounded(response, url.as_str())?,
-        Err(ureq::Error::Status(status, response)) => {
-            return Err(ClientError::RegistryRejected {
-                url: url.to_string(),
-                status,
-                message: crate::registry::response_text_bounded(response, url.as_str()),
-            });
-        }
-        Err(error) => {
-            return Err(ClientError::RegistryHttp {
-                url: url.to_string(),
-                detail: error.to_string(),
-            });
-        }
-    };
-    let token = response
-        .token
-        .take()
-        .ok_or_else(|| ClientError::RegistryRejected {
+    match response {
+        Ok(response) => crate::registry::response_json_bounded(response, url.as_str())
+            .map_err(NativeAuthError::from),
+        Err(ureq::Error::Status(status, response)) => Err(ClientError::RegistryRejected {
             url: url.to_string(),
-            status: 502,
-            message: "registry omitted the native bearer token".to_string(),
-        })?;
-    let expires_at = u64::try_from(response.expires_at.timestamp()).map_err(|_| {
-        ClientError::RegistryRejected {
-            url: url.to_string(),
-            status: 502,
-            message: "registry returned an invalid native session expiry".to_string(),
+            status,
+            message: crate::registry::response_text_bounded(response, url.as_str()),
         }
+        .into()),
+        Err(error) => Err(ClientError::RegistryHttp {
+            url: url.to_string(),
+            detail: error.to_string(),
+        }
+        .into()),
+    }
+}
+
+/// Convert and validate one frozen native token response.
+fn native_session_from_response(
+    mut response: NativeTokenResponse,
+) -> Result<LocalAccountSession, NativeAuthError> {
+    if response.token_type != "Bearer" {
+        return Err(NativeAuthError::InvalidResponse(
+            "registry returned an unsupported token type".to_string(),
+        ));
+    }
+    let now = Utc::now();
+    if response.expires_at <= now
+        || response.refresh_expires_at < response.expires_at
+        || response.session_expires_at < response.refresh_expires_at
+    {
+        return Err(NativeAuthError::InvalidResponse(
+            "registry returned inconsistent native session expiries".to_string(),
+        ));
+    }
+    let access_token = response.access_token.take().ok_or_else(|| {
+        NativeAuthError::InvalidResponse("registry omitted the native access token".to_string())
     })?;
-    let session =
-        AuthenticatedSession::from_first_party_bearer(SecretString::new(token), expires_at)
-            .map_err(|_| ClientError::RegistryRejected {
-                url: url.to_string(),
-                status: 502,
-                message: "registry returned an invalid native bearer session".to_string(),
-            })?;
+    let refresh_token = response.refresh_token.take().ok_or_else(|| {
+        NativeAuthError::InvalidResponse("registry omitted the native refresh token".to_string())
+    })?;
+    let expires_at = u64::try_from(response.expires_at.timestamp()).map_err(|_| {
+        NativeAuthError::InvalidResponse(
+            "registry returned an invalid native access expiry".to_string(),
+        )
+    })?;
+    let session = AuthenticatedSession::from_first_party_tokens(
+        SecretString::new(access_token),
+        SecretString::new(refresh_token),
+        expires_at,
+    )
+    .map_err(|_| {
+        NativeAuthError::InvalidResponse(
+            "registry returned invalid native token material".to_string(),
+        )
+    })?;
     Ok(LocalAccountSession {
         account: response.account.clone(),
         session,
     })
+}
+
+/// Parse and validate the registry-advertised browser portal.
+fn validate_native_portal(value: &str) -> Result<Url, NativeAuthError> {
+    let url = Url::parse(value).map_err(|_| {
+        NativeAuthError::InvalidConfiguration(
+            "native authorization portal is not a valid URL".to_string(),
+        )
+    })?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/account/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(NativeAuthError::InvalidConfiguration(
+            "native authorization portal must be a credential-free HTTPS /account/ URL".to_string(),
+        ));
+    }
+    Ok(url)
+}
+
+/// Require an exact HTTP callback on an IP-literal loopback address and explicit port.
+fn validate_native_redirect(url: &Url) -> Result<(), NativeAuthError> {
+    let loopback = url
+        .host_str()
+        .and_then(|host| host.parse::<IpAddr>().ok())
+        .is_some_and(|address| address.is_loopback());
+    if url.scheme() != "http"
+        || !loopback
+        || url.port().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(NativeAuthError::InvalidConfiguration(
+            "native callback must be an exact query-free HTTP IP-literal loopback URL with an explicit port"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate one callback and return its one-time code and state without logging them.
+fn validate_native_callback(
+    flow: &NativeAuthorizationFlow,
+    callback_url: &Url,
+) -> Result<(String, String), NativeAuthError> {
+    if callback_url.fragment().is_some() {
+        return Err(NativeAuthError::InvalidCallback(
+            "callback included a fragment".to_string(),
+        ));
+    }
+    let mut callback_base = callback_url.clone();
+    callback_base.set_query(None);
+    if callback_base != flow.redirect_uri {
+        return Err(NativeAuthError::InvalidCallback(
+            "callback URL did not match the pending loopback listener".to_string(),
+        ));
+    }
+    let mut code = None;
+    let mut state = None;
+    for (name, value) in callback_url.query_pairs() {
+        let slot = match name.as_ref() {
+            "code" => &mut code,
+            "state" => &mut state,
+            _ => {
+                return Err(NativeAuthError::InvalidCallback(
+                    "callback included an unsupported query field".to_string(),
+                ));
+            }
+        };
+        if value.is_empty() || slot.replace(value.into_owned()).is_some() {
+            return Err(NativeAuthError::InvalidCallback(
+                "callback included an empty or repeated query field".to_string(),
+            ));
+        }
+    }
+    let code = code.ok_or_else(|| {
+        NativeAuthError::InvalidCallback("callback omitted the authorization code".to_string())
+    })?;
+    let state = state.ok_or_else(|| {
+        NativeAuthError::InvalidCallback("callback omitted the authorization state".to_string())
+    })?;
+    if !constant_time_equal(flow.state.expose_secret().as_bytes(), state.as_bytes()) {
+        return Err(NativeAuthError::InvalidCallback(
+            "callback state did not match the pending authorization".to_string(),
+        ));
+    }
+    Ok((code, state))
+}
+
+/// Generate one 256-bit URL-safe native authorization binding.
+fn random_native_binding() -> SecretString {
+    let mut bytes = Zeroizing::new([0_u8; 32]);
+    OsRng.fill_bytes(bytes.as_mut());
+    SecretString::new(URL_SAFE_NO_PAD.encode(bytes.as_ref()))
+}
+
+/// Compare two byte strings without data-dependent early exit.
+fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
+    let mut difference = left.len() ^ right.len();
+    let max_len = left.len().max(right.len());
+    for index in 0..max_len {
+        let left_byte = left.get(index).copied().unwrap_or(0);
+        let right_byte = right.get(index).copied().unwrap_or(0);
+        difference |= usize::from(left_byte ^ right_byte);
+    }
+    difference == 0
 }
 
 /// Fetch the current account view from one FrameShift registry.
@@ -868,6 +1146,26 @@ mod tests {
         r#"{"id":"00000000-0000-0000-0000-000000000001","issuer":"https://issuer.example","subject":"subject-1","email":"alice@example.com","display_name":"Alice","status":"active","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#
     }
 
+    /// Return a first-party configuration advertising the exact browser portal.
+    fn native_auth_config() -> AccountAuthConfig {
+        AccountAuthConfig {
+            enabled: true,
+            issuer: None,
+            audience: None,
+            first_party_enabled: true,
+            registration: Some("invite_only".to_string()),
+            native_authorization_url: Some("https://market.example/account/".to_string()),
+        }
+    }
+
+    /// Return one frozen rotating native token response with future expiries.
+    fn native_token_json(access_token: &str, refresh_token: &str) -> String {
+        format!(
+            r#"{{"account":{},"access_token":"{access_token}","refresh_token":"{refresh_token}","token_type":"Bearer","expires_at":"2099-01-01T00:00:00Z","refresh_expires_at":"2099-02-01T00:00:00Z","session_expires_at":"2099-03-01T00:00:00Z"}}"#,
+            account_json()
+        )
+    }
+
     /// Return one stable publisher profile JSON object for mutation responses.
     fn publisher_json() -> &'static str {
         r#"{"id":"00000000-0000-0000-0000-000000000002","handle":"gatekeeper","display_name":"Gatekeeper","biography":"Verifies releases.","moderation_status":"pending","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#
@@ -971,22 +1269,117 @@ mod tests {
         ));
     }
 
-    /// First-party login sends credentials only in JSON and redacts its bearer result.
+    /// Native browser authorization binds exact intent, client, callback, state, and S256 PKCE.
     #[test]
-    fn logs_in_with_native_bearer_without_debug_disclosure() {
-        let body = format!(
-            r#"{{"account":{},"token":"native-session-token","expires_at":"2099-01-01T00:00:00Z"}}"#,
-            account_json()
-        );
-        let (server, handle) = serve_json_response(body);
-        let password = SecretString::new("correct horse battery staple".to_string());
-        let authenticated = login_local_account(
-            &server,
-            "alice@example.com",
-            &password,
+    fn begins_exact_native_browser_authorization_without_debug_disclosure() {
+        let redirect = Url::parse("http://127.0.0.1:43119/callback").expect("redirect URL");
+        let flow = begin_native_authorization(
+            &native_auth_config(),
             NativeAuthClient::Cli,
+            redirect.clone(),
+            NativeAuthorizationIntent::Login,
+        );
+        let flow = flow.expect("native flow");
+        let pairs: std::collections::HashMap<_, _> =
+            flow.authorization_url.query_pairs().into_owned().collect();
+        assert_eq!(flow.authorization_url.path(), "/account/");
+        assert_eq!(
+            pairs.get("intent").map(String::as_str),
+            Some("native_authorize")
+        );
+        assert_eq!(pairs.get("client_kind").map(String::as_str), Some("cli"));
+        assert_eq!(
+            pairs.get("redirect_uri").map(String::as_str),
+            Some(redirect.as_str())
+        );
+        assert_eq!(
+            pairs.get("code_challenge_method").map(String::as_str),
+            Some("S256")
+        );
+        assert_eq!(pairs.get("state").map(String::len), Some(43));
+        assert_eq!(pairs.get("code_challenge").map(String::len), Some(43));
+
+        let debug = format!("{flow:?}");
+        assert!(!debug.contains(flow.state.expose_secret()));
+        assert!(!debug.contains(pairs.get("code_challenge").expect("PKCE challenge")));
+        assert!(!debug.contains(flow.code_verifier.expose_secret()));
+    }
+
+    /// Unsafe portal and loopback variants fail before a browser is opened.
+    #[test]
+    fn rejects_unsafe_native_authorization_configuration() {
+        let redirect = Url::parse("http://127.0.0.1:43119/callback").expect("redirect URL");
+        for portal in [
+            "http://market.example/account/",
+            "https://user@market.example/account/",
+            "https://market.example/account",
+            "https://market.example/account/?source=unsafe",
+        ] {
+            let mut config = native_auth_config();
+            config.native_authorization_url = Some(portal.to_string());
+            assert!(matches!(
+                begin_native_authorization(
+                    &config,
+                    NativeAuthClient::Desktop,
+                    redirect.clone(),
+                    NativeAuthorizationIntent::Register,
+                ),
+                Err(NativeAuthError::InvalidConfiguration(_))
+            ));
+        }
+        for callback in [
+            "http://localhost:43119/callback",
+            "http://192.0.2.1:43119/callback",
+            "https://127.0.0.1:43119/callback",
+            "http://127.0.0.1/callback",
+            "http://127.0.0.1:43119/callback?code=early",
+        ] {
+            assert!(matches!(
+                begin_native_authorization(
+                    &native_auth_config(),
+                    NativeAuthClient::Desktop,
+                    Url::parse(callback).expect("callback URL"),
+                    NativeAuthorizationIntent::Register,
+                ),
+                Err(NativeAuthError::InvalidConfiguration(_))
+            ));
+        }
+    }
+
+    /// Exact callback exchange sends only the frozen one-time code contract.
+    #[test]
+    fn exchanges_exact_native_callback_for_rotating_tokens() {
+        let redirect = Url::parse("http://127.0.0.1:43119/callback").expect("redirect URL");
+        let flow = begin_native_authorization(
+            &native_auth_config(),
+            NativeAuthClient::Desktop,
+            redirect.clone(),
+            NativeAuthorizationIntent::Register,
         )
-        .expect("native login");
+        .expect("native flow");
+        let expected_state = flow.state.expose_secret().clone();
+        let expected_verifier = flow.code_verifier.expose_secret().clone();
+        let expected_challenge = flow
+            .authorization_url
+            .query_pairs()
+            .find_map(|(name, value)| (name == "code_challenge").then(|| value.into_owned()))
+            .expect("PKCE challenge");
+        assert_eq!(
+            URL_SAFE_NO_PAD.encode(Sha256::digest(expected_verifier.as_bytes())),
+            expected_challenge
+        );
+        let mut callback = redirect;
+        callback
+            .query_pairs_mut()
+            .append_pair("code", "one-time-code")
+            .append_pair("state", &expected_state);
+
+        let (server, handle) = serve_json_response(native_token_json(
+            "native-access-token",
+            "native-refresh-token",
+        ));
+        let authenticated = complete_native_authorization(&server, flow, &callback)
+            .expect("native callback exchange");
 
         assert_eq!(
             authenticated.account.email.as_deref(),
@@ -994,43 +1387,98 @@ mod tests {
         );
         assert_eq!(
             authenticated.session.access_token().expose_secret(),
-            "native-session-token"
+            "native-access-token"
+        );
+        assert_eq!(
+            authenticated
+                .session
+                .refresh_token()
+                .expect("refresh token")
+                .expose_secret(),
+            "native-refresh-token"
         );
         let debug = format!("{authenticated:?}");
-        assert!(!debug.contains("native-session-token"));
-        assert!(!debug.contains("correct horse battery staple"));
+        assert!(!debug.contains("native-access-token"));
+        assert!(!debug.contains("native-refresh-token"));
         let request = handle.join().expect("test server thread");
-        assert!(request.starts_with("POST /v1/auth/login HTTP/1.1\r\n"));
-        assert!(request.contains("\"client_kind\":\"cli\""));
-        assert!(request.contains("\"password\":\"correct horse battery staple\""));
+        assert!(request.starts_with("POST /v1/auth/native/token HTTP/1.1\r\n"));
+        assert!(request.contains("\"grant_type\":\"authorization_code\""));
+        assert!(request.contains("\"code\":\"one-time-code\""));
+        assert!(request.contains(&format!("\"code_verifier\":\"{expected_verifier}\"")));
+        assert!(request.contains("\"redirect_uri\":\"http://127.0.0.1:43119/callback\""));
+        assert!(request.contains("\"client_kind\":\"desktop\""));
         assert!(!request.contains("Authorization:"));
     }
 
-    /// Invitation registration preserves native client kind and optional profile data.
+    /// Callback mismatches and ambiguous query fields fail before token exchange.
     #[test]
-    fn registers_invited_native_account() {
-        let body = format!(
-            r#"{{"account":{},"token":"registered-session-token","expires_at":"2099-01-01T00:00:00Z"}}"#,
-            account_json()
-        );
-        let (server, handle) = serve_json_response(body);
-        let invite = SecretString::new("one-time-invite".to_string());
-        let password = SecretString::new("a sufficiently long password".to_string());
-        let authenticated = register_local_account(
-            &server,
-            &invite,
-            "alice@example.com",
-            Some("Alice"),
-            &password,
-            NativeAuthClient::Desktop,
-        )
-        .expect("native registration");
+    fn rejects_mismatched_native_callbacks_before_transport() {
+        for query in [
+            "code=one-time-code&state=wrong",
+            "code=one-time-code&code=duplicate&state=wrong",
+            "code=one-time-code&state=wrong&extra=value",
+        ] {
+            let redirect = Url::parse("http://127.0.0.1:43119/callback").expect("redirect URL");
+            let flow = begin_native_authorization(
+                &native_auth_config(),
+                NativeAuthClient::Cli,
+                redirect.clone(),
+                NativeAuthorizationIntent::Login,
+            )
+            .expect("native flow");
+            let callback = Url::parse(&format!("{redirect}?{query}")).expect("callback URL");
+            assert!(matches!(
+                complete_native_authorization("https://registry.example", flow, &callback),
+                Err(NativeAuthError::InvalidCallback(_))
+            ));
+        }
 
-        assert_eq!(authenticated.account.display_name.as_deref(), Some("Alice"));
-        let request = handle.join().expect("test server thread");
-        assert!(request.starts_with("POST /v1/auth/register HTTP/1.1\r\n"));
-        assert!(request.contains("\"invite_token\":\"one-time-invite\""));
-        assert!(request.contains("\"client_kind\":\"desktop\""));
+        let redirect = Url::parse("http://127.0.0.1:43119/callback").expect("redirect URL");
+        let flow = begin_native_authorization(
+            &native_auth_config(),
+            NativeAuthClient::Cli,
+            redirect,
+            NativeAuthorizationIntent::Login,
+        )
+        .expect("native flow");
+        let state = flow.state.expose_secret().clone();
+        let callback = Url::parse(&format!(
+            "http://127.0.0.1:43119/wrong?code=one-time-code&state={state}"
+        ))
+        .expect("callback URL");
+        assert!(matches!(
+            complete_native_authorization("https://registry.example", flow, &callback),
+            Err(NativeAuthError::InvalidCallback(_))
+        ));
+    }
+
+    /// Native refresh rotates both credentials using the exact client-bound request.
+    #[test]
+    fn refreshes_native_session_with_rotating_credentials() {
+        let (server, handle) = serve_json_response(native_token_json(
+            "rotated-access-token",
+            "rotated-refresh-token",
+        ));
+        let refresh = SecretString::new("current-refresh-token".to_string());
+        let authenticated = refresh_local_account(&server, &refresh, NativeAuthClient::Cli)
+            .expect("native refresh");
+        assert_eq!(
+            authenticated.session.access_token().expose_secret(),
+            "rotated-access-token"
+        );
+        assert_eq!(
+            authenticated
+                .session
+                .refresh_token()
+                .expect("rotated refresh token")
+                .expose_secret(),
+            "rotated-refresh-token"
+        );
+        let request = handle.join().expect("refresh request thread");
+        assert!(request.starts_with("POST /v1/auth/refresh HTTP/1.1\r\n"));
+        assert!(request.contains("\"client_kind\":\"cli\""));
+        assert!(request.contains("\"refresh_token\":\"current-refresh-token\""));
+        assert!(!request.contains("Authorization:"));
     }
 
     /// Local logout uses the bearer header and requires an affirmative acknowledgement.

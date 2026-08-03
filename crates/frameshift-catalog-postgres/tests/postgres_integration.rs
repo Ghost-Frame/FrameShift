@@ -17,12 +17,21 @@ use std::time::Duration;
 use diesel::{ExpressionMethods as _, QueryDsl as _};
 use diesel_async::{RunQueryDsl as _, SimpleAsyncConnection as _};
 use frameshift_catalog::{
+    AccountAuthAuditEventKind, AccountAuthAuditEventRecord, AccountAuthAuditOutcome,
     AccountInviteIntent, AccountInviteIssueRequest, AccountInviteRequestRecord,
-    AccountInviteStatus, AccountPasswordCredentialRecord, AccountPasswordRehashRequest,
-    AccountRecord, AccountSessionClientKind, AccountSessionRecord, AccountStatus,
+    AccountInviteStatus, AccountMfaActivationRequest, AccountMfaAuthenticatorRecord,
+    AccountMfaAuthenticatorState, AccountMfaChallengeCompletionRequest,
+    AccountMfaChallengeCompletionResult, AccountMfaChallengeCreationRequest,
+    AccountMfaChallengeProof, AccountMfaDisableRequest, AccountMfaEnrollmentRequest,
+    AccountMfaLoginChallengeRecord, AccountMfaRecoveryCodeSeed, AccountPasswordCredentialRecord,
+    AccountPasswordRehashRequest, AccountRecord, AccountSessionClientKind,
+    AccountSessionCreationRequest, AccountSessionIssuance, AccountSessionRecord,
+    AccountSessionRefreshRequest, AccountSessionRefreshResult, AccountStatus,
     AccountStatusChangeRequest, AuthorRecord, CatalogBackend, CatalogError, Ed25519PublicKey,
-    EncryptedPasswordRecoveryDelivery, LocalAccountRegistrationRequest, MembershipState,
-    ObjectHash, PackSearchFilters, PackStatus, PackVersionRecord,
+    EncryptedPasswordRecoveryDelivery, EncryptedTotpSecret, LocalAccountRegistrationRequest,
+    MembershipState, NativeAuthorizationCodeCreationRequest,
+    NativeAuthorizationCodeExchangeRequest, NativeAuthorizationCodeExchangeResult,
+    NativeAuthorizationCodeRecord, ObjectHash, PackSearchFilters, PackStatus, PackVersionRecord,
     PasswordRecoveryCompletionRequest, PasswordRecoveryDeliveryClaimRequest,
     PasswordRecoveryDeliveryKind, PasswordRecoveryEnqueueRequest, PlatformRole,
     PlatformRoleAssignmentRequest, PlatformRoleRevocationRequest, PlatformRoleState,
@@ -36,9 +45,10 @@ use frameshift_catalog::{
     SortMode, TombstoneReason, TombstoneRecord,
 };
 use frameshift_catalog_postgres::schema::{
-    account_invites, account_password_credentials, account_password_recovery_outbox,
-    account_password_recovery_tokens, account_platform_roles, account_sessions, accounts,
-    pack_versions, publication_appeal_resolutions, publication_appeals,
+    account_auth_audit_events, account_invites, account_mfa_authenticators,
+    account_mfa_recovery_codes, account_password_credentials, account_password_recovery_outbox,
+    account_password_recovery_tokens, account_platform_roles, account_session_refresh_tokens,
+    account_sessions, accounts, pack_versions, publication_appeal_resolutions, publication_appeals,
     publication_lifecycle_decisions, publication_moderation_decisions, publication_promotions,
     publication_submissions, publisher_audit_events, publisher_keys, publisher_memberships,
     publisher_profiles,
@@ -162,8 +172,10 @@ fn make_local_registration(
     email: &str,
     subject: &str,
 ) -> LocalAccountRegistrationRequest {
-    let now = chrono::DateTime::from_timestamp_micros(chrono::Utc::now().timestamp_micros())
-        .expect("current timestamp must fit");
+    let database_precision_now =
+        chrono::DateTime::from_timestamp_micros(chrono::Utc::now().timestamp_micros())
+            .expect("current timestamp must fit");
+    let now = database_precision_now + chrono::Duration::nanoseconds(123);
     let account = AccountRecord {
         id: uuid::Uuid::new_v4(),
         issuer: "https://frameshift.test/first-party".to_string(),
@@ -174,6 +186,7 @@ fn make_local_registration(
         created_at: now,
         updated_at: now,
     };
+    let session_id = uuid::Uuid::new_v4();
     LocalAccountRegistrationRequest {
         invite_token_digest: token_digest,
         credential: AccountPasswordCredentialRecord {
@@ -187,16 +200,35 @@ fn make_local_registration(
             password_changed_at: now,
             updated_at: now,
         },
-        session: AccountSessionRecord {
+        session: AccountSessionIssuance {
+            session: AccountSessionRecord {
+                id: session_id,
+                account_id: account.id,
+                token_digest: Sha256::digest(subject.as_bytes()).to_vec(),
+                client_kind: AccountSessionClientKind::Desktop,
+                created_at: now,
+                last_seen_at: now,
+                access_expires_at: now + chrono::Duration::minutes(15),
+                idle_expires_at: now + chrono::Duration::hours(1),
+                absolute_expires_at: now + chrono::Duration::hours(2),
+                mfa_verified_at: None,
+                revoked_at: None,
+            },
+            refresh_token_id: uuid::Uuid::new_v4(),
+            refresh_token_digest: Sha256::digest(format!("{subject}:refresh").as_bytes()).to_vec(),
+            refresh_expires_at: now + chrono::Duration::hours(2),
+        },
+        audit_event: AccountAuthAuditEventRecord {
             id: uuid::Uuid::new_v4(),
-            account_id: account.id,
-            token_digest: Sha256::digest(subject.as_bytes()).to_vec(),
-            client_kind: AccountSessionClientKind::Desktop,
+            event_kind: AccountAuthAuditEventKind::SessionCreated,
+            outcome: AccountAuthAuditOutcome::Success,
+            account_id: Some(account.id),
+            session_id: Some(session_id),
+            client_kind: Some(AccountSessionClientKind::Desktop),
+            identifier_tag: None,
+            network_tag: None,
+            reason_code: None,
             created_at: now,
-            last_seen_at: now,
-            idle_expires_at: now + chrono::Duration::hours(1),
-            absolute_expires_at: now + chrono::Duration::hours(2),
-            revoked_at: None,
         },
         account,
     }
@@ -236,6 +268,191 @@ fn make_password_recovery_enqueue(
         token_expires_at,
         cooldown_cutoff,
         delivery: make_password_recovery_delivery(delivery_id, seed, token_expires_at),
+    }
+}
+
+/// Build one sanitized success audit event for an exact authentication mutation.
+fn make_auth_success_audit(
+    event_kind: AccountAuthAuditEventKind,
+    account_id: uuid::Uuid,
+    session_id: Option<uuid::Uuid>,
+    client_kind: Option<AccountSessionClientKind>,
+    created_at: chrono::DateTime<chrono::Utc>,
+) -> AccountAuthAuditEventRecord {
+    AccountAuthAuditEventRecord {
+        id: uuid::Uuid::new_v4(),
+        event_kind,
+        outcome: AccountAuthAuditOutcome::Success,
+        account_id: Some(account_id),
+        session_id,
+        client_kind,
+        identifier_tag: Some(vec![0xA1; 32]),
+        network_tag: Some(vec![0xB2; 32]),
+        reason_code: None,
+        created_at,
+    }
+}
+
+/// Build deterministic digest-only access and initial refresh credentials.
+fn make_session_issuance(
+    account_id: uuid::Uuid,
+    client_kind: AccountSessionClientKind,
+    seed: u8,
+    created_at: chrono::DateTime<chrono::Utc>,
+    mfa_verified_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> AccountSessionIssuance {
+    AccountSessionIssuance {
+        session: AccountSessionRecord {
+            id: uuid::Uuid::new_v4(),
+            account_id,
+            token_digest: vec![seed; 32],
+            client_kind,
+            created_at,
+            last_seen_at: created_at,
+            access_expires_at: created_at + chrono::Duration::minutes(10),
+            idle_expires_at: created_at + chrono::Duration::hours(1),
+            absolute_expires_at: created_at + chrono::Duration::hours(8),
+            mfa_verified_at,
+            revoked_at: None,
+        },
+        refresh_token_id: uuid::Uuid::new_v4(),
+        refresh_token_digest: vec![seed.wrapping_add(1); 32],
+        refresh_expires_at: created_at + chrono::Duration::hours(8),
+    }
+}
+
+/// Enroll and activate one encrypted test authenticator with recovery codes.
+async fn enroll_test_mfa(
+    catalog: &PostgresCatalog,
+    account_id: uuid::Uuid,
+    seed: u8,
+    created_at: chrono::DateTime<chrono::Utc>,
+) -> (
+    AccountMfaAuthenticatorRecord,
+    Vec<AccountMfaRecoveryCodeSeed>,
+) {
+    let authenticator_id = uuid::Uuid::new_v4();
+    let pending = AccountMfaAuthenticatorRecord {
+        id: authenticator_id,
+        account_id,
+        state: AccountMfaAuthenticatorState::Pending,
+        secret: EncryptedTotpSecret {
+            ciphertext: vec![seed; 48],
+            nonce: [seed.wrapping_add(1); 24],
+            key_version: 1,
+        },
+        pending_expires_at: Some(created_at + chrono::Duration::minutes(10)),
+        last_used_timestep: None,
+        created_at,
+        activated_at: None,
+        disabled_at: None,
+    };
+    catalog
+        .begin_account_mfa_enrollment(AccountMfaEnrollmentRequest {
+            authenticator: pending,
+            audit_event: make_auth_success_audit(
+                AccountAuthAuditEventKind::MfaEnrollmentStarted,
+                account_id,
+                None,
+                None,
+                created_at,
+            ),
+        })
+        .await
+        .expect("begin test MFA enrollment failed");
+    let recovery_codes = (0_u8..8)
+        .map(|offset| AccountMfaRecoveryCodeSeed {
+            id: uuid::Uuid::new_v4(),
+            code_digest: vec![seed.wrapping_add(10).wrapping_add(offset); 32],
+        })
+        .collect::<Vec<_>>();
+    let activated_at = created_at + chrono::Duration::seconds(1);
+    let active = catalog
+        .activate_account_mfa(AccountMfaActivationRequest {
+            account_id,
+            authenticator_id,
+            verified_timestep: 100,
+            recovery_codes: recovery_codes.clone(),
+            activated_at,
+            audit_event: make_auth_success_audit(
+                AccountAuthAuditEventKind::MfaEnrollmentActivated,
+                account_id,
+                None,
+                None,
+                activated_at,
+            ),
+        })
+        .await
+        .expect("activate test MFA enrollment failed");
+    (active, recovery_codes)
+}
+
+/// Create one digest-only MFA challenge for a test client.
+async fn create_test_mfa_challenge(
+    catalog: &PostgresCatalog,
+    account_id: uuid::Uuid,
+    client_kind: AccountSessionClientKind,
+    seed: u8,
+    created_at: chrono::DateTime<chrono::Utc>,
+) -> Vec<u8> {
+    let token_digest = vec![seed; 32];
+    catalog
+        .create_account_mfa_challenge(AccountMfaChallengeCreationRequest {
+            challenge: AccountMfaLoginChallengeRecord {
+                id: uuid::Uuid::new_v4(),
+                account_id,
+                token_digest: token_digest.clone(),
+                client_kind,
+                created_at,
+                expires_at: created_at + chrono::Duration::minutes(5),
+                consumed_at: None,
+            },
+            audit_event: make_auth_success_audit(
+                AccountAuthAuditEventKind::MfaChallengeCreated,
+                account_id,
+                None,
+                Some(client_kind),
+                created_at,
+            ),
+        })
+        .await
+        .expect("create test MFA challenge failed");
+    token_digest
+}
+
+/// Build one exact refresh rotation request with path-specific audit identifiers.
+fn make_refresh_request(
+    account_id: uuid::Uuid,
+    session_id: uuid::Uuid,
+    client_kind: AccountSessionClientKind,
+    presented_digest: Vec<u8>,
+    seed: u8,
+    rotated_at: chrono::DateTime<chrono::Utc>,
+    absolute_expires_at: chrono::DateTime<chrono::Utc>,
+) -> AccountSessionRefreshRequest {
+    AccountSessionRefreshRequest {
+        presented_refresh_token_digest: presented_digest,
+        replacement_access_token_digest: vec![seed; 32],
+        replacement_access_expires_at: rotated_at + chrono::Duration::minutes(10),
+        replacement_idle_expires_at: rotated_at + chrono::Duration::hours(1),
+        replacement_refresh_token_id: uuid::Uuid::new_v4(),
+        replacement_refresh_token_digest: vec![seed.wrapping_add(1); 32],
+        replacement_refresh_expires_at: absolute_expires_at,
+        rotated_at,
+        success_audit_event: make_auth_success_audit(
+            AccountAuthAuditEventKind::SessionRefreshed,
+            account_id,
+            Some(session_id),
+            Some(client_kind),
+            rotated_at,
+        ),
+        replay_audit_event: make_auth_success_audit(
+            AccountAuthAuditEventKind::SessionReplayRevoked,
+            account_id,
+            Some(session_id),
+            Some(client_kind),
+            rotated_at,
+        ),
     }
 }
 
@@ -353,8 +570,10 @@ async fn password_recovery_is_atomic_digest_only_and_claim_fenced() {
                 account_sessions::client_kind.eq(client_kind),
                 account_sessions::created_at.eq(now),
                 account_sessions::last_seen_at.eq(now),
+                account_sessions::access_expires_at.eq(now + chrono::Duration::minutes(15)),
                 account_sessions::idle_expires_at.eq(now + chrono::Duration::hours(1)),
                 account_sessions::absolute_expires_at.eq(now + chrono::Duration::hours(2)),
+                account_sessions::mfa_verified_at.eq(None::<chrono::DateTime<chrono::Utc>>),
                 account_sessions::revoked_at.eq(None::<chrono::DateTime<chrono::Utc>>),
             ))
             .execute(&mut connection)
@@ -937,6 +1156,1127 @@ async fn password_recovery_migration_down_and_up_are_reversible() {
         ))
         .await
         .expect("password recovery migration reapply failed");
+}
+
+/// Prove refresh generations rotate, remain replay-detectable, and revoke the family.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn refresh_rotation_retains_history_and_revokes_on_any_generation_replay() {
+    let (catalog, _container) = setup_catalog().await;
+    let account = make_account(uuid::Uuid::new_v4(), "refresh-history");
+    catalog
+        .create_account(account.clone())
+        .await
+        .expect("create refresh-history account failed");
+    let now = chrono::Utc::now();
+    let issuance =
+        make_session_issuance(account.id, AccountSessionClientKind::Desktop, 11, now, None);
+    let session_id = issuance.session.id;
+    let initial_refresh = issuance.refresh_token_digest.clone();
+    let persisted_session = catalog
+        .create_account_session(AccountSessionCreationRequest {
+            audit_event: make_auth_success_audit(
+                AccountAuthAuditEventKind::SessionCreated,
+                account.id,
+                Some(session_id),
+                Some(AccountSessionClientKind::Desktop),
+                now,
+            ),
+            issuance,
+        })
+        .await
+        .expect("create refresh-history session failed");
+    let absolute_expires_at = persisted_session.absolute_expires_at;
+
+    let first_rotated_at = now + chrono::Duration::minutes(1);
+    let first_request = make_refresh_request(
+        account.id,
+        session_id,
+        AccountSessionClientKind::Desktop,
+        initial_refresh.clone(),
+        21,
+        first_rotated_at,
+        absolute_expires_at,
+    );
+    let first_refresh = first_request.replacement_refresh_token_digest.clone();
+    assert!(matches!(
+        catalog
+            .refresh_account_session(first_request)
+            .await
+            .expect("first refresh rotation failed"),
+        AccountSessionRefreshResult::Rotated(_)
+    ));
+
+    let second_rotated_at = first_rotated_at + chrono::Duration::minutes(1);
+    let second_request = make_refresh_request(
+        account.id,
+        session_id,
+        AccountSessionClientKind::Desktop,
+        first_refresh,
+        31,
+        second_rotated_at,
+        absolute_expires_at,
+    );
+    let newest_access = second_request.replacement_access_token_digest.clone();
+    assert!(matches!(
+        catalog
+            .refresh_account_session(second_request)
+            .await
+            .expect("second refresh rotation failed"),
+        AccountSessionRefreshResult::Rotated(_)
+    ));
+
+    let replayed_at = second_rotated_at + chrono::Duration::minutes(1);
+    let replay = make_refresh_request(
+        account.id,
+        session_id,
+        AccountSessionClientKind::Desktop,
+        initial_refresh,
+        41,
+        replayed_at,
+        absolute_expires_at,
+    );
+    assert_eq!(
+        catalog
+            .refresh_account_session(replay)
+            .await
+            .expect("old-generation replay failed"),
+        AccountSessionRefreshResult::ReplayRevoked
+    );
+    assert!(matches!(
+        catalog
+            .get_active_account_session(&newest_access, replayed_at)
+            .await,
+        Err(CatalogError::NotFound { .. })
+    ));
+
+    let mut connection = catalog
+        .pool()
+        .get()
+        .await
+        .expect("refresh history assertion connection failed");
+    let history = account_session_refresh_tokens::table
+        .filter(account_session_refresh_tokens::session_id.eq(session_id))
+        .order(account_session_refresh_tokens::generation.asc())
+        .select((
+            account_session_refresh_tokens::generation,
+            account_session_refresh_tokens::consumed_at,
+        ))
+        .load::<(i64, Option<chrono::DateTime<chrono::Utc>>)>(&mut connection)
+        .await
+        .expect("load refresh generation history failed");
+    assert_eq!(history.len(), 3);
+    assert_eq!(
+        history.iter().map(|row| row.0).collect::<Vec<_>>(),
+        [0, 1, 2]
+    );
+    assert!(history[0].1.is_some());
+    assert!(history[1].1.is_some());
+    assert!(history[2].1.is_none());
+}
+
+/// Prove concurrent use of one refresh token yields one rotation and family revocation.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn concurrent_refresh_has_at_most_one_success_and_revokes_the_family() {
+    let (catalog, _container) = setup_catalog().await;
+    let account = make_account(uuid::Uuid::new_v4(), "refresh-race");
+    catalog
+        .create_account(account.clone())
+        .await
+        .expect("create refresh-race account failed");
+    let now = chrono::Utc::now();
+    let issuance = make_session_issuance(account.id, AccountSessionClientKind::Cli, 51, now, None);
+    let session_id = issuance.session.id;
+    let presented = issuance.refresh_token_digest.clone();
+    let persisted_session = catalog
+        .create_account_session(AccountSessionCreationRequest {
+            audit_event: make_auth_success_audit(
+                AccountAuthAuditEventKind::SessionCreated,
+                account.id,
+                Some(session_id),
+                Some(AccountSessionClientKind::Cli),
+                now,
+            ),
+            issuance,
+        })
+        .await
+        .expect("create refresh-race session failed");
+    let absolute_expires_at = persisted_session.absolute_expires_at;
+    let rotated_at = persisted_session.created_at + chrono::Duration::minutes(1);
+    let first = make_refresh_request(
+        account.id,
+        session_id,
+        AccountSessionClientKind::Cli,
+        presented.clone(),
+        61,
+        rotated_at,
+        absolute_expires_at,
+    );
+    let second = make_refresh_request(
+        account.id,
+        session_id,
+        AccountSessionClientKind::Cli,
+        presented,
+        71,
+        rotated_at,
+        absolute_expires_at,
+    );
+    let (first_result, second_result) = tokio::join!(
+        catalog.refresh_account_session(first),
+        catalog.refresh_account_session(second),
+    );
+    let outcomes = [
+        first_result.expect("first concurrent refresh failed"),
+        second_result.expect("second concurrent refresh failed"),
+    ];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, AccountSessionRefreshResult::Rotated(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, AccountSessionRefreshResult::ReplayRevoked))
+            .count(),
+        1
+    );
+    let mut connection = catalog
+        .pool()
+        .get()
+        .await
+        .expect("refresh-race assertion connection failed");
+    let revoked_at = account_sessions::table
+        .find(session_id)
+        .select(account_sessions::revoked_at)
+        .first::<Option<chrono::DateTime<chrono::Utc>>>(&mut connection)
+        .await
+        .expect("load refresh-race session revocation failed");
+    assert_eq!(revoked_at, Some(rotated_at));
+}
+
+/// Prove pending MFA lookup enforces the exact owner, lifecycle, and expiry.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn pending_mfa_authenticator_lookup_is_exact_and_fail_closed() {
+    let (catalog, _container) = setup_catalog().await;
+    let owner = make_account(uuid::Uuid::new_v4(), "pending-mfa-owner");
+    let other = make_account(uuid::Uuid::new_v4(), "pending-mfa-other");
+    for account in [&owner, &other] {
+        catalog
+            .create_account(account.clone())
+            .await
+            .expect("create pending-MFA account failed");
+    }
+    let now = chrono::Utc::now();
+    let authenticator_id = uuid::Uuid::new_v4();
+    let pending_expires_at = now + chrono::Duration::minutes(5);
+    catalog
+        .begin_account_mfa_enrollment(AccountMfaEnrollmentRequest {
+            authenticator: AccountMfaAuthenticatorRecord {
+                id: authenticator_id,
+                account_id: owner.id,
+                state: AccountMfaAuthenticatorState::Pending,
+                secret: EncryptedTotpSecret {
+                    ciphertext: vec![80; 48],
+                    nonce: [81; 24],
+                    key_version: 1,
+                },
+                pending_expires_at: Some(pending_expires_at),
+                last_used_timestep: None,
+                created_at: now,
+                activated_at: None,
+                disabled_at: None,
+            },
+            audit_event: make_auth_success_audit(
+                AccountAuthAuditEventKind::MfaEnrollmentStarted,
+                owner.id,
+                None,
+                None,
+                now,
+            ),
+        })
+        .await
+        .expect("create pending authenticator lookup fixture failed");
+
+    let loaded = catalog
+        .get_pending_account_mfa_authenticator(owner.id, authenticator_id, now)
+        .await
+        .expect("load exact pending authenticator failed");
+    assert_eq!(loaded.id, authenticator_id);
+    assert_eq!(loaded.account_id, owner.id);
+    assert_eq!(loaded.state, AccountMfaAuthenticatorState::Pending);
+    assert!(matches!(
+        catalog
+            .get_pending_account_mfa_authenticator(other.id, authenticator_id, now)
+            .await,
+        Err(CatalogError::NotFound { .. })
+    ));
+    assert!(matches!(
+        catalog
+            .get_pending_account_mfa_authenticator(owner.id, authenticator_id, pending_expires_at,)
+            .await,
+        Err(CatalogError::NotFound { .. })
+    ));
+
+    let activated_at = now + chrono::Duration::seconds(1);
+    catalog
+        .activate_account_mfa(AccountMfaActivationRequest {
+            account_id: owner.id,
+            authenticator_id,
+            verified_timestep: 100,
+            recovery_codes: (0_u8..8)
+                .map(|offset| AccountMfaRecoveryCodeSeed {
+                    id: uuid::Uuid::new_v4(),
+                    code_digest: vec![90_u8.wrapping_add(offset); 32],
+                })
+                .collect(),
+            activated_at,
+            audit_event: make_auth_success_audit(
+                AccountAuthAuditEventKind::MfaEnrollmentActivated,
+                owner.id,
+                None,
+                None,
+                activated_at,
+            ),
+        })
+        .await
+        .expect("activate pending authenticator lookup fixture failed");
+    assert!(matches!(
+        catalog
+            .get_pending_account_mfa_authenticator(owner.id, authenticator_id, activated_at)
+            .await,
+        Err(CatalogError::NotFound { .. })
+    ));
+}
+
+/// Prove TOTP timesteps and recovery codes are each consumed at most once.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn mfa_challenge_fences_totp_steps_recovery_codes_expiry_and_reuse() {
+    let (catalog, _container) = setup_catalog().await;
+    let account = make_account(uuid::Uuid::new_v4(), "mfa-fencing");
+    catalog
+        .create_account(account.clone())
+        .await
+        .expect("create MFA-fencing account failed");
+    let now = chrono::Utc::now();
+    let (authenticator, recovery_codes) = enroll_test_mfa(&catalog, account.id, 81, now).await;
+
+    let first_challenge = create_test_mfa_challenge(
+        &catalog,
+        account.id,
+        AccountSessionClientKind::Browser,
+        91,
+        now + chrono::Duration::seconds(2),
+    )
+    .await;
+    let first_completed_at = now + chrono::Duration::seconds(3);
+    let first_issuance = make_session_issuance(
+        account.id,
+        AccountSessionClientKind::Browser,
+        92,
+        first_completed_at,
+        Some(first_completed_at),
+    );
+    let first_session_id = first_issuance.session.id;
+    assert!(matches!(
+        catalog
+            .complete_account_mfa_challenge(AccountMfaChallengeCompletionRequest {
+                challenge_token_digest: first_challenge.clone(),
+                authenticator_id: authenticator.id,
+                proof: AccountMfaChallengeProof::TotpTimestep(101),
+                issuance: first_issuance,
+                completed_at: first_completed_at,
+                audit_event: make_auth_success_audit(
+                    AccountAuthAuditEventKind::MfaChallengeCompleted,
+                    account.id,
+                    Some(first_session_id),
+                    Some(AccountSessionClientKind::Browser),
+                    first_completed_at,
+                ),
+            })
+            .await
+            .expect("complete first TOTP challenge failed"),
+        AccountMfaChallengeCompletionResult::Completed(_)
+    ));
+
+    let reused_challenge_at = now + chrono::Duration::seconds(4);
+    let reused_challenge_issuance = make_session_issuance(
+        account.id,
+        AccountSessionClientKind::Browser,
+        94,
+        reused_challenge_at,
+        Some(reused_challenge_at),
+    );
+    assert_eq!(
+        catalog
+            .complete_account_mfa_challenge(AccountMfaChallengeCompletionRequest {
+                challenge_token_digest: first_challenge,
+                authenticator_id: authenticator.id,
+                proof: AccountMfaChallengeProof::TotpTimestep(102),
+                audit_event: make_auth_success_audit(
+                    AccountAuthAuditEventKind::MfaChallengeCompleted,
+                    account.id,
+                    Some(reused_challenge_issuance.session.id),
+                    Some(AccountSessionClientKind::Browser),
+                    reused_challenge_at,
+                ),
+                issuance: reused_challenge_issuance,
+                completed_at: reused_challenge_at,
+            })
+            .await
+            .expect("reused MFA challenge transaction failed"),
+        AccountMfaChallengeCompletionResult::Rejected
+    );
+
+    let step_replay_challenge = create_test_mfa_challenge(
+        &catalog,
+        account.id,
+        AccountSessionClientKind::Desktop,
+        95,
+        now + chrono::Duration::seconds(5),
+    )
+    .await;
+    let step_replay_at = now + chrono::Duration::seconds(6);
+    let step_replay_issuance = make_session_issuance(
+        account.id,
+        AccountSessionClientKind::Desktop,
+        96,
+        step_replay_at,
+        Some(step_replay_at),
+    );
+    assert_eq!(
+        catalog
+            .complete_account_mfa_challenge(AccountMfaChallengeCompletionRequest {
+                challenge_token_digest: step_replay_challenge,
+                authenticator_id: authenticator.id,
+                proof: AccountMfaChallengeProof::TotpTimestep(101),
+                audit_event: make_auth_success_audit(
+                    AccountAuthAuditEventKind::MfaChallengeCompleted,
+                    account.id,
+                    Some(step_replay_issuance.session.id),
+                    Some(AccountSessionClientKind::Desktop),
+                    step_replay_at,
+                ),
+                issuance: step_replay_issuance,
+                completed_at: step_replay_at,
+            })
+            .await
+            .expect("TOTP step replay transaction failed"),
+        AccountMfaChallengeCompletionResult::Rejected
+    );
+
+    let recovery_challenge = create_test_mfa_challenge(
+        &catalog,
+        account.id,
+        AccountSessionClientKind::Cli,
+        97,
+        now + chrono::Duration::seconds(7),
+    )
+    .await;
+    let recovery_at = now + chrono::Duration::seconds(8);
+    let recovery_issuance = make_session_issuance(
+        account.id,
+        AccountSessionClientKind::Cli,
+        98,
+        recovery_at,
+        Some(recovery_at),
+    );
+    assert!(matches!(
+        catalog
+            .complete_account_mfa_challenge(AccountMfaChallengeCompletionRequest {
+                challenge_token_digest: recovery_challenge,
+                authenticator_id: authenticator.id,
+                proof: AccountMfaChallengeProof::RecoveryCodeDigest(
+                    recovery_codes[0].code_digest.clone(),
+                ),
+                audit_event: make_auth_success_audit(
+                    AccountAuthAuditEventKind::MfaChallengeCompleted,
+                    account.id,
+                    Some(recovery_issuance.session.id),
+                    Some(AccountSessionClientKind::Cli),
+                    recovery_at,
+                ),
+                issuance: recovery_issuance,
+                completed_at: recovery_at,
+            })
+            .await
+            .expect("MFA recovery-code completion failed"),
+        AccountMfaChallengeCompletionResult::Completed(_)
+    ));
+
+    let recovery_replay_challenge = create_test_mfa_challenge(
+        &catalog,
+        account.id,
+        AccountSessionClientKind::Cli,
+        99,
+        now + chrono::Duration::seconds(9),
+    )
+    .await;
+    let recovery_replay_at = now + chrono::Duration::seconds(10);
+    let recovery_replay_issuance = make_session_issuance(
+        account.id,
+        AccountSessionClientKind::Cli,
+        100,
+        recovery_replay_at,
+        Some(recovery_replay_at),
+    );
+    assert_eq!(
+        catalog
+            .complete_account_mfa_challenge(AccountMfaChallengeCompletionRequest {
+                challenge_token_digest: recovery_replay_challenge,
+                authenticator_id: authenticator.id,
+                proof: AccountMfaChallengeProof::RecoveryCodeDigest(
+                    recovery_codes[0].code_digest.clone(),
+                ),
+                audit_event: make_auth_success_audit(
+                    AccountAuthAuditEventKind::MfaChallengeCompleted,
+                    account.id,
+                    Some(recovery_replay_issuance.session.id),
+                    Some(AccountSessionClientKind::Cli),
+                    recovery_replay_at,
+                ),
+                issuance: recovery_replay_issuance,
+                completed_at: recovery_replay_at,
+            })
+            .await
+            .expect("MFA recovery-code replay transaction failed"),
+        AccountMfaChallengeCompletionResult::Rejected
+    );
+
+    let expired_created_at = now + chrono::Duration::seconds(11);
+    let expired_challenge = create_test_mfa_challenge(
+        &catalog,
+        account.id,
+        AccountSessionClientKind::Desktop,
+        101,
+        expired_created_at,
+    )
+    .await;
+    let expired_at = expired_created_at + chrono::Duration::minutes(6);
+    let expired_issuance = make_session_issuance(
+        account.id,
+        AccountSessionClientKind::Desktop,
+        102,
+        expired_at,
+        Some(expired_at),
+    );
+    assert_eq!(
+        catalog
+            .complete_account_mfa_challenge(AccountMfaChallengeCompletionRequest {
+                challenge_token_digest: expired_challenge,
+                authenticator_id: authenticator.id,
+                proof: AccountMfaChallengeProof::TotpTimestep(103),
+                audit_event: make_auth_success_audit(
+                    AccountAuthAuditEventKind::MfaChallengeCompleted,
+                    account.id,
+                    Some(expired_issuance.session.id),
+                    Some(AccountSessionClientKind::Desktop),
+                    expired_at,
+                ),
+                issuance: expired_issuance,
+                completed_at: expired_at,
+            })
+            .await
+            .expect("expired MFA challenge transaction failed"),
+        AccountMfaChallengeCompletionResult::Rejected
+    );
+
+    let mut connection = catalog
+        .pool()
+        .get()
+        .await
+        .expect("MFA fencing assertion connection failed");
+    let last_used_timestep = account_mfa_authenticators::table
+        .filter(account_mfa_authenticators::account_id.eq(account.id))
+        .filter(account_mfa_authenticators::state.eq("active"))
+        .select(account_mfa_authenticators::last_used_timestep)
+        .first::<Option<i64>>(&mut connection)
+        .await
+        .expect("load active MFA timestep failed");
+    assert_eq!(last_used_timestep, Some(101));
+    let consumed_recovery_codes = account_mfa_recovery_codes::table
+        .filter(account_mfa_recovery_codes::consumed_at.is_not_null())
+        .count()
+        .get_result::<i64>(&mut connection)
+        .await
+        .expect("count consumed MFA recovery codes failed");
+    assert_eq!(consumed_recovery_codes, 1);
+    drop(connection);
+
+    let replacement_challenge_at = now + chrono::Duration::seconds(20);
+    let replacement_challenge = create_test_mfa_challenge(
+        &catalog,
+        account.id,
+        AccountSessionClientKind::Browser,
+        110,
+        replacement_challenge_at,
+    )
+    .await;
+    enroll_test_mfa(
+        &catalog,
+        account.id,
+        111,
+        replacement_challenge_at + chrono::Duration::seconds(1),
+    )
+    .await;
+    let stale_authenticator_at = replacement_challenge_at + chrono::Duration::seconds(3);
+    let stale_authenticator_issuance = make_session_issuance(
+        account.id,
+        AccountSessionClientKind::Browser,
+        130,
+        stale_authenticator_at,
+        Some(stale_authenticator_at),
+    );
+    assert_eq!(
+        catalog
+            .complete_account_mfa_challenge(AccountMfaChallengeCompletionRequest {
+                challenge_token_digest: replacement_challenge,
+                authenticator_id: authenticator.id,
+                proof: AccountMfaChallengeProof::TotpTimestep(104),
+                audit_event: make_auth_success_audit(
+                    AccountAuthAuditEventKind::MfaChallengeCompleted,
+                    account.id,
+                    Some(stale_authenticator_issuance.session.id),
+                    Some(AccountSessionClientKind::Browser),
+                    stale_authenticator_at,
+                ),
+                issuance: stale_authenticator_issuance,
+                completed_at: stale_authenticator_at,
+            })
+            .await
+            .expect("replaced-authenticator challenge transaction failed"),
+        AccountMfaChallengeCompletionResult::Rejected
+    );
+}
+
+/// Prove native authorization codes enforce exact binding, expiry, and one-time use.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn native_authorization_codes_are_exact_expiring_and_single_use() {
+    let (catalog, _container) = setup_catalog().await;
+    let account = make_account(uuid::Uuid::new_v4(), "native-code");
+    catalog
+        .create_account(account.clone())
+        .await
+        .expect("create native-code account failed");
+    let now = chrono::Utc::now();
+    let code_digest = vec![111; 32];
+    let pkce_challenge = vec![112; 32];
+    let redirect_uri = "http://127.0.0.1:43123/callback".to_string();
+    catalog
+        .create_native_authorization_code(NativeAuthorizationCodeCreationRequest {
+            code: NativeAuthorizationCodeRecord {
+                id: uuid::Uuid::new_v4(),
+                account_id: account.id,
+                token_digest: code_digest.clone(),
+                client_kind: AccountSessionClientKind::Desktop,
+                redirect_uri: redirect_uri.clone(),
+                pkce_challenge: pkce_challenge.clone(),
+                mfa_verified_at: Some(now),
+                created_at: now,
+                expires_at: now + chrono::Duration::minutes(2),
+                consumed_at: None,
+            },
+            audit_event: make_auth_success_audit(
+                AccountAuthAuditEventKind::NativeAuthorizationCodeCreated,
+                account.id,
+                None,
+                Some(AccountSessionClientKind::Desktop),
+                now,
+            ),
+        })
+        .await
+        .expect("create native authorization code failed");
+
+    let wrong_exchange_at = now + chrono::Duration::seconds(1);
+    let wrong_issuance = make_session_issuance(
+        account.id,
+        AccountSessionClientKind::Desktop,
+        113,
+        wrong_exchange_at,
+        Some(now),
+    );
+    assert_eq!(
+        catalog
+            .exchange_native_authorization_code(NativeAuthorizationCodeExchangeRequest {
+                code_token_digest: code_digest.clone(),
+                client_kind: AccountSessionClientKind::Desktop,
+                redirect_uri: "http://127.0.0.1:43124/callback".to_string(),
+                pkce_challenge: pkce_challenge.clone(),
+                audit_event: make_auth_success_audit(
+                    AccountAuthAuditEventKind::NativeAuthorizationCodeConsumed,
+                    account.id,
+                    Some(wrong_issuance.session.id),
+                    Some(AccountSessionClientKind::Desktop),
+                    wrong_exchange_at,
+                ),
+                issuance: wrong_issuance,
+                exchanged_at: wrong_exchange_at,
+            })
+            .await
+            .expect("wrong native-code binding transaction failed"),
+        NativeAuthorizationCodeExchangeResult::Rejected
+    );
+
+    let exchanged_at = now + chrono::Duration::seconds(2);
+    let issuance = make_session_issuance(
+        account.id,
+        AccountSessionClientKind::Desktop,
+        115,
+        exchanged_at,
+        Some(now),
+    );
+    let session_id = issuance.session.id;
+    assert!(matches!(
+        catalog
+            .exchange_native_authorization_code(NativeAuthorizationCodeExchangeRequest {
+                code_token_digest: code_digest.clone(),
+                client_kind: AccountSessionClientKind::Desktop,
+                redirect_uri: redirect_uri.clone(),
+                pkce_challenge: pkce_challenge.clone(),
+                audit_event: make_auth_success_audit(
+                    AccountAuthAuditEventKind::NativeAuthorizationCodeConsumed,
+                    account.id,
+                    Some(session_id),
+                    Some(AccountSessionClientKind::Desktop),
+                    exchanged_at,
+                ),
+                issuance,
+                exchanged_at,
+            })
+            .await
+            .expect("native authorization-code exchange failed"),
+        NativeAuthorizationCodeExchangeResult::Exchanged(_)
+    ));
+
+    let reuse_at = now + chrono::Duration::seconds(3);
+    let reuse_issuance = make_session_issuance(
+        account.id,
+        AccountSessionClientKind::Desktop,
+        117,
+        reuse_at,
+        Some(now),
+    );
+    assert_eq!(
+        catalog
+            .exchange_native_authorization_code(NativeAuthorizationCodeExchangeRequest {
+                code_token_digest: code_digest,
+                client_kind: AccountSessionClientKind::Desktop,
+                redirect_uri,
+                pkce_challenge,
+                audit_event: make_auth_success_audit(
+                    AccountAuthAuditEventKind::NativeAuthorizationCodeConsumed,
+                    account.id,
+                    Some(reuse_issuance.session.id),
+                    Some(AccountSessionClientKind::Desktop),
+                    reuse_at,
+                ),
+                issuance: reuse_issuance,
+                exchanged_at: reuse_at,
+            })
+            .await
+            .expect("native authorization-code reuse transaction failed"),
+        NativeAuthorizationCodeExchangeResult::Rejected
+    );
+
+    let expired_code_digest = vec![119; 32];
+    let expired_pkce = vec![120; 32];
+    catalog
+        .create_native_authorization_code(NativeAuthorizationCodeCreationRequest {
+            code: NativeAuthorizationCodeRecord {
+                id: uuid::Uuid::new_v4(),
+                account_id: account.id,
+                token_digest: expired_code_digest.clone(),
+                client_kind: AccountSessionClientKind::Cli,
+                redirect_uri: "http://[::1]:43125/callback".to_string(),
+                pkce_challenge: expired_pkce.clone(),
+                mfa_verified_at: None,
+                created_at: now,
+                expires_at: now + chrono::Duration::seconds(1),
+                consumed_at: None,
+            },
+            audit_event: make_auth_success_audit(
+                AccountAuthAuditEventKind::NativeAuthorizationCodeCreated,
+                account.id,
+                None,
+                Some(AccountSessionClientKind::Cli),
+                now,
+            ),
+        })
+        .await
+        .expect("create expired native-code fixture failed");
+    let expired_at = now + chrono::Duration::seconds(2);
+    let expired_issuance = make_session_issuance(
+        account.id,
+        AccountSessionClientKind::Cli,
+        121,
+        expired_at,
+        None,
+    );
+    assert_eq!(
+        catalog
+            .exchange_native_authorization_code(NativeAuthorizationCodeExchangeRequest {
+                code_token_digest: expired_code_digest,
+                client_kind: AccountSessionClientKind::Cli,
+                redirect_uri: "http://[::1]:43125/callback".to_string(),
+                pkce_challenge: expired_pkce,
+                audit_event: make_auth_success_audit(
+                    AccountAuthAuditEventKind::NativeAuthorizationCodeConsumed,
+                    account.id,
+                    Some(expired_issuance.session.id),
+                    Some(AccountSessionClientKind::Cli),
+                    expired_at,
+                ),
+                issuance: expired_issuance,
+                exchanged_at: expired_at,
+            })
+            .await
+            .expect("expired native-code exchange transaction failed"),
+        NativeAuthorizationCodeExchangeResult::Rejected
+    );
+}
+
+/// Prove privileged role grants and MFA disable both fail closed around assurance.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn privileged_roles_require_and_retain_active_mfa() {
+    let (catalog, _container) = setup_catalog().await;
+    let administrator = make_account(uuid::Uuid::new_v4(), "mfa-role-admin");
+    let target = make_account(uuid::Uuid::new_v4(), "mfa-role-target");
+    catalog
+        .create_account(administrator.clone())
+        .await
+        .expect("create MFA-role administrator failed");
+    catalog
+        .create_account(target.clone())
+        .await
+        .expect("create MFA-role target failed");
+    assign_test_platform_role(&catalog, administrator.id, "administrator").await;
+
+    let without_mfa = catalog
+        .assign_account_platform_role(PlatformRoleAssignmentRequest {
+            account_id: target.id,
+            role: PlatformRole::Moderator,
+            actor_account_id: administrator.id,
+        })
+        .await;
+    assert!(matches!(without_mfa, Err(CatalogError::Validation(_))));
+
+    let now = chrono::Utc::now();
+    enroll_test_mfa(&catalog, target.id, 131, now).await;
+    let assigned = catalog
+        .assign_account_platform_role(PlatformRoleAssignmentRequest {
+            account_id: target.id,
+            role: PlatformRole::Moderator,
+            actor_account_id: administrator.id,
+        })
+        .await
+        .expect("assign MFA-protected moderator failed");
+    assert_eq!(assigned.state, PlatformRoleState::Active);
+    let disable_at = now + chrono::Duration::minutes(1);
+    let disable_result = catalog
+        .disable_account_mfa(AccountMfaDisableRequest {
+            account_id: target.id,
+            disabled_at: disable_at,
+            audit_event: make_auth_success_audit(
+                AccountAuthAuditEventKind::MfaDisabled,
+                target.id,
+                None,
+                None,
+                disable_at,
+            ),
+        })
+        .await;
+    assert!(matches!(disable_result, Err(CatalogError::Validation(_))));
+}
+
+/// Prove a concurrent role grant and MFA disable cannot commit an unassured role.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn concurrent_role_grant_and_mfa_disable_preserve_assurance() {
+    let (catalog, _container) = setup_catalog().await;
+    let administrator = make_account(uuid::Uuid::new_v4(), "mfa-race-admin");
+    let target = make_account(uuid::Uuid::new_v4(), "mfa-race-target");
+    for account in [&administrator, &target] {
+        catalog
+            .create_account(account.clone())
+            .await
+            .expect("create MFA-race account failed");
+    }
+    assign_test_platform_role(&catalog, administrator.id, "administrator").await;
+
+    let now = chrono::Utc::now();
+    enroll_test_mfa(&catalog, target.id, 133, now).await;
+    let mut connection = catalog
+        .pool()
+        .get()
+        .await
+        .expect("MFA-race trigger connection failed");
+    connection
+        .batch_execute(
+            "CREATE FUNCTION delay_mfa_race_role_insert() RETURNS trigger \
+             LANGUAGE plpgsql AS $$ \
+             BEGIN \
+                 PERFORM pg_sleep(0.5); \
+                 RETURN NEW; \
+             END \
+             $$; \
+             CREATE TRIGGER delay_mfa_race_role_insert \
+             BEFORE INSERT ON account_platform_roles \
+             FOR EACH ROW EXECUTE FUNCTION delay_mfa_race_role_insert();",
+        )
+        .await
+        .expect("install MFA-race trigger failed");
+    drop(connection);
+
+    let assignment_catalog = catalog.clone();
+    let assignment = tokio::spawn(async move {
+        assignment_catalog
+            .assign_account_platform_role(PlatformRoleAssignmentRequest {
+                account_id: target.id,
+                role: PlatformRole::Moderator,
+                actor_account_id: administrator.id,
+            })
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let disable_at = now + chrono::Duration::minutes(1);
+    let disable_result = catalog
+        .disable_account_mfa(AccountMfaDisableRequest {
+            account_id: target.id,
+            disabled_at: disable_at,
+            audit_event: make_auth_success_audit(
+                AccountAuthAuditEventKind::MfaDisabled,
+                target.id,
+                None,
+                None,
+                disable_at,
+            ),
+        })
+        .await;
+    let assignment_result = assignment.await.expect("role assignment task panicked");
+
+    assert_eq!(
+        assignment_result
+            .expect("serialized role assignment must retain MFA")
+            .state,
+        PlatformRoleState::Active
+    );
+    assert!(matches!(disable_result, Err(CatalogError::Validation(_))));
+    catalog
+        .get_active_account_mfa_authenticator(target.id)
+        .await
+        .expect("active privileged role must retain active MFA");
+}
+
+/// Prove suspension revokes session families and blocks every later issuance path.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn inactive_accounts_cannot_retain_refresh_or_create_sessions() {
+    let (catalog, _container) = setup_catalog().await;
+    let administrator = make_account(uuid::Uuid::new_v4(), "session-status-admin");
+    let target = make_account(uuid::Uuid::new_v4(), "session-status-target");
+    for account in [&administrator, &target] {
+        catalog
+            .create_account(account.clone())
+            .await
+            .expect("create session-status account failed");
+    }
+    assign_test_platform_role(&catalog, administrator.id, "administrator").await;
+
+    let now = chrono::Utc::now();
+    let issuance =
+        make_session_issuance(target.id, AccountSessionClientKind::Desktop, 135, now, None);
+    let access_digest = issuance.session.token_digest.clone();
+    let refresh_digest = issuance.refresh_token_digest.clone();
+    let session_id = issuance.session.id;
+    let persisted_session = catalog
+        .create_account_session(AccountSessionCreationRequest {
+            issuance,
+            audit_event: make_auth_success_audit(
+                AccountAuthAuditEventKind::SessionCreated,
+                target.id,
+                Some(session_id),
+                Some(AccountSessionClientKind::Desktop),
+                now,
+            ),
+        })
+        .await
+        .expect("create pre-suspension session failed");
+    catalog
+        .get_active_account_session(&access_digest, persisted_session.created_at)
+        .await
+        .expect("pre-suspension session must be active");
+
+    catalog
+        .set_account_status(AccountStatusChangeRequest {
+            account_id: target.id,
+            status: AccountStatus::Suspended,
+            actor_account_id: administrator.id,
+        })
+        .await
+        .expect("suspend session-status target failed");
+    assert!(matches!(
+        catalog
+            .get_active_account_session(&access_digest, persisted_session.created_at)
+            .await,
+        Err(CatalogError::NotFound { .. })
+    ));
+
+    let rotated_at = persisted_session.created_at + chrono::Duration::minutes(1);
+    assert_eq!(
+        catalog
+            .refresh_account_session(make_refresh_request(
+                target.id,
+                session_id,
+                AccountSessionClientKind::Desktop,
+                refresh_digest,
+                137,
+                rotated_at,
+                persisted_session.absolute_expires_at,
+            ))
+            .await
+            .expect("suspended-account refresh transaction failed"),
+        AccountSessionRefreshResult::Rejected
+    );
+
+    let replacement = make_session_issuance(
+        target.id,
+        AccountSessionClientKind::Cli,
+        139,
+        rotated_at,
+        None,
+    );
+    let replacement_session_id = replacement.session.id;
+    assert!(matches!(
+        catalog
+            .create_account_session(AccountSessionCreationRequest {
+                issuance: replacement,
+                audit_event: make_auth_success_audit(
+                    AccountAuthAuditEventKind::SessionCreated,
+                    target.id,
+                    Some(replacement_session_id),
+                    Some(AccountSessionClientKind::Cli),
+                    rotated_at,
+                ),
+            })
+            .await,
+        Err(CatalogError::Unauthorized { .. })
+    ));
+
+    let mut connection = catalog
+        .pool()
+        .get()
+        .await
+        .expect("session-status assertion connection failed");
+    let revoked_at = account_sessions::table
+        .find(session_id)
+        .select(account_sessions::revoked_at)
+        .first::<Option<chrono::DateTime<chrono::Utc>>>(&mut connection)
+        .await
+        .expect("load suspended session revocation failed");
+    assert!(revoked_at.is_some());
+}
+
+/// Prove a duplicate success-audit identifier rolls back session and refresh state.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn duplicate_auth_audit_id_rolls_back_security_state() {
+    let (catalog, _container) = setup_catalog().await;
+    let account = make_account(uuid::Uuid::new_v4(), "audit-rollback");
+    catalog
+        .create_account(account.clone())
+        .await
+        .expect("create audit-rollback account failed");
+    let now = chrono::Utc::now();
+    let duplicate_id = uuid::Uuid::new_v4();
+    catalog
+        .append_account_auth_audit_event(AccountAuthAuditEventRecord {
+            id: duplicate_id,
+            event_kind: AccountAuthAuditEventKind::AuthenticationRejected,
+            outcome: AccountAuthAuditOutcome::Rejected,
+            account_id: Some(account.id),
+            session_id: None,
+            client_kind: Some(AccountSessionClientKind::Desktop),
+            identifier_tag: Some(vec![141; 32]),
+            network_tag: Some(vec![142; 32]),
+            reason_code: Some("invalid_credentials".to_string()),
+            created_at: now,
+        })
+        .await
+        .expect("seed duplicate authentication audit id failed");
+    let issuance = make_session_issuance(
+        account.id,
+        AccountSessionClientKind::Desktop,
+        143,
+        now,
+        None,
+    );
+    let session_id = issuance.session.id;
+    let mut duplicate_success = make_auth_success_audit(
+        AccountAuthAuditEventKind::SessionCreated,
+        account.id,
+        Some(session_id),
+        Some(AccountSessionClientKind::Desktop),
+        now,
+    );
+    duplicate_success.id = duplicate_id;
+    assert!(catalog
+        .create_account_session(AccountSessionCreationRequest {
+            issuance,
+            audit_event: duplicate_success,
+        })
+        .await
+        .is_err());
+
+    let mut connection = catalog
+        .pool()
+        .get()
+        .await
+        .expect("audit rollback assertion connection failed");
+    let session_count = account_sessions::table
+        .filter(account_sessions::id.eq(session_id))
+        .count()
+        .get_result::<i64>(&mut connection)
+        .await
+        .expect("count rolled-back sessions failed");
+    let refresh_count = account_session_refresh_tokens::table
+        .filter(account_session_refresh_tokens::session_id.eq(session_id))
+        .count()
+        .get_result::<i64>(&mut connection)
+        .await
+        .expect("count rolled-back refresh generations failed");
+    assert_eq!((session_count, refresh_count), (0, 0));
+}
+
+/// Prove the authentication hardening migration refuses destructive rollback.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn account_auth_hardening_migration_is_forward_only() {
+    let (catalog, _container) = setup_catalog().await;
+    let mut connection = catalog
+        .pool()
+        .get()
+        .await
+        .expect("auth migration rollback connection failed");
+    let error = connection
+        .batch_execute(include_str!(
+            "../migrations/2026-08-02-000001_harden_account_auth/down.sql"
+        ))
+        .await
+        .expect_err("authentication hardening rollback must be refused");
+    assert!(error.to_string().contains("forward-only"));
+    let retained_table_count = account_auth_audit_events::table
+        .count()
+        .get_result::<i64>(&mut connection)
+        .await
+        .expect("authentication audit table must remain after refused rollback");
+    assert_eq!(retained_table_count, 0);
 }
 
 /// Create one approved publisher with an active deterministic signing key.
@@ -5386,6 +6726,7 @@ async fn platform_role_administration_is_authorized_idempotent_and_auditable() {
         .expect_err("granting to a missing account must fail");
     assert!(matches!(missing, CatalogError::NotFound { .. }));
 
+    enroll_test_mfa(&catalog, target.id, 151, chrono::Utc::now()).await;
     let granted = catalog
         .assign_account_platform_role(PlatformRoleAssignmentRequest {
             account_id: target.id,
@@ -5491,6 +6832,7 @@ async fn last_administrator_authority_is_protected() {
     assert!(matches!(suspend_error, CatalogError::Validation(_)));
 
     // A second administrator provides coverage.
+    enroll_test_mfa(&catalog, second.id, 152, chrono::Utc::now()).await;
     catalog
         .assign_account_platform_role(PlatformRoleAssignmentRequest {
             account_id: second.id,
@@ -5538,6 +6880,7 @@ async fn concurrent_administrator_revocations_preserve_coverage() {
             .expect("create race fixture account failed");
     }
     assign_test_platform_role(&catalog, first.id, "administrator").await;
+    enroll_test_mfa(&catalog, second.id, 153, chrono::Utc::now()).await;
     catalog
         .assign_account_platform_role(PlatformRoleAssignmentRequest {
             account_id: second.id,
@@ -5654,6 +6997,7 @@ async fn cold_deployment_drill_reaches_a_public_pack() {
     assign_test_platform_role(&catalog, promoter.id, "administrator").await;
 
     // Stage 4: from here on, only the shipped administrator API is used.
+    enroll_test_mfa(&catalog, would_be_reviewer.id, 154, chrono::Utc::now()).await;
     let granted = catalog
         .assign_account_platform_role(PlatformRoleAssignmentRequest {
             account_id: would_be_reviewer.id,
@@ -5780,11 +7124,22 @@ async fn concurrent_invite_redemption_creates_exactly_one_local_account() {
         catalog.register_local_account(first),
         catalog.register_local_account(second),
     );
-    let failed = match (first_result, second_result) {
-        (Ok(_), Err(error)) | (Err(error), Ok(_)) => error,
+    let (successful, failed) = match (first_result, second_result) {
+        (Ok(result), Err(error)) | (Err(error), Ok(result)) => (result, error),
         results => panic!("exactly one concurrent redemption may succeed, got results={results:?}"),
     };
     assert!(matches!(failed, CatalogError::Unauthorized { .. }));
+    let persisted_session = catalog
+        .get_active_account_session(
+            &successful.session.token_digest,
+            successful.session.created_at,
+        )
+        .await
+        .expect("load persisted registration session failed");
+    assert_eq!(
+        successful.session, persisted_session,
+        "registration must return PostgreSQL-normalized session timestamps"
+    );
 
     let mut connection = catalog
         .pool()

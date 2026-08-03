@@ -535,7 +535,7 @@ impl AuthenticatedSession {
         }
     }
 
-    /// Build a non-refreshable first-party bearer session with an exact expiry.
+    /// Build a non-refreshable legacy first-party bearer session with an exact expiry.
     ///
     /// # Errors
     ///
@@ -546,14 +546,37 @@ impl AuthenticatedSession {
         access_token: SecretString,
         expires_at: u64,
     ) -> Result<Self, SessionError> {
-        let token = access_token.expose_secret();
-        if token.is_empty()
-            || token
-                .chars()
-                .any(|character| character.is_whitespace() || character.is_control())
+        Self::from_first_party_parts(access_token, None, expires_at)
+    }
+
+    /// Build a refreshable first-party native session with an exact access expiry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-configuration error when either opaque token is empty,
+    /// contains HTTP-header whitespace or controls, or the supplied access expiry
+    /// is not later than the current Unix timestamp.
+    pub fn from_first_party_tokens(
+        access_token: SecretString,
+        refresh_token: SecretString,
+        expires_at: u64,
+    ) -> Result<Self, SessionError> {
+        Self::from_first_party_parts(access_token, Some(refresh_token), expires_at)
+    }
+
+    /// Validate first-party token material and construct its provider-neutral session.
+    fn from_first_party_parts(
+        access_token: SecretString,
+        refresh_token: Option<SecretString>,
+        expires_at: u64,
+    ) -> Result<Self, SessionError> {
+        if invalid_first_party_token(&access_token)
+            || refresh_token
+                .as_ref()
+                .is_some_and(invalid_first_party_token)
         {
             return Err(SessionError::InvalidConfiguration(
-                "first-party bearer token failed validation".to_string(),
+                "first-party token material failed validation".to_string(),
             ));
         }
         let acquired_at = unix_now();
@@ -567,7 +590,7 @@ impl AuthenticatedSession {
         })?;
         Ok(Self {
             access_token,
-            refresh_token: None,
+            refresh_token,
             expires_in: Some(expires_in),
             scope: None,
             acquired_at,
@@ -590,6 +613,15 @@ impl AuthenticatedSession {
             acquired_at,
         }
     }
+}
+
+/// Reject opaque first-party values that cannot be presented safely.
+fn invalid_first_party_token(token: &SecretString) -> bool {
+    token.expose_secret().is_empty()
+        || token
+            .expose_secret()
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
 }
 
 /// Build the standard discovery URL beneath the exact issuer path.
@@ -928,12 +960,46 @@ mod tests {
         assert!(!format!("{session:?}").contains("native-session-token"));
     }
 
+    /// Rotating first-party credentials retain refreshability without debug disclosure.
+    #[test]
+    fn builds_refreshable_first_party_session() {
+        let expires_at = unix_now().saturating_add(120);
+        let session = AuthenticatedSession::from_first_party_tokens(
+            SecretString::new("native-access-token".to_string()),
+            SecretString::new("native-refresh-token".to_string()),
+            expires_at,
+        )
+        .expect("refreshable first-party session");
+
+        assert_eq!(
+            session.access_token().expose_secret(),
+            "native-access-token"
+        );
+        assert_eq!(
+            session
+                .refresh_token()
+                .expect("refresh token")
+                .expose_secret(),
+            "native-refresh-token"
+        );
+        assert!(session.summary().refreshable);
+        let debug = format!("{session:?}");
+        assert!(!debug.contains("native-access-token"));
+        assert!(!debug.contains("native-refresh-token"));
+    }
+
     /// Empty, header-unsafe, and expired first-party bearer values fail closed.
     #[test]
     fn rejects_invalid_first_party_session_material() {
         let future = unix_now().saturating_add(120);
         for token in ["", "contains space", "contains\0control"] {
             assert!(AuthenticatedSession::from_first_party_bearer(
+                SecretString::new(token.to_string()),
+                future,
+            )
+            .is_err());
+            assert!(AuthenticatedSession::from_first_party_tokens(
+                SecretString::new("native-access-token".to_string()),
                 SecretString::new(token.to_string()),
                 future,
             )

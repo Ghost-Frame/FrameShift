@@ -5,7 +5,7 @@ use axum::http::header::{AUTHORIZATION, COOKIE, ORIGIN};
 use axum::http::Method;
 use axum::middleware::Next;
 use axum::response::Response;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use frameshift_catalog::{AccountRecord, AccountSessionClientKind, AccountStatus, CatalogError};
 use uuid::Uuid;
 
@@ -23,8 +23,63 @@ pub struct AuthenticatedAccount {
     pub auth_time: Option<u64>,
     /// Local session identifier when authentication used a first-party token.
     pub local_session_id: Option<Uuid>,
+    /// Most recent successful local second-factor verification.
+    pub mfa_verified_at: Option<DateTime<Utc>>,
     /// Whether the local session token arrived through the secure browser cookie.
     pub via_cookie: bool,
+}
+
+/// Require recent first-party MFA assurance on a privileged authenticated route.
+pub async fn require_fresh_mfa(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, AppError> {
+    if matches!(*request.method(), Method::GET | Method::HEAD)
+        && matches!(request.uri().path(), "/account" | "/v1/account")
+    {
+        return Ok(next.run(request).await);
+    }
+    let auth = request
+        .extensions()
+        .get::<AuthenticatedAccount>()
+        .ok_or_else(|| AppError::Unauthorized("account authentication required".to_string()))?;
+    validate_fresh_authentication(&state, auth)?;
+    Ok(next.run(request).await)
+}
+
+/// Validate recent local MFA or OIDC authentication without consuming a request.
+pub(crate) fn validate_fresh_authentication(
+    state: &AppState,
+    auth: &AuthenticatedAccount,
+) -> Result<(), AppError> {
+    let now = Utc::now();
+    if auth.local_session_id.is_some() {
+        let verified_at = auth
+            .mfa_verified_at
+            .ok_or_else(|| AppError::Forbidden("fresh MFA verification required".to_string()))?;
+        let freshness = chrono::Duration::from_std(state.config.first_party_auth.mfa_freshness_ttl)
+            .map_err(|_| AppError::Internal("MFA freshness duration is invalid".to_string()))?;
+        if verified_at > now + chrono::Duration::seconds(30) || verified_at < now - freshness {
+            return Err(AppError::Forbidden(
+                "fresh MFA verification required".to_string(),
+            ));
+        }
+    } else {
+        let auth_time = auth
+            .auth_time
+            .ok_or_else(|| AppError::Forbidden("fresh authentication required".to_string()))?;
+        let now_seconds = u64::try_from(now.timestamp()).unwrap_or_default();
+        if auth_time > now_seconds.saturating_add(30)
+            || now_seconds.saturating_sub(auth_time)
+                > state.config.oidc.fresh_auth_max_age.as_secs()
+        {
+            return Err(AppError::Forbidden(
+                "fresh authentication required".to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Require an OIDC bearer token, provision its account, and reject disabled accounts.
@@ -107,6 +162,7 @@ async fn authenticate_account(
         account,
         auth_time: identity.auth_time,
         local_session_id: None,
+        mfa_verified_at: None,
         via_cookie: false,
     })
 }
@@ -142,6 +198,10 @@ async fn authenticate_local_token(
         Err(CatalogError::NotFound { .. }) => return Ok(None),
         Err(error) => return Err(AppError::from_catalog(error, "account session")),
     };
+    let expects_cookie = session.client_kind == AccountSessionClientKind::Browser;
+    if via_cookie != expects_cookie {
+        return Ok(None);
+    }
     let account = state
         .catalog
         .get_account(session.account_id)
@@ -170,6 +230,7 @@ async fn authenticate_local_token(
         account,
         auth_time: u64::try_from(session.created_at.timestamp()).ok(),
         local_session_id: Some(session.id),
+        mfa_verified_at: session.mfa_verified_at,
         via_cookie,
     }))
 }

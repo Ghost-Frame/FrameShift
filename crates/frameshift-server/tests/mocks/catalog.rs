@@ -22,12 +22,20 @@ use frameshift_catalog::error::{CatalogError, HealthStatus};
 use frameshift_catalog::filters::{PackSearchFilters, PackSearchResult};
 use frameshift_catalog::identity::Ed25519PublicKey;
 use frameshift_catalog::records::{
-    AccountInviteIssueRequest, AccountInviteRecord, AccountInviteRequestRecord,
-    AccountInviteReviewRequest, AccountInviteStatus, AccountPasswordCredentialRecord,
-    AccountPasswordRehashRequest, AccountRecord, AccountSessionRecord, AccountStatus,
-    AccountStatusChangeRequest, AuthorRecord, EncryptedPasswordRecoveryDelivery,
-    LocalAccountRegistrationRequest, LocalAccountRegistrationResult, MembershipState, PackRecord,
-    PackVersionRecord, PasswordRecoveryCompletionRequest, PasswordRecoveryDeliveryClaimRequest,
+    AccountAuthAuditEventRecord, AccountInviteIssueRequest, AccountInviteRecord,
+    AccountInviteRequestRecord, AccountInviteReviewRequest, AccountInviteStatus,
+    AccountMfaActivationRequest, AccountMfaAuthenticatorRecord, AccountMfaAuthenticatorState,
+    AccountMfaChallengeCompletionRequest, AccountMfaChallengeCompletionResult,
+    AccountMfaChallengeCreationRequest, AccountMfaChallengeProof, AccountMfaDisableRequest,
+    AccountMfaEnrollmentRequest, AccountMfaLoginChallengeRecord, AccountPasswordCredentialRecord,
+    AccountPasswordRehashRequest, AccountRecord, AccountSessionCreationRequest,
+    AccountSessionIssuance, AccountSessionRecord, AccountSessionRefreshRequest,
+    AccountSessionRefreshResult, AccountStatus, AccountStatusChangeRequest, AuthorRecord,
+    EncryptedPasswordRecoveryDelivery, LocalAccountRegistrationRequest,
+    LocalAccountRegistrationResult, MembershipState, NativeAuthorizationCodeCreationRequest,
+    NativeAuthorizationCodeExchangeRequest, NativeAuthorizationCodeExchangeResult,
+    NativeAuthorizationCodeRecord, PackRecord, PackVersionRecord,
+    PasswordRecoveryCompletionRequest, PasswordRecoveryDeliveryClaimRequest,
     PasswordRecoveryDeliveryKind, PasswordRecoveryDeliveryRecord, PasswordRecoveryEnqueueRequest,
     PlatformRole, PlatformRoleAssignmentRequest, PlatformRoleRecord, PlatformRoleRevocationRequest,
     PlatformRoleState, PublicationAppealCaseRecord, PublicationAppealCursor,
@@ -43,6 +51,7 @@ use frameshift_catalog::records::{
     PublisherSuspensionRequest,
 };
 use frameshift_catalog::status::{PackStatus, TombstoneRecord};
+use frameshift_catalog::AccountSessionClientKind;
 // Reuse the exact same version-precedence comparator the Postgres adapter
 // uses for `register_pack_version`'s `latest_version` selection, so the
 // mock's tombstone head-recompute can never drift from the real ordering.
@@ -69,6 +78,32 @@ pub struct MockPasswordRecoveryToken {
     pub created_at: DateTime<Utc>,
 }
 
+/// Digest-only refresh generation retained by the in-memory catalog double.
+#[derive(Clone)]
+pub struct MockRefreshToken {
+    /// Stable refresh-generation identifier.
+    pub id: uuid::Uuid,
+    /// Session family owning this generation.
+    pub session_id: uuid::Uuid,
+    /// SHA-256 digest of the caller-held refresh token.
+    pub token_digest: Vec<u8>,
+    /// Exclusive token consumption deadline.
+    pub expires_at: DateTime<Utc>,
+    /// Successful consumption timestamp used to detect replay.
+    pub consumed_at: Option<DateTime<Utc>>,
+}
+
+/// Digest-only recovery code retained by the in-memory catalog double.
+#[derive(Clone)]
+pub struct MockMfaRecoveryCode {
+    /// Authenticator whose activation created the code.
+    pub authenticator_id: uuid::Uuid,
+    /// Account that owns the code.
+    pub account_id: uuid::Uuid,
+    /// Whether a successful challenge already consumed the code.
+    pub consumed_at: Option<DateTime<Utc>>,
+}
+
 /// Shared mutable state for [`MockCatalog`].
 ///
 /// Wrapped in `Arc<RwLock<MockState>>` so that the catalog can be cloned
@@ -86,6 +121,24 @@ pub struct MockState {
 
     /// Revocable first-party sessions keyed by stable identifier.
     pub account_sessions: HashMap<uuid::Uuid, AccountSessionRecord>,
+
+    /// Digest-only refresh generations keyed by their token digest.
+    pub account_refresh_tokens: HashMap<Vec<u8>, MockRefreshToken>,
+
+    /// Encrypted MFA authenticators keyed by stable identifier.
+    pub account_mfa_authenticators: HashMap<uuid::Uuid, AccountMfaAuthenticatorRecord>,
+
+    /// Digest-only recovery codes keyed by their token digest.
+    pub account_mfa_recovery_codes: HashMap<Vec<u8>, MockMfaRecoveryCode>,
+
+    /// Digest-only MFA login challenges keyed by their token digest.
+    pub account_mfa_challenges: HashMap<Vec<u8>, AccountMfaLoginChallengeRecord>,
+
+    /// Digest-only native authorization codes keyed by their token digest.
+    pub native_authorization_codes: HashMap<Vec<u8>, NativeAuthorizationCodeRecord>,
+
+    /// Immutable sanitized first-party authentication audit events.
+    pub account_auth_audit_events: Vec<AccountAuthAuditEventRecord>,
 
     /// Digest-only password reset tokens keyed by stable identifier.
     pub password_recovery_tokens: HashMap<uuid::Uuid, MockPasswordRecoveryToken>,
@@ -222,6 +275,48 @@ impl Default for MockCatalog {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Persist one mock access session and its initial digest-only refresh generation.
+fn insert_mock_session_issuance(
+    state: &mut MockState,
+    issuance: AccountSessionIssuance,
+) -> Result<AccountSessionRecord, CatalogError> {
+    let session = issuance.session;
+    if state.account_sessions.contains_key(&session.id)
+        || state
+            .account_refresh_tokens
+            .values()
+            .any(|token| token.id == issuance.refresh_token_id)
+        || state
+            .account_refresh_tokens
+            .contains_key(&issuance.refresh_token_digest)
+    {
+        return Err(CatalogError::Conflict {
+            kind: "account_session",
+            key: session.id.to_string(),
+        });
+    }
+    let refresh = MockRefreshToken {
+        id: issuance.refresh_token_id,
+        session_id: session.id,
+        token_digest: issuance.refresh_token_digest,
+        expires_at: issuance.refresh_expires_at,
+        consumed_at: None,
+    };
+    state
+        .account_refresh_tokens
+        .insert(refresh.token_digest.clone(), refresh);
+    state.account_sessions.insert(session.id, session.clone());
+    Ok(session)
+}
+
+/// Return whether the mock account exists and remains active.
+fn mock_account_is_active(state: &MockState, account_id: uuid::Uuid) -> bool {
+    state
+        .accounts
+        .get(&account_id)
+        .is_some_and(|account| account.status == AccountStatus::Active)
 }
 
 /// Validate optional audit records before applying an in-memory mutation.
@@ -450,12 +545,11 @@ impl CatalogBackend for MockCatalog {
             request.credential.normalized_email.clone(),
             request.credential,
         );
-        state
-            .account_sessions
-            .insert(request.session.id, request.session.clone());
+        let session = insert_mock_session_issuance(&mut state, request.session)?;
+        state.account_auth_audit_events.push(request.audit_event);
         Ok(LocalAccountRegistrationResult {
             account: request.account,
-            session: request.session,
+            session,
         })
     }
 
@@ -802,20 +896,15 @@ impl CatalogBackend for MockCatalog {
     /// Create one mock first-party session.
     async fn create_account_session(
         &self,
-        record: AccountSessionRecord,
-    ) -> Result<(), CatalogError> {
+        request: AccountSessionCreationRequest,
+    ) -> Result<AccountSessionRecord, CatalogError> {
         let mut state = self
             .state
             .write()
             .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
-        if state.account_sessions.contains_key(&record.id) {
-            return Err(CatalogError::Conflict {
-                kind: "account_session",
-                key: record.id.to_string(),
-            });
-        }
-        state.account_sessions.insert(record.id, record);
-        Ok(())
+        let session = insert_mock_session_issuance(&mut state, request.issuance)?;
+        state.account_auth_audit_events.push(request.audit_event);
+        Ok(session)
     }
 
     /// Resolve one active mock first-party session.
@@ -832,6 +921,7 @@ impl CatalogBackend for MockCatalog {
             .find(|session| {
                 session.token_digest == token_digest
                     && session.revoked_at.is_none()
+                    && session.access_expires_at > now
                     && session.idle_expires_at > now
                     && session.absolute_expires_at > now
             })
@@ -886,6 +976,484 @@ impl CatalogBackend for MockCatalog {
                 key: session_id.to_string(),
             })?;
         session.revoked_at = Some(revoked_at);
+        Ok(())
+    }
+
+    /// Rotate one mock refresh generation or revoke its family after replay.
+    async fn refresh_account_session(
+        &self,
+        request: AccountSessionRefreshRequest,
+    ) -> Result<AccountSessionRefreshResult, CatalogError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        let Some(refresh) = state
+            .account_refresh_tokens
+            .get(&request.presented_refresh_token_digest)
+            .cloned()
+        else {
+            return Ok(AccountSessionRefreshResult::Rejected);
+        };
+        let Some(session) = state.account_sessions.get(&refresh.session_id).cloned() else {
+            return Ok(AccountSessionRefreshResult::Rejected);
+        };
+
+        if refresh.consumed_at.is_some() {
+            if let Some(stored_session) = state.account_sessions.get_mut(&session.id) {
+                stored_session.revoked_at.get_or_insert(request.rotated_at);
+            }
+            state
+                .account_auth_audit_events
+                .push(request.replay_audit_event);
+            return Ok(AccountSessionRefreshResult::ReplayRevoked);
+        }
+        if refresh.expires_at <= request.rotated_at
+            || !mock_account_is_active(&state, session.account_id)
+            || session.revoked_at.is_some()
+            || session.idle_expires_at <= request.rotated_at
+            || session.absolute_expires_at <= request.rotated_at
+            || request.replacement_access_expires_at > session.absolute_expires_at
+            || request.replacement_idle_expires_at > session.absolute_expires_at
+            || request.replacement_refresh_expires_at > session.absolute_expires_at
+        {
+            return Ok(AccountSessionRefreshResult::Rejected);
+        }
+        if state
+            .account_refresh_tokens
+            .contains_key(&request.replacement_refresh_token_digest)
+            || state
+                .account_refresh_tokens
+                .values()
+                .any(|token| token.id == request.replacement_refresh_token_id)
+        {
+            return Err(CatalogError::Conflict {
+                kind: "account_session_refresh",
+                key: request.replacement_refresh_token_id.to_string(),
+            });
+        }
+
+        state
+            .account_refresh_tokens
+            .get_mut(&request.presented_refresh_token_digest)
+            .expect("refresh generation was resolved while holding the write lock")
+            .consumed_at = Some(request.rotated_at);
+        let replacement = MockRefreshToken {
+            id: request.replacement_refresh_token_id,
+            session_id: session.id,
+            token_digest: request.replacement_refresh_token_digest,
+            expires_at: request.replacement_refresh_expires_at,
+            consumed_at: None,
+        };
+        state
+            .account_refresh_tokens
+            .insert(replacement.token_digest.clone(), replacement);
+        let stored_session = state
+            .account_sessions
+            .get_mut(&session.id)
+            .expect("session was resolved while holding the write lock");
+        stored_session.token_digest = request.replacement_access_token_digest;
+        stored_session.last_seen_at = request.rotated_at;
+        stored_session.access_expires_at = request.replacement_access_expires_at;
+        stored_session.idle_expires_at = request.replacement_idle_expires_at;
+        let rotated = stored_session.clone();
+        state
+            .account_auth_audit_events
+            .push(request.success_audit_event);
+        Ok(AccountSessionRefreshResult::Rotated(rotated))
+    }
+
+    /// Retrieve the active mock authenticator for one account.
+    async fn get_active_account_mfa_authenticator(
+        &self,
+        account_id: uuid::Uuid,
+    ) -> Result<AccountMfaAuthenticatorRecord, CatalogError> {
+        self.state
+            .read()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?
+            .account_mfa_authenticators
+            .values()
+            .find(|authenticator| {
+                authenticator.account_id == account_id
+                    && authenticator.state == AccountMfaAuthenticatorState::Active
+            })
+            .cloned()
+            .ok_or_else(|| CatalogError::NotFound {
+                kind: "account_mfa_authenticator",
+                key: account_id.to_string(),
+            })
+    }
+
+    /// Retrieve one exact unexpired pending mock authenticator.
+    async fn get_pending_account_mfa_authenticator(
+        &self,
+        account_id: uuid::Uuid,
+        authenticator_id: uuid::Uuid,
+        now: DateTime<Utc>,
+    ) -> Result<AccountMfaAuthenticatorRecord, CatalogError> {
+        self.state
+            .read()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?
+            .account_mfa_authenticators
+            .get(&authenticator_id)
+            .filter(|authenticator| {
+                authenticator.account_id == account_id
+                    && authenticator.state == AccountMfaAuthenticatorState::Pending
+                    && authenticator
+                        .pending_expires_at
+                        .is_some_and(|expires_at| expires_at > now)
+            })
+            .cloned()
+            .ok_or_else(|| CatalogError::NotFound {
+                kind: "account_mfa_authenticator",
+                key: authenticator_id.to_string(),
+            })
+    }
+
+    /// Replace pending mock enrollment state and retain its success audit.
+    async fn begin_account_mfa_enrollment(
+        &self,
+        request: AccountMfaEnrollmentRequest,
+    ) -> Result<AccountMfaAuthenticatorRecord, CatalogError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        if !mock_account_is_active(&state, request.authenticator.account_id) {
+            return Err(CatalogError::Unauthorized {
+                kind: "account_mfa_authenticator",
+                key: request.authenticator.account_id.to_string(),
+            });
+        }
+        for authenticator in state.account_mfa_authenticators.values_mut() {
+            if authenticator.account_id == request.authenticator.account_id
+                && authenticator.state == AccountMfaAuthenticatorState::Pending
+            {
+                authenticator.state = AccountMfaAuthenticatorState::Disabled;
+                authenticator.pending_expires_at = None;
+                authenticator.disabled_at = Some(request.authenticator.created_at);
+            }
+        }
+        let authenticator = request.authenticator;
+        state
+            .account_mfa_authenticators
+            .insert(authenticator.id, authenticator.clone());
+        state.account_auth_audit_events.push(request.audit_event);
+        Ok(authenticator)
+    }
+
+    /// Activate one pending mock authenticator and replace its recovery codes.
+    async fn activate_account_mfa(
+        &self,
+        request: AccountMfaActivationRequest,
+    ) -> Result<AccountMfaAuthenticatorRecord, CatalogError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        let pending_is_valid = state
+            .account_mfa_authenticators
+            .get(&request.authenticator_id)
+            .is_some_and(|authenticator| {
+                authenticator.account_id == request.account_id
+                    && authenticator.state == AccountMfaAuthenticatorState::Pending
+                    && authenticator
+                        .pending_expires_at
+                        .is_some_and(|expires_at| expires_at > request.activated_at)
+                    && authenticator
+                        .last_used_timestep
+                        .is_none_or(|timestep| request.verified_timestep > timestep)
+            });
+        if !pending_is_valid || !mock_account_is_active(&state, request.account_id) {
+            return Err(CatalogError::Unauthorized {
+                kind: "account_mfa_authenticator",
+                key: request.authenticator_id.to_string(),
+            });
+        }
+        for authenticator in state.account_mfa_authenticators.values_mut() {
+            if authenticator.account_id == request.account_id
+                && authenticator.state == AccountMfaAuthenticatorState::Active
+            {
+                authenticator.state = AccountMfaAuthenticatorState::Disabled;
+                authenticator.disabled_at = Some(request.activated_at);
+            }
+        }
+        let authenticator = state
+            .account_mfa_authenticators
+            .get_mut(&request.authenticator_id)
+            .expect("pending authenticator was resolved while holding the write lock");
+        authenticator.state = AccountMfaAuthenticatorState::Active;
+        authenticator.pending_expires_at = None;
+        authenticator.last_used_timestep = Some(request.verified_timestep);
+        authenticator.activated_at = Some(request.activated_at);
+        let activated = authenticator.clone();
+        state
+            .account_mfa_recovery_codes
+            .retain(|_, code| code.account_id != request.account_id);
+        for seed in request.recovery_codes {
+            state.account_mfa_recovery_codes.insert(
+                seed.code_digest,
+                MockMfaRecoveryCode {
+                    authenticator_id: request.authenticator_id,
+                    account_id: request.account_id,
+                    consumed_at: None,
+                },
+            );
+        }
+        state.account_auth_audit_events.push(request.audit_event);
+        Ok(activated)
+    }
+
+    /// Disable active mock MFA unless a platform role requires it.
+    async fn disable_account_mfa(
+        &self,
+        request: AccountMfaDisableRequest,
+    ) -> Result<bool, CatalogError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        if state.platform_roles.iter().any(|role| {
+            role.account_id == request.account_id && role.state == PlatformRoleState::Active
+        }) {
+            return Err(CatalogError::Validation(
+                "active privileged roles require MFA".to_string(),
+            ));
+        }
+        let mut disabled = false;
+        for authenticator in state.account_mfa_authenticators.values_mut() {
+            if authenticator.account_id == request.account_id
+                && authenticator.state == AccountMfaAuthenticatorState::Active
+            {
+                authenticator.state = AccountMfaAuthenticatorState::Disabled;
+                authenticator.disabled_at = Some(request.disabled_at);
+                disabled = true;
+            }
+        }
+        if disabled {
+            state.account_auth_audit_events.push(request.audit_event);
+        }
+        Ok(disabled)
+    }
+
+    /// Create one digest-only mock MFA login challenge.
+    async fn create_account_mfa_challenge(
+        &self,
+        request: AccountMfaChallengeCreationRequest,
+    ) -> Result<(), CatalogError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        let active_authenticator_count = state
+            .account_mfa_authenticators
+            .values()
+            .filter(|authenticator| {
+                authenticator.account_id == request.challenge.account_id
+                    && authenticator.state == AccountMfaAuthenticatorState::Active
+            })
+            .count();
+        if !mock_account_is_active(&state, request.challenge.account_id)
+            || active_authenticator_count != 1
+        {
+            return Err(CatalogError::Unauthorized {
+                kind: "account_mfa_authenticator",
+                key: request.challenge.account_id.to_string(),
+            });
+        }
+        if state
+            .account_mfa_challenges
+            .contains_key(&request.challenge.token_digest)
+        {
+            return Err(CatalogError::Conflict {
+                kind: "account_mfa_challenge",
+                key: request.challenge.id.to_string(),
+            });
+        }
+        state
+            .account_mfa_challenges
+            .insert(request.challenge.token_digest.clone(), request.challenge);
+        state.account_auth_audit_events.push(request.audit_event);
+        Ok(())
+    }
+
+    /// Consume one mock MFA challenge and issue a verified session family.
+    async fn complete_account_mfa_challenge(
+        &self,
+        request: AccountMfaChallengeCompletionRequest,
+    ) -> Result<AccountMfaChallengeCompletionResult, CatalogError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        let Some(challenge) = state
+            .account_mfa_challenges
+            .get(&request.challenge_token_digest)
+            .cloned()
+        else {
+            return Ok(AccountMfaChallengeCompletionResult::Rejected);
+        };
+        let Some(authenticator) = state
+            .account_mfa_authenticators
+            .get(&request.authenticator_id)
+            .cloned()
+        else {
+            return Ok(AccountMfaChallengeCompletionResult::Rejected);
+        };
+        if challenge.consumed_at.is_some()
+            || challenge.expires_at <= request.completed_at
+            || challenge.account_id != request.issuance.session.account_id
+            || challenge.client_kind != request.issuance.session.client_kind
+            || !mock_account_is_active(&state, challenge.account_id)
+            || authenticator.account_id != challenge.account_id
+            || authenticator.state != AccountMfaAuthenticatorState::Active
+            || request.issuance.session.mfa_verified_at != Some(request.completed_at)
+        {
+            return Ok(AccountMfaChallengeCompletionResult::Rejected);
+        }
+
+        match &request.proof {
+            AccountMfaChallengeProof::TotpTimestep(timestep) => {
+                if *timestep < 0
+                    || authenticator
+                        .last_used_timestep
+                        .is_some_and(|last_used| *timestep <= last_used)
+                {
+                    return Ok(AccountMfaChallengeCompletionResult::Rejected);
+                }
+            }
+            AccountMfaChallengeProof::RecoveryCodeDigest(digest) => {
+                let usable = state
+                    .account_mfa_recovery_codes
+                    .get(digest)
+                    .is_some_and(|code| {
+                        code.authenticator_id == authenticator.id
+                            && code.account_id == challenge.account_id
+                            && code.consumed_at.is_none()
+                    });
+                if !usable {
+                    return Ok(AccountMfaChallengeCompletionResult::Rejected);
+                }
+            }
+        }
+        if state
+            .account_sessions
+            .contains_key(&request.issuance.session.id)
+            || state
+                .account_refresh_tokens
+                .contains_key(&request.issuance.refresh_token_digest)
+        {
+            return Err(CatalogError::Conflict {
+                kind: "account_session",
+                key: request.issuance.session.id.to_string(),
+            });
+        }
+
+        match &request.proof {
+            AccountMfaChallengeProof::TotpTimestep(timestep) => {
+                state
+                    .account_mfa_authenticators
+                    .get_mut(&authenticator.id)
+                    .expect("active authenticator was resolved while holding the write lock")
+                    .last_used_timestep = Some(*timestep);
+            }
+            AccountMfaChallengeProof::RecoveryCodeDigest(digest) => {
+                state
+                    .account_mfa_recovery_codes
+                    .get_mut(digest)
+                    .expect("recovery code was resolved while holding the write lock")
+                    .consumed_at = Some(request.completed_at);
+            }
+        }
+        state
+            .account_mfa_challenges
+            .get_mut(&request.challenge_token_digest)
+            .expect("MFA challenge was resolved while holding the write lock")
+            .consumed_at = Some(request.completed_at);
+        let session = insert_mock_session_issuance(&mut state, request.issuance)?;
+        state.account_auth_audit_events.push(request.audit_event);
+        Ok(AccountMfaChallengeCompletionResult::Completed(session))
+    }
+
+    /// Create one exactly bound digest-only mock native authorization code.
+    async fn create_native_authorization_code(
+        &self,
+        request: NativeAuthorizationCodeCreationRequest,
+    ) -> Result<(), CatalogError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        if !mock_account_is_active(&state, request.code.account_id) {
+            return Err(CatalogError::Unauthorized {
+                kind: "native_authorization_code",
+                key: request.code.account_id.to_string(),
+            });
+        }
+        if state
+            .native_authorization_codes
+            .contains_key(&request.code.token_digest)
+        {
+            return Err(CatalogError::Conflict {
+                kind: "native_authorization_code",
+                key: request.code.id.to_string(),
+            });
+        }
+        state
+            .native_authorization_codes
+            .insert(request.code.token_digest.clone(), request.code);
+        state.account_auth_audit_events.push(request.audit_event);
+        Ok(())
+    }
+
+    /// Exchange one exactly bound mock native code for a session family.
+    async fn exchange_native_authorization_code(
+        &self,
+        request: NativeAuthorizationCodeExchangeRequest,
+    ) -> Result<NativeAuthorizationCodeExchangeResult, CatalogError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?;
+        let Some(code) = state
+            .native_authorization_codes
+            .get(&request.code_token_digest)
+            .cloned()
+        else {
+            return Ok(NativeAuthorizationCodeExchangeResult::Rejected);
+        };
+        if code.consumed_at.is_some()
+            || code.expires_at <= request.exchanged_at
+            || code.client_kind == AccountSessionClientKind::Browser
+            || code.client_kind != request.client_kind
+            || code.redirect_uri != request.redirect_uri
+            || code.pkce_challenge != request.pkce_challenge
+            || code.account_id != request.issuance.session.account_id
+            || code.mfa_verified_at != request.issuance.session.mfa_verified_at
+            || !mock_account_is_active(&state, code.account_id)
+        {
+            return Ok(NativeAuthorizationCodeExchangeResult::Rejected);
+        }
+        state
+            .native_authorization_codes
+            .get_mut(&request.code_token_digest)
+            .expect("native code was resolved while holding the write lock")
+            .consumed_at = Some(request.exchanged_at);
+        let session = insert_mock_session_issuance(&mut state, request.issuance)?;
+        state.account_auth_audit_events.push(request.audit_event);
+        Ok(NativeAuthorizationCodeExchangeResult::Exchanged(session))
+    }
+
+    /// Append one sanitized mock authentication audit event.
+    async fn append_account_auth_audit_event(
+        &self,
+        event: AccountAuthAuditEventRecord,
+    ) -> Result<(), CatalogError> {
+        self.state
+            .write()
+            .map_err(|error| CatalogError::BackendError(error.to_string().into()))?
+            .account_auth_audit_events
+            .push(event);
         Ok(())
     }
 

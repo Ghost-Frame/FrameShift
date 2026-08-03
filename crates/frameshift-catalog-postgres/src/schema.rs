@@ -80,12 +80,152 @@ diesel::table! {
         created_at -> Timestamptz,
         /// Most recent authenticated-use timestamp.
         last_seen_at -> Timestamptz,
+        /// Exclusive expiry of the current short-lived access token.
+        access_expires_at -> Timestamptz,
         /// Sliding inactivity expiry timestamp.
         idle_expires_at -> Timestamptz,
         /// Non-extendable session expiry timestamp.
         absolute_expires_at -> Timestamptz,
+        /// Most recent second-factor verification inherited by the session.
+        mfa_verified_at -> Nullable<Timestamptz>,
         /// Explicit revocation timestamp.
         revoked_at -> Nullable<Timestamptz>,
+    }
+}
+
+diesel::table! {
+    /// Append-only refresh-token generations for revocable session families.
+    account_session_refresh_tokens (id) {
+        /// Stable refresh-generation identifier.
+        id -> Uuid,
+        /// Session family owning this generation.
+        session_id -> Uuid,
+        /// Monotonically increasing family generation.
+        generation -> BigInt,
+        /// SHA-256 digest of the random refresh token.
+        token_digest -> Binary,
+        /// Refresh-token creation timestamp.
+        created_at -> Timestamptz,
+        /// Exclusive refresh-token expiry timestamp.
+        expires_at -> Timestamptz,
+        /// Successful consumption or replay-observation timestamp.
+        consumed_at -> Nullable<Timestamptz>,
+    }
+}
+
+diesel::table! {
+    /// Encrypted TOTP authenticator metadata and replay fence.
+    account_mfa_authenticators (id) {
+        /// Stable authenticator identifier.
+        id -> Uuid,
+        /// Account owning this authenticator.
+        account_id -> Uuid,
+        /// Pending, active, or disabled lifecycle state.
+        state -> Text,
+        /// Opaque authenticated ciphertext containing the TOTP seed.
+        secret_ciphertext -> Binary,
+        /// Random 192-bit XChaCha20-Poly1305 nonce.
+        secret_nonce -> Binary,
+        /// Deployment-managed encryption-key version.
+        secret_key_version -> SmallInt,
+        /// Exclusive deadline for confirming a pending enrollment.
+        pending_expires_at -> Nullable<Timestamptz>,
+        /// Greatest successfully consumed TOTP timestep.
+        last_used_timestep -> Nullable<BigInt>,
+        /// Authenticator metadata creation timestamp.
+        created_at -> Timestamptz,
+        /// Successful enrollment activation timestamp.
+        activated_at -> Nullable<Timestamptz>,
+        /// Authenticator disable timestamp.
+        disabled_at -> Nullable<Timestamptz>,
+    }
+}
+
+diesel::table! {
+    /// Digest-only high-entropy recovery codes bound to one authenticator.
+    account_mfa_recovery_codes (id) {
+        /// Stable recovery-code identifier.
+        id -> Uuid,
+        /// Authenticator that issued the recovery code.
+        authenticator_id -> Uuid,
+        /// SHA-256 digest of the random recovery code.
+        code_digest -> Binary,
+        /// Recovery-code creation timestamp.
+        created_at -> Timestamptz,
+        /// Successful one-time consumption timestamp.
+        consumed_at -> Nullable<Timestamptz>,
+    }
+}
+
+diesel::table! {
+    /// Digest-only password-bound challenges for MFA login completion.
+    account_mfa_login_challenges (id) {
+        /// Stable challenge identifier.
+        id -> Uuid,
+        /// Account that passed the first factor.
+        account_id -> Uuid,
+        /// SHA-256 digest of the random challenge token.
+        token_digest -> Binary,
+        /// Browser, desktop, or CLI client binding.
+        client_kind -> Text,
+        /// Challenge creation timestamp.
+        created_at -> Timestamptz,
+        /// Exclusive challenge-completion deadline.
+        expires_at -> Timestamptz,
+        /// Successful one-time completion timestamp.
+        consumed_at -> Nullable<Timestamptz>,
+    }
+}
+
+diesel::table! {
+    /// Digest-only authorization codes bound to native S256 requests.
+    account_native_authorization_codes (id) {
+        /// Stable authorization-code identifier.
+        id -> Uuid,
+        /// Browser-authenticated account authorizing the native client.
+        account_id -> Uuid,
+        /// SHA-256 digest of the random authorization code.
+        token_digest -> Binary,
+        /// Desktop or CLI client binding.
+        client_kind -> Text,
+        /// Exact IP-literal loopback redirect URI string.
+        redirect_uri -> Text,
+        /// Decoded 32-byte S256 PKCE challenge.
+        pkce_challenge -> Binary,
+        /// MFA assurance inherited from the browser session.
+        mfa_verified_at -> Nullable<Timestamptz>,
+        /// Authorization-code creation timestamp.
+        created_at -> Timestamptz,
+        /// Exclusive authorization-code exchange deadline.
+        expires_at -> Timestamptz,
+        /// Successful one-time exchange timestamp.
+        consumed_at -> Nullable<Timestamptz>,
+    }
+}
+
+diesel::table! {
+    /// Append-only sanitized first-party authentication audit events.
+    account_auth_audit_events (id) {
+        /// Stable event identifier.
+        id -> Uuid,
+        /// Stable authentication event class.
+        event_kind -> Text,
+        /// Stable success or rejection outcome.
+        outcome -> Text,
+        /// Optional affected account identifier.
+        account_id -> Nullable<Uuid>,
+        /// Optional affected session-family identifier.
+        session_id -> Nullable<Uuid>,
+        /// Optional browser, desktop, or CLI client class.
+        client_kind -> Nullable<Text>,
+        /// Optional keyed canonical-identifier digest.
+        identifier_tag -> Nullable<Binary>,
+        /// Optional keyed canonical-network digest.
+        network_tag -> Nullable<Binary>,
+        /// Optional bounded static reason code.
+        reason_code -> Nullable<Text>,
+        /// Event creation timestamp.
+        created_at -> Timestamptz,
     }
 }
 
@@ -665,6 +805,12 @@ diesel::allow_tables_to_appear_in_same_query!(
     accounts,
     account_password_credentials,
     account_sessions,
+    account_session_refresh_tokens,
+    account_mfa_authenticators,
+    account_mfa_recovery_codes,
+    account_mfa_login_challenges,
+    account_native_authorization_codes,
+    account_auth_audit_events,
     account_password_recovery_tokens,
     account_password_recovery_outbox,
     account_invite_requests,

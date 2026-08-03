@@ -48,6 +48,8 @@ pub mod auth;
 pub mod config;
 pub mod download;
 pub mod error;
+/// First-party authentication cryptography and session lifecycle helpers.
+mod first_party_auth;
 pub mod mcp;
 pub mod metrics;
 pub mod middleware;
