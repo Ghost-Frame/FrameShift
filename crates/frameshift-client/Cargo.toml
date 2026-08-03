@@ -71,3 +71,5 @@ libc = "0.2"
 tempfile.workspace = true
 
 [dev-dependencies]
+# Drives async Studio validation in publication-boundary regression fixtures.
+tokio.workspace = true
