@@ -30,6 +30,7 @@ ProtectKernelTunables=true
 ProtectProc=invisible
 ProtectSystem=strict
 ReadWritePaths=/var/lib/frameshift/objects
+ReadWritePaths=-/var/lib/frameshift/quarantine
 RemoveIPC=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictNamespaces=true

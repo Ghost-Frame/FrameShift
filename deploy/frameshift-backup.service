@@ -13,6 +13,7 @@ PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
 ReadOnlyPaths=/etc/frameshift /var/lib/frameshift/objects
+ReadOnlyPaths=-/var/lib/frameshift/quarantine
 NoNewPrivileges=true
 LockPersonality=true
 MemoryDenyWriteExecute=true

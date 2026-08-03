@@ -14,10 +14,10 @@ parse_upload_command() {
 
   read -r action kind timestamp extra <<<"${SSH_ORIGINAL_COMMAND:-}"
   if [[ "$action" != "put" || -n "$extra" ]]; then
-    echo "expected: put <postgres|objects|manifest> <UTC timestamp>" >&2
+    echo "expected: put <postgres|objects|quarantine|manifest> <UTC timestamp>" >&2
     return 64
   fi
-  if [[ ! "$kind" =~ ^(postgres|objects|manifest)$ ]]; then
+  if [[ ! "$kind" =~ ^(postgres|objects|quarantine|manifest)$ ]]; then
     echo "invalid backup kind" >&2
     return 64
   fi
@@ -34,6 +34,7 @@ backup_suffix() {
   case "$1" in
     postgres) printf '%s\n' 'postgres.dump.gz' ;;
     objects) printf '%s\n' 'objects.tar.gz' ;;
+    quarantine) printf '%s\n' 'quarantine.tar.gz' ;;
     manifest) printf '%s\n' 'manifest.txt' ;;
   esac
 }
