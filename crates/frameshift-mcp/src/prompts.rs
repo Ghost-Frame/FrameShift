@@ -125,9 +125,9 @@ fn call_active_persona(
     let project_root = get_required_path(arguments, "project_root")?;
     let target = resolve_render_target(arguments)?;
 
-    // Failure-aware resolution: a persona can be active-by-marker while its
-    // materialized content is gone (its last sync failed and the half-built
-    // dir was cleaned). Surface that as guidance, not a raw render error.
+    // Integrity-aware resolution: a persona can be active-by-marker while its
+    // content fails current lock, completeness, or policy checks. Surface that
+    // as guidance, not a raw render error.
     let active_name = match client
         .active_persona_state(&project_root)
         .map_err(|e| format!("could not resolve active persona: {e}"))?
@@ -137,9 +137,10 @@ fn call_active_persona(
             return Ok(text_message_result(
                 None,
                 format!(
-                    "The active Frameshift persona '{name}' is not materialized: its last \
-                     sync failed. Run `frameshift sync` to see why, then reinstall it or \
-                     activate another persona via the `frameshift_use` tool."
+                    "The active Frameshift persona '{name}' does not satisfy current lock, \
+                     completeness, or prompt-policy checks. Run `frameshift sync` to see why, \
+                     then reinstall it or activate another persona via the `frameshift_use` \
+                     tool."
                 ),
             ));
         }

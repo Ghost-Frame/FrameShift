@@ -530,14 +530,15 @@ fn load_capability_manifest(
 
     let name = match persona {
         Some(p) => p.to_string(),
-        // Marker path goes through the failure-aware resolver so a persona
-        // whose last sync failed produces an actionable message instead of a
-        // raw missing-pack.toml IO error below.
+        // Marker path goes through the integrity-aware resolver so content
+        // failing current lock, completeness, or policy checks produces an
+        // actionable message instead of a raw missing-pack.toml IO error below.
         None => match client.active_persona_state(project_root) {
             Ok(frameshift_client::ActivePersonaState::Materialized(name)) => name,
             Ok(frameshift_client::ActivePersonaState::Unmaterialized(name)) => {
                 return Err(format!(
-                    "active persona '{name}' is not materialized (its last sync failed); \
+                    "active persona '{name}' does not satisfy current lock, completeness, or \
+                     prompt-policy checks; \
                      run `frameshift sync` to see why, then reinstall or activate another persona"
                 ));
             }

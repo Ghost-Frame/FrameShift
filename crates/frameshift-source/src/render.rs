@@ -242,7 +242,7 @@ fn render_concrete_patterns(src: &PersonaSource, out: &mut String) {
     for ex in &p.examples {
         // Sanitize language tag: allow only [a-zA-Z0-9_+-] to prevent
         // fence-break injection via a crafted language field. An empty
-        // result renders as a bare ``` fence.
+        // result renders as a bare fence.
         let safe_lang: String = ex
             .language
             .chars()
@@ -252,14 +252,50 @@ fn render_concrete_patterns(src: &PersonaSource, out: &mut String) {
         let _ = writeln!(out, "### {}\n", ex.title);
         let _ = writeln!(out, "{}\n", ex.context);
         let _ = writeln!(out, "**Bad:**");
-        let _ = writeln!(out, "```{safe_lang}");
-        let _ = writeln!(out, "{}", ex.bad);
-        let _ = writeln!(out, "```\n");
+        render_fenced_code(out, &safe_lang, &ex.bad);
         let _ = writeln!(out, "**Good:**");
-        let _ = writeln!(out, "```{safe_lang}");
-        let _ = writeln!(out, "{}", ex.good);
-        let _ = writeln!(out, "```\n");
+        render_fenced_code(out, &safe_lang, &ex.good);
     }
+}
+
+/// Renders one code body inside a collision-proof CommonMark fence.
+fn render_fenced_code(out: &mut String, safe_lang: &str, body: &str) {
+    let fence = safe_markdown_fence(body);
+    let _ = writeln!(out, "{fence}{safe_lang}");
+    out.push_str(body);
+    if !body.ends_with('\n') {
+        out.push('\n');
+    }
+    let _ = writeln!(out, "{fence}\n");
+}
+
+/// Selects the shortest backtick or tilde fence that cannot collide with a body run.
+fn safe_markdown_fence(body: &str) -> String {
+    let backtick_length = longest_character_run(body, '`').saturating_add(1).max(3);
+    let tilde_length = longest_character_run(body, '~').saturating_add(1).max(3);
+
+    if backtick_length <= tilde_length {
+        "`".repeat(backtick_length)
+    } else {
+        "~".repeat(tilde_length)
+    }
+}
+
+/// Returns the longest contiguous run of one character in a code body.
+fn longest_character_run(body: &str, needle: char) -> usize {
+    let mut longest = 0;
+    let mut current = 0;
+
+    for character in body.chars() {
+        if character == needle {
+            current += 1;
+            longest = longest.max(current);
+        } else {
+            current = 0;
+        }
+    }
+
+    longest
 }
 
 /// Renders the "When the Context Is Unclear" ambiguity guidance section.
@@ -635,6 +671,30 @@ mod tests {
             out.contains("**Re-anchor:**"),
             "cascade mid re-anchor prefix"
         );
+    }
+
+    /// Verifies that embedded fence runs cannot terminate a rendered example.
+    #[test]
+    fn code_example_fences_exceed_every_body_run() {
+        let mut src = full_source();
+        let body =
+            "three backticks: ```\nfour backticks: ````\nthree tildes: ~~~\nfour tildes: ~~~~";
+        src.patterns.examples[0].bad = body.to_string();
+        src.patterns.examples[0].good = body.to_string();
+
+        let out = render_to_markdown(&src, RenderTarget::Generic);
+        let expected_block = format!("`````rust\n{body}\n`````\n");
+
+        assert_eq!(out.matches(&expected_block).count(), 2);
+        assert!(!body.lines().any(|line| line == "`````"));
+    }
+
+    /// Verifies that the renderer chooses the shorter safe delimiter kind.
+    #[test]
+    fn code_example_fence_uses_shorter_delimiter() {
+        assert_eq!(safe_markdown_fence("embedded ```` run"), "~~~");
+        assert_eq!(safe_markdown_fence("embedded ~~~~ run"), "```");
+        assert_eq!(safe_markdown_fence("ordinary code"), "```");
     }
 
     /// Verifies that a minimal source (just name + non-empty voice tone)

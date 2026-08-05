@@ -2,8 +2,11 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// Current schema version for client configuration and lock files.
+/// Current schema version for persisted project configuration.
 pub const SCHEMA_VERSION: u32 = 1;
+
+/// Current schema version for persisted persona lockfiles.
+pub const LOCK_SCHEMA_VERSION: u32 = 2;
 
 /// Persisted per-project client configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -85,7 +88,7 @@ pub struct MemoryConfig {
 /// Lock file containing every installed persona.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Lockfile {
-    #[serde(default = "default_schema_version")]
+    #[serde(default = "default_lock_schema_version")]
     pub schema_version: u32,
     #[serde(default, rename = "persona")]
     pub personas: Vec<LockedPersona>,
@@ -96,7 +99,7 @@ impl Default for Lockfile {
     /// Build an empty lock file.
     fn default() -> Self {
         Self {
-            schema_version: SCHEMA_VERSION,
+            schema_version: LOCK_SCHEMA_VERSION,
             personas: Vec::new(),
         }
     }
@@ -105,11 +108,38 @@ impl Default for Lockfile {
 /// Immutable identity and cache hash for one installed persona.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LockedPersona {
+    /// Canonical persona name from the verified pack manifest.
     pub name: String,
+    /// Exact installed persona version.
     pub version: String,
+    /// Publisher handle from the verified pack manifest.
     pub author_handle: String,
+    /// Publisher public key from the verified pack manifest.
     pub author_pubkey: String,
+    /// Canonical content hash naming the immutable cache entry.
     pub hash: String,
+    /// Prompt-content posture selected outside pack-controlled content.
+    #[serde(default, skip_serializing_if = "PromptPolicyMode::is_strict")]
+    pub prompt_policy_mode: PromptPolicyMode,
+}
+
+/// Prompt-policy posture persisted independently of pack-controlled content.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptPolicyMode {
+    /// Enforce the current prompt policy during every materialization.
+    #[default]
+    Strict,
+    /// Explicitly trust prompt content installed from a local path.
+    TrustedLocalBypass,
+}
+
+/// Serialization helpers for persisted prompt-policy posture.
+impl PromptPolicyMode {
+    /// Returns whether this mode is the default strict posture.
+    fn is_strict(&self) -> bool {
+        *self == Self::Strict
+    }
 }
 
 /// Parsed persona name and explicit version requested by a caller.
@@ -177,7 +207,11 @@ impl PersonaSpec {
 /// Source from which a requested persona should be installed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallSource {
+    /// A local pack that remains subject to strict prompt-content policy.
     LocalPath(PathBuf),
+    /// A local pack explicitly exempted from prompt-content policy checks.
+    TrustedLocalPath(PathBuf),
+    /// A signed pack fetched from the configured public registry.
     Registry,
 }
 
@@ -330,22 +364,28 @@ pub struct GcReport {
 }
 
 /// Result of [`crate::Client::active_persona_state`]: the active marker
-/// cross-checked against whether the persona's content is actually on disk.
+/// cross-checked against the current lock, content hash, required files, and
+/// prompt policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActivePersonaState {
     /// No active marker (or an empty one).
     None,
-    /// The marker names a persona whose `source/pack.toml` is materialized.
+    /// The marker names a complete persona matching its lock and current policy.
     Materialized(String),
-    /// The marker names a persona whose materialized content is absent --
-    /// typically because its last sync failed and the half-built directory
-    /// was cleaned. Reading its source or rendered output will fail; the
-    /// actionable remedies are a re-sync or a reinstall.
+    /// The marker names a persona that does not satisfy the current lock,
+    /// completeness, or prompt-policy checks. Reading its source or rendered
+    /// output will fail; the actionable remedies are a re-sync or a reinstall.
     Unmaterialized(String),
 }
 
+/// Supplies the current project-configuration schema when a field is absent.
 const fn default_schema_version() -> u32 {
     SCHEMA_VERSION
+}
+
+/// Supplies the current lock schema when a field is absent.
+const fn default_lock_schema_version() -> u32 {
+    LOCK_SCHEMA_VERSION
 }
 
 #[cfg(test)]
@@ -385,5 +425,65 @@ mod tests {
     #[test]
     fn parse_loose_rejects_empty_string() {
         assert!(PersonaSpec::parse_loose("").is_err());
+    }
+
+    /// Lockfiles written before policy provenance existed default to strict mode.
+    #[test]
+    fn legacy_lockfile_defaults_prompt_policy_to_strict() {
+        let raw = r#"schema_version = 1
+
+[[persona]]
+name = "fixture"
+version = "0.1.0"
+author_handle = "alice"
+author_pubkey = "0707"
+hash = "abcd"
+"#;
+
+        let lockfile: Lockfile = toml::from_str(raw).expect("deserialize legacy lock");
+
+        assert_eq!(
+            lockfile.personas[0].prompt_policy_mode,
+            PromptPolicyMode::Strict
+        );
+    }
+
+    /// An explicit trusted-local posture survives lockfile serialization.
+    #[test]
+    fn trusted_local_prompt_policy_round_trips() {
+        let lockfile = Lockfile {
+            schema_version: LOCK_SCHEMA_VERSION,
+            personas: vec![LockedPersona {
+                name: "fixture".to_string(),
+                version: "0.1.0".to_string(),
+                author_handle: "alice".to_string(),
+                author_pubkey: "0707".to_string(),
+                hash: "abcd".to_string(),
+                prompt_policy_mode: PromptPolicyMode::TrustedLocalBypass,
+            }],
+        };
+
+        let serialized = toml::to_string(&lockfile).expect("serialize lock");
+        let restored: Lockfile = toml::from_str(&serialized).expect("deserialize lock");
+
+        assert!(serialized.contains("prompt_policy_mode = \"trusted_local_bypass\""));
+        assert_eq!(restored, lockfile);
+    }
+
+    /// Strict posture is omitted so new clients preserve compact legacy-compatible locks.
+    #[test]
+    fn strict_prompt_policy_mode_is_omitted() {
+        let persona = LockedPersona {
+            name: "fixture".to_string(),
+            version: "0.1.0".to_string(),
+            author_handle: "alice".to_string(),
+            author_pubkey: "0707".to_string(),
+            hash: "abcd".to_string(),
+            prompt_policy_mode: PromptPolicyMode::Strict,
+        };
+
+        let serialized = toml::to_string(&persona).expect("serialize persona");
+
+        assert!(!serialized.contains("prompt_policy_mode"));
     }
 }
