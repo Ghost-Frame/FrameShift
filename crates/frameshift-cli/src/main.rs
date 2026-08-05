@@ -63,6 +63,9 @@ enum Command {
         /// Install from a local pack directory instead of the registry.
         #[arg(long, value_name = "PATH")]
         from_path: Option<PathBuf>,
+        /// Bypass final prompt-content policy for this explicitly local pack.
+        #[arg(long, requires = "from_path")]
+        trust_local_prompt_content: bool,
     },
 
     /// Activate an installed persona for this project.
@@ -281,13 +284,23 @@ fn run() -> Result<(), RunError> {
         // ------------------------------------------------------------------
         // M0 -- install
         // ------------------------------------------------------------------
-        Command::Install { spec, from_path } => {
+        Command::Install {
+            spec,
+            from_path,
+            trust_local_prompt_content,
+        } => {
             let client = make_client()?;
             let (name, version) =
                 PersonaSpec::parse_loose(&spec).map_err(|e| RunError::General(e.to_string()))?;
-            let source = match from_path {
-                Some(path) => InstallSource::LocalPath(path),
-                None => InstallSource::Registry,
+            let source = match (from_path, trust_local_prompt_content) {
+                (Some(path), true) => {
+                    eprintln!(
+                        "warning: trusted-local prompt bypass enabled; final persona instructions will not be content-policy checked"
+                    );
+                    InstallSource::TrustedLocalPath(path)
+                }
+                (Some(path), false) => InstallSource::LocalPath(path),
+                (None, _) => InstallSource::Registry,
             };
             // A bare name (no `@version`) resolves to the registry's latest
             // published version; local-path installs require an explicit
@@ -297,7 +310,7 @@ fn run() -> Result<(), RunError> {
                 (None, InstallSource::Registry) => client
                     .resolve_latest_version(&name)
                     .map_err(|e| RunError::General(e.to_string()))?,
-                (None, InstallSource::LocalPath(_)) => {
+                (None, InstallSource::LocalPath(_) | InstallSource::TrustedLocalPath(_)) => {
                     return Err(RunError::General(
                         "local installs require an explicit version".to_string(),
                     ));
@@ -587,6 +600,47 @@ fn conformance_upgrade_warning(
             "{persona}'s conformance baseline score is invalid; cannot evaluate this \
              upgrade (install not blocked)"
         )),
+    }
+}
+
+/// CLI parsing regressions for explicit trusted-local prompt posture.
+#[cfg(test)]
+mod install_cli_tests {
+    use super::*;
+
+    /// Trusted-local prompt bypass cannot be selected without a local path.
+    #[test]
+    fn trusted_local_prompt_bypass_requires_path() {
+        let result = Cli::try_parse_from([
+            "frameshift",
+            "install",
+            "fixture@0.1.0",
+            "--trust-local-prompt-content",
+        ]);
+
+        assert!(result.is_err());
+    }
+
+    /// Trusted-local prompt bypass parses only alongside an explicit local path.
+    #[test]
+    fn trusted_local_prompt_bypass_accepts_path() {
+        let cli = Cli::try_parse_from([
+            "frameshift",
+            "install",
+            "fixture@0.1.0",
+            "--from-path",
+            "/tmp/fixture",
+            "--trust-local-prompt-content",
+        ])
+        .expect("trusted-local arguments should parse");
+
+        assert!(matches!(
+            cli.command,
+            Command::Install {
+                trust_local_prompt_content: true,
+                ..
+            }
+        ));
     }
 }
 

@@ -265,7 +265,10 @@ async fn rejects_report_binding_mismatches_before_writes() {
             "file inventory" => {
                 fixture.intent.file_inventory_hash = ObjectHash::of(b"other inventory")
             }
-            "scan schema" => fixture.intent.scan_schema_version += 1,
+            "scan schema" => {
+                assert_eq!(frameshift_publication::REPORT_SCHEMA_VERSION, 2);
+                fixture.intent.scan_schema_version = 1;
+            }
             _ => unreachable!("all mismatch fixtures are enumerated"),
         }
         let catalog = catalog_for(&fixture);

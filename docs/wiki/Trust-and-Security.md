@@ -37,20 +37,52 @@ content-addressed central cache. `frameshift sync` checks the lock and rebuilds
 project state from those pinned entries.
 
 The lock proves which content the project selected. It does not make the
-rendered instructions safe by itself; users should still review what a persona
-asks an agent to do.
+rendered instructions safe by itself.
+
+## Rendered prompt policy
+
+FrameShift applies a versioned, deterministic content policy to rendered
+agent instructions. The policy blocks narrow classes of behavioral override,
+safety and approval bypass, secret exfiltration, instruction-hierarchy claims,
+and hidden Unicode controls. References to dangerous commands and sensitive
+paths are reported as warnings instead of being treated as automatically
+malicious.
+
+Publication validation scans every generated Claude, Codex, Gemini, and
+Generic render, plus every raw render candidate shipped by a pack. The client
+is the final enforcement boundary: it scans the exact content after
+composition, local infrastructure overlays, and template substitution, before
+replacing an active persona. A rejected install does not write a new lock or
+replace the last successfully materialized persona.
+
+Policy errors contain stable finding codes and the policy version. They do not
+echo matched prompt text or substituted vault values. The scanner normalizes
+Unicode compatibility forms, compares Unicode UTS #39 confusable skeletons,
+and checks for hidden format controls. It is still not a general proof that
+arbitrary natural language is semantically safe.
+
+Local research packs can bypass this content policy only through the explicit
+CLI combination `--from-path <path> --trust-local-prompt-content`. FrameShift
+records that choice in the project lock and preserves it across `sync`.
+Ordinary local installs and every registry install remain strict. The bypass
+does not skip pack hashing, signature checks when present, or cache integrity
+checks.
 
 ## Publication boundary
 
 Publication validation builds an exact public-file inventory and rejects
 symlinks, special files, traversal, unknown paths, private-state paths, growth
-data, malformed schemas, stale renders, and invalid conformance evidence. The
-publisher signs and archives a private temporary snapshot, not a directory
-that can continue changing during review.
+data, malformed schemas, stale renders, prompt-policy violations, and invalid
+conformance evidence. The publisher copies only hash-matching inventoried bytes
+into a private temporary snapshot, independently revalidates that snapshot,
+and signs and archives those same bytes. It never signs a source directory that
+can continue changing during review.
 
 Creator Studio binds human review and submission intent to the exact manifest,
 scanner report, archive hash, manifest hash, inventory hash, publisher ID, and
-publisher-key ID. Any later draft mutation clears both confirmations.
+publisher-key ID. Freeze revalidates the exact in-memory snapshot bytes rather
+than rereading the mutable draft. Any later draft mutation clears both
+confirmations.
 
 ## Capabilities and host enforcement
 

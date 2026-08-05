@@ -92,10 +92,9 @@ fn project_with_broken_beta(temp: &TempDir) -> (Client, PathBuf) {
 }
 
 /// One unrenderable persona degrades to a reported failure while every other
-/// persona still materializes, and the broken persona's half-built dir is
-/// removed rather than left corrupt.
+/// persona still materializes and the broken persona keeps its last-good tree.
 #[test]
-fn sync_isolates_unrenderable_persona() {
+fn sync_isolates_unrenderable_persona_and_preserves_last_good() {
     let temp = TempDir::new().expect("tempdir");
     let (client, project_root) = project_with_broken_beta(&temp);
 
@@ -122,11 +121,11 @@ fn sync_isolates_unrenderable_persona() {
             .is_file(),
         "alpha must render despite beta's failure"
     );
-    // Beta's partial dir was cleaned up, not left half-materialized.
-    assert!(
-        !personas_dir.join("beta").exists(),
-        "failed persona dir must be removed"
-    );
+    // Beta's previous complete render survives the failed replacement.
+    let beta_render =
+        fs::read_to_string(personas_dir.join("beta").join("rendered/claude/CLAUDE.md"))
+            .expect("read last-good beta render");
+    assert_eq!(beta_render, "# beta\n");
 }
 
 /// Activating the persona that failed materialization yields the typed
@@ -327,11 +326,10 @@ fn sync_reports_all_personas_failing() {
     assert_eq!(failed, vec!["alpha", "beta"]);
 }
 
-/// `active_persona_state` distinguishes a healthy active persona from one
-/// whose materialization failed after activation (marker still set, dir
-/// cleaned), without requiring a re-sync.
+/// `active_persona_state` continues to report a persona with a preserved
+/// last-good tree as materialized after its replacement fails.
 #[test]
-fn active_persona_state_reports_materialization() {
+fn active_persona_state_reports_preserved_last_good_materialization() {
     use frameshift_client::ActivePersonaState;
 
     let temp = TempDir::new().expect("tempdir");
@@ -351,8 +349,7 @@ fn active_persona_state_reports_materialization() {
     ));
 
     // Re-point the marker at beta by hand (activation would refuse), then
-    // sync so beta's broken cache cleans its materialized dir: the marker
-    // survives (beta is still locked) but the content is gone.
+    // sync. The broken update is reported, but beta's last-good tree remains.
     let project_id = client.project_id(&project_root).expect("project id");
     fs::write(
         temp.path()
@@ -365,7 +362,7 @@ fn active_persona_state_reports_materialization() {
     client.sync(&project_root).expect("sync");
     assert!(matches!(
         client.active_persona_state(&project_root).expect("state"),
-        ActivePersonaState::Unmaterialized(ref name) if name == "beta"
+        ActivePersonaState::Materialized(ref name) if name == "beta"
     ));
 }
 

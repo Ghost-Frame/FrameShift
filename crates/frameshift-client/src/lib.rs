@@ -40,7 +40,8 @@ pub use identity::{
 pub use model::{
     ActivePersonaState, ClientOptions, GcReport, InstallReport, InstallRequest, InstallSource,
     LockedPersona, Lockfile, MaterializeFailure, MemoryConfig, MemoryRequirementStatus,
-    PersonaSpec, ProjectConfig, ProjectPaths, SyncReport, SCHEMA_VERSION,
+    PersonaSpec, ProjectConfig, ProjectPaths, PromptPolicyMode, SyncReport, LOCK_SCHEMA_VERSION,
+    SCHEMA_VERSION,
 };
 pub use publication::{PreparedPublication, PublicationBinding, PublicationReviewBinding};
 pub use publish::PublishOutcome;
@@ -64,6 +65,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -90,6 +92,16 @@ pub const VAULT_PASSPHRASE_ENV: &str = "FRAMESHIFT_VAULT_PASSPHRASE";
 /// substitution: packs that do not ship this file render exactly as they
 /// did before this feature existed, with no vault lookup performed at all.
 const PACK_TEMPLATE_MANIFEST_FILENAME: &str = "pack.template.toml";
+
+/// Prefix for deterministic prior-state artifacts retained until lock commit.
+///
+/// A directory stores the previous materialized tree. A regular file records
+/// that the persona was absent before a fresh install.
+const PERSONA_BACKUP_PREFIX: &str = ".frameshift-persona-backup-";
+/// Exact bounded bytes identifying a prior state in which no persona existed.
+const PERSONA_ABSENCE_MARKER: &[u8] = b"frameshift-prior-state=absent-v1\n";
+/// Prefix for private materialization trees that are never canonical state.
+const PERSONA_STAGE_PREFIX: &str = ".frameshift-persona-stage-";
 
 const RENDER_TARGETS: [(&str, &str); 4] = [
     ("claude", "CLAUDE.md"),
@@ -497,6 +509,7 @@ impl Client {
         };
 
         migrate_legacy_project_files(project_root, &paths);
+        recover_interrupted_persona_replacements(&paths)?;
         Ok(paths)
     }
 
@@ -519,14 +532,14 @@ impl Client {
         let paths = self.project_paths(&request.project_root)?;
         let locked = match &request.source {
             InstallSource::LocalPath(pack_dir) => {
-                let pack = Pack::from_dir(pack_dir)?;
-                validate_pack_request(&pack, &request.spec)?;
-                verify_pack_signature_if_present(&pack)?;
-                let hash = pack.canonical_hash_hex();
-                let cache_path = paths.cache_dir.join(&hash);
-                ensure_cached_pack(pack_dir, &cache_path)?;
-                validate_cached_local_pack(&cache_path, &request.spec, &hash)?
+                install_from_local_path(pack_dir, &request.spec, &paths, PromptPolicyMode::Strict)?
             }
+            InstallSource::TrustedLocalPath(pack_dir) => install_from_local_path(
+                pack_dir,
+                &request.spec,
+                &paths,
+                PromptPolicyMode::TrustedLocalBypass,
+            )?,
             InstallSource::Registry => {
                 // Fetch, extract, verify, and cache the pack from the HTTP registry.
                 install_from_registry(&request.spec, &paths)?
@@ -652,8 +665,9 @@ impl Client {
     /// lockfile yet or the lockfile does not contain `persona`. On success, the
     /// persona is dropped from `lockfile.personas` and
     /// [`Client::materialize_project_state`] is called with the updated
-    /// lockfile, which deletes `personas/<persona>` from the central store and
-    /// clears the `active` marker file if it pointed at the removed persona.
+    /// lockfile, which recoverably removes `personas/<persona>` from the central
+    /// store and clears the `active` marker file if it pointed at the removed
+    /// persona.
     /// The content-addressed cache entry is deliberately left in place; use
     /// [`Client::gc`] to reclaim cache entries no longer referenced by any
     /// project's lockfile.
@@ -669,10 +683,11 @@ impl Client {
         }
 
         lockfile.personas.retain(|p| p.name != persona);
+        lockfile.schema_version = LOCK_SCHEMA_VERSION;
         let raw_lock = toml::to_string_pretty(&lockfile)?;
         // Materialize failures of the personas that REMAIN are advisory here;
         // the uninstall of `persona` itself succeeded once the lock is written.
-        self.materialize_project_state(&paths, &lockfile, &raw_lock)
+        self.materialize_project_state(&paths, &lockfile, &raw_lock, None)
             .map(|_| ())
     }
 
@@ -822,16 +837,16 @@ impl Client {
         }
     }
 
-    /// Resolve the active persona marker together with whether its content is
-    /// actually materialized on disk, without re-syncing.
+    /// Resolve the active persona marker together with whether its content
+    /// satisfies the current lock and policy, without re-syncing.
     ///
-    /// The `active` marker outlives a failed materialization (it is only
-    /// cleared when the persona leaves the lockfile), so callers that go on
-    /// to read the persona's `source/` or `rendered/` content must not trust
-    /// the marker alone: a persona whose last sync failed had its half-built
-    /// directory cleaned and reads as [`ActivePersonaState::Unmaterialized`].
-    /// Surfacing that state lets consumers produce an actionable message
-    /// (re-sync / reinstall) instead of a raw missing-file error.
+    /// The `active` marker outlives a failed materialization and can also
+    /// outlive local tampering, so callers that read `source/` or `rendered/`
+    /// content must not trust the marker alone. Missing, hash-mismatched,
+    /// incomplete, symlinked, or policy-rejected content reads as
+    /// [`ActivePersonaState::Unmaterialized`]. Surfacing that state lets
+    /// consumers recommend a re-sync or reinstall instead of returning a raw
+    /// missing-file error.
     ///
     /// # Errors
     ///
@@ -848,12 +863,17 @@ impl Client {
         validate_persona_name(&name)?;
 
         let paths = self.project_paths(project_root)?;
-        let manifest = paths
-            .personas_dir
-            .join(&name)
-            .join("source")
-            .join("pack.toml");
-        if manifest.is_file() {
+        let locked_persona = load_lockfile(&paths.lock_path)?.and_then(|lockfile| {
+            lockfile
+                .personas
+                .into_iter()
+                .find(|persona| persona.name.as_str() == name.as_str())
+        });
+        let persona_dir = paths.personas_dir.join(&name);
+        if locked_persona
+            .as_ref()
+            .is_some_and(|persona| materialized_persona_matches_lock(&persona_dir, persona))
+        {
             Ok(ActivePersonaState::Materialized(name))
         } else {
             Ok(ActivePersonaState::Unmaterialized(name))
@@ -877,7 +897,7 @@ impl Client {
         };
 
         let failures = self
-            .materialize_project_state(&paths, &lockfile, &raw_lock)?
+            .materialize_project_state(&paths, &lockfile, &raw_lock, None)?
             .into_iter()
             .map(|(persona, error)| MaterializeFailure {
                 persona,
@@ -1036,7 +1056,17 @@ impl Client {
             });
         }
 
-        read_to_string(&rendered_path)
+        let content = read_regular_utf8_file(&rendered_path)?;
+        let locked_persona = load_lockfile(&paths.lock_path)?
+            .and_then(|lockfile| {
+                lockfile
+                    .personas
+                    .into_iter()
+                    .find(|locked| locked.name == persona)
+            })
+            .ok_or_else(|| ClientError::PersonaNotInstalled(persona.to_string()))?;
+        enforce_rendered_prompt_policy(persona, &content, locked_persona.prompt_policy_mode)?;
+        Ok(content)
     }
 
     /// Return the project state directory where orchestrator state files are placed.
@@ -1053,24 +1083,29 @@ impl Client {
 
     /// Rebuild `personas_dir` on disk to exactly match `lockfile`.
     ///
-    /// Validates every persona name (guarding against path traversal), writes
-    /// `raw_lock` to `lock_path`, removes any `personas/<name>` directory not
-    /// present in `lockfile`, and for each locked persona re-copies its
-    /// source from the content-addressed cache and re-renders its output via
-    /// `materialize_persona_rendered_outputs`.
+    /// Validates every persona name (guarding against path traversal), stages
+    /// any `personas/<name>` directory not present in `lockfile` for recoverable
+    /// removal, and for each locked persona re-copies its source from the
+    /// content-addressed cache and re-renders its output via
+    /// `materialize_persona_rendered_outputs`. The prospective `raw_lock` is
+    /// written only after required materialization succeeds. Deterministic
+    /// prior-state artifacts remain until the durable lock selects the new
+    /// state, so restart recovery can reconcile every transition.
     ///
     /// Per-persona failures (missing cache entry, unparsable manifest,
     /// unrenderable pack) do NOT abort the loop: they are collected and
     /// returned as `(persona name, original error)` pairs so callers can
     /// surface them, while every other persona still materializes. `Err` is
     /// reserved for genuinely fatal project-level failures: an invalid
-    /// persona name, or an unwritable central store. Also clears the `active`
-    /// marker file if it points at a persona no longer present in `lockfile`.
+    /// persona name, an unwritable central store, or failure of the optional
+    /// `required_persona`. Also clears the `active` marker file if it points at
+    /// a persona no longer present in `lockfile`.
     fn materialize_project_state(
         &self,
         paths: &ProjectPaths,
         lockfile: &Lockfile,
         raw_lock: &str,
+        required_persona: Option<&str>,
     ) -> Result<Vec<(String, ClientError)>, ClientError> {
         // Validate every persona name before it is joined into the central
         // store. A name like `../../x` would otherwise escape personas_dir and
@@ -1081,13 +1116,27 @@ impl Client {
 
         ensure_dir(&paths.cache_dir)?;
         ensure_dir(&paths.personas_dir)?;
-        // Lock file lives only in the central store -- nothing is written to the project root.
-        write_file(&paths.lock_path, raw_lock.as_bytes())?;
 
         let expected_names: BTreeSet<&str> =
             lockfile.personas.iter().map(|p| p.name.as_str()).collect();
         for entry in read_dir_sorted(&paths.personas_dir)? {
             let path = entry.path();
+            let file_name = entry.file_name();
+            let name = file_name.to_str().ok_or_else(|| ClientError::Io {
+                path: path.clone(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "materialized persona entry has a non-UTF-8 name",
+                ),
+            })?;
+            if name.starts_with(PERSONA_BACKUP_PREFIX) {
+                continue;
+            }
+            if name.starts_with(PERSONA_STAGE_PREFIX) {
+                remove_materialization_path(&path)?;
+                sync_directory(&paths.personas_dir)?;
+                continue;
+            }
             if !entry
                 .file_type()
                 .map_err(|source| ClientError::Io {
@@ -1099,9 +1148,9 @@ impl Client {
                 continue;
             }
 
-            let name = entry.file_name().to_string_lossy().to_string();
-            if !expected_names.contains(name.as_str()) {
-                remove_dir_all(&path)?;
+            if !expected_names.contains(name) {
+                validate_persona_name(name)?;
+                stage_materialized_persona_removal(&path)?;
             }
         }
 
@@ -1116,13 +1165,21 @@ impl Client {
         let mut failures: Vec<(String, ClientError)> = Vec::new();
         for persona in &lockfile.personas {
             if let Err(error) = self.materialize_one_persona(paths, lockfile, persona) {
-                // Cleanup of a half-built persona dir is materialize_one_persona's
-                // own job -- it alone knows whether it started mutating. Failures
-                // that occur before any mutation (a missing cache entry) leave the
-                // last successfully-materialized content untouched and usable.
+                if required_persona == Some(persona.name.as_str()) {
+                    recover_interrupted_persona_replacements(paths)?;
+                    return Err(error);
+                }
                 failures.push((persona.name.clone(), error));
             }
         }
+
+        // The lock file lives only in the central store. Delaying this atomic
+        // write prevents a rejected install from replacing the prior lock.
+        if let Err(error) = write_file(&paths.lock_path, raw_lock.as_bytes()) {
+            recover_interrupted_persona_replacements(paths)?;
+            return Err(error);
+        }
+        recover_interrupted_persona_replacements(paths)?;
 
         if paths.active_path.exists() {
             let active_name = read_to_string(&paths.active_path)?.trim().to_string();
@@ -1145,12 +1202,9 @@ impl Client {
     /// Extracted from [`Client::materialize_project_state`] so per-persona
     /// errors can be isolated by the caller instead of aborting the loop.
     ///
-    /// Failure cleanup is owned here, because only this function knows
-    /// whether it started mutating `personas/<name>`: pre-mutation failures
-    /// (the cache entry is missing) return early and leave any previously
-    /// materialized content untouched and usable, while a failure after the
-    /// wipe-and-rebuild begins removes the half-built directory so the
-    /// persona reads as "not materialized" rather than corrupt.
+    /// The complete replacement is prepared in a private same-filesystem
+    /// temporary directory. Any render or policy failure therefore leaves the
+    /// last successfully materialized persona untouched.
     fn materialize_one_persona(
         &self,
         paths: &ProjectPaths,
@@ -1168,35 +1222,33 @@ impl Client {
         }
 
         let persona_dir = paths.personas_dir.join(&persona.name);
+        canonical_persona_is_absent(&persona_dir)?;
+        let staging = tempfile::Builder::new()
+            .prefix(PERSONA_STAGE_PREFIX)
+            .tempdir_in(&paths.personas_dir)
+            .map_err(|source| ClientError::Io {
+                path: paths.personas_dir.clone(),
+                source,
+            })?;
+        let staged_persona_dir = staging.path().join("persona");
+        ensure_dir(&staged_persona_dir)?;
 
-        // Everything past this point mutates persona_dir, so any failure
-        // below must remove the half-built directory on the way out.
-        let mutate = || -> Result<(), ClientError> {
-            if persona_dir.exists() {
-                remove_dir_all(&persona_dir)?;
-            }
-            ensure_dir(&persona_dir)?;
+        let source_dir = staged_persona_dir.join("source");
+        copy_dir_recursive(&cache_path, &source_dir)?;
 
-            let source_dir = persona_dir.join("source");
-            copy_dir_recursive(&cache_path, &source_dir)?;
+        let rendered_root = staged_persona_dir.join("rendered");
+        self.materialize_persona_rendered_outputs(
+            &paths.cache_dir,
+            &cache_path,
+            &rendered_root,
+            &paths.vault_path,
+            &persona.name,
+            persona.prompt_policy_mode,
+            lockfile,
+        )?;
 
-            let rendered_root = persona_dir.join("rendered");
-            self.materialize_persona_rendered_outputs(
-                &paths.cache_dir,
-                &cache_path,
-                &rendered_root,
-                &paths.vault_path,
-                &persona.name,
-                lockfile,
-            )?;
-
-            // Growth is local-only and append-only -- a single file per persona, never published upstream.
-            touch_empty(&persona_dir.join("growth.md"))
-        };
-
-        mutate().inspect_err(|_| {
-            let _ = fs::remove_dir_all(&persona_dir);
-        })
+        preserve_or_create_growth_file(&persona_dir, &staged_persona_dir)?;
+        replace_materialized_persona(&staged_persona_dir, &persona_dir)
     }
 
     /// Renders a single persona's output into `rendered_root`, using typed
@@ -1227,6 +1279,7 @@ impl Client {
         rendered_root: &Path,
         vault_path: &Path,
         persona_name: &str,
+        prompt_policy_mode: PromptPolicyMode,
         lockfile: &Lockfile,
     ) -> Result<(), ClientError> {
         let manifest_path = cache_path.join("pack.toml");
@@ -1298,6 +1351,7 @@ impl Client {
                 persona_name,
                 self.config_root.as_deref(),
                 template_ctx.as_ref(),
+                prompt_policy_mode,
             )?;
             return Ok(());
         }
@@ -1315,6 +1369,7 @@ impl Client {
             persona_name,
             self.config_root.as_deref(),
             template_ctx.as_ref(),
+            prompt_policy_mode,
         )
     }
 }
@@ -1326,7 +1381,9 @@ fn materialize_typed_source_outputs(
     persona_name: &str,
     config_root: Option<&Path>,
     template_ctx: Option<&(frameshift_template::TemplateManifest, VaultData)>,
+    prompt_policy_mode: PromptPolicyMode,
 ) -> Result<(), ClientError> {
+    let mut prepared = Vec::new();
     for (target_dir, filename, target) in [
         (
             "claude",
@@ -1350,6 +1407,11 @@ fn materialize_typed_source_outputs(
         let context =
             format!("rendered markdown for persona {persona_name:?} (target {target_dir})");
         let final_content = substitute_tokens(&composed, &context, template_ctx)?;
+        enforce_rendered_prompt_policy(persona_name, &final_content, prompt_policy_mode)?;
+        prepared.push((target_dir, filename, final_content));
+    }
+
+    for (target_dir, filename, final_content) in prepared {
         let dir = rendered_root.join(target_dir);
         ensure_dir(&dir)?;
         write_file(&dir.join(filename), final_content.as_bytes())?;
@@ -1667,6 +1729,24 @@ fn validate_cached_local_pack(
     Ok(locked_persona_from_pack(&cached_pack))
 }
 
+/// Verify, cache, and lock one local pack under an explicit prompt-policy posture.
+fn install_from_local_path(
+    pack_dir: &Path,
+    spec: &PersonaSpec,
+    paths: &ProjectPaths,
+    prompt_policy_mode: PromptPolicyMode,
+) -> Result<LockedPersona, ClientError> {
+    let pack = Pack::from_dir(pack_dir)?;
+    validate_pack_request(&pack, spec)?;
+    verify_pack_signature_if_present(&pack)?;
+    let hash = pack.canonical_hash_hex();
+    let cache_path = paths.cache_dir.join(&hash);
+    ensure_cached_pack(pack_dir, &cache_path)?;
+    let mut locked = validate_cached_local_pack(&cache_path, spec, &hash)?;
+    locked.prompt_policy_mode = prompt_policy_mode;
+    Ok(locked)
+}
+
 /// Verify `pack`'s Ed25519 signature against its declared author pubkey, if
 /// the pack carries a signature at all.
 ///
@@ -1722,6 +1802,7 @@ pub(crate) fn locked_persona_from_pack(pack: &Pack) -> LockedPersona {
         author_handle: manifest.author_handle.clone(),
         author_pubkey: manifest.author_pubkey.clone(),
         hash: pack.canonical_hash_hex(),
+        prompt_policy_mode: PromptPolicyMode::Strict,
     }
 }
 
@@ -1810,6 +1891,7 @@ fn materialize_rendered_outputs(
     persona_name: &str,
     config_root: Option<&Path>,
     template_ctx: Option<&(frameshift_template::TemplateManifest, VaultData)>,
+    prompt_policy_mode: PromptPolicyMode,
 ) -> Result<(), ClientError> {
     let render_source = find_render_source(cache_path)?;
     let persona_content = fs::read_to_string(&render_source).map_err(|source| ClientError::Io {
@@ -1823,11 +1905,464 @@ fn materialize_rendered_outputs(
         &format!("rendered markdown for persona {persona_name:?}"),
         template_ctx,
     )?;
+    enforce_rendered_prompt_policy(persona_name, &final_content, prompt_policy_mode)?;
 
     for (target_dir, filename) in RENDER_TARGETS {
         let dir = rendered_root.join(target_dir);
         ensure_dir(&dir)?;
         write_file(&dir.join(filename), final_content.as_bytes())?;
+    }
+
+    Ok(())
+}
+
+/// Enforce the shared policy against exact post-composition, post-template content.
+fn enforce_rendered_prompt_policy(
+    persona_name: &str,
+    content: &str,
+    prompt_policy_mode: PromptPolicyMode,
+) -> Result<(), ClientError> {
+    if prompt_policy_mode == PromptPolicyMode::TrustedLocalBypass {
+        return Ok(());
+    }
+
+    let report = frameshift_source::validate_rendered_prompt(content);
+    let codes: Vec<String> = report
+        .findings
+        .into_iter()
+        .filter(|finding| finding.severity == frameshift_source::PromptPolicySeverity::Error)
+        .map(|finding| finding.code)
+        .collect();
+    if codes.is_empty() {
+        return Ok(());
+    }
+
+    Err(ClientError::PromptPolicyViolation {
+        persona: persona_name.to_string(),
+        policy_version: report.policy_version,
+        codes,
+    })
+}
+
+/// Preserve local growth state while preparing a complete persona replacement.
+fn preserve_or_create_growth_file(
+    existing_persona_dir: &Path,
+    staged_persona_dir: &Path,
+) -> Result<(), ClientError> {
+    let existing_growth = existing_persona_dir.join("growth.md");
+    let staged_growth = staged_persona_dir.join("growth.md");
+    match fs::symlink_metadata(&existing_growth) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            let bytes = read_regular_file(&existing_growth)?;
+            write_file(&staged_growth, &bytes)
+        }
+        Ok(_) => Err(ClientError::Io {
+            path: existing_growth,
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "existing growth state must be a regular file",
+            ),
+        }),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => touch_empty(&staged_growth),
+        Err(source) => Err(ClientError::Io {
+            path: existing_growth,
+            source,
+        }),
+    }
+}
+
+/// Return the deterministic prior-state artifact for a canonical persona path.
+fn persona_backup_path(destination: &Path) -> Result<PathBuf, ClientError> {
+    let parent = destination.parent().ok_or_else(|| ClientError::Io {
+        path: destination.to_path_buf(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "materialized persona destination has no parent directory",
+        ),
+    })?;
+    let persona_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| ClientError::Io {
+            path: destination.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "materialized persona destination has no UTF-8 file name",
+            ),
+        })?;
+    Ok(parent.join(format!("{PERSONA_BACKUP_PREFIX}{persona_name}")))
+}
+
+/// Refuse to begin a transition when its deterministic artifact already exists.
+fn ensure_recovery_artifact_absent(path: &Path) -> Result<(), ClientError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Err(ClientError::Io {
+            path: path.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "materialization recovery artifact already exists",
+            ),
+        }),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(ClientError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+/// Return whether a canonical persona is absent, rejecting every non-directory type.
+fn canonical_persona_is_absent(path: &Path) -> Result<bool, ClientError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(false),
+        Ok(_) => Err(ClientError::Io {
+            path: path.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "canonical materialized persona must be a directory",
+            ),
+        }),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(source) => Err(ClientError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+/// Remove one materialization file, symlink, or directory without following it.
+fn remove_materialization_path_io(path: &Path) -> std::io::Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => return Err(source),
+    };
+    if metadata.file_type().is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
+}
+
+/// Remove one materialization path while preserving typed client errors.
+fn remove_materialization_path(path: &Path) -> Result<(), ClientError> {
+    remove_materialization_path_io(path).map_err(|source| ClientError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// Promote a validated staged persona while retaining its deterministic prior state.
+fn replace_materialized_persona(staged: &Path, destination: &Path) -> Result<(), ClientError> {
+    let parent = destination.parent().ok_or_else(|| ClientError::Io {
+        path: destination.to_path_buf(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "materialized persona destination has no parent directory",
+        ),
+    })?;
+    let backup = persona_backup_path(destination)?;
+    ensure_recovery_artifact_absent(&backup)?;
+
+    let backup_represents_absence = canonical_persona_is_absent(destination)?;
+    if backup_represents_absence {
+        write_file(&backup, PERSONA_ABSENCE_MARKER)?;
+    } else {
+        fs::rename(destination, &backup).map_err(|source| ClientError::Io {
+            path: destination.to_path_buf(),
+            source,
+        })?;
+        if let Err(install_error) = sync_directory_io(parent) {
+            return Err(rollback_persona_replacement(
+                destination,
+                &backup,
+                install_error,
+                false,
+                false,
+            ));
+        }
+    }
+
+    if let Err(install_error) = fs::rename(staged, destination) {
+        return Err(rollback_persona_replacement(
+            destination,
+            &backup,
+            install_error,
+            false,
+            backup_represents_absence,
+        ));
+    }
+    if let Err(install_error) = sync_directory_io(parent) {
+        return Err(rollback_persona_replacement(
+            destination,
+            &backup,
+            install_error,
+            true,
+            backup_represents_absence,
+        ));
+    }
+
+    // The prior state stays durable until `materialize_project_state` writes
+    // the prospective lock and reconciles every artifact against that lock.
+    Ok(())
+}
+
+/// Stage one canonical persona tree for a lock-controlled removal.
+fn stage_materialized_persona_removal(destination: &Path) -> Result<(), ClientError> {
+    let parent = destination.parent().ok_or_else(|| ClientError::Io {
+        path: destination.to_path_buf(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "materialized persona destination has no parent directory",
+        ),
+    })?;
+    let backup = persona_backup_path(destination)?;
+    ensure_recovery_artifact_absent(&backup)?;
+    fs::rename(destination, &backup).map_err(|source| ClientError::Io {
+        path: destination.to_path_buf(),
+        source,
+    })?;
+    if let Err(install_error) = sync_directory_io(parent) {
+        return Err(rollback_persona_replacement(
+            destination,
+            &backup,
+            install_error,
+            false,
+            false,
+        ));
+    }
+    Ok(())
+}
+
+/// Restore the prior state after a materialization transition fails in-process.
+fn rollback_persona_replacement(
+    destination: &Path,
+    backup: &Path,
+    install_error: std::io::Error,
+    new_tree_installed: bool,
+    backup_represents_absence: bool,
+) -> ClientError {
+    let rollback_result = (|| -> std::io::Result<()> {
+        if new_tree_installed {
+            remove_materialization_path_io(destination)?;
+        }
+        if backup_represents_absence {
+            remove_materialization_path_io(backup)?;
+        } else {
+            fs::rename(backup, destination)?;
+        }
+        if let Some(parent) = destination.parent() {
+            sync_directory_io(parent)?;
+        }
+        Ok(())
+    })();
+
+    match rollback_result {
+        Ok(()) => ClientError::Io {
+            path: destination.to_path_buf(),
+            source: install_error,
+        },
+        Err(rollback_error) => ClientError::MaterializationRollbackFailed {
+            destination: destination.to_path_buf(),
+            backup: backup.to_path_buf(),
+            install_error,
+            rollback_error,
+        },
+    }
+}
+
+/// Remove a prior-state artifact after the persisted lock selects canonical state.
+fn finalize_materialized_persona_replacement(personas_dir: &Path, persona_name: &str) {
+    let backup = personas_dir.join(format!("{PERSONA_BACKUP_PREFIX}{persona_name}"));
+    if let Err(error) =
+        remove_materialization_path(&backup).and_then(|()| sync_directory(personas_dir))
+    {
+        warn!(
+            persona = persona_name,
+            path = %backup.display(),
+            error = %error,
+            "committed persona recovery-artifact cleanup was deferred"
+        );
+    }
+}
+
+/// Return whether one complete materialized tree satisfies its persisted lock entry.
+fn materialized_persona_matches_lock(persona_dir: &Path, locked_persona: &LockedPersona) -> bool {
+    let Ok(root_metadata) = fs::symlink_metadata(persona_dir) else {
+        return false;
+    };
+    if !root_metadata.file_type().is_dir() {
+        return false;
+    }
+
+    let Ok(pack) = Pack::from_dir(&persona_dir.join("source")) else {
+        return false;
+    };
+    if pack.canonical_hash_hex() != locked_persona.hash {
+        return false;
+    }
+
+    let Ok(growth_metadata) = fs::symlink_metadata(persona_dir.join("growth.md")) else {
+        return false;
+    };
+    if !growth_metadata.file_type().is_file() {
+        return false;
+    }
+
+    for (target_dir, filename) in RENDER_TARGETS {
+        let rendered_path = persona_dir.join("rendered").join(target_dir).join(filename);
+        let Ok(content) = read_regular_utf8_file(&rendered_path) else {
+            return false;
+        };
+        if locked_persona.prompt_policy_mode == PromptPolicyMode::Strict
+            && !frameshift_source::validate_rendered_prompt(&content).valid
+        {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Restore a last-good tree after the persisted lock rejects a replacement.
+fn restore_last_good_persona(
+    personas_dir: &Path,
+    persona_name: &str,
+    destination: &Path,
+    backup: &Path,
+) -> Result<(), ClientError> {
+    remove_materialization_path(destination)?;
+    sync_directory(personas_dir)?;
+    fs::rename(backup, destination).map_err(|source| ClientError::Io {
+        path: destination.to_path_buf(),
+        source,
+    })?;
+    sync_directory(personas_dir)?;
+    info!(
+        persona = persona_name,
+        "restored last-good persona after interrupted lock transaction"
+    );
+    Ok(())
+}
+
+/// Restore an absent prior state after a fresh install is not selected by the lock.
+fn restore_absent_persona(
+    personas_dir: &Path,
+    persona_name: &str,
+    destination: &Path,
+    backup: &Path,
+) -> Result<(), ClientError> {
+    remove_materialization_path(destination)?;
+    sync_directory(personas_dir)?;
+    remove_materialization_path(backup)?;
+    sync_directory(personas_dir)?;
+    info!(
+        persona = persona_name,
+        "removed uncommitted persona after interrupted lock transaction"
+    );
+    Ok(())
+}
+
+/// Recover one deterministic prior-state artifact using only the persisted lock.
+fn recover_interrupted_persona_replacement(
+    paths: &ProjectPaths,
+    persona_name: &str,
+) -> Result<(), ClientError> {
+    let backup = paths
+        .personas_dir
+        .join(format!("{PERSONA_BACKUP_PREFIX}{persona_name}"));
+    let backup_metadata = match fs::symlink_metadata(&backup) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(ClientError::Io {
+                path: backup,
+                source,
+            })
+        }
+    };
+    if !backup_metadata.file_type().is_file() && !backup_metadata.file_type().is_dir() {
+        return Err(ClientError::MaterializationRecoveryAmbiguous {
+            persona: persona_name.to_string(),
+            destination: paths.personas_dir.join(persona_name),
+            backup,
+        });
+    }
+    let destination = paths.personas_dir.join(persona_name);
+    let backup_represents_absence = if backup_metadata.file_type().is_file() {
+        let marker = fs::read(&backup).map_err(|source| ClientError::Io {
+            path: backup.clone(),
+            source,
+        })?;
+        if marker != PERSONA_ABSENCE_MARKER {
+            return Err(ClientError::MaterializationRecoveryAmbiguous {
+                persona: persona_name.to_string(),
+                destination,
+                backup,
+            });
+        }
+        true
+    } else {
+        false
+    };
+    let lockfile = load_lockfile(&paths.lock_path)?;
+
+    let Some(lockfile) = lockfile else {
+        if backup_represents_absence {
+            return restore_absent_persona(
+                &paths.personas_dir,
+                persona_name,
+                &destination,
+                &backup,
+            );
+        }
+        return restore_last_good_persona(&paths.personas_dir, persona_name, &destination, &backup);
+    };
+
+    let Some(locked_persona) = lockfile
+        .personas
+        .iter()
+        .find(|persona| persona.name == persona_name)
+    else {
+        return restore_absent_persona(&paths.personas_dir, persona_name, &destination, &backup);
+    };
+
+    if materialized_persona_matches_lock(&destination, locked_persona) {
+        finalize_materialized_persona_replacement(&paths.personas_dir, persona_name);
+        info!(
+            persona = persona_name,
+            "completed committed persona replacement recovery"
+        );
+        return Ok(());
+    }
+
+    if !backup_represents_absence && materialized_persona_matches_lock(&backup, locked_persona) {
+        return restore_last_good_persona(&paths.personas_dir, persona_name, &destination, &backup);
+    }
+
+    Err(ClientError::MaterializationRecoveryAmbiguous {
+        persona: persona_name.to_string(),
+        destination,
+        backup,
+    })
+}
+
+/// Recover every deterministic prior-state artifact found in one project store.
+fn recover_interrupted_persona_replacements(paths: &ProjectPaths) -> Result<(), ClientError> {
+    if !paths.personas_dir.is_dir() {
+        return Ok(());
+    }
+
+    for entry in read_dir_sorted(&paths.personas_dir)? {
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        let Some(persona_name) = file_name.strip_prefix(PERSONA_BACKUP_PREFIX) else {
+            continue;
+        };
+        validate_persona_name(persona_name)?;
+        recover_interrupted_persona_replacement(paths, persona_name)?;
     }
 
     Ok(())
@@ -2050,6 +2585,27 @@ fn touch_empty(path: &Path) -> Result<(), ClientError> {
 /// never race on the same temp name.
 static WRITE_FILE_TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Flush directory metadata on platforms that support opening directories.
+fn sync_directory(path: &Path) -> Result<(), ClientError> {
+    sync_directory_io(path).map_err(|source| ClientError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// Return the raw operating-system result for one directory metadata flush.
+fn sync_directory_io(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        fs::File::open(path)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
 /// Write `bytes` to `path` as a single atomic operation, creating any missing
 /// parent directories first.
 ///
@@ -2138,14 +2694,8 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<(), ClientError> {
         });
     }
 
-    #[cfg(unix)]
     if let Some(parent) = path.parent() {
-        fs::File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|source| ClientError::Io {
-                path: parent.to_path_buf(),
-                source,
-            })?;
+        sync_directory(parent)?;
     }
 
     Ok(())
@@ -2157,6 +2707,67 @@ fn read_to_string(path: &Path) -> Result<String, ClientError> {
     fs::read_to_string(path).map_err(|source| ClientError::Io {
         path: path.to_path_buf(),
         source,
+    })
+}
+
+/// Read one regular file without following a symbolic-link replacement.
+fn read_regular_file(path: &Path) -> Result<Vec<u8>, ClientError> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| ClientError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(ClientError::Io {
+            path: path.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "managed content must be a regular file",
+            ),
+        });
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path).map_err(|source| ClientError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !file
+        .metadata()
+        .map_err(|source| ClientError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?
+        .is_file()
+    {
+        return Err(ClientError::Io {
+            path: path.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "managed content changed away from a regular file",
+            ),
+        });
+    }
+
+    let mut content = Vec::new();
+    file.read_to_end(&mut content)
+        .map_err(|source| ClientError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    Ok(content)
+}
+
+/// Read one UTF-8 regular file without following a symbolic-link replacement.
+fn read_regular_utf8_file(path: &Path) -> Result<String, ClientError> {
+    String::from_utf8(read_regular_file(path)?).map_err(|source| ClientError::Io {
+        path: path.to_path_buf(),
+        source: std::io::Error::new(std::io::ErrorKind::InvalidData, source),
     })
 }
 
@@ -2242,19 +2853,14 @@ fn finish_install(
 ) -> Result<InstallReport, ClientError> {
     let mut lockfile = load_lockfile(&paths.lock_path)?.unwrap_or_default();
     upsert_locked_persona(&mut lockfile, locked.clone());
+    lockfile.schema_version = LOCK_SCHEMA_VERSION;
     let raw_lock = toml::to_string_pretty(&lockfile)?;
-    let mut raw_failures = client.materialize_project_state(paths, &lockfile, &raw_lock)?;
-
-    // The persona being installed failing to materialize is a hard install
-    // error, re-raised as its ORIGINAL typed error (callers downcast, e.g.
-    // `ClientError::Compose`); failures of OTHER locked personas ride along
-    // on the report as warnings.
-    if let Some(own_index) = raw_failures
-        .iter()
-        .position(|(persona, _)| *persona == locked.name)
-    {
-        return Err(raw_failures.swap_remove(own_index).1);
-    }
+    let raw_failures = client.materialize_project_state(
+        paths,
+        &lockfile,
+        &raw_lock,
+        Some(locked.name.as_str()),
+    )?;
 
     let materialize_failures = raw_failures
         .into_iter()

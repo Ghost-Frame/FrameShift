@@ -22,6 +22,7 @@ pub mod error;
 pub mod patch;
 pub mod patterns;
 pub mod persona;
+pub mod prompt_policy;
 pub mod render;
 pub mod rules;
 pub mod security;
@@ -37,6 +38,10 @@ pub use persona::{
     AmbiguityQuestion, Anchor, Aspect, Author, CapabilityManifest, CascadeAnchor,
     ClassificationTier, ConflictResolution, ConformanceConfig, DefaultQuestion, GrowthConfig,
     Persona, ReferenceGroup, SafetyLayer, SelfEvalStep, Voice, VoiceQuestion,
+};
+pub use prompt_policy::{
+    validate_rendered_prompt, PromptPolicyFinding, PromptPolicyReport, PromptPolicySeverity,
+    PROMPT_POLICY_VERSION,
 };
 pub use render::{render_to_markdown, RenderTarget};
 pub use rules::{Layer, Rule, RuleSet};
