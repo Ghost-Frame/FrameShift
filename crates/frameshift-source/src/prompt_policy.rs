@@ -422,8 +422,6 @@ fn is_hidden_format_control(character: char) -> bool {
 #[cfg(test)]
 /// Exercises every blocking family, normalization path, and report invariant.
 mod tests {
-    //! Unit tests for the rendered-prompt policy contract.
-
     use super::*;
 
     /// Returns all stable finding codes from a report.

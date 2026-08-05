@@ -112,6 +112,18 @@ const RENDER_TARGETS: [(&str, &str); 4] = [
 
 const RENDER_CANDIDATES: [&str; 4] = ["AGENTS.md", "CLAUDE.md", "GEMINI.md", "README.md"];
 
+/// Groups the filesystem locations used by one persona render transaction.
+struct PersonaRenderPaths<'a> {
+    /// Root containing every verified content-addressed pack cache entry.
+    cache_dir: &'a Path,
+    /// Verified cache entry for the persona being rendered.
+    cache_path: &'a Path,
+    /// Private staging directory that receives the rendered target files.
+    rendered_root: &'a Path,
+    /// Project vault used only when the pack declares template substitution.
+    vault_path: &'a Path,
+}
+
 /// Core Frameshift engine. Handles install, activate, sync, gc, and rendering.
 pub struct Client {
     /// Root of the Frameshift data directory.
@@ -1237,11 +1249,14 @@ impl Client {
         copy_dir_recursive(&cache_path, &source_dir)?;
 
         let rendered_root = staged_persona_dir.join("rendered");
+        let render_paths = PersonaRenderPaths {
+            cache_dir: &paths.cache_dir,
+            cache_path: &cache_path,
+            rendered_root: &rendered_root,
+            vault_path: &paths.vault_path,
+        };
         self.materialize_persona_rendered_outputs(
-            &paths.cache_dir,
-            &cache_path,
-            &rendered_root,
-            &paths.vault_path,
+            render_paths,
             &persona.name,
             persona.prompt_policy_mode,
             lockfile,
@@ -1274,15 +1289,12 @@ impl Client {
     /// the vault or run template substitution.
     fn materialize_persona_rendered_outputs(
         &self,
-        cache_dir: &Path,
-        cache_path: &Path,
-        rendered_root: &Path,
-        vault_path: &Path,
+        paths: PersonaRenderPaths<'_>,
         persona_name: &str,
         prompt_policy_mode: PromptPolicyMode,
         lockfile: &Lockfile,
     ) -> Result<(), ClientError> {
-        let manifest_path = cache_path.join("pack.toml");
+        let manifest_path = paths.cache_path.join("pack.toml");
         let manifest_raw =
             fs::read_to_string(&manifest_path).map_err(|source| ClientError::Io {
                 path: manifest_path.clone(),
@@ -1295,14 +1307,19 @@ impl Client {
             })?;
 
         let has_composition = manifest.extends.is_some() || !manifest.mixin.is_empty();
-        let typed_source = frameshift_source::PersonaSource::load_from_dir_or_pack(cache_path)
-            .map_err(frameshift_compose::ComposeError::from)?;
+        let typed_source =
+            frameshift_source::PersonaSource::load_from_dir_or_pack(paths.cache_path)
+                .map_err(frameshift_compose::ComposeError::from)?;
 
         // Loaded once regardless of which render branch runs below, so a
         // templated pack opens its vault a single time per materialize call
         // rather than once per render target.
-        let template_ctx =
-            load_template_context(cache_path, vault_path, self.vault.as_ref(), persona_name)?;
+        let template_ctx = load_template_context(
+            paths.cache_path,
+            paths.vault_path,
+            self.vault.as_ref(),
+            persona_name,
+        )?;
 
         if let Some(root) = typed_source {
             let source = if has_composition {
@@ -1311,7 +1328,7 @@ impl Client {
                 // a grandparent's inherited rules.
                 if let Some(extends_spec) = manifest.extends.as_deref() {
                     reject_unsupported_multi_level_base(
-                        cache_dir,
+                        paths.cache_dir,
                         lockfile,
                         persona_name,
                         extends_spec,
@@ -1319,14 +1336,14 @@ impl Client {
                 }
                 for mixin_spec in &manifest.mixin {
                     reject_unsupported_multi_level_base(
-                        cache_dir,
+                        paths.cache_dir,
                         lockfile,
                         persona_name,
                         mixin_spec,
                     )?;
                 }
 
-                let resolver = compose_support::CacheResolver::new(cache_dir, lockfile);
+                let resolver = compose_support::CacheResolver::new(paths.cache_dir, lockfile);
                 let composed = frameshift_compose::Composer::new(resolver).compose(
                     root,
                     manifest.extends.clone(),
@@ -1347,7 +1364,7 @@ impl Client {
 
             materialize_typed_source_outputs(
                 &source,
-                rendered_root,
+                paths.rendered_root,
                 persona_name,
                 self.config_root.as_deref(),
                 template_ctx.as_ref(),
@@ -1364,8 +1381,8 @@ impl Client {
         }
 
         materialize_rendered_outputs(
-            cache_path,
-            rendered_root,
+            paths.cache_path,
+            paths.rendered_root,
             persona_name,
             self.config_root.as_deref(),
             template_ctx.as_ref(),
