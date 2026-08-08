@@ -25,9 +25,11 @@
 //!    `Referrer-Policy`) -- added to every response if not already present.
 //! 7. Client request-ID capture -- preserves a caller UUID before tracing can
 //!    synthesize a missing request ID.
-//! 8. `CorsLayer` -- outermost; handles preflight `OPTIONS` requests and
-//!    stamps `Access-Control-Allow-*` headers on responses. Only applied
-//!    when `state.config.cors_allowed_origins` is non-empty.
+//! 8. `CorsLayer` -- handles preflight `OPTIONS` requests and stamps
+//!    `Access-Control-Allow-*` headers on responses. Only applied when
+//!    `state.config.cors_allowed_origins` is non-empty.
+//! 9. MCP cache barrier -- outermost; overwrites `Cache-Control` with
+//!    `no-store` on the exact `/mcp` path, including middleware rejections.
 //!
 //! # Per-route layers
 //!
@@ -169,6 +171,21 @@ pub fn app_with_publication_admission(state: AppState, quarantine: Arc<dyn PackS
         quota,
     ));
     build_app(state, Some(admission), Some(quarantine), Some(promotion))
+}
+
+/// Prohibit HTTP caching for the exact remote MCP boundary after every other layer responds.
+async fn prohibit_mcp_response_caching(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let is_mcp = request.uri().path() == "/mcp";
+    let mut response = next.run(request).await;
+    if is_mcp {
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
+    response
 }
 
 /// Compose the complete router with optional explicit quarantine services.
@@ -372,6 +389,9 @@ fn build_app(
     if let Some(cors) = cors {
         router = router.layer(cors);
     }
+
+    // This stays outside CORS, body limits, authentication, and rate limits.
+    router = router.layer(axum::middleware::from_fn(prohibit_mcp_response_caching));
 
     router.with_state(state)
 }

@@ -8,8 +8,11 @@
 
 use std::sync::Arc;
 
+use axum::http::header::CACHE_CONTROL;
+use axum::http::HeaderValue;
 use axum::routing::post;
 use axum::{Extension, Router};
+use tower_http::set_header::SetResponseHeaderLayer;
 
 /// Typed dispatcher contracts and protocol-facing tool values.
 mod dispatcher;
@@ -54,4 +57,9 @@ where
         .route("/mcp", post(handle_mcp))
         .layer(Extension(dispatcher))
         .layer(Extension(config))
+        // Account-specific discovery and rendered prompts must never enter an HTTP cache.
+        .layer(SetResponseHeaderLayer::overriding(
+            CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
+        ))
 }

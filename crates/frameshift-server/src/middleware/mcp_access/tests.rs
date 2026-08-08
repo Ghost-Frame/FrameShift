@@ -23,6 +23,7 @@ use crate::{
 use async_trait::async_trait;
 use axum::body::{to_bytes, Body};
 use axum::http::{HeaderValue, Method, Request, StatusCode};
+use axum::response::Response;
 use axum::routing::get;
 use axum::Json;
 use axum::Router;
@@ -415,6 +416,17 @@ async fn response_json(response: axum::response::Response) -> Value {
     serde_json::from_slice(&bytes).expect("test response body must be JSON")
 }
 
+/// Assert that one production MCP response cannot be stored by an HTTP cache.
+fn assert_no_store(response: &Response) {
+    assert_eq!(
+        response
+            .headers()
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+}
+
 /// Disabled or invalid runtime state leaves the application MCP route absent.
 #[tokio::test]
 async fn application_mcp_route_is_absent_without_validated_runtime() {
@@ -431,7 +443,38 @@ async fn application_mcp_route_is_absent_without_validated_runtime() {
             .unwrap();
         let response = app(state.clone()).oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_no_store(&response);
     }
+}
+
+/// The outer application boundary covers pre-handler failures only on the exact MCP path.
+#[tokio::test]
+async fn application_mcp_body_limit_rejection_is_non_cacheable_and_path_scoped() {
+    let mut config = (*test_config(enabled_access_config())).clone();
+    config.max_request_bytes = 16;
+    let state = test_state(MockCatalog::new(), Arc::new(config), None);
+    let mut request = legacy_initialize_request(None);
+    request
+        .headers_mut()
+        .insert("content-length", HeaderValue::from_static("4096"));
+
+    let response = app(state.clone()).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_no_store(&response);
+
+    let health = Request::builder()
+        .method(Method::GET)
+        .uri("/healthz")
+        .body(Body::empty())
+        .expect("health request must be valid");
+    let response = app(state).oneshot(health).await.unwrap();
+    assert_ne!(
+        response
+            .headers()
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
 }
 
 /// Enabled configuration accepts only the exact pinned Cloudflare contract.
@@ -553,6 +596,7 @@ async fn production_rs256_verifier_enforces_access_claims_end_to_end() {
         .await
         .expect("valid production assertion request must complete");
     assert_eq!(response.status(), StatusCode::OK);
+    assert_no_store(&response);
 
     let invalid_tokens = [
         ("wrong algorithm", hmac_token(valid_claims.clone())),
@@ -1027,24 +1071,21 @@ async fn account_rate_limit_applies_after_access_authentication() {
     );
     let router = app(state);
 
-    assert_eq!(
-        router
-            .clone()
-            .oneshot(legacy_initialize_request(Some("limited-token")))
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::OK
-    );
-    assert_eq!(
-        router
-            .clone()
-            .oneshot(legacy_initialize_request(Some("limited-token")))
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::TOO_MANY_REQUESTS
-    );
+    let response = router
+        .clone()
+        .oneshot(legacy_initialize_request(Some("limited-token")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_no_store(&response);
+
+    let response = router
+        .clone()
+        .oneshot(legacy_initialize_request(Some("limited-token")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_no_store(&response);
     let before = verifier.call_count();
     assert_eq!(
         router

@@ -322,11 +322,20 @@ fn modern_call_request_with_arguments(
 
 /// Send one request through a cloned Axum service.
 async fn send(router: &Router, request: Request<Body>) -> Response<Body> {
-    router
+    let response = router
         .clone()
         .oneshot(request)
         .await
-        .expect("MCP router must produce a response")
+        .expect("MCP router must produce a response");
+    assert_eq!(
+        response
+            .headers()
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store"),
+        "every MCP response must prohibit HTTP caching"
+    );
+    response
 }
 
 /// Decode a JSON response and verify its explicit V1 media type.
