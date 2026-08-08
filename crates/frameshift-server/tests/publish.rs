@@ -256,7 +256,7 @@ fn make_targz(dir: &Path) -> Vec<u8> {
     enc.finish().unwrap()
 }
 
-/// Build an archive that repeats `pack.toml` under the same normalized path.
+/// Build an archive that aliases `pack.toml` under Unicode-insensitive casing.
 fn make_targz_with_duplicate_manifest(dir: &Path) -> Vec<u8> {
     let buf: Vec<u8> = Vec::new();
     let enc = GzEncoder::new(buf, Compression::default());
@@ -265,7 +265,7 @@ fn make_targz_with_duplicate_manifest(dir: &Path) -> Vec<u8> {
         .unwrap();
     tar.append_path_with_name(dir.join("README.md"), "README.md")
         .unwrap();
-    tar.append_path_with_name(dir.join("pack.toml"), "pack.toml")
+    tar.append_path_with_name(dir.join("pack.toml"), "Pack.toml")
         .unwrap();
     let enc = tar.into_inner().unwrap();
     enc.finish().unwrap()
@@ -1389,6 +1389,38 @@ async fn publish_malformed_manifest_returns_400_generic_message_without_path_lea
     );
 }
 
+/// A malformed embedded signature is client input and cannot become a server error.
+#[tokio::test]
+async fn publish_malformed_embedded_signature_returns_400_without_storage_writes() {
+    let signing = SigningKey::from_bytes(&[54_u8; 32]);
+    let (catalog, _pubkey) = catalog_with_author(&signing, "sigmund");
+    let objects = MockPackStore::new();
+    let tmp = tempfile::TempDir::new().unwrap();
+    write_pack(tmp.path(), "signature-pack", "1.0.0", "sigmund", &signing);
+    let pack = Pack::from_dir(tmp.path()).unwrap();
+    let signature = signing.sign(&pack.canonical_hash()).to_bytes().to_vec();
+    std::fs::write(tmp.path().join("signature.sig"), [7_u8; 63]).unwrap();
+    let archive = make_targz(tmp.path());
+
+    let response = post_publish(
+        make_state(catalog.clone(), objects.clone()),
+        &archive,
+        &signature,
+        "sigmund",
+        Some(&signing),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(response).await;
+    assert_eq!(
+        body["error"],
+        "invalid archive: malformed embedded signature"
+    );
+    assert!(objects.blobs.read().unwrap().is_empty());
+    assert!(catalog.state.read().unwrap().versions.is_empty());
+}
+
 /// A correctly signed archive with an unknown file fails before any durable write.
 #[tokio::test]
 async fn publish_unknown_file_returns_400_without_storage_writes() {
@@ -1421,7 +1453,7 @@ async fn publish_unknown_file_returns_400_without_storage_writes() {
     assert!(catalog.state.read().unwrap().versions.is_empty());
 }
 
-/// Duplicate normalized archive paths fail before extraction can overwrite data.
+/// Case-aliased archive paths fail before extraction can shadow data.
 #[tokio::test]
 async fn publish_duplicate_archive_path_returns_400_without_storage_writes() {
     let signing = SigningKey::from_bytes(&[53u8; 32]);

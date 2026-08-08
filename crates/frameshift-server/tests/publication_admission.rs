@@ -68,12 +68,12 @@ fn make_nested_targz(directory: &Path) -> Vec<u8> {
     archive.into_inner().unwrap().finish().unwrap()
 }
 
-/// Encode an archive containing two entries with the same normalized manifest path.
+/// Encode an archive containing Unicode-case aliases of the manifest path.
 fn make_duplicate_manifest_targz(directory: &Path) -> Vec<u8> {
     let encoder = GzEncoder::new(Vec::new(), Compression::default());
     let mut archive = Builder::new(encoder);
     archive
-        .append_path_with_name(directory.join("pack.toml"), "pack.toml")
+        .append_path_with_name(directory.join("pack.toml"), "Pack.toml")
         .unwrap();
     archive
         .append_path_with_name(directory.join("README.md"), "README.md")
@@ -350,7 +350,7 @@ async fn rejects_unauthorized_archive_signatures_before_writes() {
     }
 }
 
-/// Unsafe duplicate paths are rejected before either durable boundary changes.
+/// Unsafe case-aliased paths are rejected before either durable boundary changes.
 #[tokio::test]
 async fn rejects_duplicate_archive_paths_before_writes() {
     let mut fixture = admission_fixture();

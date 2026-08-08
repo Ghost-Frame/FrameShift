@@ -3,6 +3,9 @@
 //! The report is versioned and deterministic so CLI, MCP, desktop, and server
 //! callers can present the same findings and compare the same inventory.
 
+/// Retained public archive verification and pure public-pack rendering.
+pub mod archive;
+
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::Read as _;

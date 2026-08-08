@@ -169,6 +169,16 @@ pub enum ClientError {
         actual: String,
     },
 
+    /// A registry archive failed the shared bounded extraction or verification boundary.
+    #[error("registry archive for {pack} failed verification: {source}")]
+    RegistryArchiveInvalid {
+        /// Exact requested pack name and version.
+        pack: String,
+        /// Stable bounded failure that never includes archive content or local paths.
+        #[source]
+        source: frameshift_publication::archive::ArchiveError,
+    },
+
     /// The registry returned a version record with no signature but one is required for verification.
     #[error("registry returned no signature for pack {pack}")]
     RegistrySignatureMissing {
@@ -203,6 +213,23 @@ pub enum ClientError {
         /// Previously trusted publisher UUID.
         expected: String,
         /// Newly presented publisher UUID.
+        actual: String,
+    },
+
+    /// A registry changed the signer or linked publisher for one stable pack name.
+    #[error(
+        "registry {owner_kind} identity changed for pack {pack} at {registry}: expected {expected}, got {actual}"
+    )]
+    RegistryPackOwnerChanged {
+        /// Registry base URL whose pack trust namespace contained the pin.
+        registry: String,
+        /// Stable requested pack name whose owner continuity check failed.
+        pack: String,
+        /// Bounded owner dimension, either `signer` or `publisher`.
+        owner_kind: &'static str,
+        /// Previously trusted signer key or publisher UUID.
+        expected: String,
+        /// Newly presented signer key or publisher UUID.
         actual: String,
     },
 
