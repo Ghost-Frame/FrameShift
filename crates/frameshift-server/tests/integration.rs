@@ -21,7 +21,7 @@
 //! - `GET /v1/authors` -> 200, default/clamped/offset pagination
 //! - `GET /healthz` -> 200 with both backends healthy, `detail` sanitized to
 //!   `"ok"`/`"degraded"` (never the adapter's raw internal detail text)
-//! - `GET /mcp/anything` -> 501
+//! - `GET /mcp` -> 405 and MCP subpaths remain absent
 //! - All responses include `x-request-id` header
 //! - `AppError::Internal` does not leak source details in body
 
@@ -1209,22 +1209,20 @@ async fn healthz_memory_degraded_sanitizes_detail() {
 // /mcp
 // ---------------------------------------------------------------------------
 
-/// `GET /mcp/anything` returns 501 Not Implemented.
+/// MCP is mounted at exactly `/mcp`, so old subpaths remain absent.
 #[tokio::test]
-async fn mcp_any_path_returns_501() {
+async fn mcp_subpath_is_not_mounted() {
     let state = make_state(MockCatalog::new(), MockPackStore::new());
     let resp = oneshot_get(state, "/mcp/tools").await;
-    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
-    let body = body_json(resp).await;
-    assert_eq!(body["error"], "MCP not implemented");
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
-/// `GET /mcp/sse` (a named sub-path) also returns 501.
+/// `GET /mcp` is rejected because the endpoint accepts POST only.
 #[tokio::test]
-async fn mcp_root_returns_501() {
+async fn mcp_get_is_method_not_allowed() {
     let state = make_state(MockCatalog::new(), MockPackStore::new());
-    let resp = oneshot_get(state, "/mcp/sse").await;
-    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    let resp = oneshot_get(state, "/mcp").await;
+    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
 }
 
 // ---------------------------------------------------------------------------

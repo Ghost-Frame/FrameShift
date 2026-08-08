@@ -117,7 +117,7 @@ use crate::state::AppState;
 ///     /telemetry -- POST /selection opt-in selection telemetry sink
 ///     /memory   -- GET /health read-only memory backend health
 ///     /admin    -- account-authenticated administrator lifecycle controls
-///   /mcp        -- MCP placeholder (501 for all methods)
+///   /mcp        -- stateless JSON-RPC MCP endpoint (POST only)
 /// ```
 ///
 /// Global middleware (applied to all routes):
@@ -341,7 +341,7 @@ fn build_app(
         .merge(ops_router())
         .nest("/v1", v1)
         .nest("/dl", dl_router())
-        .nest("/mcp", mcp_router())
+        .merge(mcp_router())
         .layer(PropagateRequestIdLayer::new(x_request_id.clone()))
         .layer(SetRequestIdLayer::new(x_request_id, RequestIdGenerator))
         .layer(make_trace_layer())
