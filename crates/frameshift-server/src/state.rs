@@ -14,6 +14,7 @@ use crate::account_auth::BearerTokenVerifier;
 use crate::auth::NonceCache;
 use crate::config::ServerConfig;
 use crate::metrics::Metrics;
+use crate::middleware::mcp_access::McpAccessRuntime;
 
 /// Shared application state for the frameshift HTTP server.
 ///
@@ -74,4 +75,11 @@ pub struct AppState {
     ///
     /// `None` keeps all authenticated account routes unmounted.
     pub account_auth: Option<Arc<dyn BearerTokenVerifier>>,
+
+    /// Optional validated Cloudflare Access runtime for the remote MCP route.
+    ///
+    /// `None` keeps `/mcp` entirely unmounted. A value is present only after
+    /// every issuer, audience, JWKS, algorithm, and resource setting passes
+    /// the dedicated fail-closed validation boundary.
+    pub mcp_access: Option<Arc<McpAccessRuntime>>,
 }

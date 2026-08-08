@@ -24,6 +24,8 @@
 pub mod account;
 pub mod auth;
 pub mod identity_limit;
+/// Dedicated Cloudflare Access identity boundary for the remote MCP route.
+pub mod mcp_access;
 pub mod metrics;
 pub mod request_id;
 pub mod tracing;

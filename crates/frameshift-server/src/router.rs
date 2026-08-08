@@ -70,8 +70,10 @@ use crate::mcp::mcp_router;
 use crate::middleware::account::{require_account, require_fresh_mfa, resolve_optional_account};
 use crate::middleware::auth::require_signed_request;
 use crate::middleware::identity_limit::{
-    enforce_account_rate_limit, enforce_signer_rate_limit, IdentityRateLimits,
+    enforce_account_rate_limit, enforce_mcp_account_rate_limit, enforce_signer_rate_limit,
+    IdentityRateLimits,
 };
+use crate::middleware::mcp_access::require_mcp_access;
 use crate::middleware::metrics::MetricsLayer;
 use crate::middleware::request_id::{capture_client_request_id, RequestIdGenerator};
 use crate::middleware::tracing::make_trace_layer;
@@ -192,6 +194,19 @@ fn build_app(
     let identity_limits = IdentityRateLimits::from_config(&state.config);
     let signer_limit = axum::middleware::from_fn(enforce_signer_rate_limit);
     let account_limit = axum::middleware::from_fn(enforce_account_rate_limit);
+
+    // The remote MCP surface does not exist unless startup produced a fully
+    // validated Access runtime. Authentication wraps the account limiter, and
+    // the per-IP governor wraps both, so anonymous traffic cannot spend an
+    // account budget and all verifier work remains source-address bounded.
+    let mcp = if state.mcp_access.is_some() {
+        let access = axum::middleware::from_fn_with_state(state.clone(), require_mcp_access);
+        let account_limit = axum::middleware::from_fn(enforce_mcp_account_rate_limit);
+        let protected = mcp_router().route_layer(account_limit).route_layer(access);
+        apply_ip_rate_limit(protected, &state, state.config.abuse_rate_per_min)
+    } else {
+        Router::new()
+    };
 
     // Publish (`POST /v1/packs`) carries the signed-request layer. It is merged
     // with the anonymous read router so GET (search) and POST (publish) share
@@ -341,7 +356,7 @@ fn build_app(
         .merge(ops_router())
         .nest("/v1", v1)
         .nest("/dl", dl_router())
-        .merge(mcp_router())
+        .merge(mcp)
         .layer(PropagateRequestIdLayer::new(x_request_id.clone()))
         .layer(SetRequestIdLayer::new(x_request_id, RequestIdGenerator))
         .layer(make_trace_layer())

@@ -288,7 +288,7 @@ fn map_auth_error(error: OidcAuthError) -> AppError {
 }
 
 /// Resolve an existing account or create it exactly once on first authentication.
-async fn resolve_account(
+pub(crate) async fn resolve_account(
     state: &AppState,
     identity: &VerifiedOidcIdentity,
 ) -> Result<AccountRecord, AppError> {

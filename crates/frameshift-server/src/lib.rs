@@ -69,10 +69,11 @@ use std::sync::Arc;
 use frameshift_objects::PackStore;
 
 pub use config::{
-    FirstPartyAuthConfig, InviteRequestConfig, LogFormat, OidcConfig, PasswordRecoveryConfig,
-    ServerConfig,
+    FirstPartyAuthConfig, InviteRequestConfig, LogFormat, McpAccessConfig, OidcConfig,
+    PasswordRecoveryConfig, ServerConfig,
 };
 pub use error::AppError;
+pub use middleware::mcp_access::{McpAccessConfigError, McpAccessRuntime, McpAuthenticatedAccount};
 pub use router::{app, app_with_publication_admission};
 pub use state::AppState;
 

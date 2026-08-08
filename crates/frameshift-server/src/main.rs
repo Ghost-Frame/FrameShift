@@ -122,6 +122,15 @@ async fn build_state(config: Arc<ServerConfig>) -> Result<InitializedState, Serv
                 None
             }
         };
+    let mcp_access = match frameshift_server::middleware::mcp_access::McpAccessRuntime::from_config(
+        &config.mcp_access,
+    ) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            tracing::error!(%error, "MCP Access configuration invalid; remote MCP route disabled");
+            None
+        }
+    };
 
     Ok(InitializedState {
         state: AppState {
@@ -133,6 +142,7 @@ async fn build_state(config: Arc<ServerConfig>) -> Result<InitializedState, Serv
             metrics,
             auth_nonces,
             account_auth,
+            mcp_access,
         },
         postgres_catalog: catalog,
     })
