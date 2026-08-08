@@ -444,6 +444,11 @@ impl Studio {
     /// Open or create a draft store and retain its canonical root.
     pub fn open(root: impl AsRef<Path>) -> Result<Self, StudioError> {
         fs::create_dir_all(root.as_ref())?;
+        Self::open_existing(root)
+    }
+
+    /// Open an existing draft store without creating or modifying its root.
+    pub fn open_existing(root: impl AsRef<Path>) -> Result<Self, StudioError> {
         let metadata = fs::symlink_metadata(root.as_ref())?;
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Err(StudioError::InvalidRoot);
@@ -1728,6 +1733,20 @@ mod tests {
             )
             .await
             .unwrap()
+    }
+
+    /// Opening an absent store for reading returns an error without creating it.
+    #[test]
+    fn open_existing_does_not_create_missing_store() {
+        let temporary = tempfile::tempdir().unwrap();
+        let missing = temporary.path().join("missing-drafts");
+
+        let error = Studio::open_existing(&missing).unwrap_err();
+
+        assert!(
+            matches!(error, StudioError::Io(error) if error.kind() == std::io::ErrorKind::NotFound)
+        );
+        assert!(!missing.exists());
     }
 
     /// Immutable snapshot validation rejects bytes hidden by a mutable-source report race.

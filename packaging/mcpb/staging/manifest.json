@@ -1,0 +1,40 @@
+{
+  "manifest_version": "0.3",
+  "name": "frameshift",
+  "display_name": "FrameShift",
+  "version": "0.0.0",
+  "description": "Install, activate, and inspect FrameShift personas from Claude Desktop using your local FrameShift data.",
+  "author": {
+    "name": "Syntheos"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Ghost-Frame/FrameShift"
+  },
+  "homepage": "https://frameshift.syntheos.dev/",
+  "documentation": "https://github.com/Ghost-Frame/FrameShift/wiki",
+  "support": "https://github.com/Ghost-Frame/FrameShift/issues",
+  "license": "Elastic-2.0",
+  "privacy_policies": [
+    "https://github.com/Ghost-Frame/FrameShift/wiki/Local-Data-and-Privacy"
+  ],
+  "server": {
+    "type": "binary",
+    "entry_point": "server/frameshift-mcp",
+    "mcp_config": {
+      "command": "${__dirname}/server/frameshift-mcp",
+      "args": []
+    }
+  },
+  "tools_generated": true,
+  "prompts_generated": true,
+  "keywords": [
+    "personas",
+    "developer-tools"
+  ],
+  "compatibility": {
+    "platforms": [
+      "win32"
+    ]
+  }
+}
