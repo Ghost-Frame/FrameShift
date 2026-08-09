@@ -184,6 +184,23 @@ fn install_request(
     persona: ExactPersonaVersion,
     canonical_request: &str,
 ) -> InstallPersonaRequest {
+    install_request_with_references(
+        account_id,
+        operation_id,
+        persona,
+        Vec::new(),
+        canonical_request,
+    )
+}
+
+/// Build one exact installation mutation fixture with a complete reference fence.
+fn install_request_with_references(
+    account_id: uuid::Uuid,
+    operation_id: uuid::Uuid,
+    persona: ExactPersonaVersion,
+    references: Vec<ExactPersonaVersion>,
+    canonical_request: &str,
+) -> InstallPersonaRequest {
     InstallPersonaRequest::new(
         mutation_context(
             account_id,
@@ -193,6 +210,7 @@ fn install_request(
             canonical_request,
         ),
         persona,
+        references,
     )
     .expect("fixture installation request must be valid")
 }
@@ -656,6 +674,17 @@ async fn tenant_isolation_exact_identity_and_tombstones_are_enforced() {
     assert!(operations_b
         .iter()
         .all(|operation| operation.account_id == account_b.id));
+    let direct_operation = catalog
+        .get_operation(account_a.id, operations_a[0].operation_id)
+        .await
+        .expect("tenant A direct operation lookup failed")
+        .expect("tenant A operation must exist");
+    assert_eq!(direct_operation, operations_a[0]);
+    assert!(catalog
+        .get_operation(account_b.id, operations_a[0].operation_id)
+        .await
+        .expect("foreign operation lookup must remain an empty scoped read")
+        .is_none());
 
     catalog
         .tombstone_pack(
@@ -875,8 +904,8 @@ async fn replay_cas_references_and_keyset_pages_are_deterministic() {
                 account.id,
                 uuid::Uuid::new_v4(),
                 Some(4),
-                next,
-                vec![dependency],
+                next.clone(),
+                vec![dependency.clone()],
                 "activate-with-tombstoned-reference",
             )
             .expect("reference request remains structurally valid"),
@@ -884,6 +913,17 @@ async fn replay_cas_references_and_keyset_pages_are_deterministic() {
         .await
         .expect_err("tombstoned reference must fail revalidation");
     assert_eq!(unavailable_reference, PersonaStateError::Unavailable);
+    let unavailable_install = catalog
+        .install(install_request_with_references(
+            account.id,
+            uuid::Uuid::new_v4(),
+            next,
+            vec![dependency],
+            "install-with-tombstoned-reference",
+        ))
+        .await
+        .expect_err("fresh install must revalidate every rendered dependency");
+    assert_eq!(unavailable_install, PersonaStateError::Unavailable);
     assert_eq!(catalog.get_snapshot(account.id).await.unwrap().revision, 4);
     let current: ActivePersonaRecord = catalog
         .get_active(account.id)
@@ -1127,6 +1167,11 @@ async fn inactive_accounts_fail_closed_without_state_changes() {
         .await
         .expect_err("suspended account operation listing must fail closed");
     assert_eq!(operation_list_error, PersonaStateError::Unavailable);
+    let operation_lookup_error = catalog
+        .get_operation(account.id, operation_id)
+        .await
+        .expect_err("suspended account direct operation lookup must fail closed");
+    assert_eq!(operation_lookup_error, PersonaStateError::Unavailable);
     let replay_error = catalog
         .install(original_request)
         .await

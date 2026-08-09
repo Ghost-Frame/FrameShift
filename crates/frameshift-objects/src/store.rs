@@ -74,7 +74,31 @@ pub trait PackStore: Send + Sync {
     ///   returned an unexpected error.
     async fn put(&self, hash: &ObjectHash, bytes: &[u8]) -> Result<(), ObjectStoreError>;
 
-    /// Retrieve the bytes stored under `hash`.
+    /// Retrieve at most `max_bytes` bytes stored under `hash`.
+    ///
+    /// This is the canonical read primitive. Implementations MUST reject an
+    /// object whose size exceeds `max_bytes` without first collecting the full
+    /// object into memory. Backends with size metadata MUST check it before
+    /// allocation and MUST still enforce the limit while consuming the body so
+    /// incorrect or stale metadata cannot bypass the boundary.
+    ///
+    /// A zero-byte maximum accepts only a zero-byte object. An object whose
+    /// size is exactly `max_bytes` is valid.
+    ///
+    /// # Errors
+    ///
+    /// - [`ObjectStoreError::NotFound`] -- no object exists for `hash`.
+    /// - [`ObjectStoreError::ReadLimitExceeded`] -- the object exceeds
+    ///   `max_bytes`.
+    /// - [`ObjectStoreError::BackendError`] -- the underlying storage
+    ///   returned an unexpected error.
+    async fn get_bounded(
+        &self,
+        hash: &ObjectHash,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, ObjectStoreError>;
+
+    /// Retrieve the bytes stored under `hash` without a caller-selected limit.
     ///
     /// Returns the exact bytes that were supplied to a prior successful `put`
     /// for the same `hash`.
@@ -91,7 +115,9 @@ pub trait PackStore: Send + Sync {
     ///   SHOULD return `BackendError` (not `HashMismatch`) when the stored
     ///   bytes do not match the key, because the mismatch is a backend
     ///   corruption, not a caller error.
-    async fn get(&self, hash: &ObjectHash) -> Result<Vec<u8>, ObjectStoreError>;
+    async fn get(&self, hash: &ObjectHash) -> Result<Vec<u8>, ObjectStoreError> {
+        self.get_bounded(hash, usize::MAX).await
+    }
 
     /// Return `true` if an object exists for `hash`, `false` if not.
     ///

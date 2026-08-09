@@ -17,6 +17,7 @@ frameshift-objects = { path = "../frameshift-objects" }
 frameshift-objects-fs = { path = "../frameshift-objects-fs" }
 frameshift-objects-r2 = { path = "../frameshift-objects-r2" }
 frameshift-publication = { path = "../frameshift-publication" }
+frameshift-source = { path = "../frameshift-source" }
 frameshift-runtime = { path = "../frameshift-runtime" }
 frameshift-memory = { path = "../frameshift-memory" }
 frameshift-memory-http = { path = "../frameshift-memory-http" }
@@ -43,6 +44,7 @@ chrono = { workspace = true }
 ed25519-dalek = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
+semver = "1"
 argon2 = { workspace = true }
 chacha20poly1305 = { workspace = true }
 rand_core = { workspace = true }

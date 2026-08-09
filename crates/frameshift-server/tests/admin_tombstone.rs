@@ -129,6 +129,7 @@ fn fixture() -> Fixture {
         )),
         account_auth: Some(Arc::new(FakeVerifier::new())),
         mcp_access: None,
+        mcp_dispatcher: None,
     };
     Fixture {
         catalog,

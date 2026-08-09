@@ -95,6 +95,7 @@ fn make_state_with_rate(abuse_rate_per_min: u32, trust_forwarded_for: bool) -> A
         )),
         account_auth: None,
         mcp_access: None,
+        mcp_dispatcher: None,
     }
 }
 

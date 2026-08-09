@@ -283,6 +283,7 @@ fn test_state_with_config(
         )),
         account_auth: verifier.map(|value| Arc::new(value) as Arc<dyn BearerTokenVerifier>),
         mcp_access: None,
+        mcp_dispatcher: None,
     }
 }
 
@@ -928,13 +929,10 @@ async fn invite_redemption_creates_one_browser_account_and_logout_revokes_it() {
             .starts_with("$argon2id$"));
     }
 
-    let replayed = send_browser(
+    let replayed = send_browser_password_operation_when_capacity_is_available(
         state.clone(),
-        Method::POST,
         "/v1/auth/register",
-        Some("https://frameshift.test"),
-        None,
-        Some(registration),
+        registration,
     )
     .await;
     assert_eq!(replayed.status(), StatusCode::UNAUTHORIZED);

@@ -318,7 +318,7 @@ fn hmac_token(claims: Value) -> String {
     .expect("test HMAC token must encode")
 }
 
-/// Build application state with an optional validated MCP Access runtime.
+/// Build application state with an optional Access runtime and deterministic MCP dispatcher.
 fn test_state(
     catalog: MockCatalog,
     config: Arc<ServerConfig>,
@@ -334,6 +334,7 @@ fn test_state(
         auth_nonces: Arc::new(crate::auth::NonceCache::new(Duration::from_secs(600))),
         account_auth: None,
         mcp_access,
+        mcp_dispatcher: Some(Arc::new(AccountProbeDispatcher::default())),
     }
 }
 
@@ -427,22 +428,44 @@ fn assert_no_store(response: &Response) {
     );
 }
 
-/// Disabled or invalid runtime state leaves the application MCP route absent.
+/// The application mounts MCP only when Access and dispatcher state are both present.
 #[tokio::test]
-async fn application_mcp_route_is_absent_without_validated_runtime() {
-    let state = test_state(
-        MockCatalog::new(),
-        test_config(McpAccessConfig::disabled()),
-        None,
-    );
-    for method in [Method::GET, Method::POST] {
+async fn application_mcp_route_requires_access_and_dispatcher() {
+    let config = test_config(enabled_access_config());
+    let access = test_runtime(FakeVerifier::default());
+    let dispatcher: Arc<dyn McpDispatcher> = Arc::new(AccountProbeDispatcher::default());
+    let cases = [
+        ("neither capability", None, None, StatusCode::NOT_FOUND),
+        (
+            "Access only",
+            Some(Arc::clone(&access)),
+            None,
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            "dispatcher only",
+            None,
+            Some(Arc::clone(&dispatcher)),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            "both capabilities",
+            Some(access),
+            Some(dispatcher),
+            StatusCode::UNAUTHORIZED,
+        ),
+    ];
+
+    for (case, mcp_access, mcp_dispatcher, expected_status) in cases {
+        let mut state = test_state(MockCatalog::new(), Arc::clone(&config), mcp_access);
+        state.mcp_dispatcher = mcp_dispatcher;
         let request = Request::builder()
-            .method(method)
+            .method(Method::POST)
             .uri("/mcp")
             .body(Body::empty())
             .unwrap();
-        let response = app(state.clone()).oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let response = app(state).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), expected_status, "{case}");
         assert_no_store(&response);
     }
 }

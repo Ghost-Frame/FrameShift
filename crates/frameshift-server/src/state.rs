@@ -13,6 +13,7 @@ use frameshift_objects::PackStore;
 use crate::account_auth::BearerTokenVerifier;
 use crate::auth::NonceCache;
 use crate::config::ServerConfig;
+use crate::mcp::McpDispatcher;
 use crate::metrics::Metrics;
 use crate::middleware::mcp_access::McpAccessRuntime;
 
@@ -22,8 +23,8 @@ use crate::middleware::mcp_access::McpAccessRuntime;
 /// access them via [`axum::extract::State<AppState>`] without any allocation
 /// per request.
 ///
-/// Because `AppState` is `Clone` (cheap Arc clone), adding new `Arc`-wrapped
-/// fields is non-breaking.
+/// Every backend handle is `Arc`-wrapped, so cloning this state remains cheap
+/// as narrowly scoped capabilities are added.
 #[derive(Clone)]
 pub struct AppState {
     /// Catalog backend: author registration, pack publication, search, etc.
@@ -42,8 +43,8 @@ pub struct AppState {
     /// Optional persona runtime.
     ///
     /// Present when the server is started with an embedded runtime for direct
-    /// persona loading. Absent in pure API-gateway mode. The MCP surface
-    /// (a later milestone) will require a `Some` value here.
+    /// persona loading. Absent in pure API-gateway mode. The remote MCP
+    /// dispatcher intentionally does not receive this broader capability.
     pub runtime: Option<Arc<frameshift_runtime::Runtime>>,
 
     /// Optional memory adapter for persona memory operations.
@@ -82,4 +83,13 @@ pub struct AppState {
     /// every issuer, audience, JWKS, algorithm, and resource setting passes
     /// the dedicated fail-closed validation boundary.
     pub mcp_access: Option<Arc<McpAccessRuntime>>,
+
+    /// Optional least-capability dispatcher for account-scoped remote MCP tools.
+    ///
+    /// Startup constructs this only alongside a validated MCP Access runtime.
+    /// The router requires both values before mounting `/mcp`, so every partial
+    /// configuration remains fail closed. The dispatcher owns only the catalog,
+    /// public pack store, and account-persona state capabilities needed by its
+    /// tools, never the embedded runtime, memory adapter, or credential vault.
+    pub mcp_dispatcher: Option<Arc<dyn McpDispatcher>>,
 }

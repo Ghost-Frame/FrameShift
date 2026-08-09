@@ -180,6 +180,7 @@ fn make_state_with_config(
         )),
         account_auth: None,
         mcp_access: None,
+        mcp_dispatcher: None,
     }
 }
 

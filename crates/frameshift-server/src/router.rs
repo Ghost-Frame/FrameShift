@@ -68,7 +68,7 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::request_id::{PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::set_header::SetResponseHeaderLayer;
 
-use crate::mcp::mcp_router;
+use crate::mcp::{mcp_router_with_dispatcher, McpTransportConfig};
 use crate::middleware::account::{require_account, require_fresh_mfa, resolve_optional_account};
 use crate::middleware::auth::require_signed_request;
 use crate::middleware::identity_limit::{
@@ -212,14 +212,20 @@ fn build_app(
     let signer_limit = axum::middleware::from_fn(enforce_signer_rate_limit);
     let account_limit = axum::middleware::from_fn(enforce_account_rate_limit);
 
-    // The remote MCP surface does not exist unless startup produced a fully
-    // validated Access runtime. Authentication wraps the account limiter, and
-    // the per-IP governor wraps both, so anonymous traffic cannot spend an
-    // account budget and all verifier work remains source-address bounded.
-    let mcp = if state.mcp_access.is_some() {
+    // The remote MCP surface does not exist unless startup produced both a
+    // validated Access runtime and its least-capability dispatcher.
+    // Authentication wraps the account limiter, and the per-IP governor wraps
+    // both, so anonymous traffic cannot spend an account budget and all
+    // verifier work remains source-address bounded.
+    let mcp = if let (Some(_), Some(dispatcher)) =
+        (state.mcp_access.as_ref(), state.mcp_dispatcher.as_ref())
+    {
         let access = axum::middleware::from_fn_with_state(state.clone(), require_mcp_access);
         let account_limit = axum::middleware::from_fn(enforce_mcp_account_rate_limit);
-        let protected = mcp_router().route_layer(account_limit).route_layer(access);
+        let protected =
+            mcp_router_with_dispatcher(McpTransportConfig::default(), Arc::clone(dispatcher))
+                .route_layer(account_limit)
+                .route_layer(access);
         apply_ip_rate_limit(protected, &state, state.config.abuse_rate_per_min)
     } else {
         Router::new()

@@ -14,11 +14,14 @@ use axum::routing::post;
 use axum::{Extension, Router};
 use tower_http::set_header::SetResponseHeaderLayer;
 
+/// Account-scoped cloud persona discovery, verification, and mutation tools.
+mod cloud_dispatcher;
 /// Typed dispatcher contracts and protocol-facing tool values.
 mod dispatcher;
 /// Stateless HTTP and JSON-RPC validation implementation.
 mod transport;
 
+pub use cloud_dispatcher::CloudPersonaMcpDispatcher;
 pub use dispatcher::{
     McpCallToolResult, McpDispatchError, McpDispatcher, McpListToolsRequest, McpListToolsResult,
     McpPrepareToolRequest, McpPreparedTool, McpPreparedToolCallRequest, McpProtocolVersion,

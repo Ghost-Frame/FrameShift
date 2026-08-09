@@ -151,6 +151,7 @@ fn test_state(catalog: &MockCatalog, public_objects: &MockPackStore) -> AppState
         )),
         account_auth: Some(Arc::new(FakeVerifier::new())),
         mcp_access: None,
+        mcp_dispatcher: None,
     }
 }
 

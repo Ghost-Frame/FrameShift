@@ -1114,6 +1114,24 @@ impl AccountPersonaStateBackend for PostgresCatalog {
         map_transaction_result(result)
     }
 
+    /// Read one immutable operation without any unscoped lookup path.
+    async fn get_operation(
+        &self,
+        account_id: Uuid,
+        operation_id: Uuid,
+    ) -> Result<Option<PersonaOperationRecord>, PersonaStateError> {
+        if operation_id.is_nil() {
+            return Err(PersonaStateError::Invalid);
+        }
+        let mut connection = self.pool().get().await.map_err(|_| pool_error())?;
+        require_active_account(&mut connection, account_id, AccountLock::None)
+            .await
+            .map_err(public_transaction_error)?;
+        load_operation(&mut connection, account_id, operation_id)
+            .await
+            .map_err(public_transaction_error)
+    }
+
     /// List immutable operations in stable account revision order.
     async fn list_operations(
         &self,
@@ -1163,6 +1181,8 @@ impl AccountPersonaStateBackend for PostgresCatalog {
         let mut connection = self.pool().get().await.map_err(|_| pool_error())?;
         let context = request.context().clone();
         let persona = request.persona().clone();
+        let mut references = request.references().to_vec();
+        references.sort_by(exact_persona_order);
         let result = connection
             .transaction::<MutationOutcome, PersonaTransactionError, _>(async move |connection| {
                 let start = begin_mutation(connection, &context).await?;
@@ -1176,6 +1196,10 @@ impl AccountPersonaStateBackend for PostgresCatalog {
                     } => (previous_revision, sequence),
                 };
                 require_active_catalog_version(connection, &persona).await?;
+                for reference in &references {
+                    require_available_installation(connection, context.account_id(), reference)
+                        .await?;
+                }
 
                 let existing = diesel::sql_query(
                     "SELECT account_id, pack_name, version, content_hash, installed_at \

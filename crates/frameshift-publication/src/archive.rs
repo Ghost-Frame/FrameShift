@@ -75,6 +75,8 @@ pub struct InspectedPublicArchive {
     pack_root: PathBuf,
     /// SHA-256 over the exact compressed input bytes.
     archive_sha256: [u8; 32],
+    /// Exact decoded tar-stream bytes that upper-bound retained extracted payload storage.
+    decompressed_archive_bytes: usize,
     /// Deterministic report generated from the extracted public pack.
     report: PublicationReport,
     /// Parsed manifest snapshot whose fields remain unauthenticated until verification.
@@ -198,6 +200,28 @@ pub struct VerifiedPackProvenance {
     pub signature: [u8; 64],
 }
 
+/// A completed public-pack render bound to every selected verified dependency.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedPublicRender {
+    /// Final rendered base text after composition, templating, and policy checks.
+    rendered_text: String,
+    /// Exact verified dependencies selected in deterministic manifest order.
+    selected_dependencies: Vec<VerifiedPackProvenance>,
+}
+
+/// Read-only access to one completed verified public-pack render.
+impl VerifiedPublicRender {
+    /// Return the final rendered base text.
+    pub fn rendered_text(&self) -> &str {
+        &self.rendered_text
+    }
+
+    /// Return exact selected dependency provenance in manifest resolution order.
+    pub fn selected_dependencies(&self) -> &[VerifiedPackProvenance] {
+        &self.selected_dependencies
+    }
+}
+
 /// A retained public pack whose transport, identity, policy, and signature passed.
 #[derive(Debug)]
 pub struct VerifiedPublicPack {
@@ -235,6 +259,11 @@ impl VerifiedPublicPack {
     /// Return exact verified provenance fields.
     pub fn provenance(&self) -> &VerifiedPackProvenance {
         &self.provenance
+    }
+
+    /// Return the decoded archive size used for retained per-call resource accounting.
+    pub fn decompressed_archive_bytes(&self) -> usize {
+        self.inspection.decompressed_archive_bytes
     }
 
     /// Return whether this pack contains a typed persona source snapshot.
@@ -493,6 +522,7 @@ pub fn inspect_public_archive(
         _temp_dir: temp_dir,
         pack_root,
         archive_sha256,
+        decompressed_archive_bytes: decompressed.len(),
         report,
         unverified_manifest,
         embedded_signature,
@@ -513,21 +543,22 @@ pub fn verify_public_archive(
     inspect_public_archive(archive_bytes)?.verify(expected)
 }
 
-/// Render the base text of a verified public pack without filesystem or vault access.
+/// Render authenticated base text together with exact selected dependency provenance.
 ///
 /// Typed source takes precedence. Composition accepts only the separately
 /// verified artifacts supplied in `dependencies`, resolves exactly one level,
 /// and delegates L1 protections to `frameshift-compose`. Raw fallback follows
 /// the local client's fixed candidate priority. Template values are explicit
 /// token substitutions only; section overlays remain caller-owned.
-pub fn render_public_pack_base(
+pub fn render_verified_public_pack(
     pack: &VerifiedPublicPack,
     target: RenderTarget,
     dependencies: &[VerifiedRenderDependency<'_>],
     template_values: Option<&BTreeMap<String, String>>,
-) -> Result<String, PublicPackRenderError> {
+) -> Result<VerifiedPublicRender, PublicPackRenderError> {
     let has_composition = pack.manifest.extends.is_some() || !pack.manifest.mixin.is_empty();
     let mut template_manifests = Vec::new();
+    let mut selected_dependencies = Vec::new();
     if let Some(manifest) = pack.template_manifest.as_ref() {
         template_manifests.push(manifest);
     }
@@ -538,6 +569,7 @@ pub fn render_public_pack_base(
             let mut layers = Vec::new();
             if let Some(spec) = pack.manifest.extends.as_deref() {
                 let dependency = resolve_dependency(pack, spec, dependencies, &mut seen)?;
+                selected_dependencies.push(dependency.provenance.clone());
                 let source = dependency
                     .typed_source
                     .as_ref()
@@ -552,6 +584,7 @@ pub fn render_public_pack_base(
             }
             for spec in &pack.manifest.mixin {
                 let dependency = resolve_dependency(pack, spec, dependencies, &mut seen)?;
+                selected_dependencies.push(dependency.provenance.clone());
                 let source = dependency
                     .typed_source
                     .as_ref()
@@ -589,7 +622,21 @@ pub fn render_public_pack_base(
     if !codes.is_empty() {
         return Err(PublicPackRenderError::PromptPolicyRejected { codes });
     }
-    Ok(rendered)
+    Ok(VerifiedPublicRender {
+        rendered_text: rendered,
+        selected_dependencies,
+    })
+}
+
+/// Render only the base text while preserving the established compatibility API.
+pub fn render_public_pack_base(
+    pack: &VerifiedPublicPack,
+    target: RenderTarget,
+    dependencies: &[VerifiedRenderDependency<'_>],
+    template_values: Option<&BTreeMap<String, String>>,
+) -> Result<String, PublicPackRenderError> {
+    render_verified_public_pack(pack, target, dependencies, template_values)
+        .map(|render| render.rendered_text)
 }
 
 /// Logical archive entry type allowed to materialize on disk.
@@ -2009,6 +2056,187 @@ mod tests {
         assert!(claude.contains("Keep changes reversible."));
         assert!(!claude.contains("raw fallback must not win"));
         assert!(!codex.contains("Keep changes reversible."));
+    }
+
+    /// A render without composition authenticates text with no dependency provenance.
+    #[test]
+    fn verified_render_without_composition_has_no_selected_dependencies() {
+        let verified = raw_fixture(
+            "standalone-render",
+            "1.0.0",
+            "# Standalone render\n",
+            "",
+            None,
+            false,
+        )
+        .verify()
+        .expect("verify standalone render");
+
+        let rendered = render_verified_public_pack(&verified, RenderTarget::Generic, &[], None)
+            .expect("render standalone pack");
+
+        assert!(verified.decompressed_archive_bytes() > 0);
+        assert!(verified.decompressed_archive_bytes() <= MAX_DECOMPRESSED_BYTES);
+        assert_eq!(rendered.rendered_text(), "# Standalone render\n");
+        assert!(rendered.selected_dependencies().is_empty());
+    }
+
+    /// Selected provenance follows extends then manifest mixin order and excludes root.
+    #[test]
+    fn verified_render_reports_exact_dependency_provenance_in_manifest_order() {
+        let base = typed_fixture(
+            "ordered-base",
+            "1.0.0",
+            vec![rule("ordered-base", Layer::L2, "Ordered base guidance.")],
+            "",
+        )
+        .verify()
+        .expect("verify ordered base");
+        let first_mixin = typed_fixture(
+            "ordered-first-mixin",
+            "1.1.0",
+            vec![rule(
+                "ordered-first-mixin",
+                Layer::L2,
+                "Ordered first mixin guidance.",
+            )],
+            "",
+        )
+        .verify()
+        .expect("verify ordered first mixin");
+        let second_mixin = typed_fixture(
+            "ordered-second-mixin",
+            "1.2.0",
+            vec![rule(
+                "ordered-second-mixin",
+                Layer::L2,
+                "Ordered second mixin guidance.",
+            )],
+            "",
+        )
+        .verify()
+        .expect("verify ordered second mixin");
+        let root = typed_fixture(
+            "ordered-root",
+            "2.0.0",
+            vec![rule("ordered-root", Layer::L2, "Ordered root guidance.")],
+            "extends = \"ordered-base@^1\"\n\
+             mixin = [\"ordered-first-mixin@^1\", \"ordered-second-mixin@^1\"]\n",
+        )
+        .verify()
+        .expect("verify ordered root");
+        let dependencies = [
+            VerifiedRenderDependency::active(&second_mixin),
+            VerifiedRenderDependency::active(&base),
+            VerifiedRenderDependency::active(&first_mixin),
+        ];
+
+        let rendered =
+            render_verified_public_pack(&root, RenderTarget::Generic, &dependencies, None)
+                .expect("render ordered composition");
+        let expected = vec![
+            base.provenance().clone(),
+            first_mixin.provenance().clone(),
+            second_mixin.provenance().clone(),
+        ];
+
+        assert_eq!(rendered.selected_dependencies(), expected.as_slice());
+        assert!(!rendered.selected_dependencies().contains(root.provenance()));
+    }
+
+    /// Resolver errors expose no authenticated result, including after partial selection.
+    #[test]
+    fn verified_render_resolution_failures_return_no_output() {
+        let root = typed_fixture(
+            "no-output-root",
+            "1.0.0",
+            vec![rule("no-output-root", Layer::L2, "Root guidance.")],
+            "extends = \"no-output-base@*\"\n",
+        )
+        .verify()
+        .expect("verify no-output root");
+        let partial_root = typed_fixture(
+            "partial-output-root",
+            "1.0.0",
+            vec![rule(
+                "partial-output-root",
+                Layer::L2,
+                "Partial root guidance.",
+            )],
+            "extends = \"no-output-base@=1.0.0\"\n\
+             mixin = [\"missing-output-mixin@*\"]\n",
+        )
+        .verify()
+        .expect("verify partial-output root");
+        let base_one = typed_fixture(
+            "no-output-base",
+            "1.0.0",
+            vec![rule("no-output-base-one", Layer::L2, "Base one guidance.")],
+            "",
+        )
+        .verify()
+        .expect("verify no-output base one");
+        let base_two = typed_fixture(
+            "no-output-base",
+            "2.0.0",
+            vec![rule("no-output-base-two", Layer::L2, "Base two guidance.")],
+            "",
+        )
+        .verify()
+        .expect("verify no-output base two");
+
+        assert!(matches!(
+            render_verified_public_pack(
+                &root,
+                RenderTarget::Generic,
+                &[VerifiedRenderDependency::inactive(&base_one)],
+                None,
+            ),
+            Err(PublicPackRenderError::InactiveDependency)
+        ));
+        assert!(matches!(
+            render_verified_public_pack(
+                &root,
+                RenderTarget::Generic,
+                &[
+                    VerifiedRenderDependency::active(&base_one),
+                    VerifiedRenderDependency::active(&base_two),
+                ],
+                None,
+            ),
+            Err(PublicPackRenderError::AmbiguousDependency)
+        ));
+        assert!(matches!(
+            render_verified_public_pack(
+                &partial_root,
+                RenderTarget::Generic,
+                &[VerifiedRenderDependency::active(&base_one)],
+                None,
+            ),
+            Err(PublicPackRenderError::UnresolvedDependency)
+        ));
+    }
+
+    /// The compatibility renderer returns exactly the authenticated render text.
+    #[test]
+    fn compatibility_renderer_matches_verified_render_text() {
+        let verified = raw_fixture(
+            "compatibility-render",
+            "1.0.0",
+            "# Compatibility render\n",
+            "",
+            None,
+            false,
+        )
+        .verify()
+        .expect("verify compatibility render");
+        let authenticated =
+            render_verified_public_pack(&verified, RenderTarget::Generic, &[], None)
+                .expect("render authenticated text");
+        let compatibility = render_public_pack_base(&verified, RenderTarget::Generic, &[], None)
+            .expect("render compatibility text");
+
+        assert_eq!(compatibility, authenticated.rendered_text());
     }
 
     /// One separately verified active base composes successfully with provenance.

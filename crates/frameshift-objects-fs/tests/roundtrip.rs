@@ -38,6 +38,55 @@ async fn put_then_get_roundtrip() {
     assert_eq!(back, data);
 }
 
+/// A bounded read accepts an object exactly equal to the caller's byte ceiling.
+#[tokio::test]
+async fn get_bounded_accepts_exact_limit() {
+    let (store, _dir) = make_store().await;
+    let data = b"exactly eight";
+    let hash = ObjectHash::of(data);
+    store.put(&hash, data).await.unwrap();
+
+    let back = store.get_bounded(&hash, data.len()).await.unwrap();
+
+    assert_eq!(back, data);
+}
+
+/// A bounded read rejects oversized file metadata before returning object bytes.
+#[tokio::test]
+async fn get_bounded_rejects_object_above_limit() {
+    let (store, _dir) = make_store().await;
+    let data = b"one byte too large";
+    let hash = ObjectHash::of(data);
+    store.put(&hash, data).await.unwrap();
+    let max_bytes = data.len() - 1;
+
+    let result = store.get_bounded(&hash, max_bytes).await;
+
+    assert!(matches!(
+        result,
+        Err(ObjectStoreError::ReadLimitExceeded {
+            hash: rejected_hash,
+            observed_bytes,
+            max_bytes: rejected_max,
+        }) if rejected_hash == hash
+            && observed_bytes == data.len() as u64
+            && rejected_max == max_bytes as u64
+    ));
+}
+
+/// A zero-byte bound accepts the content-addressed empty object.
+#[tokio::test]
+async fn get_bounded_zero_limit_accepts_empty_object() {
+    let (store, _dir) = make_store().await;
+    let data = b"";
+    let hash = ObjectHash::of(data);
+    store.put(&hash, data).await.unwrap();
+
+    let back = store.get_bounded(&hash, 0).await.unwrap();
+
+    assert!(back.is_empty());
+}
+
 // --- put same hash, same bytes twice is idempotent ---
 
 #[tokio::test]
@@ -115,6 +164,7 @@ async fn exists_missing_is_false() {
 }
 
 #[tokio::test]
+/// A stored regular object is reported as present.
 async fn exists_present_is_true() {
     let (store, _dir) = make_store().await;
     let data = b"present";
@@ -124,6 +174,7 @@ async fn exists_present_is_true() {
 }
 
 #[tokio::test]
+/// A symlink at an object path is never reported as a stored object.
 async fn exists_symlink_is_false() {
     let (store, dir) = make_store().await;
     let data = b"symlink target";
@@ -166,6 +217,7 @@ async fn list_prefix_empty_returns_all_up_to_limit() {
 }
 
 #[tokio::test]
+/// Prefix listing stops at the exact caller-selected result limit.
 async fn list_prefix_limit_is_respected() {
     let (store, _dir) = make_store().await;
     for i in 0u8..10 {

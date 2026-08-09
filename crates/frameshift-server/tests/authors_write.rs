@@ -95,6 +95,7 @@ fn mk_state(catalog: MockCatalog) -> AppState {
         )),
         account_auth: None,
         mcp_access: None,
+        mcp_dispatcher: None,
     }
 }
 

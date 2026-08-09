@@ -903,6 +903,8 @@ pub struct InstallPersonaRequest {
     context: MutationContext,
     /// Exact active catalog version verified before persistence.
     persona: ExactPersonaVersion,
+    /// Complete exact dependency set selected by the verified render.
+    references: Vec<ExactPersonaVersion>,
 }
 
 /// Validated constructors for [`InstallPersonaRequest`].
@@ -911,10 +913,16 @@ impl InstallPersonaRequest {
     pub fn new(
         context: MutationContext,
         persona: ExactPersonaVersion,
+        references: Vec<ExactPersonaVersion>,
     ) -> Result<Self, PersonaStateError> {
         context.require_tool(FRAMESHIFT_INSTALL_TOOL_NAME)?;
         persona.validate()?;
-        Ok(Self { context, persona })
+        validate_exact_references(&persona, &references)?;
+        Ok(Self {
+            context,
+            persona,
+            references,
+        })
     }
 
     /// Borrow the trusted mutation metadata.
@@ -925,6 +933,11 @@ impl InstallPersonaRequest {
     /// Borrow the exact persona version being installed.
     pub const fn persona(&self) -> &ExactPersonaVersion {
         &self.persona
+    }
+
+    /// Borrow the bounded unique exact dependency versions.
+    pub fn references(&self) -> &[ExactPersonaVersion] {
+        &self.references
     }
 }
 
@@ -956,19 +969,7 @@ impl SetActivePersonaRequest {
             return Err(PersonaStateError::Invalid);
         }
         root.validate()?;
-        if references.len() > MAX_REFERENCED_PERSONA_VERSIONS {
-            return Err(PersonaStateError::Invalid);
-        }
-        for (index, reference) in references.iter().enumerate() {
-            reference.validate()?;
-            if same_persona_version(reference, &root)
-                || references[..index]
-                    .iter()
-                    .any(|prior| same_persona_version(reference, prior))
-            {
-                return Err(PersonaStateError::Invalid);
-            }
-        }
+        validate_exact_references(&root, &references)?;
         Ok(Self {
             context,
             root,
@@ -990,6 +991,27 @@ impl SetActivePersonaRequest {
     pub fn references(&self) -> &[ExactPersonaVersion] {
         &self.references
     }
+}
+
+/// Validate one complete bounded unique dependency set against its exact root.
+fn validate_exact_references(
+    root: &ExactPersonaVersion,
+    references: &[ExactPersonaVersion],
+) -> Result<(), PersonaStateError> {
+    if references.len() > MAX_REFERENCED_PERSONA_VERSIONS {
+        return Err(PersonaStateError::Invalid);
+    }
+    for (index, reference) in references.iter().enumerate() {
+        reference.validate()?;
+        if same_persona_version(reference, root)
+            || references[..index]
+                .iter()
+                .any(|prior| same_persona_version(reference, prior))
+        {
+            return Err(PersonaStateError::Invalid);
+        }
+    }
+    Ok(())
 }
 
 /// Validated request to append one exact authenticated growth entry.
@@ -1209,6 +1231,13 @@ pub trait AccountPersonaStateBackend: Send + Sync {
         account_id: Uuid,
         root: &ExactPersonaVersion,
     ) -> Result<RenderPersonaStateSnapshot, PersonaStateError>;
+
+    /// Read one append-only operation by its tenant-composite identity.
+    async fn get_operation(
+        &self,
+        account_id: Uuid,
+        operation_id: Uuid,
+    ) -> Result<Option<PersonaOperationRecord>, PersonaStateError>;
 
     /// List append-only account operations in stable revision sequence order.
     async fn list_operations(
@@ -1565,6 +1594,12 @@ mod tests {
             references.clone()
         )
         .is_ok());
+        assert!(InstallPersonaRequest::new(
+            context(FRAMESHIFT_INSTALL_TOOL_NAME, None),
+            exact(),
+            references.clone()
+        )
+        .is_ok());
 
         let mut too_many = references;
         too_many.push(ExactPersonaVersion::new("overflow", "v1", hash(99)).expect("exact"));
@@ -1574,18 +1609,35 @@ mod tests {
             too_many
         )
         .is_err());
+        let too_many = (0..=MAX_REFERENCED_PERSONA_VERSIONS)
+            .map(|index| {
+                ExactPersonaVersion::new(format!("overflow{index}"), "v1", hash(index as u8))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .expect("structurally valid references above the collection bound");
+        assert!(InstallPersonaRequest::new(
+            context(FRAMESHIFT_INSTALL_TOOL_NAME, None),
+            exact(),
+            too_many
+        )
+        .is_err());
     }
 
     #[test]
     /// Every mutation request accepts only its exact public tool name.
     fn request_constructors_reject_cross_tool_contexts() {
-        assert!(
-            InstallPersonaRequest::new(context(FRAMESHIFT_INSTALL_TOOL_NAME, None), exact())
-                .is_ok()
-        );
-        assert!(
-            InstallPersonaRequest::new(context(FRAMESHIFT_PREFS_TOOL_NAME, None), exact()).is_err()
-        );
+        assert!(InstallPersonaRequest::new(
+            context(FRAMESHIFT_INSTALL_TOOL_NAME, None),
+            exact(),
+            Vec::new()
+        )
+        .is_ok());
+        assert!(InstallPersonaRequest::new(
+            context(FRAMESHIFT_PREFS_TOOL_NAME, None),
+            exact(),
+            Vec::new()
+        )
+        .is_err());
 
         assert!(SetActivePersonaRequest::new(
             context(FRAMESHIFT_USE_TOOL_NAME, Some(7)),
@@ -1630,7 +1682,7 @@ mod tests {
     }
 
     #[test]
-    /// Active selection requires a revision fence and unique non-root references.
+    /// Install and active requests require unique non-root exact references.
     fn set_active_constructor_enforces_split_phase_identity() {
         assert!(SetActivePersonaRequest::new(
             context(FRAMESHIFT_USE_TOOL_NAME, None),
@@ -1640,6 +1692,12 @@ mod tests {
         .is_err());
 
         let root = exact();
+        assert!(InstallPersonaRequest::new(
+            context(FRAMESHIFT_INSTALL_TOOL_NAME, None),
+            root.clone(),
+            vec![root.clone()]
+        )
+        .is_err());
         assert!(SetActivePersonaRequest::new(
             context(FRAMESHIFT_USE_TOOL_NAME, Some(7)),
             root.clone(),
@@ -1651,6 +1709,12 @@ mod tests {
             ExactPersonaVersion::new("dependency", "1.0.0", hash(8)).expect("valid reference");
         let conflicting_hash = ExactPersonaVersion::new("dependency", "1.0.0", hash(9))
             .expect("valid conflicting reference fixture");
+        assert!(InstallPersonaRequest::new(
+            context(FRAMESHIFT_INSTALL_TOOL_NAME, None),
+            exact(),
+            vec![first.clone(), conflicting_hash.clone()]
+        )
+        .is_err());
         assert!(SetActivePersonaRequest::new(
             context(FRAMESHIFT_USE_TOOL_NAME, Some(7)),
             exact(),

@@ -288,6 +288,7 @@ fn fixture() -> Fixture {
         )),
         account_auth: Some(Arc::new(FakeVerifier::new())),
         mcp_access: None,
+        mcp_dispatcher: None,
     };
     let quarantine = MockPackStore::new();
     quarantine.insert(submission.archive_hash, archive_bytes.clone());

@@ -128,6 +128,7 @@ fn make_state(catalog: MockCatalog, objects: MockPackStore) -> AppState {
         )),
         account_auth: None,
         mcp_access: None,
+        mcp_dispatcher: None,
     }
 }
 
@@ -150,6 +151,7 @@ async fn cors_preflight_allows_write_request_headers() {
     let state = AppState {
         config: Arc::new(config),
         mcp_access: None,
+        mcp_dispatcher: None,
         ..make_state(MockCatalog::new(), MockPackStore::new())
     };
     let request = Request::builder()
@@ -1433,6 +1435,7 @@ fn dl_state_with_rate(catalog: MockCatalog, objects: MockPackStore, rate: u32) -
         )),
         account_auth: None,
         mcp_access: None,
+        mcp_dispatcher: None,
     }
 }
 

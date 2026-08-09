@@ -12,12 +12,13 @@ use mimalloc::MiMalloc;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
-use frameshift_catalog::CatalogBackend;
+use frameshift_catalog::{AccountPersonaStateBackend, CatalogBackend};
 use frameshift_catalog_postgres::{PostgresCatalog, PostgresCatalogConfig};
 use frameshift_memory::MemoryAdapter;
 use frameshift_objects::PackStore;
 use frameshift_objects_fs::{FsPackStore, FsPackStoreConfig};
 use frameshift_objects_r2::{R2PackStore, R2PackStoreConfig};
+use frameshift_server::mcp::{CloudPersonaMcpDispatcher, McpDispatcher};
 use frameshift_server::metrics::Metrics;
 use frameshift_server::recovery_delivery::{
     run_recovery_delivery_worker, RecoveryDeliveryCipher, RecoveryDeliveryDispatcher,
@@ -131,6 +132,15 @@ async fn build_state(config: Arc<ServerConfig>) -> Result<InitializedState, Serv
             None
         }
     };
+    let mcp_dispatcher = mcp_access.as_ref().map(|_| {
+        let catalog_backend: Arc<dyn CatalogBackend> = catalog.clone();
+        let persona_state_backend: Arc<dyn AccountPersonaStateBackend> = catalog.clone();
+        Arc::new(CloudPersonaMcpDispatcher::new(
+            catalog_backend,
+            Arc::clone(&objects),
+            persona_state_backend,
+        )) as Arc<dyn McpDispatcher>
+    });
 
     Ok(InitializedState {
         state: AppState {
@@ -143,6 +153,7 @@ async fn build_state(config: Arc<ServerConfig>) -> Result<InitializedState, Serv
             auth_nonces,
             account_auth,
             mcp_access,
+            mcp_dispatcher,
         },
         postgres_catalog: catalog,
     })
