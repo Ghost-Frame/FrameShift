@@ -19,7 +19,7 @@
 //!        -> app(state)          <- this function is the testable unit
 //!             -> router.rs      <- sub-router composition + middleware
 //!                  -> routes/   <- individual handler modules
-//!                  -> mcp/      <- MCP placeholder (501)
+//!                  -> mcp/      <- stateless remote MCP transport
 //! ```
 //!
 //! ## Milestone scope
@@ -39,9 +39,10 @@
 //!   an active administrator role.
 //! - OIDC account and publisher-owner APIs under `/v1/account` and
 //!   `/v1/publishers`, mounted only when a valid verifier is configured.
-//! - MCP placeholder: `/mcp/*` returns 501.
+//! - Remote MCP endpoint: `POST /mcp` serves stateless JSON-RPC, including the
+//!   bounded batch form required only by the 2025-03-26 compatibility revision.
 //!
-//! Deferred (M5+): transparency log and the full MCP surface.
+//! Deferred (M5+): transparency log and account-scoped remote MCP tools.
 
 pub mod account_auth;
 pub mod auth;
@@ -68,10 +69,11 @@ use std::sync::Arc;
 use frameshift_objects::PackStore;
 
 pub use config::{
-    FirstPartyAuthConfig, InviteRequestConfig, LogFormat, OidcConfig, PasswordRecoveryConfig,
-    ServerConfig,
+    FirstPartyAuthConfig, InviteRequestConfig, LogFormat, McpAccessConfig, OidcConfig,
+    PasswordRecoveryConfig, ServerConfig,
 };
 pub use error::AppError;
+pub use middleware::mcp_access::{McpAccessConfigError, McpAccessRuntime, McpAuthenticatedAccount};
 pub use router::{app, app_with_publication_admission};
 pub use state::AppState;
 

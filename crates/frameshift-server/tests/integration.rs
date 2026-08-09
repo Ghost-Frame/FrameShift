@@ -21,7 +21,7 @@
 //! - `GET /v1/authors` -> 200, default/clamped/offset pagination
 //! - `GET /healthz` -> 200 with both backends healthy, `detail` sanitized to
 //!   `"ok"`/`"degraded"` (never the adapter's raw internal detail text)
-//! - `GET /mcp/anything` -> 501
+//! - disabled MCP keeps `/mcp` and its subpaths absent with 404
 //! - All responses include `x-request-id` header
 //! - `AppError::Internal` does not leak source details in body
 
@@ -100,6 +100,7 @@ fn test_config() -> Arc<ServerConfig> {
         admin_pubkeys: Vec::new(),
         publisher_ownership_reads: true,
         oidc: frameshift_server::OidcConfig::disabled(),
+        mcp_access: frameshift_server::McpAccessConfig::disabled(),
         invite_requests: frameshift_server::InviteRequestConfig::disabled(),
         first_party_auth: frameshift_server::FirstPartyAuthConfig::disabled(),
         memory_backend: "none".to_string(),
@@ -126,6 +127,8 @@ fn make_state(catalog: MockCatalog, objects: MockPackStore) -> AppState {
             Duration::from_secs(600),
         )),
         account_auth: None,
+        mcp_access: None,
+        mcp_dispatcher: None,
     }
 }
 
@@ -147,6 +150,8 @@ async fn cors_preflight_allows_write_request_headers() {
     config.cors_allowed_origins = "https://app.frameshift.example".to_string();
     let state = AppState {
         config: Arc::new(config),
+        mcp_access: None,
+        mcp_dispatcher: None,
         ..make_state(MockCatalog::new(), MockPackStore::new())
     };
     let request = Request::builder()
@@ -1209,22 +1214,20 @@ async fn healthz_memory_degraded_sanitizes_detail() {
 // /mcp
 // ---------------------------------------------------------------------------
 
-/// `GET /mcp/anything` returns 501 Not Implemented.
+/// MCP is mounted at exactly `/mcp`, so old subpaths remain absent.
 #[tokio::test]
-async fn mcp_any_path_returns_501() {
+async fn mcp_subpath_is_not_mounted() {
     let state = make_state(MockCatalog::new(), MockPackStore::new());
     let resp = oneshot_get(state, "/mcp/tools").await;
-    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
-    let body = body_json(resp).await;
-    assert_eq!(body["error"], "MCP not implemented");
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
-/// `GET /mcp/sse` (a named sub-path) also returns 501.
+/// `GET /mcp` is absent when the dedicated MCP access surface is disabled.
 #[tokio::test]
-async fn mcp_root_returns_501() {
+async fn mcp_get_is_not_found_when_disabled() {
     let state = make_state(MockCatalog::new(), MockPackStore::new());
-    let resp = oneshot_get(state, "/mcp/sse").await;
-    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    let resp = oneshot_get(state, "/mcp").await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 // ---------------------------------------------------------------------------
@@ -1409,6 +1412,7 @@ fn dl_state_with_rate(catalog: MockCatalog, objects: MockPackStore, rate: u32) -
         admin_pubkeys: Vec::new(),
         publisher_ownership_reads: true,
         oidc: frameshift_server::OidcConfig::disabled(),
+        mcp_access: frameshift_server::McpAccessConfig::disabled(),
         invite_requests: frameshift_server::InviteRequestConfig::disabled(),
         first_party_auth: frameshift_server::FirstPartyAuthConfig::disabled(),
         memory_backend: "none".to_string(),
@@ -1430,6 +1434,8 @@ fn dl_state_with_rate(catalog: MockCatalog, objects: MockPackStore, rate: u32) -
             Duration::from_secs(600),
         )),
         account_auth: None,
+        mcp_access: None,
+        mcp_dispatcher: None,
     }
 }
 

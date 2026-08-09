@@ -1,61 +1,68 @@
-//! MCP (Model Context Protocol) router -- milestone placeholder.
+//! Remote Model Context Protocol endpoint.
 //!
-//! Every method under `/mcp/*` returns `501 Not Implemented` with a JSON body
-//! that explains which milestone will provide the real implementation. This
-//! allows the routing structure to be finalized now so that the MCP surface
-//! can land as new handlers inside this module without touching the skeleton.
-//!
-//! # Future surface
-//!
-//! The full MCP implementation will expose:
-//! - SSE connection endpoint (`/mcp/sse`)
-//! - JSON-RPC message endpoint (`/mcp/messages`)
-//! - Tool listing (`/mcp/tools`)
-//!
-//! All of those are deferred to a follow-up milestone.
+//! The router exposes exactly one stateless `POST /mcp` endpoint. It supports
+//! handshake-era compatibility without creating sessions and the final
+//! 2026-07-28 per-request metadata protocol without SSE. Transport validation
+//! remains separate from account-aware tool discovery and execution through a
+//! small typed dispatcher seam.
 
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
-use axum::routing::any;
-use axum::{Json, Router};
+use std::sync::Arc;
 
-use crate::state::AppState;
+use axum::http::header::CACHE_CONTROL;
+use axum::http::HeaderValue;
+use axum::routing::post;
+use axum::{Extension, Router};
+use tower_http::set_header::SetResponseHeaderLayer;
 
-/// Build the MCP sub-router mounted at `/mcp`.
-///
-/// Currently returns `501 Not Implemented` for every method on every path
-/// under `/mcp/*`. The `any` handler catches all HTTP methods.
-pub fn mcp_router() -> Router<AppState> {
-    Router::new()
-        .route("/{*path}", any(mcp_placeholder))
-        .route("/", any(mcp_placeholder))
+/// Account-scoped cloud persona discovery, verification, and mutation tools.
+mod cloud_dispatcher;
+/// Typed dispatcher contracts and protocol-facing tool values.
+mod dispatcher;
+/// Stateless HTTP and JSON-RPC validation implementation.
+mod transport;
+
+pub use cloud_dispatcher::CloudPersonaMcpDispatcher;
+pub use dispatcher::{
+    McpCallToolResult, McpDispatchError, McpDispatcher, McpListToolsRequest, McpListToolsResult,
+    McpPrepareToolRequest, McpPreparedTool, McpPreparedToolCallRequest, McpProtocolVersion,
+    McpRequestContext, McpTool, McpToolAnnotations, McpToolContent,
+};
+pub use transport::{
+    McpTransportConfig, McpTransportConfigError, DEFAULT_MCP_MAX_BODY_BYTES,
+    DEFAULT_MCP_MAX_TOOL_OUTPUT_CHARS, DEFAULT_MCP_PRIVATE_CACHE_TTL_MS,
+    DEFAULT_MCP_REQUEST_TIMEOUT, FALLBACK_LEGACY_PROTOCOL_VERSION, LATEST_LEGACY_PROTOCOL_VERSION,
+    MODERN_PROTOCOL_VERSION,
+};
+
+use dispatcher::UnavailableMcpDispatcher;
+use transport::handle_mcp;
+
+/// Build the exact `/mcp` route with conservative transport defaults.
+pub fn mcp_router<S>() -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    mcp_router_with_dispatcher(
+        McpTransportConfig::default(),
+        Arc::new(UnavailableMcpDispatcher),
+    )
 }
 
-/// `ANY /mcp/*`
-///
-/// Placeholder for the MCP (Model Context Protocol) surface. Returns
-/// `501 Not Implemented` for all methods and paths under `/mcp`.
-///
-/// # Response
-///
-/// `501 Not Implemented` with body:
-/// ```json
-/// {
-///   "error": "MCP not implemented",
-///   "detail": "The MCP surface is planned for a follow-up milestone."
-/// }
-/// ```
-///
-/// # Errors
-///
-/// This handler never returns an error; it always produces a `501` response.
-async fn mcp_placeholder() -> Response {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(serde_json::json!({
-            "error": "MCP not implemented",
-            "detail": "The MCP surface is planned for a follow-up milestone."
-        })),
-    )
-        .into_response()
+/// Build the exact `/mcp` route with an explicit policy and tool dispatcher.
+pub fn mcp_router_with_dispatcher<S>(
+    config: McpTransportConfig,
+    dispatcher: Arc<dyn McpDispatcher>,
+) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    Router::new()
+        .route("/mcp", post(handle_mcp))
+        .layer(Extension(dispatcher))
+        .layer(Extension(config))
+        // Account-specific discovery and rendered prompts must never enter an HTTP cache.
+        .layer(SetResponseHeaderLayer::overriding(
+            CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
+        ))
 }

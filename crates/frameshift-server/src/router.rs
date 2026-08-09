@@ -25,9 +25,11 @@
 //!    `Referrer-Policy`) -- added to every response if not already present.
 //! 7. Client request-ID capture -- preserves a caller UUID before tracing can
 //!    synthesize a missing request ID.
-//! 8. `CorsLayer` -- outermost; handles preflight `OPTIONS` requests and
-//!    stamps `Access-Control-Allow-*` headers on responses. Only applied
-//!    when `state.config.cors_allowed_origins` is non-empty.
+//! 8. `CorsLayer` -- handles preflight `OPTIONS` requests and stamps
+//!    `Access-Control-Allow-*` headers on responses. Only applied when
+//!    `state.config.cors_allowed_origins` is non-empty.
+//! 9. MCP cache barrier -- outermost; overwrites `Cache-Control` with
+//!    `no-store` on the exact `/mcp` path, including middleware rejections.
 //!
 //! # Per-route layers
 //!
@@ -66,12 +68,14 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::request_id::{PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::set_header::SetResponseHeaderLayer;
 
-use crate::mcp::mcp_router;
+use crate::mcp::{mcp_router_with_dispatcher, McpTransportConfig};
 use crate::middleware::account::{require_account, require_fresh_mfa, resolve_optional_account};
 use crate::middleware::auth::require_signed_request;
 use crate::middleware::identity_limit::{
-    enforce_account_rate_limit, enforce_signer_rate_limit, IdentityRateLimits,
+    enforce_account_rate_limit, enforce_mcp_account_rate_limit, enforce_signer_rate_limit,
+    IdentityRateLimits,
 };
+use crate::middleware::mcp_access::require_mcp_access;
 use crate::middleware::metrics::MetricsLayer;
 use crate::middleware::request_id::{capture_client_request_id, RequestIdGenerator};
 use crate::middleware::tracing::make_trace_layer;
@@ -117,7 +121,7 @@ use crate::state::AppState;
 ///     /telemetry -- POST /selection opt-in selection telemetry sink
 ///     /memory   -- GET /health read-only memory backend health
 ///     /admin    -- account-authenticated administrator lifecycle controls
-///   /mcp        -- MCP placeholder (501 for all methods)
+///   /mcp        -- stateless JSON-RPC MCP endpoint (POST only)
 /// ```
 ///
 /// Global middleware (applied to all routes):
@@ -169,6 +173,21 @@ pub fn app_with_publication_admission(state: AppState, quarantine: Arc<dyn PackS
     build_app(state, Some(admission), Some(quarantine), Some(promotion))
 }
 
+/// Prohibit HTTP caching for the exact remote MCP boundary after every other layer responds.
+async fn prohibit_mcp_response_caching(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let is_mcp = request.uri().path() == "/mcp";
+    let mut response = next.run(request).await;
+    if is_mcp {
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
+    response
+}
+
 /// Compose the complete router with optional explicit quarantine services.
 fn build_app(
     state: AppState,
@@ -192,6 +211,25 @@ fn build_app(
     let identity_limits = IdentityRateLimits::from_config(&state.config);
     let signer_limit = axum::middleware::from_fn(enforce_signer_rate_limit);
     let account_limit = axum::middleware::from_fn(enforce_account_rate_limit);
+
+    // The remote MCP surface does not exist unless startup produced both a
+    // validated Access runtime and its least-capability dispatcher.
+    // Authentication wraps the account limiter, and the per-IP governor wraps
+    // both, so anonymous traffic cannot spend an account budget and all
+    // verifier work remains source-address bounded.
+    let mcp = if let (Some(_), Some(dispatcher)) =
+        (state.mcp_access.as_ref(), state.mcp_dispatcher.as_ref())
+    {
+        let access = axum::middleware::from_fn_with_state(state.clone(), require_mcp_access);
+        let account_limit = axum::middleware::from_fn(enforce_mcp_account_rate_limit);
+        let protected =
+            mcp_router_with_dispatcher(McpTransportConfig::default(), Arc::clone(dispatcher))
+                .route_layer(account_limit)
+                .route_layer(access);
+        apply_ip_rate_limit(protected, &state, state.config.abuse_rate_per_min)
+    } else {
+        Router::new()
+    };
 
     // Publish (`POST /v1/packs`) carries the signed-request layer. It is merged
     // with the anonymous read router so GET (search) and POST (publish) share
@@ -341,7 +379,7 @@ fn build_app(
         .merge(ops_router())
         .nest("/v1", v1)
         .nest("/dl", dl_router())
-        .nest("/mcp", mcp_router())
+        .merge(mcp)
         .layer(PropagateRequestIdLayer::new(x_request_id.clone()))
         .layer(SetRequestIdLayer::new(x_request_id, RequestIdGenerator))
         .layer(make_trace_layer())
@@ -357,6 +395,9 @@ fn build_app(
     if let Some(cors) = cors {
         router = router.layer(cors);
     }
+
+    // This stays outside CORS, body limits, authentication, and rate limits.
+    router = router.layer(axum::middleware::from_fn(prohibit_mcp_response_caching));
 
     router.with_state(state)
 }

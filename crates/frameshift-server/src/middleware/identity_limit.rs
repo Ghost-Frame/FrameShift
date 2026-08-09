@@ -29,6 +29,7 @@ use crate::auth::VerifiedSigner;
 use crate::config::ServerConfig;
 use crate::error::AppError;
 use crate::middleware::account::AuthenticatedAccount;
+use crate::middleware::mcp_access::McpAuthenticatedAccount;
 
 /// Keyed token-bucket limiter over one identity dimension.
 ///
@@ -150,6 +151,26 @@ pub async fn enforce_account_rate_limit(
             AppError::Internal("account rate limit ran without authentication".to_string())
         })?;
     limits.check_account(account.account.id)?;
+    Ok(next.run(request).await)
+}
+
+/// Enforce the per-account limit for a Cloudflare Access authenticated MCP request.
+///
+/// Mounted strictly inside [`crate::middleware::mcp_access::require_mcp_access`],
+/// so only a cryptographically verified durable account can spend this budget.
+/// A missing extension is a wiring bug and fails closed.
+pub async fn enforce_mcp_account_rate_limit(
+    Extension(limits): Extension<Arc<IdentityRateLimits>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, AppError> {
+    let account = request
+        .extensions()
+        .get::<McpAuthenticatedAccount>()
+        .ok_or_else(|| {
+            AppError::Internal("MCP account rate limit ran without authentication".to_string())
+        })?;
+    limits.check_account(account.account_id)?;
     Ok(next.run(request).await)
 }
 

@@ -27,7 +27,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Json, Router};
 use chrono::Utc;
-use ed25519_dalek::{Signature, VerifyingKey};
 use frameshift_catalog::filters::{PackSearchFilters, SortMode};
 use frameshift_catalog::records::{
     PackRecord, PackVersionRecord, PublisherKeyRecord, PublisherProfileRecord,
@@ -36,7 +35,7 @@ use frameshift_catalog::status::PackStatus;
 use frameshift_catalog::Ed25519PublicKey;
 use frameshift_catalog::{CatalogError, MembershipState, PublisherKeyState, PublisherRole};
 use frameshift_objects::{ObjectHash, ObjectStoreError};
-use frameshift_pack::Pack;
+use frameshift_publication::archive::{ArchiveError, PublicArchiveExpectation};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -46,7 +45,8 @@ use crate::error::AppError;
 use crate::middleware::account::AuthenticatedAccount;
 use crate::middleware::identity_limit::IdentityRateLimits;
 use crate::publication::{
-    enforce_publication_report, inspect_publication_archive, PublicationAdmissionError,
+    enforce_publication_report, inspect_publication_archive, map_public_archive_error,
+    PublicationAdmissionError,
 };
 use crate::state::AppState;
 
@@ -124,17 +124,36 @@ fn map_publication_inspection_error(error: PublicationAdmissionError) -> AppErro
         PublicationAdmissionError::Validation { codes } => {
             AppError::BadRequest(format!("publication validation failed: {codes}"))
         }
+        PublicationAdmissionError::Signature => {
+            AppError::BadRequest("invalid archive: malformed embedded signature".to_string())
+        }
         PublicationAdmissionError::Internal(source) => {
             tracing::warn!(error = %source, "publication inspection failed internally");
             AppError::Internal("publication inspection failed".to_string())
         }
         PublicationAdmissionError::ArchiveHashMismatch
         | PublicationAdmissionError::IntentMismatch { .. }
-        | PublicationAdmissionError::Signature
         | PublicationAdmissionError::Quarantine(_)
         | PublicationAdmissionError::Catalog(_) => {
             AppError::Internal("unexpected publication inspection state".to_string())
         }
+    }
+}
+
+/// Preserve the legacy endpoint's distinction between bad signatures and malformed packs.
+fn map_legacy_archive_verification_error(error: ArchiveError) -> AppError {
+    tracing::warn!(error = %error, "failed to verify publication archive");
+    match error {
+        ArchiveError::SignatureMismatch | ArchiveError::EmbeddedSignatureMismatch => {
+            AppError::Unauthorized("authentication failed".to_string())
+        }
+        ArchiveError::SignerKeyMismatch => AppError::BadRequest(
+            "manifest author_pubkey does not match the registered author".to_string(),
+        ),
+        ArchiveError::InvalidVerifyingKey => {
+            AppError::Internal("invalid registered pubkey".to_string())
+        }
+        error => map_publication_inspection_error(map_public_archive_error(error)),
     }
 }
 
@@ -535,7 +554,6 @@ pub async fn publish_pack(
         .as_slice()
         .try_into()
         .map_err(|_| AppError::BadRequest("signature must be 64 bytes".to_string()))?;
-    let signature = Signature::from_bytes(&sig_arr);
 
     let authority = resolve_publish_authority(
         &state,
@@ -552,37 +570,24 @@ pub async fn publish_pack(
     }
     let pubkey = authority.pubkey;
 
-    let verifying_key = VerifyingKey::from_bytes(&pubkey.0)
-        .map_err(|e| AppError::Internal(format!("invalid registered pubkey: {e}")))?;
-
     let inspected = inspect_publication_archive(&pack_archive)
         .await
         .map_err(map_publication_inspection_error)?;
-    enforce_publication_report(&inspected.report)
+    enforce_publication_report(inspected.report())
         .map_err(|error| AppError::BadRequest(error.to_string()))?;
-    let pack_root = inspected.pack_root();
-
-    // Write the supplied signature into the pack dir under `signature.sig` so
-    // Pack::verify can pick it up via its on-disk load path.
-    std::fs::write(pack_root.join("signature.sig"), &signature_bytes)
-        .map_err(|e| AppError::Internal(format!("write signature.sig: {e}")))?;
-
-    let pack = Pack::from_dir(pack_root).map_err(|e| {
-        // `PackError` variants can embed the server's absolute temp-directory
-        // path (e.g. `Io`, `NonUtf8Path`); log the detailed error server-side
-        // and return a generic, path-free message to the client.
-        tracing::warn!(error = %e, "failed to load pack from extracted archive");
-        AppError::BadRequest("invalid pack".to_string())
-    })?;
-
-    // Verify signature against canonical hash using the registered pubkey.
-    // This is the authentication check: a wrong key means 401.
-    use ed25519_dalek::Verifier as _;
-    verifying_key
-        .verify(&pack.canonical_hash(), &signature)
-        .map_err(|_| AppError::Unauthorized("authentication failed".to_string()))?;
-
-    let manifest = pack.manifest().clone();
+    let expected_name = inspected.unverified_manifest().name.clone();
+    let expected_version = inspected.unverified_manifest().version.clone();
+    let content_hash = ObjectHash::of(&pack_archive);
+    let verified = inspected
+        .verify(PublicArchiveExpectation {
+            name: &expected_name,
+            version: &expected_version,
+            archive_sha256: *content_hash.as_bytes(),
+            author_public_key: pubkey.0,
+            signature: sig_arr,
+        })
+        .map_err(map_legacy_archive_verification_error)?;
+    let manifest = verified.manifest().clone();
 
     // Manifest's declared handle must match the supplied one. A mismatch is a
     // client bug, not an auth failure.
@@ -603,17 +608,7 @@ pub async fn publish_pack(
                 .to_string(),
         ));
     }
-    if manifest.author_pubkey != hex::encode(pubkey.0) {
-        tracing::warn!(
-            handle = %author_handle,
-            "manifest author key does not match registered author key"
-        );
-        return Err(AppError::BadRequest(
-            "manifest author_pubkey does not match the registered author".to_string(),
-        ));
-    }
-
-    let canonical_hex = pack.canonical_hash_hex();
+    let canonical_hex = hex::encode(verified.provenance().canonical_pack_sha256);
 
     // Reject duplicates BEFORE touching the object store. We use the existing
     // `get_pack_version` read; a NotFound result means we may proceed.
@@ -640,7 +635,6 @@ pub async fn publish_pack(
     // bytes-on-the-wire so the existing FsPackStore verify-on-write contract
     // holds. The canonical pack hash (independent of archive encoding) is
     // recorded as `pack_hash` in the response.
-    let content_hash = ObjectHash::of(&pack_archive);
     let object_existed = state
         .objects
         .exists(&content_hash)

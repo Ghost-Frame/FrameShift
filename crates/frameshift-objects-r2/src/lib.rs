@@ -33,6 +33,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use frameshift_objects::{ObjectHash, ObjectStoreError, ObjectStoreHealth, PackStore};
+use futures::stream::BoxStream;
+use futures::TryStreamExt;
 use object_store::aws::{AmazonS3, AmazonS3Builder};
 use object_store::path::Path as ObjectStorePath;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
@@ -192,6 +194,72 @@ fn endpoint_host_is_loopback(endpoint: &url::Url) -> bool {
     }
 }
 
+/// Collect one object-store response without retaining bytes above `max_bytes`.
+///
+/// The response metadata is checked before the stream is polled. Every chunk is
+/// then checked before it is copied into the aggregate buffer, which protects
+/// the boundary when a backend supplies stale or dishonest size metadata.
+async fn collect_bounded_object_stream(
+    hash: ObjectHash,
+    declared_bytes: u64,
+    mut stream: BoxStream<'static, object_store::Result<Bytes>>,
+    max_bytes: usize,
+) -> Result<Vec<u8>, ObjectStoreError> {
+    let max_bytes_u64 = max_bytes as u64;
+    if declared_bytes > max_bytes_u64 {
+        return Err(ObjectStoreError::ReadLimitExceeded {
+            hash,
+            observed_bytes: declared_bytes,
+            max_bytes: max_bytes_u64,
+        });
+    }
+    let declared_len = usize::try_from(declared_bytes).map_err(|_| {
+        ObjectStoreError::BackendError("object length cannot be represented in this process".into())
+    })?;
+    let mut bytes = Vec::with_capacity(declared_len);
+    while let Some(chunk) = stream
+        .try_next()
+        .await
+        .map_err(|error| ObjectStoreError::BackendError(Box::new(error)))?
+    {
+        let observed_len =
+            bytes
+                .len()
+                .checked_add(chunk.len())
+                .ok_or(ObjectStoreError::ReadLimitExceeded {
+                    hash,
+                    observed_bytes: u64::MAX,
+                    max_bytes: max_bytes_u64,
+                })?;
+        if observed_len > max_bytes {
+            return Err(ObjectStoreError::ReadLimitExceeded {
+                hash,
+                observed_bytes: observed_len as u64,
+                max_bytes: max_bytes_u64,
+            });
+        }
+        if observed_len > declared_len {
+            return Err(ObjectStoreError::BackendError(
+                format!(
+                    "object-store body exceeded declared length for {hash}: declared {declared_bytes} bytes"
+                )
+                .into(),
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if bytes.len() != declared_len {
+        return Err(ObjectStoreError::BackendError(
+            format!(
+                "object-store body length differed for {hash}: declared {declared_bytes} bytes, received {} bytes",
+                bytes.len()
+            )
+            .into(),
+        ));
+    }
+    Ok(bytes)
+}
+
 #[async_trait]
 /// S3-backed implementation of the content-addressed object-store contract.
 impl PackStore for R2PackStore {
@@ -217,11 +285,12 @@ impl PackStore for R2PackStore {
             .map(|_| ())
     }
 
-    /// Download the object bytes via a single S3 GET.
-    ///
-    /// The trait returns `Vec<u8>`, so we buffer fully. A streaming variant
-    /// would be a future optimization for very large pack archives.
-    async fn get(&self, hash: &ObjectHash) -> Result<Vec<u8>, ObjectStoreError> {
+    /// Download one object while enforcing `max_bytes` before and during collection.
+    async fn get_bounded(
+        &self,
+        hash: &ObjectHash,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, ObjectStoreError> {
         let key = self.key_for(hash);
         let result = self.inner.get(&key).await.map_err(|e| {
             if matches!(e, object_store::Error::NotFound { .. }) {
@@ -230,11 +299,8 @@ impl PackStore for R2PackStore {
                 ObjectStoreError::BackendError(Box::new(e))
             }
         })?;
-        let bytes = result
-            .bytes()
-            .await
-            .map_err(|e| ObjectStoreError::BackendError(Box::new(e)))?;
-        Ok(bytes.to_vec())
+        let declared_bytes = result.meta.size;
+        collect_bounded_object_stream(*hash, declared_bytes, result.into_stream(), max_bytes).await
     }
 
     /// HEAD the object; `Ok(true)` if it exists, `Ok(false)` if 404,
@@ -341,6 +407,10 @@ impl PackStore for R2PackStore {
 #[cfg(test)]
 /// Unit tests for endpoint validation and key construction.
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use futures::StreamExt;
+
     use super::*;
 
     /// Build a minimal HTTPS R2 configuration for tests.
@@ -410,6 +480,85 @@ mod tests {
             }
             other => panic!("expected HashMismatch, got {other:?}"),
         }
+    }
+
+    /// A declared oversized response is rejected before its body stream is polled.
+    #[tokio::test]
+    async fn bounded_collector_rejects_metadata_before_polling() {
+        let polled = Arc::new(AtomicBool::new(false));
+        let poll_observer = Arc::clone(&polled);
+        let stream = futures::stream::once(async move {
+            poll_observer.store(true, Ordering::SeqCst);
+            Ok::<Bytes, object_store::Error>(Bytes::from_static(b"oversized"))
+        })
+        .boxed();
+        let hash = ObjectHash::of(b"oversized");
+
+        let result = collect_bounded_object_stream(hash, 9, stream, 8).await;
+
+        assert!(matches!(
+            result,
+            Err(ObjectStoreError::ReadLimitExceeded {
+                hash: rejected_hash,
+                observed_bytes: 9,
+                max_bytes: 8,
+            }) if rejected_hash == hash
+        ));
+        assert!(!polled.load(Ordering::SeqCst));
+    }
+
+    /// A response exactly equal to its declared size and caller limit succeeds.
+    #[tokio::test]
+    async fn bounded_collector_accepts_exact_limit() {
+        let stream = futures::stream::iter([
+            Ok::<Bytes, object_store::Error>(Bytes::from_static(b"four")),
+            Ok::<Bytes, object_store::Error>(Bytes::from_static(b"byte")),
+        ])
+        .boxed();
+        let hash = ObjectHash::of(b"fourbyte");
+
+        let bytes = collect_bounded_object_stream(hash, 8, stream, 8)
+            .await
+            .expect("exact bounded response must succeed");
+
+        assert_eq!(bytes, b"fourbyte");
+    }
+
+    /// Streamed bytes above the caller limit are rejected before aggregation.
+    #[tokio::test]
+    async fn bounded_collector_rechecks_each_chunk() {
+        let stream = futures::stream::iter([
+            Ok::<Bytes, object_store::Error>(Bytes::from_static(b"ab")),
+            Ok::<Bytes, object_store::Error>(Bytes::from_static(b"c")),
+        ])
+        .boxed();
+        let hash = ObjectHash::of(b"abc");
+
+        let result = collect_bounded_object_stream(hash, 2, stream, 2).await;
+
+        assert!(matches!(
+            result,
+            Err(ObjectStoreError::ReadLimitExceeded {
+                hash: rejected_hash,
+                observed_bytes: 3,
+                max_bytes: 2,
+            }) if rejected_hash == hash
+        ));
+    }
+
+    /// A body larger than its metadata is rejected even when under the caller limit.
+    #[tokio::test]
+    async fn bounded_collector_rejects_underdeclared_body() {
+        let stream = futures::stream::iter([
+            Ok::<Bytes, object_store::Error>(Bytes::from_static(b"ab")),
+            Ok::<Bytes, object_store::Error>(Bytes::from_static(b"c")),
+        ])
+        .boxed();
+        let hash = ObjectHash::of(b"abc");
+
+        let result = collect_bounded_object_stream(hash, 2, stream, 4).await;
+
+        assert!(matches!(result, Err(ObjectStoreError::BackendError(_))));
     }
 
     /// Remote plaintext endpoints are rejected before any credentials can be sent.

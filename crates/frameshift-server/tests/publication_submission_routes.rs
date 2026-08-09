@@ -150,6 +150,8 @@ fn test_state(catalog: &MockCatalog, public_objects: &MockPackStore) -> AppState
             Duration::from_secs(600),
         )),
         account_auth: Some(Arc::new(FakeVerifier::new())),
+        mcp_access: None,
+        mcp_dispatcher: None,
     }
 }
 

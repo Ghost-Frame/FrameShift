@@ -17,6 +17,7 @@ frameshift-objects = { path = "../frameshift-objects" }
 frameshift-objects-fs = { path = "../frameshift-objects-fs" }
 frameshift-objects-r2 = { path = "../frameshift-objects-r2" }
 frameshift-publication = { path = "../frameshift-publication" }
+frameshift-source = { path = "../frameshift-source" }
 frameshift-runtime = { path = "../frameshift-runtime" }
 frameshift-memory = { path = "../frameshift-memory" }
 frameshift-memory-http = { path = "../frameshift-memory-http" }
@@ -41,11 +42,9 @@ hex = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 ed25519-dalek = { workspace = true }
-tempfile = { workspace = true }
-tar = "0.4"
-flate2 = "1"
 hmac = { workspace = true }
 sha2 = { workspace = true }
+semver = "1"
 argon2 = { workspace = true }
 chacha20poly1305 = { workspace = true }
 rand_core = { workspace = true }
@@ -63,7 +62,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 [dev-dependencies]
 tokio = { workspace = true }
 tower = { workspace = true }
-http-body-util = { workspace = true }
+http-body-util = { workspace = true, features = ["channel"] }
 tempfile = { workspace = true }
 ed25519-dalek = { workspace = true }
 tar = "0.4"

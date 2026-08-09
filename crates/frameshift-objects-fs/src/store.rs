@@ -36,7 +36,8 @@
 //! are documented as a known limitation.
 
 use std::{
-    io::Write as _,
+    fs::{File, Metadata, OpenOptions},
+    io::{Read as _, Write as _},
     path::{Path, PathBuf},
     sync::atomic::AtomicU64,
 };
@@ -256,10 +257,9 @@ enum PutOutcome {
 
 /// [`PackStore`] implementation for [`FsPackStore`].
 ///
-/// All six trait methods (`put`, `get`, `exists`, `delete`, `list_prefix`,
-/// `health`) are implemented here. Each method dispatches blocking filesystem
-/// work to `tokio::task::spawn_blocking` and then updates in-memory state
-/// (quota counter) after the blocking call returns.
+/// All required trait methods are implemented here. Each method dispatches
+/// blocking filesystem work to `tokio::task::spawn_blocking` and then updates
+/// in-memory state (quota counter) after the blocking call returns.
 #[async_trait]
 impl PackStore for FsPackStore {
     /// Store `bytes` under the content address `hash`.
@@ -400,13 +400,18 @@ impl PackStore for FsPackStore {
         Ok(())
     }
 
-    /// Retrieve the bytes stored under `hash`.
+    /// Retrieve the bytes stored under `hash` without exceeding `max_bytes`.
     ///
     /// # Procedure
     ///
     /// 1. Resolve the target path `{root}/{aa}/{bb}/{hex}`.
-    /// 2. Read the file. If absent, return [`ObjectStoreError::NotFound`].
-    /// 3. If `verify_on_read` is set in the config, compute `SHA-256(bytes)`
+    /// 2. Open the final object entry without following a symlink or Windows
+    ///    reparse point, then reject a non-regular opened handle or metadata
+    ///    length above `max_bytes` before allocating a payload buffer.
+    /// 3. Read exactly the opened file's declared metadata length.
+    ///    Probe one trailing byte so growth during the read cannot evade the
+    ///    ceiling or enter the returned buffer.
+    /// 4. If `verify_on_read` is set in the config, compute `SHA-256(bytes)`
     ///    and compare it to `hash`. On mismatch, return
     ///    [`ObjectStoreError::BackendError`] with a message of the form
     ///    `"object corrupted at {path}: expected {hash}, got {computed}"`. This
@@ -416,60 +421,76 @@ impl PackStore for FsPackStore {
     /// # Errors
     ///
     /// - [`ObjectStoreError::NotFound`] -- no object file exists at the path.
+    /// - [`ObjectStoreError::ReadLimitExceeded`] -- file metadata or a trailing
+    ///   growth probe proves the object is larger than `max_bytes`.
     /// - [`ObjectStoreError::BackendError`] -- I/O failure, or `verify_on_read`
     ///   is enabled and the stored bytes do not match the key.
-    async fn get(&self, hash: &ObjectHash) -> Result<Vec<u8>, ObjectStoreError> {
+    async fn get_bounded(
+        &self,
+        hash: &ObjectHash,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, ObjectStoreError> {
         let path = object_path(&self.config.root, hash);
         let hash_owned = *hash;
         let verify = self.config.verify_on_read;
+        let max_bytes_u64 = max_bytes as u64;
 
         tokio::task::spawn_blocking(move || {
-            // D9: stat without following symlinks before reading.  A symlink at
-            // the object path is not a valid object -- treat it as absent to
-            // prevent an attacker-controlled symlink from redirecting a read to
-            // arbitrary filesystem content.
-            match std::fs::symlink_metadata(&path) {
-                Ok(meta) if meta.file_type().is_symlink() => {
-                    // Symlink present -- report NotFound, do not follow.
-                    return Err(ObjectStoreError::NotFound { hash: hash_owned });
+            let (mut file, metadata) = open_regular_object(&path, hash_owned)?;
+
+            let declared_bytes = metadata.len();
+            if declared_bytes > max_bytes_u64 {
+                return Err(ObjectStoreError::ReadLimitExceeded {
+                    hash: hash_owned,
+                    observed_bytes: declared_bytes,
+                    max_bytes: max_bytes_u64,
+                });
+            }
+            let declared_len = usize::try_from(declared_bytes).map_err(|_| {
+                ObjectStoreError::BackendError(
+                    "object length cannot be represented in this process".into(),
+                )
+            })?;
+            let mut bytes = vec![0_u8; declared_len];
+            file.read_exact(&mut bytes).map_err(|error| {
+                ObjectStoreError::BackendError(
+                    format!(
+                        "object changed during bounded read at {}: {error}",
+                        path.display()
+                    )
+                    .into(),
+                )
+            })?;
+            let mut trailing_byte = [0_u8; 1];
+            if file.read(&mut trailing_byte).map_err(io_err)? != 0 {
+                let observed_bytes = declared_bytes.saturating_add(1);
+                if observed_bytes > max_bytes_u64 {
+                    return Err(ObjectStoreError::ReadLimitExceeded {
+                        hash: hash_owned,
+                        observed_bytes,
+                        max_bytes: max_bytes_u64,
+                    });
                 }
-                Ok(meta) if !meta.is_file() => {
-                    // Non-regular entry (directory, device, etc.) -- report NotFound.
-                    return Err(ObjectStoreError::NotFound { hash: hash_owned });
-                }
-                Ok(_) => {
-                    // Regular file confirmed; proceed to read below.
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    return Err(ObjectStoreError::NotFound { hash: hash_owned });
-                }
-                Err(e) => return Err(io_err(e)),
+                return Err(ObjectStoreError::BackendError(
+                    format!("object grew during bounded read at {}", path.display()).into(),
+                ));
             }
 
-            // Path is a regular file; read its contents.
-            match std::fs::read(&path) {
-                Ok(bytes) => {
-                    if verify {
-                        let computed = ObjectHash::of(&bytes);
-                        if computed != hash_owned {
-                            return Err(ObjectStoreError::BackendError(
-                                format!(
-                                    "object corrupted at {}: expected {}, got {}",
-                                    path.display(),
-                                    hash_owned,
-                                    computed
-                                )
-                                .into(),
-                            ));
-                        }
-                    }
-                    Ok(bytes)
+            if verify {
+                let computed = ObjectHash::of(&bytes);
+                if computed != hash_owned {
+                    return Err(ObjectStoreError::BackendError(
+                        format!(
+                            "object corrupted at {}: expected {}, got {}",
+                            path.display(),
+                            hash_owned,
+                            computed
+                        )
+                        .into(),
+                    ));
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    Err(ObjectStoreError::NotFound { hash: hash_owned })
-                }
-                Err(e) => Err(io_err(e)),
             }
+            Ok(bytes)
         })
         .await
         .map_err(join_err)?
@@ -758,6 +779,80 @@ fn collect_from_dir(
     Ok(())
 }
 
+/// Open one final object entry without following an object-path symlink on Unix.
+#[cfg(unix)]
+fn open_regular_object(
+    path: &Path,
+    hash: ObjectHash,
+) -> Result<(File, Metadata), ObjectStoreError> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ELOOP)
+            {
+                ObjectStoreError::NotFound { hash }
+            } else {
+                io_err(error)
+            }
+        })?;
+    let metadata = file.metadata().map_err(io_err)?;
+    if !metadata.is_file() {
+        return Err(ObjectStoreError::NotFound { hash });
+    }
+    Ok((file, metadata))
+}
+
+/// Open one final object entry as a reparse object and reject redirects on Windows.
+#[cfg(windows)]
+fn open_regular_object(
+    path: &Path,
+    hash: ObjectHash,
+) -> Result<(File, Metadata), ObjectStoreError> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    /// Windows flag that opens a reparse point itself instead of traversing it.
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    /// Windows file attribute identifying a symlink, junction, or other reparse entry.
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                ObjectStoreError::NotFound { hash }
+            } else {
+                io_err(error)
+            }
+        })?;
+    let metadata = file.metadata().map_err(io_err)?;
+    if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(ObjectStoreError::NotFound { hash });
+    }
+    Ok((file, metadata))
+}
+
+/// Reject filesystem reads on targets lacking atomic no-follow open semantics.
+#[cfg(not(any(unix, windows)))]
+fn open_regular_object(
+    _path: &Path,
+    _hash: ObjectHash,
+) -> Result<(File, Metadata), ObjectStoreError> {
+    Err(ObjectStoreError::BackendError(
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "bounded filesystem reads require atomic no-follow open support",
+        )
+        .into(),
+    ))
+}
+
 /// Convert an [`std::io::Error`] into [`ObjectStoreError::BackendError`].
 fn io_err(e: std::io::Error) -> ObjectStoreError {
     ObjectStoreError::BackendError(Box::new(e))
@@ -771,6 +866,7 @@ fn join_err(e: tokio::task::JoinError) -> ObjectStoreError {
 #[cfg(test)]
 /// Unit tests for [`FsPackStore`] security and correctness.
 mod tests {
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
     use frameshift_objects::ObjectStoreError;
@@ -796,6 +892,7 @@ mod tests {
     /// `NotFound` rather than reading through the symlink to its target.
     ///
     /// This exercises the D9 symlink-rejection guard added to `get()`.
+    #[cfg(unix)]
     #[tokio::test]
     async fn get_returns_not_found_for_symlink_at_object_path() {
         let dir = TempDir::new().unwrap();

@@ -65,6 +65,7 @@ fn test_config(abuse_rate_per_min: u32, trust_forwarded_for: bool) -> Arc<Server
         admin_pubkeys: Vec::new(),
         publisher_ownership_reads: true,
         oidc: frameshift_server::OidcConfig::disabled(),
+        mcp_access: frameshift_server::McpAccessConfig::disabled(),
         invite_requests: frameshift_server::InviteRequestConfig::disabled(),
         first_party_auth: frameshift_server::FirstPartyAuthConfig::disabled(),
         memory_backend: "none".to_string(),
@@ -93,6 +94,8 @@ fn make_state_with_rate(abuse_rate_per_min: u32, trust_forwarded_for: bool) -> A
             Duration::from_secs(600),
         )),
         account_auth: None,
+        mcp_access: None,
+        mcp_dispatcher: None,
     }
 }
 

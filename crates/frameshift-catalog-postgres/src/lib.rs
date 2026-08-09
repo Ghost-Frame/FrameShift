@@ -35,6 +35,8 @@
 //! - [`errors`] -- mapping from Diesel/bb8 errors to [`CatalogError`].
 //! - [`ownership_backfill`] -- dry-run-first transactional publisher ownership
 //!   migration driven by a private exact-census manifest.
+//! - [`persona_state`] -- account-scoped remote persona state and idempotency
+//!   operation persistence.
 //!
 //! ## Migration behaviour
 //!
@@ -47,6 +49,7 @@ pub mod config;
 pub mod errors;
 pub mod models;
 pub mod ownership_backfill;
+pub mod persona_state;
 pub mod pool;
 pub mod schema;
 

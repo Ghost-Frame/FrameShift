@@ -24,6 +24,7 @@ use crate::ObjectHash;
 /// | Condition | Variant |
 /// |-----------|---------|
 /// | `get` or `delete` of a key that does not exist | [`NotFound`](Self::NotFound) |
+/// | bounded read larger than its caller-selected ceiling | [`ReadLimitExceeded`](Self::ReadLimitExceeded) |
 /// | `put` of a key that already has a MATCHING object | idempotent `Ok(())` |
 /// | `put` of a key where hash(bytes) != supplied hash | [`HashMismatch`](Self::HashMismatch) |
 /// | Backend quota exceeded mid-write | [`QuotaExceeded`](Self::QuotaExceeded) |
@@ -42,6 +43,24 @@ pub enum ObjectStoreError {
     NotFound {
         /// The hash that was requested but not present in the store.
         hash: ObjectHash,
+    },
+
+    /// A bounded read observed an object larger than the caller's byte ceiling.
+    ///
+    /// `observed_bytes` is either the backend's declared object size or the
+    /// smallest body length that proved the limit was exceeded. It is therefore
+    /// a lower bound and is not guaranteed to be the object's final size when a
+    /// streaming backend supplied incorrect metadata.
+    #[error(
+        "object {hash} exceeds bounded read limit: observed {observed_bytes} bytes, limit is {max_bytes} bytes"
+    )]
+    ReadLimitExceeded {
+        /// The content address whose read was rejected.
+        hash: ObjectHash,
+        /// The declared or minimally observed byte length that exceeded the limit.
+        observed_bytes: u64,
+        /// The caller-selected maximum byte length.
+        max_bytes: u64,
     },
 
     /// A `put` was rejected because an object with the same hash already exists

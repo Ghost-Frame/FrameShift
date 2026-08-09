@@ -38,6 +38,14 @@ jobs:
         with:
           toolchain: 1.88.0
           targets: ${{ matrix.target }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        if: matrix.windows
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install pinned MCPB toolchain
+        if: matrix.windows
+        run: npm ci --ignore-scripts
       - name: Verify tag matches binary versions
         if: github.ref_type == 'tag'
         shell: bash
@@ -106,6 +114,24 @@ jobs:
           Compress-Archive -Path "$folder/*" -DestinationPath $archive
           $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
           "$hash  ${{ matrix.asset }}.zip" | Set-Content -NoNewline "dist/${{ matrix.asset }}.sha256"
+      - name: Package Windows Claude Desktop bundle
+        if: matrix.windows
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="$(sed -n '/^version = /{s/version = "\([^"]*\)"/\1/p;q;}' crates/frameshift-mcp/Cargo.toml)"
+          fi
+          artifact="frameshift-windows-$version.mcpb"
+          bash packaging/mcpb/package-windows.sh \
+            --version "$version" \
+            --binary "target/${{ matrix.target }}/release/frameshift-mcp.exe" \
+            --output "dist/$artifact"
+          (
+            cd dist
+            sha256sum "$artifact" > "$artifact.sha256"
+          )
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.asset }}
@@ -113,6 +139,8 @@ jobs:
             dist/${{ matrix.asset }}.tar.gz
             dist/${{ matrix.asset }}.zip
             dist/${{ matrix.asset }}.sha256
+            dist/frameshift-windows-*.mcpb
+            dist/frameshift-windows-*.mcpb.sha256
           if-no-files-found: ignore
 
   publish:
@@ -141,7 +169,7 @@ jobs:
             release_flags+=(--prerelease)
           fi
           gh release create "$GITHUB_REF_NAME" \
-            artifacts/*.tar.gz artifacts/*.zip artifacts/SHA256SUMS \
+            artifacts/*.tar.gz artifacts/*.zip artifacts/*.mcpb artifacts/SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
             --generate-notes \
