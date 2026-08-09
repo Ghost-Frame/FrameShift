@@ -134,7 +134,7 @@ jobs:
         run: sudo apt-get update -q && sudo apt-get install -y libpq-dev
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Pre-pull Postgres image
-        run: docker pull postgres:11-alpine
+        run: docker pull postgres:16-alpine
       - run: cargo test --locked -p frameshift-catalog-postgres -- --include-ignored
 
   # Supply-chain advisory scan against the RustSec database. Now blocking: the

@@ -2036,9 +2036,11 @@ dependencies = [
  "chrono",
  "frameshift-pack",
  "frameshift-publication",
+ "frameshift-source",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "unicode-normalization",
  "uuid",
 ]
 

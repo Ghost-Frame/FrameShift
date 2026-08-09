@@ -12,6 +12,7 @@
 //! - [`error`] -- [`error::CatalogError`] and [`error::HealthStatus`].
 //! - [`identity`] -- [`identity::Ed25519PublicKey`] newtype. [`ObjectHash`] is
 //!   re-exported from `frameshift-pack` (the workspace canonical type).
+//! - [`persona_state`] -- account-scoped cloud persona state records and backend.
 //! - [`records`] -- [`records::AuthorRecord`], [`records::PackRecord`],
 //!   [`records::PackVersionRecord`], [`records::OauthLink`].
 //! - [`status`] -- [`status::PackStatus`], [`status::TombstoneReason`],
@@ -29,6 +30,7 @@ pub mod backend;
 pub mod error;
 pub mod filters;
 pub mod identity;
+pub mod persona_state;
 pub mod records;
 pub mod status;
 
@@ -60,6 +62,24 @@ pub use error::{CatalogError, HealthStatus};
 pub use filters::{PackSearchFilters, PackSearchResult, SortMode};
 pub use frameshift_pack::ObjectHash;
 pub use identity::Ed25519PublicKey;
+pub use persona_state::{
+    exact_reference_set_hash, render_growth_policy_candidate, validate_growth_policy_candidate,
+    validate_growth_text, AccountPersonaStateBackend, AccountPersonaStateSnapshot,
+    ActivePersonaRecord, AppendGrowthRequest, ExactPersonaVersion, GrowthCursor,
+    InstallPersonaRequest, InstallationCursor, MutatePreferenceRequest, MutationContext,
+    MutationOutcome, MutationReceipt, OperationCursor, PageLimit, PersonaGrowthListItem,
+    PersonaGrowthRecord, PersonaInstallationListItem, PersonaInstallationRecord, PersonaName,
+    PersonaOperationRecord, PersonaPreferenceRecord, PersonaStateError, PreferenceCursor,
+    PreferenceMutation, RenderPersonaStateSnapshot, SetActivePersonaRequest, StatePage,
+    AUTHENTICATED_GROWTH_POLICY_HEADER, DEFAULT_PAGE_SIZE, FRAMESHIFT_GROW_APPEND_TOOL_NAME,
+    FRAMESHIFT_INSTALL_TOOL_NAME, FRAMESHIFT_PREFS_TOOL_NAME, FRAMESHIFT_USE_TOOL_NAME,
+    MAX_GROWTH_ENTRIES_PER_ACCOUNT_PACK, MAX_GROWTH_ENTRY_BYTES, MAX_INSTALLATIONS_PER_ACCOUNT,
+    MAX_OPERATIONS_PER_ACCOUNT, MAX_OPERATION_RECEIPT_BYTES, MAX_PAGE_SIZE, MAX_PERSONA_NAME_BYTES,
+    MAX_PERSONA_STATE_TOOL_NAME_BYTES, MAX_PERSONA_VERSION_BYTES, MAX_PREFERENCES_PER_ACCOUNT,
+    MAX_PREFERENCE_BIAS_MILLIS, MAX_REFERENCED_PERSONA_VERSIONS, MAX_RENDER_GROWTH_BYTES,
+    MAX_RENDER_GROWTH_ENTRIES, MIN_PREFERENCE_BIAS_MILLIS, PERSONA_STATE_REQUEST_SCHEMA_VERSION,
+    PREFERENCE_BUMP_MILLIS, PREFERENCE_DECAY_MILLIS,
+};
 pub use records::{
     AccountAuthAuditEventKind, AccountAuthAuditEventRecord, AccountAuthAuditOutcome,
     AccountInviteIntent, AccountInviteIssueRequest, AccountInviteRecord,
