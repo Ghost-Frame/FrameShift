@@ -10,27 +10,27 @@
 //! 2. `GET {base}/v1/packs/{name}/versions/{version}` -- fetch the [`VersionRecord`] JSON.
 //! 3. `GET {base}/v1/packs/{name}/versions/{version}/pack` -- fetch the raw `.tar.gz` bytes.
 //! 4. Verify `SHA-256(bytes) == content_hash` from the version record.
-//! 5. Extract the `.tar.gz` into a temporary directory (with path-traversal hardening).
-//! 6. Load the [`Pack`] from the extracted directory, write `signature.sig`.
-//! 7. Verify the Ed25519 signature using the `author_pubkey` from the version record.
+//! 5. Pass the bytes and immutable catalog bindings to the shared public-archive verifier.
+//! 6. Retain only the verifier's authenticated pack root, including `signature.sig`.
+//! 7. Apply registry-local publisher-key and publisher-UUID trust-on-first-use checks.
 //! 8. Cache the extracted pack directory under `cache/<pack_canonical_hash>`.
 //! 9. Return the [`LockedPersona`] for the caller to commit to the lockfile.
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use ed25519_dalek::VerifyingKey;
-use flate2::read::GzDecoder;
-use frameshift_pack::{ForkOrigin, ObjectHash, Pack};
+use frameshift_pack::{ForkOrigin, ObjectHash, Pack, PackManifest};
+use frameshift_publication::archive::{
+    verify_public_archive, ArchiveError, PublicArchiveExpectation, VerifiedPublicPack,
+};
 use serde::Deserialize;
 use std::fs::OpenOptions;
 use std::io::{Read as _, Write as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
-use tar::Archive;
 use tracing::debug;
 
 use crate::error::ClientError;
-use crate::model::{LockedPersona, PersonaSpec, ProjectPaths};
+use crate::model::{LockedPersona, Lockfile, PersonaSpec, ProjectPaths};
 use crate::publisher::EnrolledPublisherKeyState;
 
 /// Environment variable that overrides the registry base URL.
@@ -45,22 +45,12 @@ pub const REGISTRY_URL_ENV: &str = "FRAMESHIFT_REGISTRY_URL";
 /// not serve the API -- do not point this back at it.
 const DEFAULT_REGISTRY_URL: &str = "https://frameshift-api.syntheos.dev";
 
-/// Maximum number of decompressed bytes we will accept from a registry pack archive.
-///
-/// A pack that decompresses to more than this is rejected before any content is written
-/// to the cache. This is a decompression-bomb guard analogous to the server-side limit.
-const MAX_DECOMPRESSED_BYTES: u64 = 16 * 1024 * 1024;
-
-/// Maximum number of filesystem entries accepted from one registry archive.
-const MAX_ARCHIVE_ENTRIES: usize = 256;
-
 /// Maximum number of compressed (wire) bytes we will read from an HTTP registry response.
 ///
 /// Applied via [`LimitedReader`] around the raw HTTP response body *before* `read_to_end`
 /// so an oversized response is rejected during streaming, not after full buffering.
-/// A valid `.tar.gz` archive cannot expand beyond [`MAX_DECOMPRESSED_BYTES`] of useful
-/// content, so the same cap is a safe upper bound on the compressed wire size as well.
-const MAX_ARCHIVE_BYTES: u64 = 16 * 1024 * 1024;
+/// The shared verifier applies the same limit again before decoding any archive data.
+const MAX_ARCHIVE_BYTES: u64 = frameshift_publication::archive::MAX_ARCHIVE_BYTES as u64;
 
 /// Maximum accepted JSON response body for small registry control responses.
 const MAX_JSON_RESPONSE_BYTES: u64 = 1024 * 1024;
@@ -70,6 +60,32 @@ const MAX_ERROR_RESPONSE_BYTES: u64 = 64 * 1024;
 
 /// Maximum size of one author key pin file.
 const MAX_TRUST_PIN_BYTES: u64 = 1024;
+
+/// Maximum legacy project lock size considered while migrating pack-owner trust.
+const MAX_LEGACY_LOCK_BYTES: u64 = 1024 * 1024;
+
+/// Maximum project directories inspected during one legacy trust migration.
+const MAX_LEGACY_PROJECTS: usize = 4096;
+
+/// Maximum Creator Studio draft directories inspected during one legacy migration.
+const MAX_LEGACY_DRAFTS: usize = 4096;
+
+/// Maximum legacy Studio manifest size considered while detecting fork provenance.
+const MAX_LEGACY_DRAFT_MANIFEST_BYTES: u64 = 1024 * 1024;
+
+/// Maximum content-addressed cache entries inspected during legacy migration.
+const MAX_LEGACY_CACHE_ENTRIES: usize = 4096;
+
+/// Serialization token for a pack that had no ownership-linked publisher yet.
+const UNLINKED_PACK_PUBLISHER: &str = "unlinked";
+
+/// Parsed immutable package-owner record stored before handle-scoped trust.
+struct RegistryPackOwnerRecord {
+    /// Exact lowercase Ed25519 signer key for this registry pack name.
+    signer: String,
+    /// Publisher UUID linked when the package record was first established.
+    publisher: Option<String>,
+}
 
 /// Minimal JSON shape returned by `GET /v1/packs/{name}/versions/{version}`.
 ///
@@ -107,10 +123,8 @@ struct VersionRecord {
 
 /// Owned temporary result of exact registry transport and cryptographic verification.
 pub(crate) struct VerifiedRegistryPack {
-    /// Temporary extraction root retained for the lifetime of the verified files.
-    _extraction: tempfile::TempDir,
-    /// Directory containing the verified public pack files and transport signature.
-    pack_root: std::path::PathBuf,
+    /// Shared retained artifact proving archive, manifest, policy, signer, and signature bindings.
+    artifact: VerifiedPublicPack,
     /// Immutable raw-archive provenance proven by the registry transport.
     origin: ForkOrigin,
 }
@@ -119,7 +133,7 @@ pub(crate) struct VerifiedRegistryPack {
 impl VerifiedRegistryPack {
     /// Return the extracted directory containing the verified pack.
     pub(crate) fn pack_root(&self) -> &Path {
-        &self.pack_root
+        self.artifact.pack_root()
     }
 
     /// Return the exact immutable registry provenance for this download.
@@ -502,72 +516,78 @@ pub(crate) fn fetch_verified_pack(
     }
     debug!(hash = %actual_hash, "content hash verified");
 
-    // Step 4: extract archive into a tempdir.
-    let tmp = tempfile::TempDir::new().map_err(|source| ClientError::Io {
-        path: std::path::PathBuf::from("<tempdir>"),
-        source,
-    })?;
-    extract_targz(&archive_bytes, tmp.path())?;
-
-    // Step 5: locate the pack root (flat or single-nested layout).
-    let pack_root = find_pack_root(tmp.path(), name, version)?;
-
-    // Step 6: write signature.sig so Pack::from_dir picks it up.
-    let sig_bytes = &record.signature;
-    let sig_path = pack_root.join("signature.sig");
-    std::fs::write(&sig_path, sig_bytes).map_err(|source| ClientError::Io {
-        path: sig_path.clone(),
-        source,
-    })?;
-
-    // Step 7: load the Pack and verify it.
-    let pack = Pack::from_dir(&pack_root)?;
-    crate::validate_pack_request(&pack, spec)?;
-
-    // The signature must be present (we just wrote it) -- reject missing.
-    if !pack.has_signature() {
+    // Step 4: require one exact detached signature before any archive extraction.
+    if record.signature.is_empty() {
         return Err(ClientError::RegistrySignatureMissing {
             pack: format!("{name}@{version}"),
         });
     }
-
-    // Verify against the pubkey from the registry record (not the manifest, to
-    // avoid a manifest-tampering attack where the manifest claims a different key).
-    let key = VerifyingKey::from_bytes(&record.author_pubkey.0)
-        .map_err(|_| ClientError::InvalidAuthorPublicKey(format!("{name}@{version}")))?;
-    pack.verify(&key)
+    let signature: [u8; 64] = record
+        .signature
+        .as_slice()
+        .try_into()
         .map_err(|_| ClientError::SignatureVerification)?;
-    debug!("pack signature verified against registry pubkey");
 
-    let signer_pubkey = hex::encode(record.author_pubkey.0);
-    if pack.manifest().author_pubkey != signer_pubkey {
-        return Err(ClientError::RegistryOwnershipInvalid {
-            pack: format!("{name}@{version}"),
-            detail: "signed manifest author key does not match the verified registry signer"
-                .to_string(),
-        });
-    }
+    // Step 5: apply the shared fail-closed extraction, publication-policy,
+    // manifest-identity, signer-key, and Ed25519 boundary in one retained artifact.
+    let artifact = verify_public_archive(
+        &archive_bytes,
+        PublicArchiveExpectation {
+            name,
+            version,
+            archive_sha256: *record.content_hash.as_bytes(),
+            author_public_key: record.author_pubkey.0,
+            signature,
+        },
+    )
+    .map_err(|error| map_registry_archive_error(error, name, version))?;
+    debug!("pack archive and signature passed the shared public boundary");
 
-    // Cryptographic validity is not enough when the registry supplies both
+    // Step 6: cryptographic validity is not enough when the registry supplies both
     // the signature and key. All responses retain exact key TOFU, while
     // ownership-aware responses additionally pin the stable publisher UUID.
     check_or_create_registry_trust(
         data_root,
         &base,
-        &pack.manifest().author_handle,
+        &artifact.manifest().author_handle,
         &record.author_pubkey.0,
         &record,
     )?;
 
     Ok(VerifiedRegistryPack {
-        _extraction: tmp,
-        pack_root,
+        artifact,
         origin: ForkOrigin {
             name: record.pack_name,
             version: record.version,
             content_hash: record.content_hash.to_hex(),
         },
     })
+}
+
+/// Preserve established client error classes while retaining bounded shared failures.
+fn map_registry_archive_error(error: ArchiveError, name: &str, version: &str) -> ClientError {
+    let pack = format!("{name}@{version}");
+    match error {
+        ArchiveError::InvalidVerifyingKey => ClientError::InvalidAuthorPublicKey(pack),
+        ArchiveError::SignatureMismatch | ArchiveError::EmbeddedSignatureMismatch => {
+            ClientError::SignatureVerification
+        }
+        ArchiveError::SignerKeyMismatch => ClientError::RegistryOwnershipInvalid {
+            pack,
+            detail: "signed manifest author key does not match the verified registry signer"
+                .to_string(),
+        },
+        ArchiveError::PublicationRejected { codes }
+            if !codes.is_empty() && codes.iter().all(|code| code.starts_with("prompt.")) =>
+        {
+            ClientError::PromptPolicyViolation {
+                persona: name.to_string(),
+                policy_version: frameshift_source::PROMPT_POLICY_VERSION,
+                codes,
+            }
+        }
+        source => ClientError::RegistryArchiveInvalid { pack, source },
+    }
 }
 
 /// Require the immutable record identity to match the requested resource.
@@ -594,7 +614,7 @@ fn check_or_create_registry_trust(
     record: &VersionRecord,
 ) -> Result<(), ClientError> {
     let pack = format!("{}@{}", record.pack_name, record.version);
-    match (
+    let (linked_publisher_id, presented_publisher_id) = match (
         &record.publisher,
         &record.publisher_key,
         record.publisher_key_id.as_deref(),
@@ -603,7 +623,7 @@ fn check_or_create_registry_trust(
         // immutable signing evidence. Historical archives may retain an older
         // signed handle after the registry profile is renamed; exact signer-key
         // continuity remains enforced by the author pin below.
-        (None, None, _) => check_or_create_author_pin(data_root, registry, author, pubkey),
+        (None, None, None) => (None, None),
         (Some(publisher), None, None) => {
             let legacy_author = record.legacy_author.as_ref().ok_or_else(|| {
                 ClientError::RegistryOwnershipInvalid {
@@ -619,7 +639,8 @@ fn check_or_create_registry_trust(
                             .to_string(),
                 });
             }
-            check_or_create_author_pin(data_root, registry, author, pubkey)
+            let publisher_id = parse_publisher_id(&pack, &publisher.id)?;
+            (None, Some(publisher_id))
         }
         (Some(publisher), Some(publisher_key), Some(linked_key_id)) => {
             if record.legacy_author.is_some() {
@@ -634,12 +655,7 @@ fn check_or_create_registry_trust(
                     detail: "publisher handle does not match the signed pack manifest".to_string(),
                 });
             }
-            let publisher_id = publisher.id.parse::<uuid::Uuid>().map_err(|_| {
-                ClientError::RegistryOwnershipInvalid {
-                    pack: pack.clone(),
-                    detail: "publisher identifier is not a UUID".to_string(),
-                }
-            })?;
+            let publisher_id = parse_publisher_id(&pack, &publisher.id)?;
             let summarized_key_id = publisher_key.id.parse::<uuid::Uuid>().map_err(|_| {
                 ClientError::RegistryOwnershipInvalid {
                     pack: pack.clone(),
@@ -658,19 +674,826 @@ fn check_or_create_registry_trust(
                     detail: "publisher key summary does not match the catalog key link".to_string(),
                 });
             }
-            check_or_create_publisher_pin(
-                data_root,
-                registry,
-                author,
-                &publisher_id.to_string(),
-                pubkey,
-            )
+            (Some(publisher_id.clone()), Some(publisher_id))
         }
-        _ => Err(ClientError::RegistryOwnershipInvalid {
-            pack,
-            detail: "publisher ownership metadata is internally inconsistent".to_string(),
+        _ => {
+            return Err(ClientError::RegistryOwnershipInvalid {
+                pack,
+                detail: "publisher ownership metadata is internally inconsistent".to_string(),
+            });
+        }
+    };
+
+    let signer = hex::encode(pubkey);
+    // Author and publisher pins are shared across pack names. Serialize the
+    // entire registry-local preflight and write sequence so two concurrent
+    // first-use installs cannot each persist incompatible package records
+    // before one loses the shared-handle pin race.
+    let registry_lock = acquire_registry_trust_lock(data_root, registry)?;
+    preflight_existing_handle_trust(
+        data_root,
+        registry,
+        author,
+        &signer,
+        presented_publisher_id.as_deref(),
+    )?;
+    if !pack_owner_record_exists(data_root, registry, &record.pack_name)? {
+        verify_legacy_pack_owner_migration(data_root, &record.pack_name, &pack)?;
+    }
+    check_or_create_pack_owner_record(
+        data_root,
+        registry,
+        &record.pack_name,
+        &signer,
+        linked_publisher_id.as_deref(),
+        presented_publisher_id.as_deref(),
+    )?;
+
+    if let Some(publisher_id) = linked_publisher_id.as_deref() {
+        check_or_create_publisher_pin(data_root, registry, author, publisher_id, pubkey)?;
+    } else {
+        check_or_create_author_pin(data_root, registry, author, pubkey)?;
+    }
+    drop(registry_lock);
+    Ok(())
+}
+
+/// Acquire the persistent per-registry lock that serializes trust mutations.
+fn acquire_registry_trust_lock(
+    data_root: &Path,
+    registry: &str,
+) -> Result<std::fs::File, ClientError> {
+    let lock_dir = data_root.join("trust").join("registry-transactions");
+    std::fs::create_dir_all(&lock_dir).map_err(|source| ClientError::Io {
+        path: lock_dir.clone(),
+        source,
+    })?;
+    set_private_dir_permissions(&lock_dir)?;
+
+    let namespace = ObjectHash::of(registry.as_bytes()).to_hex();
+    let lock_path = lock_dir.join(format!("{namespace}.lock"));
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(&lock_path).map_err(|source| ClientError::Io {
+        path: lock_path.clone(),
+        source,
+    })?;
+    let metadata = file.metadata().map_err(|source| ClientError::Io {
+        path: lock_path.clone(),
+        source,
+    })?;
+    if !metadata.file_type().is_file() || metadata_is_windows_reparse_point(&metadata) {
+        return Err(ClientError::Io {
+            path: lock_path,
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "registry trust lock path is not a regular file",
+            ),
+        });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|source| ClientError::Io {
+                path: lock_path.clone(),
+                source,
+            })?;
+    }
+    fs2::FileExt::lock_exclusive(&file).map_err(|source| ClientError::Io {
+        path: lock_path,
+        source,
+    })?;
+    Ok(file)
+}
+
+/// Return whether opened metadata identifies a Windows reparse point.
+fn metadata_is_windows_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = metadata;
+        false
+    }
+}
+
+/// Verify every existing handle-scoped pin without creating new trust state.
+fn preflight_existing_handle_trust(
+    data_root: &Path,
+    registry: &str,
+    author: &str,
+    presented_signer: &str,
+    presented_publisher: Option<&str>,
+) -> Result<(), ClientError> {
+    let author_path = author_pin_path(data_root, registry, author);
+    match std::fs::symlink_metadata(&author_path) {
+        Ok(_) => verify_author_pin(&author_path, registry, author, presented_signer)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(ClientError::Io {
+                path: author_path,
+                source,
+            });
+        }
+    }
+
+    let publisher_path = publisher_pin_path(data_root, registry, author);
+    match std::fs::symlink_metadata(&publisher_path) {
+        Ok(_) => match presented_publisher {
+            Some(publisher) => {
+                verify_publisher_pin(&publisher_path, registry, author, publisher)?;
+            }
+            None => {
+                let expected = read_publisher_pin(&publisher_path, registry, author)?;
+                return Err(ClientError::RegistryPublisherChanged {
+                    registry: registry.to_string(),
+                    author: author.to_string(),
+                    expected,
+                    actual: "<missing>".to_string(),
+                });
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(ClientError::Io {
+                path: publisher_path,
+                source,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Parse one publisher UUID into its stable canonical string representation.
+fn parse_publisher_id(pack: &str, publisher_id: &str) -> Result<String, ClientError> {
+    publisher_id
+        .parse::<uuid::Uuid>()
+        .map(|publisher_id| publisher_id.to_string())
+        .map_err(|_| ClientError::RegistryOwnershipInvalid {
+            pack: pack.to_string(),
+            detail: "publisher identifier is not a UUID".to_string(),
+        })
+}
+
+/// Return the collision-resistant path for one authoritative package record.
+fn pack_owner_record_path(data_root: &Path, registry: &str, pack: &str) -> PathBuf {
+    let namespace = ObjectHash::of(format!("{registry}\0{pack}").as_bytes()).to_hex();
+    data_root
+        .join("trust")
+        .join("registry-pack-owners")
+        .join(format!("{namespace}.pin"))
+}
+
+/// Return the append-only claim path for a later publisher-link transition.
+fn pack_publisher_claim_path(data_root: &Path, registry: &str, pack: &str) -> PathBuf {
+    let namespace = ObjectHash::of(format!("{registry}\0{pack}").as_bytes()).to_hex();
+    data_root
+        .join("trust")
+        .join("registry-pack-owners")
+        .join(format!("{namespace}.publisher"))
+}
+
+/// Report whether an authoritative package record already occupies its trust path.
+fn pack_owner_record_exists(
+    data_root: &Path,
+    registry: &str,
+    pack: &str,
+) -> Result<bool, ClientError> {
+    let record_path = pack_owner_record_path(data_root, registry, pack);
+    match std::fs::symlink_metadata(&record_path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(ClientError::Io {
+            path: record_path,
+            source,
         }),
     }
+}
+
+/// Refuse automatic TOFU when legacy local state cannot prove registry provenance.
+fn verify_legacy_pack_owner_migration(
+    data_root: &Path,
+    pack_name: &str,
+    requested_pack: &str,
+) -> Result<(), ClientError> {
+    if has_legacy_fork_provenance(data_root, pack_name, requested_pack)?
+        || has_legacy_project_lock(data_root, pack_name, requested_pack)?
+        || has_legacy_cached_pack(data_root, pack_name, requested_pack)?
+    {
+        return Err(ClientError::RegistryOwnershipInvalid {
+            pack: requested_pack.to_string(),
+            detail: "legacy local pack state cannot prove registry ownership".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Detect a bounded pre-package-pin Studio fork that cannot prove its source signer.
+fn has_legacy_fork_provenance(
+    data_root: &Path,
+    pack_name: &str,
+    requested_pack: &str,
+) -> Result<bool, ClientError> {
+    let studio_root = data_root.join("studio").join("drafts");
+    let entries = match std::fs::read_dir(&studio_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => {
+            return Err(ClientError::Io {
+                path: studio_root,
+                source,
+            });
+        }
+    };
+
+    for (index, entry) in entries.enumerate() {
+        if index >= MAX_LEGACY_DRAFTS {
+            return Err(legacy_migration_invalid(
+                requested_pack,
+                "legacy trust migration exceeds the Studio draft scan limit",
+            ));
+        }
+        let entry = entry.map_err(|source| ClientError::Io {
+            path: studio_root.clone(),
+            source,
+        })?;
+        let file_type = entry.file_type().map_err(|source| ClientError::Io {
+            path: entry.path(),
+            source,
+        })?;
+        if !file_type.is_dir() || file_type.is_symlink() {
+            continue;
+        }
+
+        let manifest_path = entry.path().join("content").join("pack.toml");
+        let metadata = match std::fs::symlink_metadata(&manifest_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => {
+                return Err(ClientError::Io {
+                    path: manifest_path,
+                    source,
+                });
+            }
+        };
+        if !metadata.file_type().is_file() {
+            continue;
+        }
+
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = options.open(&manifest_path).map_err(|_| {
+            legacy_migration_invalid(requested_pack, "legacy Studio fork manifest is unreadable")
+        })?;
+        let mut raw = String::new();
+        LimitedReader::new(file, MAX_LEGACY_DRAFT_MANIFEST_BYTES)
+            .read_to_string(&mut raw)
+            .map_err(|_| {
+                legacy_migration_invalid(
+                    requested_pack,
+                    "legacy Studio fork manifest is unreadable",
+                )
+            })?;
+        let Ok(manifest) = toml::from_str::<PackManifest>(&raw) else {
+            continue;
+        };
+        if manifest
+            .forked_from
+            .as_ref()
+            .is_some_and(|origin| origin.name == pack_name)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Detect a bounded legacy project lock whose install source was never persisted.
+fn has_legacy_project_lock(
+    data_root: &Path,
+    pack_name: &str,
+    requested_pack: &str,
+) -> Result<bool, ClientError> {
+    let projects_root = data_root.join("projects");
+    let entries = match std::fs::read_dir(&projects_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => {
+            return Err(ClientError::Io {
+                path: projects_root,
+                source,
+            });
+        }
+    };
+
+    for (index, entry) in entries.enumerate() {
+        if index >= MAX_LEGACY_PROJECTS {
+            return Err(ClientError::RegistryOwnershipInvalid {
+                pack: requested_pack.to_string(),
+                detail: "legacy trust migration exceeds the project scan limit".to_string(),
+            });
+        }
+        let entry = entry.map_err(|source| ClientError::Io {
+            path: projects_root.clone(),
+            source,
+        })?;
+        let file_type = entry.file_type().map_err(|source| ClientError::Io {
+            path: entry.path(),
+            source,
+        })?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let Some(lockfile) = read_legacy_project_lock(&entry.path().join("lock.toml"))? else {
+            continue;
+        };
+        if lockfile
+            .personas
+            .iter()
+            .any(|locked| locked.name == pack_name)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Read one regular central lock under a strict migration-only byte ceiling.
+fn read_legacy_project_lock(path: &Path) -> Result<Option<Lockfile>, ClientError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(ClientError::Io {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if !metadata.file_type().is_file() {
+        return Err(ClientError::RegistryOwnershipInvalid {
+            pack: path.display().to_string(),
+            detail: "legacy trust migration lock is not a regular file".to_string(),
+        });
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(path).map_err(|source| ClientError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut raw = String::new();
+    LimitedReader::new(file, MAX_LEGACY_LOCK_BYTES)
+        .read_to_string(&mut raw)
+        .map_err(|source| ClientError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    toml::from_str(&raw)
+        .map(Some)
+        .map_err(|source| ClientError::TomlDeserialize {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+/// Detect a bounded retained cache entry whose original registry source is unknown.
+fn has_legacy_cached_pack(
+    data_root: &Path,
+    pack_name: &str,
+    requested_pack: &str,
+) -> Result<bool, ClientError> {
+    let cache_root = data_root.join("cache");
+    let entries = match std::fs::read_dir(&cache_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => {
+            return Err(ClientError::Io {
+                path: cache_root,
+                source,
+            });
+        }
+    };
+
+    for (index, entry) in entries.enumerate() {
+        if index >= MAX_LEGACY_CACHE_ENTRIES {
+            return Err(legacy_migration_invalid(
+                requested_pack,
+                "legacy trust migration exceeds the cache scan limit",
+            ));
+        }
+        let entry = entry.map_err(|source| ClientError::Io {
+            path: cache_root.clone(),
+            source,
+        })?;
+        let entry_path = entry.path();
+        let file_type = entry.file_type().map_err(|source| ClientError::Io {
+            path: entry_path.clone(),
+            source,
+        })?;
+        if !file_type.is_dir() || file_type.is_symlink() {
+            return Err(legacy_migration_invalid(
+                requested_pack,
+                "legacy cache entry is not a regular directory",
+            ));
+        }
+
+        let manifest_path = entry_path.join("pack.toml");
+        let metadata = std::fs::symlink_metadata(&manifest_path).map_err(|_| {
+            legacy_migration_invalid(requested_pack, "legacy cache manifest is unreadable")
+        })?;
+        if !metadata.file_type().is_file() {
+            return Err(legacy_migration_invalid(
+                requested_pack,
+                "legacy cache manifest is not a regular file",
+            ));
+        }
+
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = options.open(&manifest_path).map_err(|_| {
+            legacy_migration_invalid(requested_pack, "legacy cache manifest is unreadable")
+        })?;
+        let mut raw = String::new();
+        LimitedReader::new(file, MAX_LEGACY_DRAFT_MANIFEST_BYTES)
+            .read_to_string(&mut raw)
+            .map_err(|_| {
+                legacy_migration_invalid(requested_pack, "legacy cache manifest is unreadable")
+            })?;
+        let manifest = toml::from_str::<PackManifest>(&raw).map_err(|_| {
+            legacy_migration_invalid(requested_pack, "legacy cache manifest is invalid")
+        })?;
+        if manifest.name == pack_name {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Construct one bounded failure for unusable pre-package-pin local evidence.
+fn legacy_migration_invalid(requested_pack: &str, detail: &'static str) -> ClientError {
+    ClientError::RegistryOwnershipInvalid {
+        pack: requested_pack.to_string(),
+        detail: detail.to_string(),
+    }
+}
+
+/// Verify or create the authoritative signer-plus-publisher package record.
+fn check_or_create_pack_owner_record(
+    data_root: &Path,
+    registry: &str,
+    pack: &str,
+    signer: &str,
+    linked_publisher: Option<&str>,
+    presented_publisher: Option<&str>,
+) -> Result<(), ClientError> {
+    let record_path = pack_owner_record_path(data_root, registry, pack);
+    let pin_dir = data_root.join("trust").join("registry-pack-owners");
+    std::fs::create_dir_all(&pin_dir).map_err(|source| ClientError::Io {
+        path: pin_dir.clone(),
+        source,
+    })?;
+    set_private_dir_permissions(&pin_dir)?;
+
+    let publisher = linked_publisher
+        .map(|publisher| format!("linked:{publisher}"))
+        .unwrap_or_else(|| UNLINKED_PACK_PUBLISHER.to_string());
+    let contents = format!("frameshift-pack-owner-v1\n{registry}\n{pack}\n{signer}\n{publisher}\n");
+    match create_private_file(&record_path) {
+        Ok(mut file) => file
+            .write_all(contents.as_bytes())
+            .map_err(|source| ClientError::Io {
+                path: record_path.clone(),
+                source,
+            })?,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(source) => Err(ClientError::Io {
+            path: record_path.clone(),
+            source,
+        })?,
+    }
+    verify_pack_owner_record(
+        data_root,
+        &record_path,
+        registry,
+        pack,
+        signer,
+        linked_publisher,
+        presented_publisher,
+    )
+}
+
+/// Compare one package record and any append-only publisher claim with a response.
+fn verify_pack_owner_record(
+    data_root: &Path,
+    record_path: &Path,
+    registry: &str,
+    pack: &str,
+    signer: &str,
+    linked_publisher: Option<&str>,
+    presented_publisher: Option<&str>,
+) -> Result<(), ClientError> {
+    let record = read_pack_owner_record(record_path, registry, pack)?;
+    if record.signer != signer {
+        return Err(ClientError::RegistryPackOwnerChanged {
+            registry: registry.to_string(),
+            pack: pack.to_string(),
+            owner_kind: "signer",
+            expected: record.signer,
+            actual: signer.to_string(),
+        });
+    }
+
+    let claim = read_pack_publisher_claim(data_root, registry, pack)?;
+    let expected_publisher = match (record.publisher, claim) {
+        (Some(recorded), Some(claimed)) if recorded != claimed => {
+            return Err(ClientError::RegistryPackOwnerChanged {
+                registry: registry.to_string(),
+                pack: pack.to_string(),
+                owner_kind: "publisher",
+                expected: recorded,
+                actual: claimed,
+            });
+        }
+        (Some(recorded), _) => Some(recorded),
+        (None, claimed) => claimed,
+    };
+    if let Some(expected) = expected_publisher {
+        let actual = presented_publisher.unwrap_or("<missing>");
+        if expected != actual {
+            return Err(ClientError::RegistryPackOwnerChanged {
+                registry: registry.to_string(),
+                pack: pack.to_string(),
+                owner_kind: "publisher",
+                expected,
+                actual: actual.to_string(),
+            });
+        }
+        return Ok(());
+    }
+
+    if let Some(publisher) = linked_publisher {
+        check_or_create_pack_publisher_claim(data_root, registry, pack, publisher)?;
+    }
+    Ok(())
+}
+
+/// Parse one bounded package-owner record from a regular no-follow file.
+fn read_pack_owner_record(
+    record_path: &Path,
+    registry: &str,
+    pack: &str,
+) -> Result<RegistryPackOwnerRecord, ClientError> {
+    let raw = read_private_trust_file(record_path)?;
+    let mut lines = raw.lines();
+    let valid = lines.next() == Some("frameshift-pack-owner-v1")
+        && lines.next() == Some(registry)
+        && lines.next() == Some(pack);
+    let signer = lines.next();
+    let publisher = lines.next();
+    if !valid || signer.is_none() || publisher.is_none() || lines.next().is_some() {
+        return Err(ClientError::Io {
+            path: record_path.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "registry pack owner record is malformed",
+            ),
+        });
+    }
+    let signer = signer.unwrap_or_default();
+    if signer.len() != 64
+        || !signer
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(ClientError::Io {
+            path: record_path.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "registry pack owner signer is malformed",
+            ),
+        });
+    }
+    let publisher = publisher.unwrap_or_default();
+    let publisher = if publisher == UNLINKED_PACK_PUBLISHER {
+        None
+    } else if let Some(value) = publisher.strip_prefix("linked:") {
+        let canonical = value
+            .parse::<uuid::Uuid>()
+            .map(|publisher| publisher.to_string())
+            .ok();
+        if canonical.as_deref() != Some(value) {
+            return Err(ClientError::Io {
+                path: record_path.to_path_buf(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "registry pack owner publisher is malformed",
+                ),
+            });
+        }
+        Some(value.to_string())
+    } else {
+        return Err(ClientError::Io {
+            path: record_path.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "registry pack owner publisher state is malformed",
+            ),
+        });
+    };
+    Ok(RegistryPackOwnerRecord {
+        signer: signer.to_string(),
+        publisher,
+    })
+}
+
+/// Verify or create the append-only publisher claim for a later link upgrade.
+fn check_or_create_pack_publisher_claim(
+    data_root: &Path,
+    registry: &str,
+    pack: &str,
+    publisher: &str,
+) -> Result<(), ClientError> {
+    let claim_path = pack_publisher_claim_path(data_root, registry, pack);
+    let contents = format!("frameshift-pack-publisher-v1\n{registry}\n{pack}\n{publisher}\n");
+    match create_private_file(&claim_path) {
+        Ok(mut file) => file
+            .write_all(contents.as_bytes())
+            .map_err(|source| ClientError::Io {
+                path: claim_path.clone(),
+                source,
+            })?,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(source) => {
+            return Err(ClientError::Io {
+                path: claim_path,
+                source,
+            });
+        }
+    }
+    let expected =
+        read_pack_publisher_claim(data_root, registry, pack)?.ok_or_else(|| ClientError::Io {
+            path: claim_path.clone(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "registry pack publisher claim disappeared",
+            ),
+        })?;
+    if expected != publisher {
+        return Err(ClientError::RegistryPackOwnerChanged {
+            registry: registry.to_string(),
+            pack: pack.to_string(),
+            owner_kind: "publisher",
+            expected,
+            actual: publisher.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Read and validate an optional append-only package publisher claim.
+fn read_pack_publisher_claim(
+    data_root: &Path,
+    registry: &str,
+    pack: &str,
+) -> Result<Option<String>, ClientError> {
+    let claim_path = pack_publisher_claim_path(data_root, registry, pack);
+    match std::fs::symlink_metadata(&claim_path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(ClientError::Io {
+                path: claim_path,
+                source,
+            });
+        }
+    }
+    let raw = read_private_trust_file(&claim_path)?;
+    let mut lines = raw.lines();
+    let valid = lines.next() == Some("frameshift-pack-publisher-v1")
+        && lines.next() == Some(registry)
+        && lines.next() == Some(pack);
+    let publisher = lines.next();
+    if !valid || publisher.is_none() || lines.next().is_some() {
+        return Err(ClientError::Io {
+            path: claim_path,
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "registry pack publisher claim is malformed",
+            ),
+        });
+    }
+    let publisher = publisher.unwrap_or_default();
+    let canonical = publisher
+        .parse::<uuid::Uuid>()
+        .map(|publisher| publisher.to_string())
+        .ok();
+    if canonical.as_deref() != Some(publisher) {
+        return Err(ClientError::Io {
+            path: claim_path,
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "registry pack publisher claim is malformed",
+            ),
+        });
+    }
+    Ok(Some(publisher.to_string()))
+}
+
+/// Read one bounded regular trust file without following its final component.
+fn read_private_trust_file(path: &Path) -> Result<String, ClientError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|source| ClientError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(ClientError::Io {
+            path: path.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "registry trust path is not a regular file",
+            ),
+        });
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path).map_err(|source| ClientError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let metadata = file.metadata().map_err(|source| ClientError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.file_type().is_file() || metadata_is_windows_reparse_point(&metadata) {
+        return Err(ClientError::Io {
+            path: path.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "registry trust path is not a regular file",
+            ),
+        });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|source| ClientError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+    }
+    let mut raw = String::new();
+    LimitedReader::new(file, MAX_TRUST_PIN_BYTES)
+        .read_to_string(&mut raw)
+        .map_err(|source| ClientError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    Ok(raw)
 }
 
 /// Verify or atomically establish an author key continuity pin.
@@ -680,7 +1503,6 @@ fn check_or_create_author_pin(
     author: &str,
     pubkey: &[u8; 32],
 ) -> Result<(), ClientError> {
-    let namespace = ObjectHash::of(format!("{registry}\0{author}").as_bytes()).to_hex();
     let pin_dir = data_root.join("trust").join("registry-authors");
     std::fs::create_dir_all(&pin_dir).map_err(|source| ClientError::Io {
         path: pin_dir.clone(),
@@ -688,7 +1510,7 @@ fn check_or_create_author_pin(
     })?;
     set_private_dir_permissions(&pin_dir)?;
 
-    let pin_path = pin_dir.join(format!("{namespace}.pin"));
+    let pin_path = author_pin_path(data_root, registry, author);
     let presented = hex::encode(pubkey);
     let contents = format!("frameshift-author-key-v1\n{registry}\n{author}\n{presented}\n");
 
@@ -709,6 +1531,15 @@ fn check_or_create_author_pin(
     }
 }
 
+/// Return the collision-resistant legacy author-key trust path.
+fn author_pin_path(data_root: &Path, registry: &str, author: &str) -> PathBuf {
+    let namespace = ObjectHash::of(format!("{registry}\0{author}").as_bytes()).to_hex();
+    data_root
+        .join("trust")
+        .join("registry-authors")
+        .join(format!("{namespace}.pin"))
+}
+
 /// Compare an existing bounded pin file with the newly presented key.
 fn verify_author_pin(
     pin_path: &Path,
@@ -716,39 +1547,18 @@ fn verify_author_pin(
     author: &str,
     presented: &str,
 ) -> Result<(), ClientError> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    let file = options.open(pin_path).map_err(|source| ClientError::Io {
-        path: pin_path.to_path_buf(),
-        source,
-    })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .map_err(|source| ClientError::Io {
-                path: pin_path.to_path_buf(),
-                source,
-            })?;
-    }
-    let mut raw = String::new();
-    LimitedReader::new(file, MAX_TRUST_PIN_BYTES)
-        .read_to_string(&mut raw)
-        .map_err(|source| ClientError::Io {
-            path: pin_path.to_path_buf(),
-            source,
-        })?;
+    let raw = read_private_trust_file(pin_path)?;
     let mut lines = raw.lines();
     let valid_header = lines.next() == Some("frameshift-author-key-v1");
     let stored_registry = lines.next();
     let stored_author = lines.next();
     let stored_key = lines.next();
-    if !valid_header || stored_registry != Some(registry) || stored_author != Some(author) {
+    if !valid_header
+        || stored_registry != Some(registry)
+        || stored_author != Some(author)
+        || stored_key.is_none()
+        || lines.next().is_some()
+    {
         return Err(ClientError::Io {
             path: pin_path.to_path_buf(),
             source: std::io::Error::new(
@@ -782,7 +1592,6 @@ fn check_or_create_publisher_pin(
     // rotation proof, a newly presented key must retain the existing warning.
     check_or_create_author_pin(data_root, registry, author, presented_pubkey)?;
 
-    let namespace = ObjectHash::of(format!("{registry}\0{author}").as_bytes()).to_hex();
     let pin_dir = data_root.join("trust").join("registry-publishers");
     std::fs::create_dir_all(&pin_dir).map_err(|source| ClientError::Io {
         path: pin_dir.clone(),
@@ -790,7 +1599,7 @@ fn check_or_create_publisher_pin(
     })?;
     set_private_dir_permissions(&pin_dir)?;
 
-    let pin_path = pin_dir.join(format!("{namespace}.pin"));
+    let pin_path = publisher_pin_path(data_root, registry, author);
     match std::fs::symlink_metadata(&pin_path) {
         Ok(_) => return verify_publisher_pin(&pin_path, registry, author, publisher_id),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -820,6 +1629,15 @@ fn check_or_create_publisher_pin(
     }
 }
 
+/// Return the collision-resistant legacy publisher-identity trust path.
+fn publisher_pin_path(data_root: &Path, registry: &str, author: &str) -> PathBuf {
+    let namespace = ObjectHash::of(format!("{registry}\0{author}").as_bytes()).to_hex();
+    data_root
+        .join("trust")
+        .join("registry-publishers")
+        .join(format!("{namespace}.pin"))
+}
+
 /// Compare an existing bounded publisher pin with the presented identity.
 fn verify_publisher_pin(
     pin_path: &Path,
@@ -827,39 +1645,36 @@ fn verify_publisher_pin(
     author: &str,
     presented_publisher_id: &str,
 ) -> Result<(), ClientError> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW);
+    let expected = read_publisher_pin(pin_path, registry, author)?;
+    if expected != presented_publisher_id {
+        return Err(ClientError::RegistryPublisherChanged {
+            registry: registry.to_string(),
+            author: author.to_string(),
+            expected,
+            actual: presented_publisher_id.to_string(),
+        });
     }
-    let file = options.open(pin_path).map_err(|source| ClientError::Io {
-        path: pin_path.to_path_buf(),
-        source,
-    })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .map_err(|source| ClientError::Io {
-                path: pin_path.to_path_buf(),
-                source,
-            })?;
-    }
-    let mut raw = String::new();
-    LimitedReader::new(file, MAX_TRUST_PIN_BYTES)
-        .read_to_string(&mut raw)
-        .map_err(|source| ClientError::Io {
-            path: pin_path.to_path_buf(),
-            source,
-        })?;
+    Ok(())
+}
+
+/// Parse and return the UUID stored in one bounded legacy publisher pin.
+fn read_publisher_pin(
+    pin_path: &Path,
+    registry: &str,
+    author: &str,
+) -> Result<String, ClientError> {
+    let raw = read_private_trust_file(pin_path)?;
     let mut lines = raw.lines();
     let valid_header = lines.next() == Some("frameshift-publisher-v1");
     let stored_registry = lines.next();
     let stored_author = lines.next();
     let stored_publisher_id = lines.next();
-    if !valid_header || stored_registry != Some(registry) || stored_author != Some(author) {
+    if !valid_header
+        || stored_registry != Some(registry)
+        || stored_author != Some(author)
+        || stored_publisher_id.is_none()
+        || lines.next().is_some()
+    {
         return Err(ClientError::Io {
             path: pin_path.to_path_buf(),
             source: std::io::Error::new(
@@ -868,16 +1683,7 @@ fn verify_publisher_pin(
             ),
         });
     }
-    let expected = stored_publisher_id.unwrap_or_default();
-    if expected != presented_publisher_id {
-        return Err(ClientError::RegistryPublisherChanged {
-            registry: registry.to_string(),
-            author: author.to_string(),
-            expected: expected.to_string(),
-            actual: presented_publisher_id.to_string(),
-        });
-    }
-    Ok(())
+    Ok(stored_publisher_id.unwrap_or_default().to_string())
 }
 
 /// Open a new private file without following an existing path.
@@ -1013,124 +1819,6 @@ fn response_bytes_bounded(
     Ok(bytes)
 }
 
-/// Extract a `.tar.gz` archive into `dir`.
-///
-/// Enforces the following security constraints (mirroring the server-side extractor):
-///
-/// - Decompressed total byte count is capped at [`MAX_DECOMPRESSED_BYTES`] (bomb guard).
-/// - Filesystem entry count is capped at [`MAX_ARCHIVE_ENTRIES`] (inode/IO guard).
-/// - Entries with absolute paths are rejected.
-/// - Entries with `..` path components are rejected.
-/// - Non-regular-file / non-directory entries (symlinks, device nodes, etc.) are rejected.
-fn extract_targz(archive_bytes: &[u8], dir: &Path) -> Result<(), ClientError> {
-    let gz = GzDecoder::new(std::io::Cursor::new(archive_bytes));
-    let limited = LimitedReader::new(gz, MAX_DECOMPRESSED_BYTES);
-    let mut archive = Archive::new(limited);
-    archive.set_preserve_permissions(false);
-    archive.set_overwrite(true);
-
-    let entries = archive.entries().map_err(|err| ClientError::Io {
-        path: dir.to_path_buf(),
-        source: err,
-    })?;
-
-    for (index, entry) in entries.enumerate() {
-        if index >= MAX_ARCHIVE_ENTRIES {
-            return Err(ClientError::Io {
-                path: dir.to_path_buf(),
-                source: std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "pack archive contains too many entries",
-                ),
-            });
-        }
-        let mut entry = entry.map_err(|err| ClientError::Io {
-            path: dir.to_path_buf(),
-            source: err,
-        })?;
-
-        // Reject non-regular-file / non-directory entries (symlinks, hardlinks, device nodes).
-        let entry_type = entry.header().entry_type();
-        if !(entry_type.is_file() || entry_type.is_dir()) {
-            return Err(ClientError::Io {
-                path: dir.to_path_buf(),
-                source: std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "pack archive contains a non-regular file entry",
-                ),
-            });
-        }
-
-        // Path-traversal protection.
-        let path = entry
-            .path()
-            .map_err(|err| ClientError::Io {
-                path: dir.to_path_buf(),
-                source: err,
-            })?
-            .into_owned();
-
-        if path.is_absolute()
-            || path
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir))
-        {
-            return Err(ClientError::Io {
-                path: dir.to_path_buf(),
-                source: std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "pack archive contains unsafe path",
-                ),
-            });
-        }
-
-        entry.unpack_in(dir).map_err(|err| ClientError::Io {
-            path: dir.to_path_buf(),
-            source: err,
-        })?;
-    }
-
-    Ok(())
-}
-
-/// Locate the directory inside `extract_dir` that contains `pack.toml`.
-///
-/// Accepts two layouts:
-/// - Flat: `pack.toml` directly inside `extract_dir`.
-/// - Nested: a single subdirectory inside `extract_dir` that contains `pack.toml`.
-///
-/// Returns `ClientError::Io` if no `pack.toml` is found in either location.
-fn find_pack_root(
-    extract_dir: &Path,
-    name: &str,
-    version: &str,
-) -> Result<std::path::PathBuf, ClientError> {
-    if extract_dir.join("pack.toml").is_file() {
-        return Ok(extract_dir.to_path_buf());
-    }
-
-    let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(extract_dir)
-        .map_err(|source| ClientError::Io {
-            path: extract_dir.to_path_buf(),
-            source,
-        })?
-        .filter_map(|r| r.ok().map(|d| d.path()))
-        .collect();
-    entries.sort();
-
-    if entries.len() == 1 && entries[0].is_dir() && entries[0].join("pack.toml").is_file() {
-        return Ok(entries[0].clone());
-    }
-
-    Err(ClientError::Io {
-        path: extract_dir.to_path_buf(),
-        source: std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("no pack.toml found in registry archive for {name}@{version}"),
-        ),
-    })
-}
-
 /// A [`Read`] adapter that returns an error once more than `limit` total bytes
 /// have been read through it.
 ///
@@ -1254,6 +1942,162 @@ mod tests {
         }
     }
 
+    /// A durable package record alone rejects substitution after an interrupted first use.
+    #[test]
+    fn atomic_pack_owner_record_survives_pre_handle_interruption() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = "https://registry.example";
+        let pack_name = "atomic-owner-pack";
+        let publisher_id = "4a128e72-cc91-4721-b452-943ce736799b";
+        let signer = hex::encode([7_u8; 32]);
+        check_or_create_pack_owner_record(
+            temp.path(),
+            registry,
+            pack_name,
+            &signer,
+            Some(publisher_id),
+            Some(publisher_id),
+        )
+        .expect("the authoritative package tuple must persist before handle trust");
+
+        let mut substituted = ownership_version_record(
+            "6199b23b-906f-4689-a840-664a184c5f75",
+            "1e41ae38-9a5e-4623-8fcc-8f705928dacf",
+            EnrolledPublisherKeyState::Active,
+            [8_u8; 32],
+        );
+        substituted.pack_name = pack_name.to_string();
+        substituted.publisher.as_mut().unwrap().handle = "mallory".to_string();
+        let error = check_or_create_registry_trust(
+            temp.path(),
+            registry,
+            "mallory",
+            &[8_u8; 32],
+            &substituted,
+        )
+        .expect_err("a retry cannot reset the package owner after interruption");
+
+        assert!(matches!(
+            error,
+            ClientError::RegistryPackOwnerChanged {
+                owner_kind: "signer",
+                ..
+            }
+        ));
+    }
+
+    /// An append-only publisher claim rejects omission after an interrupted link upgrade.
+    #[test]
+    fn atomic_pack_owner_publisher_upgrade_survives_interruption() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = "https://registry.example";
+        let pack_name = "atomic-owner-pack";
+        let publisher_id = "4a128e72-cc91-4721-b452-943ce736799b";
+        let signer = hex::encode([7_u8; 32]);
+        check_or_create_pack_owner_record(temp.path(), registry, pack_name, &signer, None, None)
+            .expect("the original signer-only owner record must persist");
+        check_or_create_pack_owner_record(
+            temp.path(),
+            registry,
+            pack_name,
+            &signer,
+            Some(publisher_id),
+            Some(publisher_id),
+        )
+        .expect("the first linked version must persist its publisher claim");
+
+        let error = check_or_create_pack_owner_record(
+            temp.path(),
+            registry,
+            pack_name,
+            &signer,
+            None,
+            None,
+        )
+        .expect_err("a retry cannot omit a publisher claim after interruption");
+        assert!(matches!(
+            error,
+            ClientError::RegistryPackOwnerChanged {
+                owner_kind: "publisher",
+                actual,
+                ..
+            } if actual == "<missing>"
+        ));
+    }
+
+    /// An existing author conflict is rejected before package trust can be poisoned.
+    #[test]
+    fn registry_trust_preflights_author_pin_before_package_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = "https://registry.example";
+        let pack_name = "author-conflict-pack";
+        check_or_create_author_pin(temp.path(), registry, "alice", &[7_u8; 32])
+            .expect("the prior author pin must exist");
+
+        let mut conflicting = ownership_version_record(
+            "4a128e72-cc91-4721-b452-943ce736799b",
+            "cc56ea2b-991d-46eb-a94f-936a9b071a4a",
+            EnrolledPublisherKeyState::Active,
+            [8_u8; 32],
+        );
+        conflicting.pack_name = pack_name.to_string();
+        let error = check_or_create_registry_trust(
+            temp.path(),
+            registry,
+            "alice",
+            &[8_u8; 32],
+            &conflicting,
+        )
+        .expect_err("an existing author conflict must reject before package mutation");
+
+        assert!(matches!(
+            error,
+            ClientError::RegistryAuthorKeyChanged { .. }
+        ));
+        assert!(!pack_owner_record_path(temp.path(), registry, pack_name).exists());
+        assert!(!pack_publisher_claim_path(temp.path(), registry, pack_name).exists());
+    }
+
+    /// An existing publisher conflict is rejected before package trust can be poisoned.
+    #[test]
+    fn registry_trust_preflights_publisher_pin_before_package_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = "https://registry.example";
+        let pack_name = "publisher-conflict-pack";
+        let original_publisher = "4a128e72-cc91-4721-b452-943ce736799b";
+        check_or_create_publisher_pin(
+            temp.path(),
+            registry,
+            "alice",
+            original_publisher,
+            &[7_u8; 32],
+        )
+        .expect("the prior publisher pin must exist");
+
+        let mut conflicting = ownership_version_record(
+            "6199b23b-906f-4689-a840-664a184c5f75",
+            "cc56ea2b-991d-46eb-a94f-936a9b071a4a",
+            EnrolledPublisherKeyState::Active,
+            [7_u8; 32],
+        );
+        conflicting.pack_name = pack_name.to_string();
+        let error = check_or_create_registry_trust(
+            temp.path(),
+            registry,
+            "alice",
+            &[7_u8; 32],
+            &conflicting,
+        )
+        .expect_err("an existing publisher conflict must reject before package mutation");
+
+        assert!(matches!(
+            error,
+            ClientError::RegistryPublisherChanged { .. }
+        ));
+        assert!(!pack_owner_record_path(temp.path(), registry, pack_name).exists());
+        assert!(!pack_publisher_claim_path(temp.path(), registry, pack_name).exists());
+    }
+
     /// A publisher UUID cannot silently authorize an unproven signing-key rotation.
     #[test]
     fn publisher_pin_rejects_unproven_key_rotation() {
@@ -1293,20 +2137,24 @@ mod tests {
             ClientError::RegistryAuthorKeyChanged { .. }
         ));
 
-        let legacy_only = VersionRecord {
+        let omitted_publisher = VersionRecord {
             publisher: None,
             publisher_key: None,
             publisher_key_id: None,
             ..first
         };
-        check_or_create_registry_trust(
+        let omission = check_or_create_registry_trust(
             temp.path(),
             "https://registry.example",
             "alice",
             &[7_u8; 32],
-            &legacy_only,
+            &omitted_publisher,
         )
-        .expect("legacy response with the pinned signer must retain continuity");
+        .expect_err("a linked publisher pin cannot be bypassed by metadata omission");
+        assert!(matches!(
+            omission,
+            ClientError::RegistryPublisherChanged { actual, .. } if actual == "<missing>"
+        ));
     }
 
     /// A renamed legacy profile cannot invalidate an immutable signed archive.
@@ -1354,6 +2202,21 @@ mod tests {
     #[test]
     fn publisher_with_legacy_historical_version_uses_author_key_pin() {
         let temp = tempfile::tempdir().unwrap();
+        let linked = ownership_version_record(
+            "4a128e72-cc91-4721-b452-943ce736799b",
+            "cc56ea2b-991d-46eb-a94f-936a9b071a4a",
+            EnrolledPublisherKeyState::Active,
+            [7_u8; 32],
+        );
+        check_or_create_registry_trust(
+            temp.path(),
+            "https://registry.example",
+            "alice",
+            &[7_u8; 32],
+            &linked,
+        )
+        .expect("linked version must establish publisher continuity");
+
         let mut historical = ownership_version_record(
             "4a128e72-cc91-4721-b452-943ce736799b",
             "cc56ea2b-991d-46eb-a94f-936a9b071a4a",
@@ -1425,6 +2288,92 @@ mod tests {
         assert!(matches!(
             error,
             ClientError::RegistryPublisherChanged { .. }
+        ));
+    }
+
+    /// A registry cannot reset trust by replacing handle, signer, and publisher together.
+    #[test]
+    fn pack_owner_pin_rejects_simultaneous_identity_substitution() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = ownership_version_record(
+            "4a128e72-cc91-4721-b452-943ce736799b",
+            "cc56ea2b-991d-46eb-a94f-936a9b071a4a",
+            EnrolledPublisherKeyState::Active,
+            [7_u8; 32],
+        );
+        check_or_create_registry_trust(
+            temp.path(),
+            "https://registry.example",
+            "alice",
+            &[7_u8; 32],
+            &first,
+        )
+        .expect("first pack owner pin must succeed");
+
+        let mut substituted = ownership_version_record(
+            "6199b23b-906f-4689-a840-664a184c5f75",
+            "1e41ae38-9a5e-4623-8fcc-8f705928dacf",
+            EnrolledPublisherKeyState::Active,
+            [8_u8; 32],
+        );
+        substituted.publisher.as_mut().unwrap().handle = "mallory".to_string();
+        let error = check_or_create_registry_trust(
+            temp.path(),
+            "https://registry.example",
+            "mallory",
+            &[8_u8; 32],
+            &substituted,
+        )
+        .expect_err("stable pack ownership must survive an attacker-selected handle");
+        assert!(matches!(
+            error,
+            ClientError::RegistryPackOwnerChanged {
+                owner_kind: "signer",
+                ..
+            }
+        ));
+    }
+
+    /// A stable signer cannot hide a simultaneous handle and publisher substitution.
+    #[test]
+    fn pack_owner_pin_rejects_publisher_substitution_under_new_handle() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = ownership_version_record(
+            "4a128e72-cc91-4721-b452-943ce736799b",
+            "cc56ea2b-991d-46eb-a94f-936a9b071a4a",
+            EnrolledPublisherKeyState::Active,
+            [7_u8; 32],
+        );
+        check_or_create_registry_trust(
+            temp.path(),
+            "https://registry.example",
+            "alice",
+            &[7_u8; 32],
+            &first,
+        )
+        .expect("first pack owner pin must succeed");
+
+        let mut substituted = ownership_version_record(
+            "6199b23b-906f-4689-a840-664a184c5f75",
+            "cc56ea2b-991d-46eb-a94f-936a9b071a4a",
+            EnrolledPublisherKeyState::Active,
+            [7_u8; 32],
+        );
+        substituted.publisher.as_mut().unwrap().handle = "mallory".to_string();
+        let error = check_or_create_registry_trust(
+            temp.path(),
+            "https://registry.example",
+            "mallory",
+            &[7_u8; 32],
+            &substituted,
+        )
+        .expect_err("publisher continuity must be keyed by the stable pack name");
+        assert!(matches!(
+            error,
+            ClientError::RegistryPackOwnerChanged {
+                owner_kind: "publisher",
+                ..
+            }
         ));
     }
 
@@ -1888,102 +2837,6 @@ mod tests {
         let actual_hash = ObjectHash::of(real_bytes);
         let mismatch = actual_hash != wrong_hash;
         assert!(mismatch, "mismatch detection logic should trigger");
-    }
-
-    /// extract_targz rejects an archive with a path-traversal component.
-    #[test]
-    fn extract_targz_rejects_non_regular_entries() {
-        use flate2::write::GzEncoder;
-        use flate2::Compression;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let out_dir = tmp.path().join("out");
-        std::fs::create_dir_all(&out_dir).unwrap();
-
-        // Build a .tar.gz containing a symlink entry. The tar builder validates
-        // and rejects literal `..` paths, so the realistic malicious shape we
-        // defend against is a symlink (or other non-regular entry) that the
-        // extractor must refuse before it can be planted on disk.
-        let mut gz_buf: Vec<u8> = Vec::new();
-        {
-            let enc = GzEncoder::new(&mut gz_buf, Compression::default());
-            let mut tar = tar::Builder::new(enc);
-
-            let mut header = tar::Header::new_gnu();
-            header.set_entry_type(tar::EntryType::Symlink);
-            header.set_size(0);
-            header.set_mode(0o777);
-            header
-                .set_link_name("../../../../etc/passwd")
-                .expect("set symlink target");
-            tar.append_data(&mut header, "innocent.txt", std::io::empty())
-                .unwrap();
-            tar.finish().unwrap();
-        }
-
-        let result = extract_targz(&gz_buf, &out_dir);
-        assert!(
-            result.is_err(),
-            "extract_targz must reject a non-regular (symlink) entry"
-        );
-    }
-
-    /// extract_targz rejects an archive that decompresses to more than the limit.
-    #[test]
-    fn extract_targz_rejects_decompression_bomb() {
-        use flate2::write::GzEncoder;
-        use flate2::Compression;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let out_dir = tmp.path().join("out");
-        std::fs::create_dir_all(&out_dir).unwrap();
-
-        // Build a .tar.gz with content larger than MAX_DECOMPRESSED_BYTES.
-        let huge = vec![0u8; (MAX_DECOMPRESSED_BYTES + 1) as usize];
-        let mut gz_buf: Vec<u8> = Vec::new();
-        {
-            let enc = GzEncoder::new(&mut gz_buf, Compression::default());
-            let mut tar = tar::Builder::new(enc);
-
-            let mut header = tar::Header::new_gnu();
-            header.set_size(huge.len() as u64);
-            header.set_mode(0o644);
-            header.set_cksum();
-            tar.append_data(&mut header, "big.bin", huge.as_slice())
-                .unwrap();
-            tar.finish().unwrap();
-        }
-
-        let result = extract_targz(&gz_buf, &out_dir);
-        assert!(
-            result.is_err(),
-            "extract_targz must reject archives exceeding the decompressed size limit"
-        );
-    }
-
-    /// extract_targz rejects metadata-heavy archives before creating excessive entries.
-    #[test]
-    fn extract_targz_rejects_too_many_entries() {
-        let mut gz_buf = Vec::new();
-        {
-            let enc = flate2::write::GzEncoder::new(&mut gz_buf, flate2::Compression::default());
-            let mut builder = tar::Builder::new(enc);
-            for index in 0..=MAX_ARCHIVE_ENTRIES {
-                let mut header = tar::Header::new_gnu();
-                header.set_entry_type(tar::EntryType::Directory);
-                header.set_size(0);
-                header.set_mode(0o755);
-                header.set_cksum();
-                builder
-                    .append_data(&mut header, format!("entry-{index}"), std::io::empty())
-                    .unwrap();
-            }
-            builder.into_inner().unwrap().finish().unwrap();
-        }
-
-        let out = tempfile::tempdir().unwrap();
-        let result = extract_targz(&gz_buf, out.path());
-        assert!(matches!(result, Err(ClientError::Io { .. })));
     }
 
     // ---- Test helpers ----

@@ -58,6 +58,16 @@
 //! | `OIDC_JWKS_STALE_SECS` | `900` | Additional stale-key window used only during provider outages |
 //! | `OIDC_CLOCK_SKEW_SECS` | `30` | Token validation clock skew allowance |
 //! | `OIDC_FRESH_AUTH_SECS` | `300` | Maximum `auth_time` age for sensitive key operations |
+//! | `MCP_ACCESS_ENABLED` | `false` | Mount `POST /mcp` only when every dedicated Access setting validates |
+//! | `MCP_ACCESS_ISSUER` | `""` | Exact Cloudflare Access team issuer |
+//! | `MCP_ACCESS_AUDIENCE` | `""` | Exact Cloudflare Access application audience |
+//! | `MCP_ACCESS_JWKS_URL` | `""` | Exact team `/cdn-cgi/access/certs` endpoint |
+//! | `MCP_ACCESS_ALLOWED_ALGORITHMS` | `RS256` | Access assertion algorithm; only the documented Cloudflare algorithm is accepted |
+//! | `MCP_ACCESS_JWKS_CACHE_SECS` | `300` | Fresh Access JWKS cache lifetime |
+//! | `MCP_ACCESS_JWKS_STALE_SECS` | `900` | Additional bounded stale-key window during provider outages |
+//! | `MCP_ACCESS_CLOCK_SKEW_SECS` | `30` | Access assertion validation clock skew |
+//! | `MCP_ACCESS_RESOURCE_URL` | `""` | Exact public HTTPS MCP resource URL ending in `/mcp` |
+//! | `MCP_ACCESS_RESOURCE_METADATA_URL` | `""` | Exact same-origin Managed OAuth metadata URL |
 //! | `INVITE_TURNSTILE_SITE_KEY` | `""` | Public Turnstile site key; empty disables invite intake |
 //! | `INVITE_TURNSTILE_SECRET` | `""` | Secret Turnstile verification key |
 //! | `INVITE_TURNSTILE_EXPECTED_HOSTNAME` | `""` | Exact hostname accepted from Turnstile |
@@ -163,6 +173,33 @@ impl OidcConfig {
             jwks_stale_ttl: Duration::from_secs(900),
             clock_skew: Duration::from_secs(30),
             fresh_auth_max_age: Duration::from_secs(300),
+        }
+    }
+}
+
+/// Dedicated Cloudflare Access policy for the public MCP resource.
+///
+/// The assertion policy is intentionally separate from account-route OIDC so
+/// `/mcp` cannot inherit bearer, cookie, or discovery behavior. The
+/// `assertion.enabled` bit controls whether this surface may be mounted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpAccessConfig {
+    /// Exact JWT and JWKS policy for `Cf-Access-Jwt-Assertion`.
+    pub assertion: OidcConfig,
+    /// Exact externally visible protected resource URL.
+    pub resource_url: String,
+    /// Exact OAuth authorization-server metadata URL advertised on a 401.
+    pub resource_metadata_url: String,
+}
+
+/// Constructors for MCP Access configuration states.
+impl McpAccessConfig {
+    /// Return the disabled default that leaves `POST /mcp` unmounted.
+    pub fn disabled() -> Self {
+        Self {
+            assertion: OidcConfig::disabled(),
+            resource_url: String::new(),
+            resource_metadata_url: String::new(),
         }
     }
 }
@@ -770,6 +807,9 @@ pub struct ServerConfig {
     /// OIDC resource-server settings for account and publisher routes.
     pub oidc: OidcConfig,
 
+    /// Dedicated Cloudflare Access assertion policy for the remote MCP route.
+    pub mcp_access: McpAccessConfig,
+
     /// Invite-only account application and anti-bot settings.
     pub invite_requests: InviteRequestConfig,
 
@@ -948,6 +988,7 @@ impl std::fmt::Debug for ServerConfig {
             )
             .field("publisher_ownership_reads", &self.publisher_ownership_reads)
             .field("oidc", &self.oidc)
+            .field("mcp_access", &self.mcp_access)
             .field("invite_requests", &self.invite_requests)
             .field("first_party_auth", &self.first_party_auth)
             .field("memory_backend", &self.memory_backend)
@@ -1099,6 +1140,27 @@ struct RawConfig {
     oidc_clock_skew_secs: u64,
     /// Maximum fresh-auth age in seconds.
     oidc_fresh_auth_secs: u64,
+
+    /// Whether Cloudflare Access authentication may mount the MCP route.
+    mcp_access_enabled: bool,
+    /// Exact Cloudflare Access team issuer.
+    mcp_access_issuer: String,
+    /// Exact Cloudflare Access application audience.
+    mcp_access_audience: String,
+    /// Explicit team JWKS endpoint.
+    mcp_access_jwks_url: String,
+    /// Comma-separated Access assertion algorithm policy.
+    mcp_access_allowed_algorithms: String,
+    /// Fresh Access JWKS cache lifetime in seconds.
+    mcp_access_jwks_cache_secs: u64,
+    /// Stale-on-outage Access JWKS lifetime in seconds.
+    mcp_access_jwks_stale_secs: u64,
+    /// Access assertion clock skew in seconds.
+    mcp_access_clock_skew_secs: u64,
+    /// Exact public MCP protected resource URL.
+    mcp_access_resource_url: String,
+    /// Exact Managed OAuth authorization-server metadata URL.
+    mcp_access_resource_metadata_url: String,
 
     /// Public Turnstile site key for the invite application.
     invite_turnstile_site_key: String,
@@ -1292,6 +1354,21 @@ impl RawConfig {
                 clock_skew: Duration::from_secs(self.oidc_clock_skew_secs),
                 fresh_auth_max_age: Duration::from_secs(self.oidc_fresh_auth_secs),
             },
+            mcp_access: McpAccessConfig {
+                assertion: OidcConfig {
+                    enabled: self.mcp_access_enabled,
+                    issuer: self.mcp_access_issuer,
+                    audience: self.mcp_access_audience,
+                    jwks_url: self.mcp_access_jwks_url,
+                    allowed_algorithms: split_comma_list(&self.mcp_access_allowed_algorithms),
+                    jwks_cache_ttl: Duration::from_secs(self.mcp_access_jwks_cache_secs),
+                    jwks_stale_ttl: Duration::from_secs(self.mcp_access_jwks_stale_secs),
+                    clock_skew: Duration::from_secs(self.mcp_access_clock_skew_secs),
+                    fresh_auth_max_age: Duration::from_secs(300),
+                },
+                resource_url: self.mcp_access_resource_url,
+                resource_metadata_url: self.mcp_access_resource_metadata_url,
+            },
             invite_requests: InviteRequestConfig {
                 turnstile_site_key: self.invite_turnstile_site_key,
                 turnstile_secret: SecretString::new(self.invite_turnstile_secret),
@@ -1394,6 +1471,16 @@ fn default_raw_config() -> RawConfig {
         oidc_jwks_stale_secs: 900,
         oidc_clock_skew_secs: 30,
         oidc_fresh_auth_secs: 300,
+        mcp_access_enabled: false,
+        mcp_access_issuer: String::new(),
+        mcp_access_audience: String::new(),
+        mcp_access_jwks_url: String::new(),
+        mcp_access_allowed_algorithms: "RS256".to_string(),
+        mcp_access_jwks_cache_secs: 300,
+        mcp_access_jwks_stale_secs: 900,
+        mcp_access_clock_skew_secs: 30,
+        mcp_access_resource_url: String::new(),
+        mcp_access_resource_metadata_url: String::new(),
         invite_turnstile_site_key: String::new(),
         invite_turnstile_secret: String::new(),
         invite_turnstile_expected_hostname: String::new(),
@@ -1531,6 +1618,7 @@ mod tests {
             admin_pubkeys: Vec::new(),
             publisher_ownership_reads: true,
             oidc: OidcConfig::disabled(),
+            mcp_access: McpAccessConfig::disabled(),
             invite_requests: InviteRequestConfig::disabled(),
             first_party_auth: FirstPartyAuthConfig::disabled(),
             memory_backend: "none".to_string(),
@@ -1597,6 +1685,7 @@ mod tests {
             admin_pubkeys: Vec::new(),
             publisher_ownership_reads: true,
             oidc: OidcConfig::disabled(),
+            mcp_access: McpAccessConfig::disabled(),
             invite_requests: InviteRequestConfig::disabled(),
             first_party_auth: FirstPartyAuthConfig::disabled(),
             memory_backend: "none".to_string(),
@@ -1655,6 +1744,7 @@ mod tests {
             admin_pubkeys: Vec::new(),
             publisher_ownership_reads: true,
             oidc: OidcConfig::disabled(),
+            mcp_access: McpAccessConfig::disabled(),
             invite_requests: InviteRequestConfig::disabled(),
             first_party_auth: FirstPartyAuthConfig::disabled(),
             memory_backend: "none".to_string(),
@@ -1706,6 +1796,60 @@ mod tests {
         let mut raw = default_raw_config();
         raw.publisher_ownership_reads = false;
         assert!(!raw.into_server_config().publisher_ownership_reads);
+    }
+
+    #[test]
+    /// Dedicated MCP Access settings default off and preserve every raw policy value.
+    fn mcp_access_defaults_disabled_and_maps_raw_policy() {
+        let default = default_raw_config().into_server_config();
+        assert_eq!(default.mcp_access, McpAccessConfig::disabled());
+
+        let mut raw = default_raw_config();
+        raw.mcp_access_enabled = true;
+        raw.mcp_access_issuer = "https://team.cloudflareaccess.com".to_string();
+        raw.mcp_access_audience = "application-audience".to_string();
+        raw.mcp_access_jwks_url =
+            "https://team.cloudflareaccess.com/cdn-cgi/access/certs".to_string();
+        raw.mcp_access_allowed_algorithms = "RS256".to_string();
+        raw.mcp_access_jwks_cache_secs = 123;
+        raw.mcp_access_jwks_stale_secs = 456;
+        raw.mcp_access_clock_skew_secs = 7;
+        raw.mcp_access_resource_url = "https://mcp.frameshift.test/mcp".to_string();
+        raw.mcp_access_resource_metadata_url =
+            "https://mcp.frameshift.test/.well-known/oauth-authorization-server".to_string();
+        let config = raw.into_server_config();
+
+        assert!(config.mcp_access.assertion.enabled);
+        assert_eq!(
+            config.mcp_access.assertion.issuer,
+            "https://team.cloudflareaccess.com"
+        );
+        assert_eq!(config.mcp_access.assertion.audience, "application-audience");
+        assert_eq!(
+            config.mcp_access.assertion.jwks_url,
+            "https://team.cloudflareaccess.com/cdn-cgi/access/certs"
+        );
+        assert_eq!(config.mcp_access.assertion.allowed_algorithms, ["RS256"]);
+        assert_eq!(
+            config.mcp_access.assertion.jwks_cache_ttl,
+            Duration::from_secs(123)
+        );
+        assert_eq!(
+            config.mcp_access.assertion.jwks_stale_ttl,
+            Duration::from_secs(456)
+        );
+        assert_eq!(
+            config.mcp_access.assertion.clock_skew,
+            Duration::from_secs(7)
+        );
+        assert_eq!(
+            config.mcp_access.resource_url,
+            "https://mcp.frameshift.test/mcp"
+        );
+        assert_eq!(
+            config.mcp_access.resource_metadata_url,
+            "https://mcp.frameshift.test/.well-known/oauth-authorization-server"
+        );
     }
 
     #[test]
@@ -1873,6 +2017,7 @@ mod tests {
             admin_pubkeys: Vec::new(),
             publisher_ownership_reads: true,
             oidc: OidcConfig::disabled(),
+            mcp_access: McpAccessConfig::disabled(),
             invite_requests: InviteRequestConfig::disabled(),
             first_party_auth: FirstPartyAuthConfig::disabled(),
             memory_backend: "none".to_string(),

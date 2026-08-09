@@ -40,6 +40,7 @@ fn test_config() -> Arc<ServerConfig> {
         admin_pubkeys: Vec::new(),
         publisher_ownership_reads: true,
         oidc: frameshift_server::OidcConfig::disabled(),
+        mcp_access: frameshift_server::McpAccessConfig::disabled(),
         shutdown_grace: Duration::from_secs(1),
         cors_allowed_origins: String::new(),
         download_secret: SecretString::new(String::new()),
@@ -93,6 +94,8 @@ fn mk_state(catalog: MockCatalog) -> AppState {
             Duration::from_secs(600),
         )),
         account_auth: None,
+        mcp_access: None,
+        mcp_dispatcher: None,
     }
 }
 

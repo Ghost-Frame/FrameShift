@@ -1,7 +1,7 @@
 //! Diesel table! macro declarations for the frameshift catalog schema.
 //!
-//! Column names and types here MUST match the schema defined in
-//! `migrations/2026-05-13-000000_initial_schema/up.sql`.
+//! Column names and types here MUST match the complete ordered migration
+//! history under `migrations/`.
 //!
 //! # Type mapping
 //!
@@ -14,6 +14,8 @@
 //! | `TIMESTAMPTZ` | `diesel::sql_types::Timestamptz` | `DateTime<Utc>` |
 //! | `BIGINT` | `diesel::sql_types::BigInt` | `i64` |
 //! | `INTEGER` | `diesel::sql_types::Integer` | `i32` |
+//! | `SMALLINT` | `diesel::sql_types::SmallInt` | `i16` |
+//! | `UUID` | `diesel::sql_types::Uuid` | `uuid::Uuid` |
 
 // Diesel's table! macro generates dead_code for columns not referenced in
 // every query file; suppress the lint workspace-wide to keep CI green.
@@ -246,6 +248,114 @@ diesel::table! {
         consumed_at -> Nullable<Timestamptz>,
         /// Explicit supersession or revocation timestamp.
         revoked_at -> Nullable<Timestamptz>,
+    }
+}
+
+diesel::table! {
+    /// Per-account serialization lock and remote persona-state revision fence.
+    account_persona_state (account_id) {
+        /// Stable authenticated account identifier.
+        account_id -> Uuid,
+        /// Latest committed fresh mutation sequence.
+        revision -> BigInt,
+        /// Timestamp of the latest committed fresh mutation.
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    /// Exact verified public persona versions attached to one account.
+    account_persona_installations (account_id, pack_name, version) {
+        /// Account that owns the installation.
+        account_id -> Uuid,
+        /// Canonical public pack name.
+        pack_name -> Text,
+        /// Exact immutable public version string.
+        version -> Text,
+        /// Raw 32-byte SHA-256 archive content hash.
+        content_hash -> Binary,
+        /// Timestamp of the first successful account attachment.
+        installed_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    /// Single account-level active persona bound to an exact installation.
+    account_active_personas (account_id) {
+        /// Account that owns the active selection.
+        account_id -> Uuid,
+        /// Exact installed root pack name.
+        pack_name -> Text,
+        /// Exact installed root version.
+        version -> Text,
+        /// Raw 32-byte SHA-256 archive content hash.
+        content_hash -> Binary,
+        /// Timestamp of the latest successful selection.
+        selected_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    /// Bounded global-only integer selection preferences for one account.
+    account_persona_preferences (account_id, pack_name) {
+        /// Account that owns the preference.
+        account_id -> Uuid,
+        /// Installed active pack name receiving the preference.
+        pack_name -> Text,
+        /// Exact signed selection bias in milli-units.
+        bias_millis -> SmallInt,
+        /// Number of mutations incorporated into this preference.
+        mutation_count -> BigInt,
+        /// Timestamp of the latest preference mutation.
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    /// Append-only idempotency evidence for account persona mutations.
+    account_persona_operations (account_id, operation_id) {
+        /// Account that owns the operation.
+        account_id -> Uuid,
+        /// Caller-selected non-nil idempotency identifier.
+        operation_id -> Uuid,
+        /// Account revision committed by this fresh mutation.
+        sequence -> BigInt,
+        /// Exact bounded mutation tool name.
+        tool_name -> Text,
+        /// Canonical request-hashing schema version.
+        request_schema_version -> Integer,
+        /// Raw 32-byte SHA-256 canonical request hash.
+        request_hash -> Binary,
+        /// Bounded typed receipt whose non-secret fields are enforced in Rust.
+        receipt -> Jsonb,
+        /// Timestamp at which the operation committed.
+        created_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    /// Exact authenticated account growth bound to an installed persona.
+    account_persona_growth_entries (account_id, entry_id) {
+        /// Account-scoped half of the tenant-composite entry identity.
+        account_id -> Uuid,
+        /// Caller-selected non-nil growth entry identifier.
+        entry_id -> Uuid,
+        /// Exact installed pack name receiving the growth.
+        pack_name -> Text,
+        /// Exact installed version receiving the growth.
+        version -> Text,
+        /// Raw 32-byte SHA-256 installed archive hash.
+        content_hash -> Binary,
+        /// Positive monotonic account/persona sequence.
+        sequence -> BigInt,
+        /// Exact structurally admitted UTF-8 growth text.
+        text -> Text,
+        /// Raw 32-byte SHA-256 hash of the exact text bytes.
+        text_hash -> Binary,
+        /// Timestamp at which the growth mutation committed.
+        created_at -> Timestamptz,
+        /// Idempotency operation that created the entry.
+        operation_id -> Uuid,
     }
 }
 
@@ -768,6 +878,12 @@ diesel::joinable!(publisher_memberships -> publisher_profiles (publisher_id));
 // Allow Diesel join inference for first-party credentials and sessions.
 diesel::joinable!(account_password_credentials -> accounts (account_id));
 diesel::joinable!(account_sessions -> accounts (account_id));
+// Allow Diesel join inference for the account persona-state owner row.
+diesel::joinable!(account_persona_state -> accounts (account_id));
+// Allow Diesel join inference for mutable account persona-state projections.
+diesel::joinable!(account_persona_installations -> account_persona_state (account_id));
+diesel::joinable!(account_persona_preferences -> account_persona_state (account_id));
+diesel::joinable!(account_persona_operations -> account_persona_state (account_id));
 // Recovery rows are anchored to the first-party credential primary key.
 diesel::joinable!(account_password_recovery_tokens -> account_password_credentials (account_id));
 diesel::joinable!(account_password_recovery_outbox -> account_password_credentials (account_id));
@@ -811,6 +927,12 @@ diesel::allow_tables_to_appear_in_same_query!(
     account_mfa_login_challenges,
     account_native_authorization_codes,
     account_auth_audit_events,
+    account_persona_state,
+    account_persona_installations,
+    account_active_personas,
+    account_persona_preferences,
+    account_persona_operations,
+    account_persona_growth_entries,
     account_password_recovery_tokens,
     account_password_recovery_outbox,
     account_invite_requests,

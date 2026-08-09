@@ -60,6 +60,24 @@ pub struct ToolDef {
     /// JSON Schema for the tool's input parameters.
     #[serde(rename = "inputSchema")]
     pub input_schema: serde_json::Value,
+    /// Client-facing safety and interaction hints for this tool.
+    pub annotations: ToolAnnotations,
+}
+
+/// MCP tool behavior hints used by clients when presenting or approving calls.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolAnnotations {
+    /// Human-readable tool title shown in client interfaces.
+    pub title: String,
+    /// Whether invoking the tool leaves its user-visible environment unchanged.
+    pub read_only_hint: bool,
+    /// Whether invoking the tool may remove or replace persisted state.
+    pub destructive_hint: bool,
+    /// Whether repeating the same call has no additional user-visible effect.
+    pub idempotent_hint: bool,
+    /// Whether the tool can interact with data outside FrameShift-managed state.
+    pub open_world_hint: bool,
 }
 
 /// Result of a tools/call invocation.

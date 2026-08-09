@@ -67,6 +67,8 @@ fn test_state(catalog: MockCatalog, config: Arc<ServerConfig>) -> AppState {
             Duration::from_secs(600),
         )),
         account_auth: None,
+        mcp_access: None,
+        mcp_dispatcher: None,
     }
 }
 

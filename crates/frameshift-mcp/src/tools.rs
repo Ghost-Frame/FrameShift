@@ -13,7 +13,7 @@ use frameshift_studio::{
 use serde::Deserialize;
 
 use crate::context::{resolve_render_target, validate_absolute_path, with_project_root};
-use crate::protocol::{ToolContent, ToolDef, ToolResult};
+use crate::protocol::{ToolAnnotations, ToolContent, ToolDef, ToolResult};
 
 /// Bounded exact registry source and new identity accepted by the fork creation mode.
 #[derive(Debug, Deserialize)]
@@ -95,12 +95,30 @@ fn shared_embedder() -> Option<&'static dyn Embedder> {
     None
 }
 
+/// Build the complete static MCP annotation set for one tool definition.
+fn tool_annotations(
+    title: &str,
+    read_only_hint: bool,
+    destructive_hint: bool,
+    idempotent_hint: bool,
+    open_world_hint: bool,
+) -> ToolAnnotations {
+    ToolAnnotations {
+        title: title.to_string(),
+        read_only_hint,
+        destructive_hint,
+        idempotent_hint,
+        open_world_hint,
+    }
+}
+
 /// Return the complete list of available MCP tools with their JSON Schema definitions.
 pub fn tool_definitions() -> Vec<ToolDef> {
     vec![
         ToolDef {
             name: "frameshift_install".to_string(),
             description: "Install a persona pack into the Frameshift central store for a project.".to_string(),
+            annotations: tool_annotations("Install Persona", false, true, false, true),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -114,6 +132,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         ToolDef {
             name: "frameshift_activate".to_string(),
             description: "Mark an installed persona as active for the given project.".to_string(),
+            annotations: tool_annotations("Activate Persona", false, true, true, false),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -126,6 +145,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         ToolDef {
             name: "frameshift_list".to_string(),
             description: "List all personas installed for the given project.".to_string(),
+            annotations: tool_annotations("List Personas", true, false, true, false),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -136,6 +156,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         ToolDef {
             name: "frameshift_grow_append".to_string(),
             description: "Append a growth entry to a persona's growth log for the given project.".to_string(),
+            annotations: tool_annotations("Append Persona Growth", false, true, false, false),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -148,7 +169,8 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "frameshift_select".to_string(),
-            description: "Rank installed personas for the given project context. Returns a ranked list with score, confidence, and rationale. Read-only; does not change active state. Pass 'library' to rank from a catalog directory instead of installed personas.".to_string(),
+            description: "Rank installed personas for the given project context. Returns a ranked list with score, confidence, and rationale. Does not change active state or preferences; builds with semantic embeddings may populate local model and embedding caches. Pass 'library' to rank from a catalog directory instead of installed personas.".to_string(),
+            annotations: tool_annotations("Select Persona Candidates", false, false, true, true),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -161,6 +183,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         ToolDef {
             name: "frameshift_use".to_string(),
             description: "Activate a persona for the given project and return its rendered content.".to_string(),
+            annotations: tool_annotations("Use Persona", false, true, true, false),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -174,6 +197,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         ToolDef {
             name: "frameshift_automate".to_string(),
             description: "Manage automate-mode state for a project. Actions: on, off, status, lock, unlock. Enabling Automate stores policy only; the connected host or daemon must invoke selection and activation.".to_string(),
+            annotations: tool_annotations("Manage Automate Mode", false, true, false, false),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -195,6 +219,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         ToolDef {
             name: "frameshift_capabilities".to_string(),
             description: "Report the resolved persona's declared capability manifest and, when a candidate tool list is given, annotate which of those tools are allowed by it. Advisory only -- never blocks or hides any of this server's own MCP tools (persona `required_tools` names agent-side tools such as Read/Bash, a different namespace).".to_string(),
+            annotations: tool_annotations("Inspect Persona Capabilities", true, false, true, false),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -227,6 +252,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         ToolDef {
             name: "frameshift_prefs".to_string(),
             description: "View and adjust per-persona preference biases. Actions: show, bump, decay, reset.".to_string(),
+            annotations: tool_annotations("Manage Persona Preferences", false, true, false, false),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -243,6 +269,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         ToolDef {
             name: "frameshift_search".to_string(),
             description: "Search the registry's pack catalog by free-text query, optionally restricted to a single tag, and return matching packs with name, latest version, download count, tags, and description. Read-only; does not install anything. Use this to discover packs before calling frameshift_install.".to_string(),
+            annotations: tool_annotations("Search Persona Registry", true, false, true, true),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -262,6 +289,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         ToolDef {
             name: "frameshift_draft_create".to_string(),
             description: "Create a local Creator Studio draft as an empty workspace, atomic blank template, validated guided template, verified registry fork, or hardened import.".to_string(),
+            annotations: tool_annotations("Create Persona Draft", false, false, false, true),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -392,6 +420,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         ToolDef {
             name: "frameshift_draft_list".to_string(),
             description: "List local Creator Studio drafts without exposing filesystem paths.".to_string(),
+            annotations: tool_annotations("List Persona Drafts", true, false, true, false),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {}
@@ -400,6 +429,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         ToolDef {
             name: "frameshift_draft_status".to_string(),
             description: "Validate a draft and return its exact public file inventory, findings, and review freshness.".to_string(),
+            annotations: tool_annotations("Inspect Persona Draft Status", true, false, true, false),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -411,6 +441,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         ToolDef {
             name: "frameshift_draft_preview".to_string(),
             description: "Render every supported agent target from the exact current typed draft without exposing filesystem paths.".to_string(),
+            annotations: tool_annotations("Preview Persona Draft", true, false, true, false),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -422,6 +453,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         ToolDef {
             name: "frameshift_draft_read".to_string(),
             description: "Read one documented public file from a local Creator Studio draft.".to_string(),
+            annotations: tool_annotations("Read Persona Draft File", true, false, true, false),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -434,6 +466,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         ToolDef {
             name: "frameshift_draft_write".to_string(),
             description: "Write or remove one documented public draft file. Every mutation invalidates prior review and submission intent.".to_string(),
+            annotations: tool_annotations("Modify Persona Draft File", false, true, false, false),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -530,14 +563,15 @@ fn load_capability_manifest(
 
     let name = match persona {
         Some(p) => p.to_string(),
-        // Marker path goes through the failure-aware resolver so a persona
-        // whose last sync failed produces an actionable message instead of a
-        // raw missing-pack.toml IO error below.
+        // Marker path goes through the integrity-aware resolver so content
+        // failing current lock, completeness, or policy checks produces an
+        // actionable message instead of a raw missing-pack.toml IO error below.
         None => match client.active_persona_state(project_root) {
             Ok(frameshift_client::ActivePersonaState::Materialized(name)) => name,
             Ok(frameshift_client::ActivePersonaState::Unmaterialized(name)) => {
                 return Err(format!(
-                    "active persona '{name}' is not materialized (its last sync failed); \
+                    "active persona '{name}' does not satisfy current lock, completeness, or \
+                     prompt-policy checks; \
                      run `frameshift sync` to see why, then reinstall or activate another persona"
                 ));
             }
@@ -817,7 +851,7 @@ fn call_activate(arguments: &serde_json::Value, client: &Client) -> ToolResult {
 
 /// Handle the frameshift_list tool call.
 ///
-/// Calls client.sync to get the current list of installed personas.
+/// Reads the project lockfile without re-materializing project state.
 fn call_list(arguments: &serde_json::Value, client: &Client) -> ToolResult {
     let project_root_str = match arguments.get("project_root").and_then(|v| v.as_str()) {
         Some(s) => s,
@@ -829,17 +863,10 @@ fn call_list(arguments: &serde_json::Value, client: &Client) -> ToolResult {
         Err(e) => return err_result(e),
     };
 
-    match client.sync(&project_root) {
-        Ok(report) => {
-            // `failures` is additive: locked personas that could not be
-            // materialized this sync, each with its cause.
-            let failures: Vec<serde_json::Value> = report
-                .failures
-                .iter()
-                .map(|f| serde_json::json!({"persona": f.persona, "error": f.error}))
-                .collect();
-            let text =
-                serde_json::json!({"personas": report.personas, "failures": failures}).to_string();
+    match client.list_personas(&project_root) {
+        Ok(locked) => {
+            let personas: Vec<String> = locked.into_iter().map(|persona| persona.name).collect();
+            let text = serde_json::json!({"personas": personas, "failures": []}).to_string();
             ok_result(text)
         }
         Err(e) => err_result(format!("list failed: {e}")),
@@ -1374,6 +1401,19 @@ fn studio_for_client(client: &Client) -> Result<Studio, String> {
         .map_err(|error| format!("draft store unavailable: {error}"))
 }
 
+/// Open the managed Creator Studio store for a read without creating it.
+fn existing_studio_for_client(client: &Client) -> Result<Option<Studio>, String> {
+    match Studio::open_existing(client.data_root().join("studio").join("drafts")) {
+        Ok(studio) => Ok(Some(studio)),
+        Err(frameshift_studio::StudioError::Io(error))
+            if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(format!("draft store unavailable: {error}")),
+    }
+}
+
 /// Read one required string argument with a stable MCP error.
 fn required_string<'a>(
     arguments: &'a serde_json::Value,
@@ -1508,8 +1548,9 @@ fn call_draft_create(arguments: &serde_json::Value, client: &Client) -> ToolResu
 
 /// Handle stable listing of local Creator Studio draft metadata.
 fn call_draft_list(client: &Client) -> ToolResult {
-    let studio = match studio_for_client(client) {
-        Ok(studio) => studio,
+    let studio = match existing_studio_for_client(client) {
+        Ok(Some(studio)) => studio,
+        Ok(None) => return ok_result("[]".to_string()),
         Err(error) => return err_result(error),
     };
     match studio
@@ -1527,8 +1568,9 @@ fn call_draft_status(arguments: &serde_json::Value, client: &Client) -> ToolResu
         Ok(value) => value,
         Err(result) => return result,
     };
-    let studio = match studio_for_client(client) {
-        Ok(studio) => studio,
+    let studio = match existing_studio_for_client(client) {
+        Ok(Some(studio)) => studio,
+        Ok(None) => return err_result("draft status failed: draft not found".to_string()),
         Err(error) => return err_result(error),
     };
     match studio.status(id) {
@@ -1543,8 +1585,9 @@ fn call_draft_preview(arguments: &serde_json::Value, client: &Client) -> ToolRes
         Ok(value) => value,
         Err(result) => return result,
     };
-    let studio = match studio_for_client(client) {
-        Ok(studio) => studio,
+    let studio = match existing_studio_for_client(client) {
+        Ok(Some(studio)) => studio,
+        Ok(None) => return err_result("draft preview failed: draft not found".to_string()),
         Err(error) => return err_result(error),
     };
     match studio
@@ -1566,8 +1609,9 @@ fn call_draft_read(arguments: &serde_json::Value, client: &Client) -> ToolResult
         Ok(value) => value,
         Err(result) => return result,
     };
-    let studio = match studio_for_client(client) {
-        Ok(studio) => studio,
+    let studio = match existing_studio_for_client(client) {
+        Ok(Some(studio)) => studio,
+        Ok(None) => return err_result("draft read failed: draft not found".to_string()),
         Err(error) => return err_result(error),
     };
     match studio.read_file(id, path).and_then(|bytes| {
@@ -1696,6 +1740,162 @@ mod tests {
         assert!(!defs
             .iter()
             .any(|definition| definition.name == "frameshift_draft_review"));
+    }
+
+    /// Every published tool serializes the complete reviewed MCP annotation set.
+    #[test]
+    fn tool_definitions_publish_reviewed_annotations() {
+        let serialized = serde_json::to_value(tool_definitions()).unwrap();
+        let actual = serialized
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| {
+                serde_json::json!({
+                    "name": tool["name"],
+                    "annotations": tool["annotations"],
+                })
+            })
+            .collect::<Vec<_>>();
+        let expected = vec![
+            annotation_snapshot(
+                "frameshift_install",
+                "Install Persona",
+                false,
+                true,
+                false,
+                true,
+            ),
+            annotation_snapshot(
+                "frameshift_activate",
+                "Activate Persona",
+                false,
+                true,
+                true,
+                false,
+            ),
+            annotation_snapshot("frameshift_list", "List Personas", true, false, true, false),
+            annotation_snapshot(
+                "frameshift_grow_append",
+                "Append Persona Growth",
+                false,
+                true,
+                false,
+                false,
+            ),
+            annotation_snapshot(
+                "frameshift_select",
+                "Select Persona Candidates",
+                false,
+                false,
+                true,
+                true,
+            ),
+            annotation_snapshot("frameshift_use", "Use Persona", false, true, true, false),
+            annotation_snapshot(
+                "frameshift_automate",
+                "Manage Automate Mode",
+                false,
+                true,
+                false,
+                false,
+            ),
+            annotation_snapshot(
+                "frameshift_capabilities",
+                "Inspect Persona Capabilities",
+                true,
+                false,
+                true,
+                false,
+            ),
+            annotation_snapshot(
+                "frameshift_prefs",
+                "Manage Persona Preferences",
+                false,
+                true,
+                false,
+                false,
+            ),
+            annotation_snapshot(
+                "frameshift_search",
+                "Search Persona Registry",
+                true,
+                false,
+                true,
+                true,
+            ),
+            annotation_snapshot(
+                "frameshift_draft_create",
+                "Create Persona Draft",
+                false,
+                false,
+                false,
+                true,
+            ),
+            annotation_snapshot(
+                "frameshift_draft_list",
+                "List Persona Drafts",
+                true,
+                false,
+                true,
+                false,
+            ),
+            annotation_snapshot(
+                "frameshift_draft_status",
+                "Inspect Persona Draft Status",
+                true,
+                false,
+                true,
+                false,
+            ),
+            annotation_snapshot(
+                "frameshift_draft_preview",
+                "Preview Persona Draft",
+                true,
+                false,
+                true,
+                false,
+            ),
+            annotation_snapshot(
+                "frameshift_draft_read",
+                "Read Persona Draft File",
+                true,
+                false,
+                true,
+                false,
+            ),
+            annotation_snapshot(
+                "frameshift_draft_write",
+                "Modify Persona Draft File",
+                false,
+                true,
+                false,
+                false,
+            ),
+        ];
+
+        assert_eq!(actual, expected);
+    }
+
+    /// Build the expected serialized annotation projection for one tool test row.
+    fn annotation_snapshot(
+        name: &str,
+        title: &str,
+        read_only_hint: bool,
+        destructive_hint: bool,
+        idempotent_hint: bool,
+        open_world_hint: bool,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "name": name,
+            "annotations": {
+                "title": title,
+                "readOnlyHint": read_only_hint,
+                "destructiveHint": destructive_hint,
+                "idempotentHint": idempotent_hint,
+                "openWorldHint": open_world_hint,
+            }
+        })
     }
 
     /// Draft creation advertises bounded blank, guided, and registry-fork contracts.
@@ -1883,6 +2083,76 @@ mod tests {
         );
         let parsed: serde_json::Value = serde_json::from_str(&result.content[0].text).unwrap();
         assert!(parsed["personas"].is_array());
+    }
+
+    /// Verify that frameshift_list never repairs or replaces materialized state.
+    #[test]
+    fn tool_call_list_is_read_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_root = tmp.path().join("data");
+        let pack_dir = tmp.path().join("pack");
+        make_pack_dir(&pack_dir, "listed", "0.1.0");
+
+        let project_root = tmp.path().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let client = make_client(&data_root);
+        let install_result = call_tool(
+            "frameshift_install",
+            &serde_json::json!({
+                "spec": "listed@0.1.0",
+                "project_root": project_root.to_str().unwrap(),
+                "from_path": pack_dir.to_str().unwrap()
+            }),
+            &client,
+        );
+        assert!(install_result.is_error.is_none(), "fixture install failed");
+
+        let sentinel = client
+            .project_paths(&project_root)
+            .unwrap()
+            .personas_dir
+            .join("listed")
+            .join("list-must-not-repair.txt");
+        fs::write(&sentinel, b"preserve me").unwrap();
+
+        let result = call_tool(
+            "frameshift_list",
+            &serde_json::json!({
+                "project_root": project_root.to_str().unwrap()
+            }),
+            &client,
+        );
+        assert!(result.is_error.is_none(), "unexpected list error");
+        assert_eq!(fs::read(&sentinel).unwrap(), b"preserve me");
+    }
+
+    /// Draft read tools leave an absent persistent store absent.
+    #[test]
+    fn draft_read_tools_do_not_create_missing_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_root = tmp.path().join("data");
+        let store_root = data_root.join("studio").join("drafts");
+        let client = make_client(&data_root);
+        let calls = [
+            ("frameshift_draft_list", serde_json::json!({})),
+            (
+                "frameshift_draft_status",
+                serde_json::json!({"id": "missing"}),
+            ),
+            (
+                "frameshift_draft_preview",
+                serde_json::json!({"id": "missing"}),
+            ),
+            (
+                "frameshift_draft_read",
+                serde_json::json!({"id": "missing", "path": "persona.toml"}),
+            ),
+        ];
+
+        for (name, arguments) in calls {
+            let _ = call_tool(name, &arguments, &client);
+            assert!(!store_root.exists(), "{name} created the draft store");
+        }
     }
 
     /// Verify that frameshift_grow_append returns {"appended": true} after

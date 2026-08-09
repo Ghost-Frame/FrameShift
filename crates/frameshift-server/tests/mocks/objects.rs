@@ -93,14 +93,27 @@ impl PackStore for MockPackStore {
         Ok(())
     }
 
-    /// Retrieve the bytes stored under `hash`, or `NotFound` if absent.
-    async fn get(&self, hash: &ObjectHash) -> Result<Vec<u8>, ObjectStoreError> {
-        self.blobs
+    /// Retrieve the bytes stored under `hash` without cloning above `max_bytes`.
+    async fn get_bounded(
+        &self,
+        hash: &ObjectHash,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, ObjectStoreError> {
+        let blobs = self
+            .blobs
             .read()
-            .map_err(|e| ObjectStoreError::BackendError(e.to_string().into()))?
+            .map_err(|e| ObjectStoreError::BackendError(e.to_string().into()))?;
+        let bytes = blobs
             .get(hash)
-            .cloned()
-            .ok_or_else(|| ObjectStoreError::NotFound { hash: *hash })
+            .ok_or_else(|| ObjectStoreError::NotFound { hash: *hash })?;
+        if bytes.len() > max_bytes {
+            return Err(ObjectStoreError::ReadLimitExceeded {
+                hash: *hash,
+                observed_bytes: bytes.len() as u64,
+                max_bytes: max_bytes as u64,
+            });
+        }
+        Ok(bytes.clone())
     }
 
     /// Return `true` if a blob exists for `hash`.

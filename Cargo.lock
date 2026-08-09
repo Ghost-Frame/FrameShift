@@ -2036,9 +2036,11 @@ dependencies = [
  "chrono",
  "frameshift-pack",
  "frameshift-publication",
+ "frameshift-source",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "unicode-normalization",
  "uuid",
 ]
 
@@ -2301,6 +2303,7 @@ dependencies = [
  "frameshift-objects",
  "frameshift-pack",
  "hex",
+ "libc",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -2358,17 +2361,23 @@ dependencies = [
 name = "frameshift-publication"
 version = "0.1.0"
 dependencies = [
+ "ed25519-dalek",
+ "flate2",
+ "frameshift-compose",
  "frameshift-conformance",
  "frameshift-pack",
  "frameshift-source",
  "frameshift-template",
  "hex",
  "libc",
+ "semver",
  "serde",
  "sha2 0.10.9",
+ "tar",
  "tempfile",
  "thiserror 2.0.18",
  "toml 0.8.23",
+ "unicase",
  "unicode-normalization",
 ]
 
@@ -2434,6 +2443,7 @@ dependencies = [
  "frameshift-pack",
  "frameshift-publication",
  "frameshift-runtime",
+ "frameshift-source",
  "governor",
  "hex",
  "hmac 0.12.1",
@@ -2444,6 +2454,7 @@ dependencies = [
  "rand_core 0.6.4",
  "reqwest 0.12.28",
  "secrecy",
+ "semver",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2469,6 +2480,8 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "toml 0.8.23",
+ "unicode-normalization",
+ "unicode-security",
 ]
 
 [[package]]
@@ -3028,6 +3041,7 @@ dependencies = [
  "http",
  "http-body",
  "pin-project-lite",
+ "tokio",
 ]
 
 [[package]]
@@ -6576,6 +6590,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "unicase"
+version = "2.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dbc4bc3a9f746d862c45cb89d705aa10f187bb96c76001afab07a0d35ce60142"
+
+[[package]]
 name = "unicode-bidi"
 version = "0.3.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6610,6 +6630,22 @@ name = "unicode-properties"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7df058c713841ad818f1dc5d3fd88063241cc61f49f5fbea4b951e8cf5a8d71d"
+
+[[package]]
+name = "unicode-script"
+version = "0.5.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "383ad40bb927465ec0ce7720e033cb4ca06912855fc35db31b5755d0de75b1ee"
+
+[[package]]
+name = "unicode-security"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e4ddba1535dd35ed8b61c52166b7155d7f4e4b8847cec6f48e71dc66d8b5e50"
+dependencies = [
+ "unicode-normalization",
+ "unicode-script",
+]
 
 [[package]]
 name = "unicode-segmentation"

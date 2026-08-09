@@ -2349,7 +2349,7 @@ fn make_publication_intent(
         archive_hash: make_hash(hash_seed),
         manifest_hash: make_hash(hash_seed.wrapping_add(1)),
         file_inventory_hash: make_hash(hash_seed.wrapping_add(2)),
-        scan_schema_version: 1,
+        scan_schema_version: frameshift_publication::REPORT_SCHEMA_VERSION,
         created_at,
         expires_at,
         consumed_at: None,
