@@ -1,6 +1,6 @@
 # Persona Catalog
 
-42 personas ship with Frameshift. Each is defined by a public `pack.toml` declaring identity, capabilities, selection signals, and behavioral scope.
+43 personas ship with Frameshift. Each is defined by a public `pack.toml` declaring identity, capabilities, selection signals, and behavioral scope.
 
 ## Domain engineering
 
@@ -42,6 +42,7 @@
 | `devops/` | Deployment engineer. Staged rollouts, named rollback paths, fleet-wide awareness |
 | `security/` | Security analyst. Opsec-first, classifies by noise level |
 | `gatekeeper/` | Paranoid gatekeeper. Classifies before it lets anything cross the public boundary |
+| `google-workspace-administrator/` | Google Workspace administrator. Tenant-verified, least-privileged operations across identity, collaboration, security, compliance, and automation |
 | `performance/` | Performance analyst. Profiles before optimizing, benchmarks before claiming |
 | `incident-commander/` | Incident commander. Establishes control, coordinates responders, and protects recovery |
 
@@ -84,6 +85,7 @@ Exceptions:
 |---|---|
 | `api-integrator/` | `network_egress = true` |
 | `incident-commander/` | `network_egress = true`; `memory_required = "soft"` (search, store) |
+| `google-workspace-administrator/` | `network_egress = true`; `filesystem_scope = "home"`; `memory_required = "soft"` (search, store) |
 | `product-strategist/` | `network_egress = true`; `memory_required = "soft"` (search, store) |
 | `visual-director/` | `network_egress = true`; `memory_required = "soft"` (search, store) |
 | `mmo-simulation-engineer/` | `memory_required = "soft"` (search, store) |
