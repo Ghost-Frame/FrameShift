@@ -118,6 +118,7 @@ Resolution order: base -> mixins (in order) -> root persona. Conflicting rule ID
 | `frontend/` | Frontend engineer. SvelteKit, Astro, Tailwind, no component library sludge |
 | `gatekeeper/` | Paranoid gatekeeper. Classifies before it lets anything cross the public boundary |
 | `go-engineer/` | Go engineer. Stdlib-first, table tests, context propagation, errors-as-values |
+| `google-workspace-administrator/` | Google Workspace administrator. Proves tenant identity, minimizes authority, preserves data and recovery, and verifies live service outcomes |
 | `incident-commander/` | Incident commander. Stabilizes user impact, preserves evidence, coordinates owners, and verifies recovery |
 | `issue-triager/` | Issue triage. Labels, priorities, dedup, needs-info detection |
 | `journal-keeper/` | Daily and weekly logger. Captures what was learned, done, pending, stuck |
