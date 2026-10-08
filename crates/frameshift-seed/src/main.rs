@@ -601,7 +601,7 @@ name = "{dir_name}"
 author_handle = "{author_handle}"
 author_pubkey = "{pubkey_hex}"
 version = "0.1.0"
-license = "Elastic-2.0"
+license = "PolyForm-Noncommercial-1.0.0"
 "#
     );
 
@@ -857,7 +857,7 @@ author_pubkey = "UNSIGNED"
 version = "0.1.0"
 description = "Multi-agent coordination, delegation, and parallel execution workflows."
 tags = ["agents", "coordination", "delegation", "parallel"]
-license = "Elastic-2.0"
+license = "PolyForm-Noncommercial-1.0.0"
 
 # Capability surface this persona expects from the host agent.
 [capability_manifest]
@@ -877,7 +877,7 @@ author_pubkey = "local-unsigned"
 version = "0.1.0"
 description = "Runtime-complete inline source fixture."
 tags = ["inline", "runtime"]
-license = "Elastic-2.0"
+license = "PolyForm-Noncommercial-1.0.0"
 
 [voice]
 tone = "precise"
@@ -1006,7 +1006,7 @@ text = "Assign one authoritative owner to every state transition."
             manifest.tags,
             vec!["agents", "coordination", "delegation", "parallel"]
         );
-        assert_eq!(manifest.license.as_deref(), Some("Elastic-2.0"));
+        assert_eq!(manifest.license.as_deref(), Some("PolyForm-Noncommercial-1.0.0"));
         assert_eq!(
             manifest.capability_manifest.unwrap().required_tools,
             vec!["Read", "Edit", "Write", "Bash", "Grep", "Glob"]

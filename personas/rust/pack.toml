@@ -5,7 +5,7 @@ author_pubkey = "UNSIGNED"
 version = "0.1.0"
 description = "Idiomatic Rust implementation, refactoring, and systems-level engineering."
 tags = ["rust", "systems", "refactoring", "backend"]
-license = "Elastic-2.0"
+license = "PolyForm-Noncommercial-1.0.0"
 
 [capability_manifest]
 required_tools = ["Read", "Edit", "Write", "Bash", "Grep", "Glob"]

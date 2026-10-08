@@ -163,6 +163,4 @@ Report security issues through [GitHub private vulnerability reporting](https://
 
 ## License
 
-FrameShift source code is available under the [Elastic License 2.0](LICENSE). Persona packs can declare their own licenses.
-
-Elastic License 2.0 does not permit offering FrameShift to third parties as a hosted or managed service. Commercial terms for hosted or managed offerings are available from `support@syntheos.dev`.
+[PolyForm Noncommercial License 1.0.0](LICENSE). Personal, hobby, research, and other noncommercial use is permitted. Any commercial use, including selling, reselling, hosting, bundling, or otherwise earning revenue from this software, requires a separate written commercial license. Contact support@syntheos.dev. Third-party persona packs can declare their own licenses.

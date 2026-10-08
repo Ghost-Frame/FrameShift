@@ -31,4 +31,4 @@ Frameshift is not a model fine-tune. It works with any agent that reads AGENTS.m
 
 ## License
 
-The runtime, engine, and tooling are licensed under [Elastic License 2.0](https://www.elastic.co/licensing/elastic-license). Persona content in `personas/` is open source.
+The runtime, engine, and tooling are licensed under the [PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0). Commercial use requires a separate written license from support@syntheos.dev. Persona content in `personas/` is open source.

@@ -36,7 +36,7 @@ edition = "2021"
 # The locked dependency graph includes crates whose published MSRV is 1.88.
 # Keep this value aligned with the pinned CI and release toolchains.
 rust-version = "1.88"
-license = "Elastic-2.0"
+license = "PolyForm-Noncommercial-1.0.0"
 
 [workspace.dependencies]
 age = { version = "0.10", features = [] }

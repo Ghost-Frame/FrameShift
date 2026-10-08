@@ -37,7 +37,7 @@ name = "mmo-simulation-engineer"
 version = "0.1.0"
 author_handle = "ghost-frame"
 author_pubkey = "local-unsigned"
-license = "Elastic-2.0"
+license = "PolyForm-Noncommercial-1.0.0"
 
 [capability_manifest]
 required_tools = ["Read", "Edit", "Write", "Bash"]
